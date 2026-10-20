@@ -1,0 +1,4 @@
+# Preserve official upstream ASERT vector fixtures byte-for-byte, including source trailing whitespace.
+# Their data rows and headers are intentionally unmodified; suppress only the two whitespace
+# diagnostics that are present in the authoritative source files.
+simulations/asert_upstream_vectors/run* whitespace=-blank-at-eol,-blank-at-eof

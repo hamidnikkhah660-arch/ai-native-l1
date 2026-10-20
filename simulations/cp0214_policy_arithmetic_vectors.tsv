@@ -1,0 +1,26 @@
+# CP-0214 policy arithmetic shared Rust/Python vectors
+# Format: function|input_integer|expected_integer
+subsidy|0|0
+subsidy|1|35673515981
+subsidy|2|35673515981
+subsidy|4204800|35673515981
+subsidy|4204801|17836757990
+subsidy|8409601|8918378995
+subsidy|16819201|2229594748
+subsidy|100000001|4252
+subsidy|151372801|0
+miner_cumulative|0|0
+miner_cumulative|151372800|299999999913926400
+founder_periods|0|0
+founder_periods|1051199|0
+founder_periods|1051200|0
+founder_periods|1138799|0
+founder_periods|1138800|1
+founder_periods|1226400|2
+founder_periods|5168400|47
+founder_periods|5256000|48
+founder_periods|18446744073709551615|48
+founder_due|1138800|8333333333333333
+founder_due|1226400|16666666666666666
+founder_due|5168400|391666666666666666
+founder_due|5256000|400000000000000000

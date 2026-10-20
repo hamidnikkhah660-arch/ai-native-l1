@@ -1,0 +1,25 @@
+{
+  "name": "qanvoryx-launch-asset-candidate",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Tested fixed-supply EVM asset candidate; not approved for mainnet or sale.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "compile": "node scripts/compile.mjs",
+    "build:wallet": "node scripts/build-wallet-console.mjs",
+    "pretest": "node scripts/build-wallet-console.mjs",
+    "test": "node test/local-deployment.test.mjs && node test/wallet-console.test.mjs && node test/wallet-server.test.mjs",
+    "deploy:testnet": "node scripts/deploy-testnet.mjs",
+    "wallet:serve": "node scripts/serve-wallet-console.mjs"
+  },
+  "devDependencies": {
+    "@openzeppelin/contracts": "5.6.1",
+    "ethers": "6.17.0",
+    "hardhat": "3.19.0",
+    "solc": "0.8.37"
+  },
+  "overrides": {
+    "tmp": "0.2.7"
+  }
+}

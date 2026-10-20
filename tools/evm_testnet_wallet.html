@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Qanvoryx — Testnet Wallet Console</title>
+<style>
+:root{color-scheme:dark;--bg:#0a1020;--panel:#121c31;--line:#293a59;--text:#eef3ff;--muted:#a6b4ce;--blue:#8eb9ff;--green:#4ee0a3;--amber:#ffd178;--red:#ff8291}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(800px 420px at 100% 0,#1e3156,transparent 70%),var(--bg);color:var(--text);font:15px/1.5 system-ui,Segoe UI,sans-serif}
+main{max-width:900px;margin:30px auto;padding:0 17px 40px}header{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;flex-wrap:wrap}h1{margin:0;font-size:clamp(1.7rem,4vw,2.4rem);letter-spacing:-.035em}h2{font-size:1.05rem;margin:0 0 14px}p{margin:7px 0;color:var(--muted)}.pill{border:1px solid #775e2b;border-radius:999px;padding:6px 10px;color:var(--amber);font-size:.78rem;font-weight:800;letter-spacing:.04em}
+.warn{margin:20px 0;background:#2a2318;border:1px solid #775e2b;border-radius:12px;padding:13px 15px;color:#ffe7ae}.card{margin-top:15px;padding:19px;background:linear-gradient(150deg,#16223a,#11192b);border:1px solid var(--line);border-radius:15px}.row{display:flex;gap:10px;flex-wrap:wrap}.row>*{flex:1;min-width:185px}.field{margin-bottom:12px}label{display:block;color:var(--muted);font-size:.85rem;margin-bottom:5px}input{width:100%;padding:11px 12px;color:var(--text);background:#090f1e;border:1px solid #354968;border-radius:9px;font:inherit}button{border:1px solid #46628c;background:#1d3152;color:#fff;border-radius:9px;padding:11px 15px;font:inherit;font-weight:700;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}button.secondary{background:#121d31}button.primary{background:#315b98;border-color:#5c8dd0}
+.status{border:1px solid var(--line);background:#0b1324;border-radius:10px;padding:12px;color:var(--muted);margin-top:12px;overflow-wrap:anywhere}.status.good{color:var(--green)}.status.warn{color:var(--amber)}.status.bad{color:var(--red)}
+.metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric{background:#0b1325;border:1px solid #283854;padding:14px;border-radius:10px;min-width:0}.metric .k{font-size:.79rem;color:var(--muted)}.metric .v{font-size:clamp(1rem,2.8vw,1.45rem);font-weight:800;overflow-wrap:anywhere;letter-spacing:-.02em}.metric .s{font-size:.78rem;color:var(--muted);overflow-wrap:anywhere}.small{font-size:.82rem}footer{margin-top:20px;color:var(--muted);font-size:.8rem}code{color:#d5e7ff;overflow-wrap:anywhere}
+@media(max-width:550px){.card{padding:14px}.metrics{grid-template-columns:1fr}.row>*{min-width:100%}}
+</style>
+</head>
+<body>
+<main>
+<header>
+  <div><h1>Qanvoryx Wallet Console</h1><p>Self-custody ERC-20 testnet interface · local static page</p></div>
+  <span class="pill">TESTNET ONLY</span>
+</header>
+<div class="warn"><strong>Not a mainnet wallet.</strong> This console only accepts Base Sepolia or Ethereum Sepolia and verifies the token bytecode against this repository’s compiled fixed-supply candidate. It is not the native AI_NATIVE_L1 coin. It never asks for a seed phrase or private key, and it stores no credentials. Do not send real funds or share secrets here.</div>
+
+<section class="card">
+  <h2>1 · Connect a wallet extension</h2>
+  <div class="row">
+    <button class="primary" id="connectBtn" type="button">Connect wallet</button>
+    <button class="secondary" id="readBtn" type="button" disabled>Verify token & read balances</button>
+  </div>
+  <div id="walletStatus" class="status" role="status">Not connected. Install/use a browser wallet extension and select a supported testnet.</div>
+  <p class="small">Allowed chain IDs only: Base Sepolia (84532) and Ethereum Sepolia (11155111). Mainnets and local chains are refused.</p>
+</section>
+
+<section class="card">
+  <h2>2 · Deploy the fixed-supply candidate (testnet only)</h2>
+  <div class="row">
+    <div class="field"><label for="deployName">Token name</label><input id="deployName" maxlength="32" value="Qanvoryx Launch Candidate" autocomplete="off"></div>
+    <div class="field"><label for="deploySymbol">Token symbol</label><input id="deploySymbol" maxlength="16" value="QX" autocomplete="off"></div>
+  </div>
+  <div class="field"><label for="deployFounder">Founder treasury address · receives 4B / 40%</label><input id="deployFounder" value="" autocomplete="off" spellcheck="false" placeholder="Enter founder treasury address (required)"></div>
+  <div class="row">
+    <div class="field"><label for="deploySecurity">Security reserve address · receives 3B / 30%</label><input id="deploySecurity" value="" autocomplete="off" spellcheck="false" placeholder="Enter security reserve address (required)"></div>
+    <div class="field"><label for="deployPublicGoods">Public-goods treasury address · receives 3B / 30%</label><input id="deployPublicGoods" value="" autocomplete="off" spellcheck="false" placeholder="Enter public-goods treasury address (required)"></div>
+  </div>
+  <button id="deployBtn" class="primary" type="button" disabled>Deploy from connected wallet</button>
+  <div id="deployStatus" class="status">Disabled until connected to Base Sepolia or Ethereum Sepolia. Your wallet extension must approve and sign the deployment transaction.</div>
+  <p class="small">This creates a separate ERC-20, not the native L1 coin. All three allocations are immediately transferable with no vesting. The founder gets 40% only if the specified treasury address is the wallet you control. Deployment consumes testnet gas. No key or seed phrase is requested by this page.</p>
+</section>
+
+<section class="card">
+  <h2>3 · Enter the deployed testnet contract</h2>
+  <div class="field"><label for="tokenAddress">Fixed-supply token contract address</label><input id="tokenAddress" inputmode="text" autocomplete="off" spellcheck="false" placeholder="0x…"></div>
+  <div class="field"><label for="founderAddress">Founder treasury address (optional)</label><input id="founderAddress" inputmode="text" autocomplete="off" spellcheck="false" placeholder="Blank = connected wallet address"></div>
+  <p class="small">A connected wallet address is not automatically the founder treasury address. Enter the treasury only if you independently control it. The console reads live on-chain balances and calculates the treasury's actual current share; it does not assume the wallet still owns 40% after transfers.</p>
+</section>
+
+<section class="card">
+  <h2>4 · On-chain supply and balances</h2>
+  <div class="metrics">
+    <div class="metric"><div class="k">Network</div><div class="v" id="networkOut">—</div><div class="s" id="chainOut">Chain ID not verified</div></div>
+    <div class="metric"><div class="k">Verified token</div><div class="v" id="tokenOut">—</div><div class="s" id="tokenAddressOut">No contract read</div></div>
+    <div class="metric"><div class="k">Total supply</div><div class="v" id="supplyOut">—</div><div class="s">Read from the verified contract</div></div>
+    <div class="metric"><div class="k">Connected wallet balance</div><div class="v" id="walletBalanceOut">—</div><div class="s" id="walletAddressOut">No wallet connected</div></div>
+    <div class="metric"><div class="k">Founder treasury balance</div><div class="v" id="founderBalanceOut">—</div><div class="s" id="founderShareOut">Current share of total supply: —</div></div>
+    <div class="metric"><div class="k">Expected initial founder allocation</div><div class="v">4,000,000,000 tokens</div><div class="s">40% at initial deployment only; no enforced lock</div></div>
+  </div>
+  <div id="readStatus" class="status">No token contract has been verified.</div>
+</section>
+
+<section class="card">
+  <h2>5 · Transfer tokens (testnet only)</h2>
+  <div class="field"><label for="recipientAddress">Recipient EVM address</label><input id="recipientAddress" autocomplete="off" spellcheck="false" placeholder="0x…"></div>
+  <div class="field"><label for="transferAmount">Amount in tokens</label><input id="transferAmount" inputmode="decimal" autocomplete="off" placeholder="e.g. 25.5"></div>
+  <button id="transferBtn" class="primary" type="button" disabled>Review in wallet & send testnet transfer</button>
+  <div id="transferStatus" class="status">Transfer disabled until wallet and exact contract bytecode are verified on a supported testnet.</div>
+  <p class="small">The extension displays and signs each transaction; this page never has private-key access. Review chain, contract, recipient, amount, and wallet confirmation yourself. A transaction sent to the wrong address generally cannot be reversed.</p>
+</section>
+
+<footer>Build fingerprint comes from the repository’s compiled contract runtime bytecode. Source-bytecode match does not replace an independent audit or prove RPC-provider honesty. No market pool, exchange, live price, or candlestick feed is connected. Testnet token balances have no promised monetary value.</footer>
+</main>
+<script>
+(function(){
+"use strict";
+const EXPECTED_RUNTIME_CODE = "0x608060405234801561000f575f5ffd5b50600436106100e5575f3560e01c806370a082311161008857806395d89b411161006357806395d89b411461019e578063a5c9cd82146101a6578063a9059cbb146101b5578063dd62ed3e146101c8575f5ffd5b806370a082311461016e57806389a6630e1461016657806394d32a5d14610196575f5ffd5b806323b872dd116100c357806323b872dd1461013c578063313ce5671461014f57806332cb6b0c1461015e57806362c3db9b14610166575f5ffd5b806306fdde03146100e9578063095ea7b31461010757806318160ddd1461012a575b5f5ffd5b6100f1610200565b6040516100fe9190610616565b60405180910390f35b61011a61011536600461067c565b610290565b60405190151581526020016100fe565b6002545b6040519081526020016100fe565b61011a61014a3660046106a4565b6102a9565b604051601281526020016100fe565b61012e6102cc565b61012e6102e6565b61012e61017c3660046106de565b6001600160a01b03165f9081526020819052604090205490565b61012e6102fc565b6100f1610312565b61012e670de0b6b3a764000081565b61011a6101c336600461067c565b610321565b61012e6101d63660046106fe565b6001600160a01b039182165f90815260016020908152604080832093909416825291909152205490565b60606003805461020f9061072f565b80601f016020809104026020016040519081016040528092919081815260200182805461023b9061072f565b80156102865780601f1061025d57610100808354040283529160200191610286565b820191905f5260205f20905b81548152906001019060200180831161026957829003601f168201915b5050505050905090565b5f3361029d81858561032e565b60019150505b92915050565b5f336102b6858285610340565b6102c18585856103c1565b506001949350505050565b6102e3670de0b6b3a76400006402540be40061077b565b81565b6102e3670de0b6b3a764000063b2d05e0061077b565b6102e3670de0b6b3a764000063ee6b280061077b565b60606004805461020f9061072f565b5f3361029d8185856103c1565b61033b838383600161041e565b505050565b6001600160a01b038381165f908152600160209081526040808320938616835292905220545f198110156103bb57818110156103ad57604051637dc7a0d960e11b81526001600160a01b038416600482015260248101829052604481018390526064015b60405180910390fd5b6103bb84848484035f61041e565b50505050565b6001600160a01b0383166103ea57604051634b637e8f60e11b81525f60048201526024016103a4565b6001600160a01b0382166104135760405163ec442f0560e01b81525f60048201526024016103a4565b61033b8383836104f0565b6001600160a01b0384166104475760405163e602df0560e01b81525f60048201526024016103a4565b6001600160a01b03831661047057604051634a1406b160e11b81525f60048201526024016103a4565b6001600160a01b038085165f90815260016020908152604080832093871683529290522082905580156103bb57826001600160a01b0316846001600160a01b03167f8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925846040516104e291815260200190565b60405180910390a350505050565b6001600160a01b03831661051a578060025f82825461050f9190610792565b9091555061058a9050565b6001600160a01b0383165f908152602081905260409020548181101561056c5760405163391434e360e21b81526001600160a01b038516600482015260248101829052604481018390526064016103a4565b6001600160a01b0384165f9081526020819052604090209082900390555b6001600160a01b0382166105a6576002805482900390556105c4565b6001600160a01b0382165f9081526020819052604090208054820190555b816001600160a01b0316836001600160a01b03167fddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef8360405161060991815260200190565b60405180910390a3505050565b602081525f82518060208401525f5b818110156106425760208186018101516040868401015201610625565b505f604082850101526040601f19601f83011684010191505092915050565b80356001600160a01b0381168114610677575f5ffd5b919050565b5f5f6040838503121561068d575f5ffd5b61069683610661565b946020939093013593505050565b5f5f5f606084860312156106b6575f5ffd5b6106bf84610661565b92506106cd60208501610661565b929592945050506040919091013590565b5f602082840312156106ee575f5ffd5b6106f782610661565b9392505050565b5f5f6040838503121561070f575f5ffd5b61071883610661565b915061072660208401610661565b90509250929050565b600181811c9082168061074357607f821691505b60208210810361076157634e487b7160e01b5f52602260045260245ffd5b50919050565b634e487b7160e01b5f52601160045260245ffd5b80820281158282048414176102a3576102a3610767565b808201808211156102a3576102a361076756fea164736f6c6343000825000a";
+const CREATION_BYTECODE = "0x608060405234801561000f575f5ffd5b50604051610e2b380380610e2b83398101604081905261002e91610432565b8484600361003c8382610556565b5060046100498282610556565b5050506001600160a01b038316158061006957506001600160a01b038216155b8061007b57506001600160a01b038116155b1561009957604051631a0c547760e11b815260040160405180910390fd5b816001600160a01b0316836001600160a01b031614806100ca5750806001600160a01b0316836001600160a01b0316145b806100e65750806001600160a01b0316826001600160a01b0316145b156101045760405163063715af60e41b815260040160405180910390fd5b6101238361011e670de0b6b3a764000063ee6b2800610628565b610202565b61013d8261011e670de0b6b3a764000063b2d05e00610628565b6101578161011e670de0b6b3a764000063b2d05e00610628565b61016e670de0b6b3a76400006402540be400610628565b6002541461017e5761017e610645565b610195670de0b6b3a76400006402540be400610628565b6101ab670de0b6b3a764000063b2d05e00610628565b6101c1670de0b6b3a764000063b2d05e00610628565b6101d7670de0b6b3a764000063ee6b2800610628565b6101e19190610659565b6101eb9190610659565b146101f8576101f8610645565b505050505061066c565b6001600160a01b0382166102305760405163ec442f0560e01b81525f60048201526024015b60405180910390fd5b61023b5f838361023f565b5050565b6001600160a01b038316610269578060025f82825461025e9190610659565b909155506102d99050565b6001600160a01b0383165f90815260208190526040902054818110156102bb5760405163391434e360e21b81526001600160a01b03851660048201526024810182905260448101839052606401610227565b6001600160a01b0384165f9081526020819052604090209082900390555b6001600160a01b0382166102f557600280548290039055610313565b6001600160a01b0382165f9081526020819052604090208054820190555b816001600160a01b0316836001600160a01b03167fddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef8360405161035891815260200190565b60405180910390a3505050565b634e487b7160e01b5f52604160045260245ffd5b5f82601f830112610388575f5ffd5b81516001600160401b038111156103a1576103a1610365565b604051601f8201601f19908116603f011681016001600160401b03811182821017156103cf576103cf610365565b6040528181528382016020018510156103e6575f5ffd5b5f5b82811015610404576020818601810151838301820152016103e8565b505f918101602001919091529392505050565b80516001600160a01b038116811461042d575f5ffd5b919050565b5f5f5f5f5f60a08688031215610446575f5ffd5b85516001600160401b0381111561045b575f5ffd5b61046788828901610379565b602088015190965090506001600160401b03811115610484575f5ffd5b61049088828901610379565b94505061049f60408701610417565b92506104ad60608701610417565b91506104bb60808701610417565b90509295509295909350565b600181811c908216806104db57607f821691505b6020821081036104f957634e487b7160e01b5f52602260045260245ffd5b50919050565b601f821115610551578282111561055157805f5260205f20601f840160051c602085101561052a57505f5b90810190601f840160051c035f5b8181101561054d575f83820155600101610538565b5050505b505050565b81516001600160401b0381111561056f5761056f610365565b6105838161057d84546104c7565b846104ff565b6020601f8211600181146105b5575f831561059e5750848201515b5f19600385901b1c1916600184901b17845561060d565b5f84815260208120601f198516915b828110156105e457878501518255602094850194600190920191016105c4565b508482101561060157868401515f19600387901b60f8161c191681555b505060018360011b0184555b5050505050565b634e487b7160e01b5f52601160045260245ffd5b808202811582820484141761063f5761063f610614565b92915050565b634e487b7160e01b5f52600160045260245ffd5b8082018082111561063f5761063f610614565b6107b2806106795f395ff3fe608060405234801561000f575f5ffd5b50600436106100e5575f3560e01c806370a082311161008857806395d89b411161006357806395d89b411461019e578063a5c9cd82146101a6578063a9059cbb146101b5578063dd62ed3e146101c8575f5ffd5b806370a082311461016e57806389a6630e1461016657806394d32a5d14610196575f5ffd5b806323b872dd116100c357806323b872dd1461013c578063313ce5671461014f57806332cb6b0c1461015e57806362c3db9b14610166575f5ffd5b806306fdde03146100e9578063095ea7b31461010757806318160ddd1461012a575b5f5ffd5b6100f1610200565b6040516100fe9190610616565b60405180910390f35b61011a61011536600461067c565b610290565b60405190151581526020016100fe565b6002545b6040519081526020016100fe565b61011a61014a3660046106a4565b6102a9565b604051601281526020016100fe565b61012e6102cc565b61012e6102e6565b61012e61017c3660046106de565b6001600160a01b03165f9081526020819052604090205490565b61012e6102fc565b6100f1610312565b61012e670de0b6b3a764000081565b61011a6101c336600461067c565b610321565b61012e6101d63660046106fe565b6001600160a01b039182165f90815260016020908152604080832093909416825291909152205490565b60606003805461020f9061072f565b80601f016020809104026020016040519081016040528092919081815260200182805461023b9061072f565b80156102865780601f1061025d57610100808354040283529160200191610286565b820191905f5260205f20905b81548152906001019060200180831161026957829003601f168201915b5050505050905090565b5f3361029d81858561032e565b60019150505b92915050565b5f336102b6858285610340565b6102c18585856103c1565b506001949350505050565b6102e3670de0b6b3a76400006402540be40061077b565b81565b6102e3670de0b6b3a764000063b2d05e0061077b565b6102e3670de0b6b3a764000063ee6b280061077b565b60606004805461020f9061072f565b5f3361029d8185856103c1565b61033b838383600161041e565b505050565b6001600160a01b038381165f908152600160209081526040808320938616835292905220545f198110156103bb57818110156103ad57604051637dc7a0d960e11b81526001600160a01b038416600482015260248101829052604481018390526064015b60405180910390fd5b6103bb84848484035f61041e565b50505050565b6001600160a01b0383166103ea57604051634b637e8f60e11b81525f60048201526024016103a4565b6001600160a01b0382166104135760405163ec442f0560e01b81525f60048201526024016103a4565b61033b8383836104f0565b6001600160a01b0384166104475760405163e602df0560e01b81525f60048201526024016103a4565b6001600160a01b03831661047057604051634a1406b160e11b81525f60048201526024016103a4565b6001600160a01b038085165f90815260016020908152604080832093871683529290522082905580156103bb57826001600160a01b0316846001600160a01b03167f8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925846040516104e291815260200190565b60405180910390a350505050565b6001600160a01b03831661051a578060025f82825461050f9190610792565b9091555061058a9050565b6001600160a01b0383165f908152602081905260409020548181101561056c5760405163391434e360e21b81526001600160a01b038516600482015260248101829052604481018390526064016103a4565b6001600160a01b0384165f9081526020819052604090209082900390555b6001600160a01b0382166105a6576002805482900390556105c4565b6001600160a01b0382165f9081526020819052604090208054820190555b816001600160a01b0316836001600160a01b03167fddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef8360405161060991815260200190565b60405180910390a3505050565b602081525f82518060208401525f5b818110156106425760208186018101516040868401015201610625565b505f604082850101526040601f19601f83011684010191505092915050565b80356001600160a01b0381168114610677575f5ffd5b919050565b5f5f6040838503121561068d575f5ffd5b61069683610661565b946020939093013593505050565b5f5f5f606084860312156106b6575f5ffd5b6106bf84610661565b92506106cd60208501610661565b929592945050506040919091013590565b5f602082840312156106ee575f5ffd5b6106f782610661565b9392505050565b5f5f6040838503121561070f575f5ffd5b61071883610661565b915061072660208401610661565b90509250929050565b600181811c9082168061074357607f821691505b60208210810361076157634e487b7160e01b5f52602260045260245ffd5b50919050565b634e487b7160e01b5f52601160045260245ffd5b80820281158282048414176102a3576102a3610767565b808201808211156102a3576102a361076756fea164736f6c6343000825000a";
+const ALLOWED = new Map([["0x14a34","Base Sepolia"],["0xaa36a7","Ethereum Sepolia"]]);
+const EXPECTED_SUPPLY = 10000000000n * (10n ** 18n);
+const byId = id => document.getElementById(id);
+let account = null;
+let tokenReady = false;
+let tokenMeta = null;
+let activeChain = null;
+const addressOk = value => /^0x[0-9a-fA-F]{40}$/.test(value);
+const cleanAddress = value => { if(!addressOk(value.trim())) throw new Error("Enter a valid 0x-prefixed 20-byte address."); return "0x"+value.trim().slice(2).toLowerCase(); };
+function status(id,message,kind=""){const el=byId(id);el.textContent=message;el.className="status"+(kind?" "+kind:"");}
+function allowedChain(chain){return ALLOWED.has(String(chain).toLowerCase());}
+function chainLabel(chain){return ALLOWED.get(String(chain).toLowerCase())||("Unsupported chain ("+chain+")");}
+function wordHex(value){return value.replace(/^0x/,"").padStart(64,"0");}
+function decodeUint(data){const hex=(data||"0x").replace(/^0x/,"");if(hex.length<64)throw new Error("Token returned malformed ABI data.");return BigInt("0x"+hex.slice(0,64));}
+function decodeString(data){
+  const hex=(data||"0x").replace(/^0x/,"");
+  if(hex.length<128)throw new Error("Token returned malformed text metadata.");
+  const offset=Number(BigInt("0x"+hex.slice(0,64)))*2;
+  if(!Number.isSafeInteger(offset)||offset<0||offset+64>hex.length)throw new Error("Token returned malformed text offset.");
+  const length=Number(BigInt("0x"+hex.slice(offset,offset+64)));
+  if(!Number.isSafeInteger(length)||length<0||length>256||offset+64+length*2>hex.length)throw new Error("Token metadata length is invalid.");
+  const bytes=hex.slice(offset+64,offset+64+length*2).match(/.{2}/g)||[];
+  return new TextDecoder().decode(Uint8Array.from(bytes,b=>parseInt(b,16)));
+}
+function formatUnits(raw,decimals){
+  const value=BigInt(raw), scale=10n**BigInt(decimals), whole=value/scale, fraction=(value%scale).toString().padStart(decimals,"0").replace(/0+$/,"");
+  return whole.toLocaleString("en-US")+(fraction?"."+fraction:"");
+}
+function parseUnits(value,decimals){
+  const text=value.trim();
+  if(!/^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/.test(text))throw new Error("Amount must be a plain decimal number greater than zero.");
+  const parts=text.split(".");
+  const fraction=parts[1]||"";
+  if(fraction.length>decimals)throw new Error("Amount has more decimal places than the token supports.");
+  const raw=BigInt(parts[0])*10n**BigInt(decimals)+BigInt((fraction+"0".repeat(decimals)).slice(0,decimals)||"0");
+  if(raw<=0n)throw new Error("Amount must be greater than zero.");
+  if(raw>=2n**256n)throw new Error("Amount is too large.");
+  return raw;
+}
+async function providerRequest(method,params=[]){
+  if(!window.ethereum||typeof window.ethereum.request!=="function")throw new Error("No injected wallet found. Open this page in a supported wallet-enabled browser.");
+  return window.ethereum.request({method,params});
+}
+async function requireAllowedNetwork(){
+  const chain=String(await providerRequest("eth_chainId")).toLowerCase();
+  if(!allowedChain(chain)){
+    tokenReady=false;tokenMeta=null;byId("transferBtn").disabled=true;byId("deployBtn").disabled=true;byId("readBtn").disabled=!account;
+    status("walletStatus","Unsupported network. Switch manually to Base Sepolia or Ethereum Sepolia; mainnet transactions are blocked here.","bad");
+    throw new Error("Only Base Sepolia (84532) and Ethereum Sepolia (11155111) are allowed.");
+  }
+  activeChain=chain;
+  byId("networkOut").textContent=chainLabel(chain);
+  byId("chainOut").textContent="Chain ID "+BigInt(chain).toString(10)+" · allowed testnet";
+  return chain;
+}
+async function call(token,data){
+  return providerRequest("eth_call",[{to:token,data},"latest"]);
+}
+async function requireExactContract(token){
+  const code=String(await providerRequest("eth_getCode",[token,"latest"])).toLowerCase();
+  if(code==="0x"||code==="0x0")throw new Error("No contract bytecode found at this address on the selected testnet.");
+  if(code!==EXPECTED_RUNTIME_CODE.toLowerCase())throw new Error("Runtime bytecode does not match this repository's fixed-supply candidate. Transfers remain disabled.");
+}
+async function readState(){
+  if(!account)throw new Error("Connect a wallet first.");
+  const verifiedChain=await requireAllowedNetwork();
+  const token=cleanAddress(byId("tokenAddress").value);
+  status("readStatus","Checking deployed runtime bytecode against the locally compiled candidate…");
+  await requireExactContract(token);
+  const [nameRaw,symbolRaw,decimalsRaw,supplyRaw]=await Promise.all([
+    call(token,"0x06fdde03"),call(token,"0x95d89b41"),call(token,"0x313ce567"),call(token,"0x18160ddd")
+  ]);
+  const name=decodeString(nameRaw),symbol=decodeString(symbolRaw),decimals=Number(decodeUint(decimalsRaw)),supply=decodeUint(supplyRaw);
+  if(decimals!==18||supply!==EXPECTED_SUPPLY)throw new Error("Token decimals/supply do not match the 18-decimal fixed 10B candidate.");
+  const founderInput=byId("founderAddress").value.trim();
+  const founder=founderInput?cleanAddress(founderInput):account;
+  const [walletRaw,founderRaw]=await Promise.all([
+    call(token,"0x70a08231"+wordHex(account)),call(token,"0x70a08231"+wordHex(founder))
+  ]);
+  const walletBalance=decodeUint(walletRaw),founderBalance=decodeUint(founderRaw);
+  tokenMeta={address:token,name,symbol,decimals,supply,founder,chainId:verifiedChain};
+  tokenReady=true;
+  byId("transferBtn").disabled=false;
+  byId("tokenOut").textContent=name+" ("+symbol+")";
+  byId("tokenAddressOut").textContent=token;
+  byId("supplyOut").textContent=formatUnits(supply,decimals)+" "+symbol;
+  byId("walletBalanceOut").textContent=formatUnits(walletBalance,decimals)+" "+symbol;
+  byId("walletAddressOut").textContent=account;
+  byId("founderBalanceOut").textContent=formatUnits(founderBalance,decimals)+" "+symbol;
+  const shareBps=(founderBalance*10000n+supply/2n)/supply;
+  byId("founderShareOut").textContent="Current share of total supply: "+(shareBps/100n).toString()+"."+(shareBps%100n).toString().padStart(2,"0")+"% · "+founder;
+  status("readStatus","Exact runtime bytecode matched; live balances read from the connected testnet. This confirms code equality and RPC responses only; it is not an independent audit.","good");
+}
+async function connect(){
+  const accounts=await providerRequest("eth_requestAccounts");
+  if(!Array.isArray(accounts)||!accounts.length)throw new Error("Wallet did not provide an account.");
+  account=cleanAddress(accounts[0]);
+  byId("walletAddressOut").textContent=account;
+  byId("readBtn").disabled=false;
+  status("walletStatus","Connected: "+account+". Checking supported network…");
+  await requireAllowedNetwork();
+  byId("deployBtn").disabled=false;
+  if(!byId("deployFounder").value.trim())byId("deployFounder").value=account;
+  status("walletStatus","Wallet connected on "+chainLabel(activeChain)+". The page has no access to your private key or seed phrase.","good");
+  if(byId("tokenAddress").value.trim())await readState();
+}
+function abiWordNumber(value){return BigInt(value).toString(16).padStart(64,"0");}
+function encodeDynamicString(value){
+  const bytes=new TextEncoder().encode(value);
+  const raw=Array.from(bytes,b=>b.toString(16).padStart(2,"0")).join("");
+  return abiWordNumber(bytes.length)+raw.padEnd(Math.ceil(raw.length/64)*64,"0");
+}
+function constructorArgs(name,symbol,founder,security,publicGoods){
+  const nameTail=encodeDynamicString(name),symbolTail=encodeDynamicString(symbol);
+  const nameOffset=160n;
+  const symbolOffset=160n+BigInt(nameTail.length/2);
+  const addressWord=value=>value.slice(2).toLowerCase().padStart(64,"0");
+  return abiWordNumber(nameOffset)+abiWordNumber(symbolOffset)+addressWord(founder)+addressWord(security)+addressWord(publicGoods)+nameTail+symbolTail;
+}
+async function waitForReceipt(hash){
+  for(let i=0;i<60;i++){
+    await new Promise(resolve=>setTimeout(resolve,1500));
+    const receipt=await providerRequest("eth_getTransactionReceipt",[hash]);
+    if(receipt)return receipt;
+  }
+  throw new Error("Receipt not seen within 90 seconds. The transaction may still be pending; check the wallet/explorer before retrying. Hash: "+hash);
+}
+async function deployAsset(){
+  if(!account)throw new Error("Connect a wallet first.");
+  const chain=await requireAllowedNetwork();
+  const name=byId("deployName").value.trim(),symbol=byId("deploySymbol").value.trim();
+  if(name.length<1||name.length>32||symbol.length<1||symbol.length>16)throw new Error("Token name must be 1–32 characters and symbol 1–16.");
+  const founder=cleanAddress(byId("deployFounder").value||account);
+  const security=cleanAddress(byId("deploySecurity").value);
+  const publicGoods=cleanAddress(byId("deployPublicGoods").value);
+  if([founder,security,publicGoods].some(address=>/^0x0{40}$/.test(address)))throw new Error("Treasury addresses must not be the zero address.");
+  if(account.toLowerCase()!==founder.toLowerCase())throw new Error("Connected MetaMask account "+account+" does not match the founder treasury "+founder+". The security and public-goods wallets should receive allocations, not be used here as the gas-paying signer. Select the founder treasury account in MetaMask, reconnect, and retry. No transaction was sent.");
+  if(new Set([founder,security,publicGoods]).size!==3)throw new Error("Founder, security reserve, and public-goods addresses must be three distinct wallets.");
+  if(!/^0x[0-9a-f]+$/i.test(CREATION_BYTECODE)||CREATION_BYTECODE.length<100)throw new Error("Compiled creation bytecode is unavailable; rebuild this local console from the repository.");
+  const data=CREATION_BYTECODE+constructorArgs(name,symbol,founder,security,publicGoods);
+  // Preflight the connected signer before triggering a wallet signature. The connected
+  // account pays gas; the founder address only receives the founder allocation.
+  const nativeBalance=BigInt(await providerRequest("eth_getBalance",[account,"latest"]));
+  if(nativeBalance===0n)throw new Error("Connected MetaMask account "+account+" has 0 native balance on "+chainLabel(chain)+". Switch MetaMask to the configured founder treasury account on the selected testnet, reconnect, and retry after confirming sufficient native testnet balance. No transaction was sent.");
+  const [gasEstimateHex,gasPriceHex]=await Promise.all([
+    providerRequest("eth_estimateGas",[{from:account,data}]),providerRequest("eth_gasPrice",[])
+  ]);
+  const estimatedCost=BigInt(gasEstimateHex)*BigInt(gasPriceHex);
+  const safetyThreshold=(estimatedCost*125n+99n)/100n;
+  if(nativeBalance<safetyThreshold)throw new Error("Connected account "+account+" may not have enough "+chainLabel(chain)+" native token for deployment gas. Balance: "+formatUnits(nativeBalance,18)+"; estimated cost with 25% buffer: "+formatUnits(safetyThreshold,18)+". Fund this exact account on the selected testnet or switch to the funded founder wallet. No transaction was sent.");
+  byId("deployBtn").disabled=true;
+  status("deployStatus","Waiting for your wallet to review the contract deployment on "+chainLabel(chain)+". Check the three treasury addresses before confirming.");
+  const hash=await providerRequest("eth_sendTransaction",[{from:account,data}]);
+  status("deployStatus","Deployment transaction submitted: "+hash+" · waiting for testnet confirmation…","warn");
+  const receipt=await waitForReceipt(hash);
+  if(BigInt(receipt.status||"0x0")!==1n)throw new Error("Contract deployment reverted. Transaction hash: "+hash);
+  const deployedAddress=receipt.contractAddress;
+  if(!deployedAddress||!addressOk(deployedAddress))throw new Error("Successful receipt did not include a valid contract address. Check transaction hash: "+hash);
+  const verifiedAddress=cleanAddress(deployedAddress);
+  await requireExactContract(verifiedAddress);
+  byId("tokenAddress").value=verifiedAddress;
+  byId("founderAddress").value=founder;
+  byId("deployFounder").value=founder;
+  await readState();
+  status("deployStatus","Testnet contract deployed and exact runtime bytecode verified. Address: "+verifiedAddress+" · transaction: "+hash,"good");
+}
+async function sendTransfer(){
+  if(!account||!tokenReady||!tokenMeta)throw new Error("Connect and verify the exact token contract first.");
+  const currentChain=await requireAllowedNetwork();
+  if(currentChain!==tokenMeta.chainId){
+    tokenReady=false;tokenMeta=null;byId("transferBtn").disabled=true;
+    throw new Error("Network changed since token verification. Re-verify the contract on this exact testnet before transferring.");
+  }
+  // Re-check exact code immediately before a user-authorized transfer.
+  await requireExactContract(tokenMeta.address);
+  const recipient=cleanAddress(byId("recipientAddress").value);
+  if(recipient===tokenMeta.address)throw new Error("Recipient cannot be the token contract address.");
+  const amount=parseUnits(byId("transferAmount").value,tokenMeta.decimals);
+  const calldata="0xa9059cbb"+wordHex(recipient)+amount.toString(16).padStart(64,"0");
+  byId("transferBtn").disabled=true;
+  status("transferStatus","Waiting for your wallet to review and authorize this testnet transfer. No transaction is sent until you confirm in the wallet.");
+  const hash=await providerRequest("eth_sendTransaction",[{from:account,to:tokenMeta.address,data:calldata}]);
+  status("transferStatus","Transaction submitted: "+hash+" · waiting for testnet confirmation…","warn");
+  let receipt=null;
+  for(let i=0;i<60;i++){
+    await new Promise(resolve=>setTimeout(resolve,1500));
+    receipt=await providerRequest("eth_getTransactionReceipt",[hash]);
+    if(receipt)break;
+  }
+  if(!receipt)throw new Error("Receipt not seen within 90 seconds. The transaction may still be pending; check the wallet/explorer before retrying. Hash: "+hash);
+  if(BigInt(receipt.status||"0x0")!==1n)throw new Error("Transaction reverted on testnet. Hash: "+hash);
+  status("transferStatus","Confirmed on testnet. Transaction hash: "+hash,"good");
+  await readState();
+}
+byId("deployBtn").addEventListener("click",async()=>{
+  try{await deployAsset();}catch(error){status("deployStatus",error.message||"Testnet deployment failed or was cancelled.","bad");}
+  finally{byId("deployBtn").disabled=!account;}
+});
+byId("connectBtn").addEventListener("click",async()=>{
+  try{await connect();}catch(error){status("walletStatus",error.message||"Wallet connection failed.","bad");}
+});
+byId("readBtn").addEventListener("click",async()=>{
+  try{await readState();}catch(error){tokenReady=false;tokenMeta=null;byId("transferBtn").disabled=true;status("readStatus",error.message||"Token verification/read failed.","bad");}
+});
+byId("transferBtn").addEventListener("click",async()=>{
+  try{await sendTransfer();}catch(error){status("transferStatus",error.message||"Transfer failed or was cancelled.","bad");}
+  finally{byId("transferBtn").disabled=!(tokenReady&&tokenMeta&&account);}
+});
+function invalidateTokenVerification(){tokenReady=false;tokenMeta=null;byId("transferBtn").disabled=true;}
+byId("tokenAddress").addEventListener("input",invalidateTokenVerification);
+byId("founderAddress").addEventListener("input",invalidateTokenVerification);
+if(window.ethereum&&typeof window.ethereum.on==="function"){
+  window.ethereum.on("chainChanged",()=>{tokenReady=false;tokenMeta=null;activeChain=null;byId("transferBtn").disabled=true;byId("deployBtn").disabled=true;status("walletStatus","Network changed. Reconnect and verify the supported testnet again.","warn");});
+  window.ethereum.on("accountsChanged",accounts=>{account=Array.isArray(accounts)&&accounts.length?accounts[0]:null;tokenReady=false;tokenMeta=null;byId("transferBtn").disabled=true;byId("deployBtn").disabled=true;byId("readBtn").disabled=!account;status("walletStatus",account?"Wallet account changed; reconnect and verify again.":"Wallet disconnected.","warn");});
+}
+})();
+</script>
+</body>
+</html>

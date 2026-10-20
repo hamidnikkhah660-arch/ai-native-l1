@@ -1,0 +1,19 @@
+CP0118N_MTP_ANCHOR_V1
+# M|case|ancestor_timestamps_csv|candidate_timestamp|expected_median_or_dash|expected_status
+M|single_ancestor|100|101|100|ACCEPT
+M|equal_to_median|100,90,110|100|100|REJECT_MTP
+M|greater_than_median|100,90,110|101|100|ACCEPT
+M|latest_eleven_window|9999,11,12,13,14,15,16,17,18,19,20,21|16|16|REJECT_MTP
+M|latest_eleven_accept|9999,11,12,13,14,15,16,17,18,19,20,21|17|16|ACCEPT
+M|out_of_order_ancestors|100,10,90,40,80,60,70|71|70|ACCEPT
+M|negative_history|100,-1,102|103|-|REJECT_NEGATIVE_TIMESTAMP
+M|negative_candidate|100,101,102|-1|101|REJECT_NEGATIVE_TIMESTAMP
+# A|case|ancestor_timestamps_csv|compact_bits_csv|anchor_height|max_bits_hex|expected_parent_timestamp|expected_anchor_bits_hex|expected_status
+A|anchor_basic|100,110,120,145|1d00ffff,1d00ffff,1c00ffff,1b00ffff|3|207fffff|120|1b00ffff|OK
+A|anchor_first_block|100,105|1d00ffff,1c00ffff|1|207fffff|100|1c00ffff|OK
+A|branch_left|100,110,120,130|1d00ffff,1d00ffff,1d00ffff,1c00ffff|3|207fffff|120|1c00ffff|OK
+A|branch_right|100,110,150,160|1d00ffff,1d00ffff,1d00ffff,1b00ffff|3|207fffff|150|1b00ffff|OK
+A|missing_anchor_height|100,110|1d00ffff,1c00ffff|3|207fffff|-|-|REJECT_ANCHOR_HEIGHT
+A|target_above_pow_limit|100,110|1d00ffff,207fffff|1|1d00ffff|-|-|REJECT_POW_LIMIT
+A|invalid_compact_bits|100,110|1d00ffff,1d80ffff|1|207fffff|-|-|REJECT_INVALID_BITS
+END

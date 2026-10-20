@@ -1,0 +1,29 @@
+[package]
+name = "ai_native_l1_pow_bench"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[features]
+default = []
+# Explicitly opt-in diagnostic pause points for local Devnet WAL crash/recovery smoke tests.
+devnet-wal-fault-injection = []
+
+[dependencies]
+# Pinned for the current Cargo 1.82.0 toolchain; candidate only, not consensus code.
+argon2 = "=0.5.3"
+# Standard audited primitives for the research authenticated-transport prototype.
+hmac = "=0.12.1"
+sha2 = "=0.10.8"
+ed25519-dalek = "=2.1.1"
+getrandom = "=0.2.16"
+# Noise framework prototype; pinned to the local Rust 1.82-compatible line.
+snow = "=0.9.6"
+# FIPS 204 ML-DSA-65 implementation; its arithmetic/NTT/serialization components are formally verified, but deployment still requires an external review.
+libcrux-ml-dsa = "=0.0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

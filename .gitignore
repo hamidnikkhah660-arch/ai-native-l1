@@ -1,0 +1,34 @@
+# Generated files
+**/node_modules/
+.env
+.env.*
+!.env.example
+**/artifacts/
+__pycache__/
+*.py[cod]
+target/
+simulations/_cpw_local_network_smoke/
+results/
+
+# Local environments
+.venv/
+venv/
+
+# Local security material: never stage owner vaults or credential containers
+**/OwnerVault/
+**/owner-vault/
+**/secrets/
+**/private-vault/
+*.p12
+*.pfx
+*.keystore
+*.jks
+*.key
+id_rsa
+id_ed25519
+*.mnemonic
+*seed_phrase*.txt
+
+# OS/editor
+.DS_Store
+Thumbs.db

@@ -1,0 +1,10 @@
+# CP-0025-N request lifecycle vectors v0.1
+# name|operations|expected
+success|open,7,3,100,8;complete,7,3,8,100|accept
+zero_request|open,0,3,100,8|reject
+duplicate_request|open,7,3,100,8;open,7,3,100,8|reject
+wrong_response|open,7,3,100,8;complete,7,41,8,9|reject
+late_response|open,7,3,100,8;complete,7,3,8,101|reject
+expire_then_unknown|open,7,3,10,64;expire,11;complete,7,3,8,11|reject
+response_oversized|open,7,3,100,8;complete,7,3,9,9|reject
+aggregate_bytes|open,7,3,100,8388609|reject

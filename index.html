@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="AI-Native L1: an open research project exploring a native Layer-1 prototype, authenticated transport, deterministic state and post-quantum signature experiments.">
+  <meta name="theme-color" content="#101827">
+  <title>AI-Native L1 — Global Open Research</title>
+  <style>
+    :root { color-scheme: dark; --bg: #0b1220; --panel: #121d30; --text: #edf3ff; --muted: #aebbd0; --line: #2a3b54; --accent: #7dd3fc; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; line-height: 1.6; background: radial-gradient(ellipse at top, #182942 0%, var(--bg) 55%); color: var(--text); }
+    a { color: var(--accent); }
+    .wrap { width: min(1060px, calc(100% - 32px)); margin: 0 auto; }
+    header { padding: 26px 0; border-bottom: 1px solid var(--line); }
+    .nav { display:flex; justify-content:space-between; align-items:center; gap:20px; flex-wrap:wrap; }
+    .brand { font-weight: 750; letter-spacing:.02em; }
+    .nav a { margin-left: 14px; text-decoration:none; color:var(--muted); }
+    main { padding: 62px 0 40px; }
+    .eyebrow { color:var(--accent); text-transform:uppercase; letter-spacing:.16em; font-size:.78rem; font-weight:700; }
+    h1 { font-size:clamp(2.5rem, 7vw, 5rem); line-height:1.03; max-width:900px; margin:14px 0 20px; letter-spacing:-.04em; }
+    .lead { max-width:760px; color:var(--muted); font-size:1.18rem; }
+    .actions { display:flex; flex-wrap:wrap; gap:12px; margin:28px 0 36px; }
+    .button { display:inline-block; border:1px solid var(--line); border-radius:9px; padding:11px 16px; text-decoration:none; font-weight:650; }
+    .primary { background:var(--accent); color:#07111f; border-color:var(--accent); }
+    .notice { border:1px solid #755a29; background:#33281388; color:#ffe7b0; padding:14px 16px; border-radius:10px; margin:26px 0 40px; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:14px; margin:22px 0 50px; }
+    .card { padding:20px; background:#121d30d9; border:1px solid var(--line); border-radius:12px; }
+    .card h3 { margin:0 0 8px; }
+    .card p { margin:0; color:var(--muted); }
+    h2 { margin-top:45px; font-size:1.65rem; letter-spacing:-.02em; }
+    .status { display:grid; grid-template-columns:minmax(140px, .5fr) 1fr; gap:8px 18px; border-top:1px solid var(--line); padding-top:14px; max-width:820px; }
+    .status dt { color:var(--muted); }
+    .status dd { margin:0; }
+    footer { border-top:1px solid var(--line); padding:26px 0 42px; color:var(--muted); font-size:.92rem; }
+    @media(max-width:620px) { main { padding-top:42px; } .nav a { margin-left:0; margin-right:12px; } .status { grid-template-columns:1fr; gap:2px; } .status dd { margin-bottom:12px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap nav">
+      <div class="brand">AI-Native L1</div>
+      <nav aria-label="Primary">
+        <a href="README.md">Source</a>
+        <a href="docs/PUBLIC_RELEASE_MANIFEST_V01_2026-10-20.md">Release notes</a>
+        <a href="sbom/native-pow-bench.cdx.json">SBOM</a>
+        <a href="SECURITY.md">Security</a>
+      </nav>
+    </div>
+  </header>
+  <main class="wrap">
+    <div class="eyebrow">Open research · public source</div>
+    <h1>Building a verifiable native Layer‑1, one test at a time.</h1>
+    <p class="lead">AI-Native L1 is a research project exploring deterministic state transitions, authenticated peer transport, durable recovery, fixed-supply policy candidates, and post-quantum signature experiments. Source is openly available for worldwide technical review and collaboration.</p>
+    <div class="actions">
+      <a class="button primary" href="https://github.com/hamidnikkhah660-arch/ai-native-l1">Browse public source on GitHub</a>
+      <a class="button" href="README.md">Build and test locally</a>
+      <a class="button" href="docs/DEPENDENCY_SBOM_STATUS_V01_2026-10-20.md">Dependency/SBOM details</a>
+    </div>
+    <div class="notice"><strong>Research status:</strong> this is not a production mainnet or an investment offering. No native mainnet launch, token sale, liquidity pool, exchange listing, live market price, revenue, or independent security audit is claimed here. The separate EVM candidate is a Sepolia testnet asset only.</div>
+    <h2>What is in the source</h2>
+    <div class="grid">
+      <section class="card"><h3>Native research crate</h3><p>Rust experiments for proof-of-work policy, transaction/state validation, authenticated networking, recovery, and reproducible test vectors.</p></section>
+      <section class="card"><h3>Independent test fixtures</h3><p>Cross-language vectors and mutation cases check encoding, monetary arithmetic, state commitments and fail-closed behavior.</p></section>
+      <section class="card"><h3>Separate EVM candidate</h3><p>A fixed-supply ERC-20 test asset with an isolated local-EVM suite; it is not the native L1 coin and is not approved for sale.</p></section>
+      <section class="card"><h3>Open contribution path</h3><p>Review the scope notes, open an issue or submit a focused pull request with reproducible results and clear limitations.</p></section>
+    </div>
+    <h2>Honest release status</h2>
+    <dl class="status">
+      <dt>Source access</dt><dd>Public repository intended for unrestricted worldwide reading, cloning and forking.</dd>
+      <dt>Working codename</dt><dd>“Quantum ZX” is provisional only. ZX/QZX have existing ecosystem uses; no ticker or trademark clearance is claimed.</dd>
+      <dt>Gate 2 — canonical issuance</dt><dd>Open: native canonical issuance, Genesis and runtime integration still need a release-grade freeze and independent verification.</dd>
+      <dt>Gate 8 — anti-rollback trust</dt><dd>Open: a production-independent trust domain and power-loss/recovery qualification have not been established.</dd>
+      <dt>Security</dt><dd>Local test suites are available; independent external protocol/cryptographic audit is not complete. ML-DSA experiments are not proof of end-to-end quantum resistance.</dd>
+      <dt>License</dt><dd>Apache-2.0 for scoped project-authored material, subject to file-level exceptions and third-party notices. See <a href="LICENSES/README.md">license scope</a>.</dd>
+    </dl>
+    <h2>Join the engineering effort</h2>
+    <p class="lead">Independent reviewers, developers, test operators and potential research partners are welcome to evaluate the code, reproduce results and challenge assumptions. Support or funding arrangements are not yet established; no return or token value is promised.</p>
+    <div class="actions">
+      <a class="button primary" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/issues">Discuss an issue</a>
+      <a class="button" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/CONTRIBUTING.md">Contribute</a>
+      <a class="button" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/docs/TESTNET_DEPLOYMENT_STATUS.md">Testnet facts</a>
+    </div>
+  </main>
+  <footer><div class="wrap">Open source research · transparent limits · no promises of price, profit, audit, listing, or regulatory approval. Check the repository for current, verifiable status.</div></footer>
+</body>
+</html>

@@ -1,0 +1,904 @@
+//! Private-testnet consensus chain driver for CP-W.
+//!
+//! This driver keeps target history, cumulative work, and canonical state together without
+//! changing the legacy BLK2 body encoding. It is deliberately small and explicit so a later
+//! network implementation can adopt the exact tested behavior instead of duplicating rules.
+
+use crate::{
+    chain_admission::{BlockAdmissionReceipt, ChainAdmissionBoundary, ReferenceTimeProvider},
+    consensus::{
+        block_work, compare_chain_tips, ChainTip, ConsensusError, ConsensusParameters, Uint256,
+    },
+    private_testnet_consensus::{
+        admit_live as admit_candidate_live, CandidateConsensusBlock, PrivateConsensusError,
+    },
+    state_machine::{
+        Block, LedgerState, MonetaryBlock, MonetaryLedgerState, TransactionAuthenticator,
+    },
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetHistory {
+    params: ConsensusParameters,
+    /// target_after_height[h] is the target used for blocks at height h; index 0 is
+    /// the configured genesis/initial target carried into the first block.
+    targets: Vec<Uint256>,
+}
+
+impl TargetHistory {
+    pub fn new(params: ConsensusParameters) -> Result<Self, ConsensusError> {
+        params.validate()?;
+        let initial_target = params.initial_target;
+        Ok(Self {
+            params,
+            targets: vec![initial_target],
+        })
+    }
+
+    pub fn params(&self) -> ConsensusParameters {
+        self.params.clone()
+    }
+
+    pub fn height(&self) -> u64 {
+        self.targets.len().saturating_sub(1) as u64
+    }
+
+    pub fn target_at(&self, height: u64) -> Option<Uint256> {
+        self.targets.get(height as usize).copied()
+    }
+
+    pub fn expected_target(
+        &self,
+        next_height: u64,
+        measured_window_elapsed_secs: Option<u64>,
+    ) -> Result<Uint256, PrivateConsensusError> {
+        let previous_target = self.target_at(next_height.saturating_sub(1)).ok_or(
+            PrivateConsensusError::Consensus(ConsensusError::InvalidNextBlockHeight),
+        )?;
+        crate::private_testnet_consensus::target_for_next_block(
+            previous_target,
+            next_height,
+            measured_window_elapsed_secs,
+            &self.params,
+        )
+    }
+
+    fn record_next(&mut self, height: u64, target: Uint256) -> Result<(), PrivateConsensusError> {
+        let expected_height = self.height().saturating_add(1);
+        if height != expected_height {
+            return Err(PrivateConsensusError::HeaderBodyMismatch(
+                "target_history_height",
+            ));
+        }
+        if target.is_zero() {
+            return Err(PrivateConsensusError::Consensus(
+                ConsensusError::InvalidTarget,
+            ));
+        }
+        if target > self.params.pow_limit {
+            return Err(PrivateConsensusError::Consensus(
+                ConsensusError::TargetAbovePowLimit,
+            ));
+        }
+        self.targets.push(target);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateTestnetChain {
+    /// Public legacy-state view retained for existing PTB2 callers. On a monetary
+    /// chain this mirrors the ledger stored inside monetary_state; all monetary writes
+    /// must go through append_monetary_live and cannot use the legacy append method.
+    state: LedgerState,
+    monetary_state: Option<MonetaryLedgerState>,
+    target_history: TargetHistory,
+    cumulative_work: Uint256,
+    /// Consensus tip identifier. This includes PoW-header uniqueness; BLK2 state tip hashes
+    /// intentionally do not include nonce/target and therefore cannot identify PoW forks alone.
+    tip_consensus_hash: [u8; 32],
+}
+
+impl PrivateTestnetChain {
+    pub fn new(state: LedgerState, params: ConsensusParameters) -> Result<Self, ConsensusError> {
+        let tip_consensus_hash = state.tip_hash();
+        Ok(Self {
+            state,
+            monetary_state: None,
+            target_history: TargetHistory::new(params)?,
+            cumulative_work: Uint256::ZERO,
+            tip_consensus_hash,
+        })
+    }
+
+    /// Construct a PoW-driven chain over the versioned MBK3/MST3 monetary transition.
+    /// This reuses the shared target history/work logic, but archive/wire/runtime persistence
+    /// must still be integrated separately before this can be a production chain.
+    pub fn new_monetary(
+        state: MonetaryLedgerState,
+        params: ConsensusParameters,
+    ) -> Result<Self, ConsensusError> {
+        let ledger_view = state.ledger().clone();
+        let tip_consensus_hash = state.tip_hash();
+        Ok(Self {
+            state: ledger_view,
+            monetary_state: Some(state),
+            target_history: TargetHistory::new(params)?,
+            cumulative_work: Uint256::ZERO,
+            tip_consensus_hash,
+        })
+    }
+
+    pub fn monetary_state(&self) -> Option<&MonetaryLedgerState> {
+        self.monetary_state.as_ref()
+    }
+
+    pub fn state(&self) -> &LedgerState {
+        &self.state
+    }
+
+    pub fn target_history(&self) -> &TargetHistory {
+        &self.target_history
+    }
+
+    pub fn cumulative_work(&self) -> Uint256 {
+        self.cumulative_work
+    }
+
+    pub fn chain_tip(&self) -> ChainTip {
+        ChainTip {
+            height: self.state.height(),
+            cumulative_work: self.cumulative_work,
+            tip_hash: self.tip_consensus_hash,
+        }
+    }
+
+    pub fn fork(&self) -> Self {
+        self.clone()
+    }
+
+    pub fn compare_to(&self, other: &Self) -> std::cmp::Ordering {
+        compare_chain_tips(self.chain_tip(), other.chain_tip())
+    }
+
+    pub fn expected_target(
+        &self,
+        measured_window_elapsed_secs: Option<u64>,
+    ) -> Result<Uint256, PrivateConsensusError> {
+        self.target_history.expected_target(
+            self.state.height().saturating_add(1),
+            measured_window_elapsed_secs,
+        )
+    }
+
+    pub fn append_live<A: TransactionAuthenticator>(
+        &mut self,
+        block: &Block,
+        pow_header: &crate::consensus::PowHeader,
+        measured_window_elapsed_secs: Option<u64>,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+    ) -> Result<(BlockAdmissionReceipt, [u8; 32]), PrivateConsensusError> {
+        if self.monetary_state.is_some() {
+            return Err(PrivateConsensusError::LegacyBlockOnMonetaryChain);
+        }
+        let next_height = self.state.height().saturating_add(1);
+        let expected_target = self
+            .target_history
+            .expected_target(next_height, measured_window_elapsed_secs)?;
+
+        if pow_header.target != expected_target {
+            return Err(PrivateConsensusError::ExpectedTargetMismatch);
+        }
+
+        let (receipt, digest) = admit_candidate_live(
+            &mut self.state,
+            CandidateConsensusBlock { block, pow_header },
+            self.tip_consensus_hash,
+            expected_target,
+            &self.target_history.params,
+            authenticator,
+            clock,
+        )?;
+
+        let work = block_work(pow_header.target)?;
+        self.target_history
+            .record_next(next_height, pow_header.target)?;
+        self.cumulative_work = self.cumulative_work.saturating_add(work);
+        self.tip_consensus_hash = digest;
+
+        Ok((receipt, digest))
+    }
+
+    /// Validate and append a PoW candidate using exact scheduled monetary issuance.
+    /// The legacy PTB2/block-body path and monetary MBK3 path are mutually exclusive.
+    pub fn append_monetary_live<A: TransactionAuthenticator>(
+        &mut self,
+        block: &MonetaryBlock,
+        pow_header: &crate::consensus::PowHeader,
+        measured_window_elapsed_secs: Option<u64>,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+    ) -> Result<(BlockAdmissionReceipt, [u8; 32]), PrivateConsensusError> {
+        let Some(monetary_state) = self.monetary_state.as_mut() else {
+            return Err(PrivateConsensusError::MonetaryBlockOnLegacyChain);
+        };
+        let next_height =
+            monetary_state
+                .height()
+                .checked_add(1)
+                .ok_or(PrivateConsensusError::Consensus(
+                    ConsensusError::InvalidNextBlockHeight,
+                ))?;
+        let expected_target = self
+            .target_history
+            .expected_target(next_height, measured_window_elapsed_secs)?;
+
+        if pow_header.network_id != monetary_state.ledger().network_id() {
+            return Err(PrivateConsensusError::NetworkMismatch);
+        }
+        if pow_header.protocol_version != self.target_history.params.protocol_version {
+            return Err(PrivateConsensusError::HeaderBodyMismatch(
+                "protocol_version",
+            ));
+        }
+        if pow_header.height != block.body.height {
+            return Err(PrivateConsensusError::HeaderBodyMismatch("height"));
+        }
+        if pow_header.timestamp != block.body.timestamp {
+            return Err(PrivateConsensusError::HeaderBodyMismatch("timestamp"));
+        }
+        if pow_header.parent_hash != block.body.parent_hash {
+            return Err(PrivateConsensusError::HeaderBodyMismatch("parent_hash"));
+        }
+        if pow_header.previous_consensus_hash != self.tip_consensus_hash {
+            return Err(PrivateConsensusError::HeaderBodyMismatch(
+                "previous_consensus_hash",
+            ));
+        }
+        if pow_header.state_root != block.body.state_root {
+            return Err(PrivateConsensusError::HeaderBodyMismatch("state_root"));
+        }
+        if pow_header.target != expected_target {
+            return Err(PrivateConsensusError::ExpectedTargetMismatch);
+        }
+
+        let digest = crate::consensus::verify_pow(pow_header, &self.target_history.params)?;
+        let receipt = ChainAdmissionBoundary::testnet()
+            .admit_live_monetary(monetary_state, block, authenticator, clock)
+            .map_err(PrivateConsensusError::Admission)?;
+
+        self.state = self
+            .monetary_state
+            .as_ref()
+            .expect("monetary state checked before admission")
+            .ledger()
+            .clone();
+        let work = block_work(pow_header.target)?;
+        self.target_history
+            .record_next(next_height, pow_header.target)?;
+        self.cumulative_work = self.cumulative_work.saturating_add(work);
+        self.tip_consensus_hash = digest;
+        Ok((receipt, digest))
+    }
+
+    /// Deterministic monetary replay does not sample wall-clock time. It still validates
+    /// network/header/parent/height, expected difficulty, PoW and the complete monetary
+    /// state transition; historical timestamps must increase but are not checked against
+    /// a present-day future window.
+    pub fn append_monetary_historical<A: TransactionAuthenticator>(
+        &mut self,
+        block: &MonetaryBlock,
+        pow_header: &crate::consensus::PowHeader,
+        measured_window_elapsed_secs: Option<u64>,
+        authenticator: &A,
+    ) -> Result<(BlockAdmissionReceipt, [u8; 32]), PrivateConsensusError> {
+        let Some(monetary_state) = self.monetary_state.as_mut() else {
+            return Err(PrivateConsensusError::MonetaryBlockOnLegacyChain);
+        };
+        let next_height =
+            monetary_state
+                .height()
+                .checked_add(1)
+                .ok_or(PrivateConsensusError::Consensus(
+                    ConsensusError::InvalidNextBlockHeight,
+                ))?;
+        let expected_target = self
+            .target_history
+            .expected_target(next_height, measured_window_elapsed_secs)?;
+
+        if pow_header.network_id != monetary_state.ledger().network_id() {
+            return Err(PrivateConsensusError::NetworkMismatch);
+        }
+        if pow_header.protocol_version != self.target_history.params.protocol_version {
+            return Err(PrivateConsensusError::HeaderBodyMismatch(
+                "protocol_version",
+            ));
+        }
+        if pow_header.height != block.body.height {
+            return Err(PrivateConsensusError::HeaderBodyMismatch("height"));
+        }
+        if pow_header.timestamp != block.body.timestamp {
+            return Err(PrivateConsensusError::HeaderBodyMismatch("timestamp"));
+        }
+        if pow_header.parent_hash != block.body.parent_hash {
+            return Err(PrivateConsensusError::HeaderBodyMismatch("parent_hash"));
+        }
+        if pow_header.previous_consensus_hash != self.tip_consensus_hash {
+            return Err(PrivateConsensusError::HeaderBodyMismatch(
+                "previous_consensus_hash",
+            ));
+        }
+        if pow_header.state_root != block.body.state_root {
+            return Err(PrivateConsensusError::HeaderBodyMismatch("state_root"));
+        }
+        if pow_header.target != expected_target {
+            return Err(PrivateConsensusError::ExpectedTargetMismatch);
+        }
+
+        let digest = crate::consensus::verify_pow(pow_header, &self.target_history.params)?;
+        let receipt = ChainAdmissionBoundary::testnet()
+            .replay_monetary(monetary_state, block, authenticator)
+            .map_err(PrivateConsensusError::Admission)?;
+
+        self.state = self
+            .monetary_state
+            .as_ref()
+            .expect("monetary state checked before replay")
+            .ledger()
+            .clone();
+        let work = block_work(pow_header.target)?;
+        self.target_history
+            .record_next(next_height, pow_header.target)?;
+        self.cumulative_work = self.cumulative_work.saturating_add(work);
+        self.tip_consensus_hash = digest;
+        Ok((receipt, digest))
+    }
+
+    /// Validate and append a PoW candidate using canonical MBK4/TXN4 hybrid authorization.
+    /// This remains a separate candidate chain path until PMT4/PFM4 node wiring is complete.
+    pub fn append_v4_hybrid_monetary_live<
+        V: crate::v4_account_identity_candidate::MlDsa65Verifier,
+    >(
+        &mut self,
+        block: &crate::state_machine::V4HybridMonetaryBlock,
+        pow_header: &crate::consensus::PowHeader,
+        measured_window_elapsed_secs: Option<u64>,
+        expected_manifest_id: &[u8; 32],
+        verifier: &V,
+        clock: &dyn ReferenceTimeProvider,
+    ) -> Result<(BlockAdmissionReceipt, [u8; 32]), PrivateConsensusError> {
+        let Some(monetary_state) = self.monetary_state.as_mut() else {
+            return Err(PrivateConsensusError::MonetaryBlockOnLegacyChain);
+        };
+        let next_height =
+            monetary_state
+                .height()
+                .checked_add(1)
+                .ok_or(PrivateConsensusError::Consensus(
+                    ConsensusError::InvalidNextBlockHeight,
+                ))?;
+        let expected_target = self
+            .target_history
+            .expected_target(next_height, measured_window_elapsed_secs)?;
+
+        if pow_header.network_id != monetary_state.ledger().network_id() {
+            return Err(PrivateConsensusError::NetworkMismatch);
+        }
+        if pow_header.protocol_version != self.target_history.params.protocol_version {
+            return Err(PrivateConsensusError::HeaderBodyMismatch(
+                "protocol_version",
+            ));
+        }
+        if pow_header.height != block.height {
+            return Err(PrivateConsensusError::HeaderBodyMismatch("height"));
+        }
+        if pow_header.timestamp != block.timestamp {
+            return Err(PrivateConsensusError::HeaderBodyMismatch("timestamp"));
+        }
+        if pow_header.parent_hash != block.parent_hash {
+            return Err(PrivateConsensusError::HeaderBodyMismatch("parent_hash"));
+        }
+        if pow_header.previous_consensus_hash != self.tip_consensus_hash {
+            return Err(PrivateConsensusError::HeaderBodyMismatch(
+                "previous_consensus_hash",
+            ));
+        }
+        if pow_header.state_root != block.state_root {
+            return Err(PrivateConsensusError::HeaderBodyMismatch("state_root"));
+        }
+        if block
+            .transactions
+            .iter()
+            .any(|tx| tx.authorization.network_id != pow_header.network_id)
+        {
+            return Err(PrivateConsensusError::HeaderBodyMismatch(
+                "transaction.network_id",
+            ));
+        }
+        if pow_header.target != expected_target {
+            return Err(PrivateConsensusError::ExpectedTargetMismatch);
+        }
+
+        let digest = crate::consensus::verify_pow(pow_header, &self.target_history.params)?;
+        let receipt = ChainAdmissionBoundary::testnet()
+            .admit_live_v4_hybrid_monetary(
+                monetary_state,
+                block,
+                expected_manifest_id,
+                verifier,
+                clock,
+            )
+            .map_err(PrivateConsensusError::Admission)?;
+
+        self.state = self
+            .monetary_state
+            .as_ref()
+            .expect("monetary state checked before V4 admission")
+            .ledger()
+            .clone();
+        let work = block_work(pow_header.target)?;
+        self.target_history
+            .record_next(next_height, pow_header.target)?;
+        self.cumulative_work = self.cumulative_work.saturating_add(work);
+        self.tip_consensus_hash = digest;
+        Ok((receipt, digest))
+    }
+
+    /// Deterministic historical append for replaying a canonical MBK4/TXN4 branch.
+    /// It verifies PoW and ancestry but deliberately does not sample present-day time.
+    pub fn append_v4_hybrid_monetary_historical<
+        V: crate::v4_account_identity_candidate::MlDsa65Verifier,
+    >(
+        &mut self,
+        block: &crate::state_machine::V4HybridMonetaryBlock,
+        pow_header: &crate::consensus::PowHeader,
+        measured_window_elapsed_secs: Option<u64>,
+        expected_manifest_id: &[u8; 32],
+        verifier: &V,
+    ) -> Result<(BlockAdmissionReceipt, [u8; 32]), PrivateConsensusError> {
+        let Some(monetary_state) = self.monetary_state.as_mut() else {
+            return Err(PrivateConsensusError::MonetaryBlockOnLegacyChain);
+        };
+        let next_height =
+            monetary_state
+                .height()
+                .checked_add(1)
+                .ok_or(PrivateConsensusError::Consensus(
+                    ConsensusError::InvalidNextBlockHeight,
+                ))?;
+        let expected_target = self
+            .target_history
+            .expected_target(next_height, measured_window_elapsed_secs)?;
+
+        if pow_header.network_id != monetary_state.ledger().network_id() {
+            return Err(PrivateConsensusError::NetworkMismatch);
+        }
+        if pow_header.protocol_version != self.target_history.params.protocol_version {
+            return Err(PrivateConsensusError::HeaderBodyMismatch(
+                "protocol_version",
+            ));
+        }
+        if pow_header.height != block.height {
+            return Err(PrivateConsensusError::HeaderBodyMismatch("height"));
+        }
+        if pow_header.timestamp != block.timestamp {
+            return Err(PrivateConsensusError::HeaderBodyMismatch("timestamp"));
+        }
+        if pow_header.parent_hash != block.parent_hash {
+            return Err(PrivateConsensusError::HeaderBodyMismatch("parent_hash"));
+        }
+        if pow_header.previous_consensus_hash != self.tip_consensus_hash {
+            return Err(PrivateConsensusError::HeaderBodyMismatch(
+                "previous_consensus_hash",
+            ));
+        }
+        if pow_header.state_root != block.state_root {
+            return Err(PrivateConsensusError::HeaderBodyMismatch("state_root"));
+        }
+        if block
+            .transactions
+            .iter()
+            .any(|tx| tx.authorization.network_id != pow_header.network_id)
+        {
+            return Err(PrivateConsensusError::HeaderBodyMismatch(
+                "transaction.network_id",
+            ));
+        }
+        if pow_header.target != expected_target {
+            return Err(PrivateConsensusError::ExpectedTargetMismatch);
+        }
+
+        let digest = crate::consensus::verify_pow(pow_header, &self.target_history.params)?;
+        let receipt = ChainAdmissionBoundary::testnet()
+            .replay_v4_hybrid_monetary(monetary_state, block, expected_manifest_id, verifier)
+            .map_err(PrivateConsensusError::Admission)?;
+
+        self.state = self
+            .monetary_state
+            .as_ref()
+            .expect("monetary state checked before V4 replay")
+            .ledger()
+            .clone();
+        let work = block_work(pow_header.target)?;
+        self.target_history
+            .record_next(next_height, pow_header.target)?;
+        self.cumulative_work = self.cumulative_work.saturating_add(work);
+        self.tip_consensus_hash = digest;
+        Ok((receipt, digest))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        chain_admission::{ChainAdmissionError, ReferenceTimeProvenance, ReferenceTimeSample},
+        consensus::PowHeader,
+        state_machine::{AccountId, StateError},
+    };
+
+    struct EmptyAuthenticator;
+    impl TransactionAuthenticator for EmptyAuthenticator {
+        fn verify(&self, _: &AccountId, _: &[u8; 32], _: &[u8]) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    struct FixedClock;
+    impl ReferenceTimeProvider for FixedClock {
+        fn sample(
+            &self,
+        ) -> Result<ReferenceTimeSample, crate::chain_admission::ReferenceTimeError> {
+            Ok(ReferenceTimeSample {
+                unix_seconds: 100,
+                provenance: ReferenceTimeProvenance::ConfiguredProvider,
+                source_id: "private-testnet-driver-clock",
+            })
+        }
+    }
+
+    fn params() -> ConsensusParameters {
+        let mut params = ConsensusParameters::candidate_testnet().unwrap();
+        params.initial_target = Uint256::MAX;
+        params.pow_limit = Uint256::MAX;
+        params
+    }
+
+    fn state() -> LedgerState {
+        LedgerState::genesis([0xA7; 32], vec![([1; 32], 1_000)]).unwrap()
+    }
+
+    fn monetary_state() -> MonetaryLedgerState {
+        MonetaryLedgerState::genesis(
+            [0xA7; 32],
+            [1; 32],
+            vec![(
+                [2; 32],
+                crate::state_machine::MONETARY_PUBLIC_GOODS_BUDGET_ATOMS as u64,
+            )],
+        )
+        .unwrap()
+    }
+
+    fn monetary_block(
+        state: &MonetaryLedgerState,
+        timestamp: u64,
+        miner: AccountId,
+    ) -> MonetaryBlock {
+        let mut block = MonetaryBlock {
+            body: Block {
+                height: state.height() + 1,
+                timestamp,
+                parent_hash: state.tip_hash(),
+                state_root: [0; 32],
+                transactions: Vec::new(),
+            },
+            miner,
+            claimed_subsidy_atoms: state.expected_miner_reward().unwrap(),
+        };
+        block.body.state_root = state
+            .preview_state_root_after(&block, &EmptyAuthenticator)
+            .unwrap();
+        block
+    }
+
+    fn monetary_header(
+        chain: &PrivateTestnetChain,
+        block: &MonetaryBlock,
+        params: &ConsensusParameters,
+        nonce: u64,
+    ) -> PowHeader {
+        PowHeader {
+            protocol_version: params.protocol_version,
+            network_id: chain
+                .monetary_state()
+                .expect("monetary fixture")
+                .ledger()
+                .network_id(),
+            height: block.body.height,
+            timestamp: block.body.timestamp,
+            parent_hash: block.body.parent_hash,
+            previous_consensus_hash: chain.chain_tip().tip_hash,
+            state_root: block.body.state_root,
+            target: params.initial_target,
+            nonce,
+        }
+    }
+
+    fn body(state: &LedgerState, timestamp: u64) -> Block {
+        let mut block = Block {
+            height: state.height() + 1,
+            timestamp,
+            parent_hash: state.tip_hash(),
+            state_root: [0; 32],
+            transactions: Vec::new(),
+        };
+        block.state_root = state
+            .preview_state_root_after(&block, &EmptyAuthenticator)
+            .unwrap();
+        block
+    }
+
+    fn header(
+        state: &LedgerState,
+        block: &Block,
+        params: &ConsensusParameters,
+        target: Uint256,
+        nonce: u64,
+    ) -> PowHeader {
+        PowHeader {
+            protocol_version: params.protocol_version,
+            network_id: state.network_id(),
+            height: block.height,
+            timestamp: block.timestamp,
+            parent_hash: block.parent_hash,
+            previous_consensus_hash: state.tip_hash(),
+            state_root: block.state_root,
+            target,
+            nonce,
+        }
+    }
+
+    #[test]
+    fn driver_tracks_target_and_work_after_each_block() {
+        let params = params();
+        let mut chain = PrivateTestnetChain::new(state(), params.clone()).unwrap();
+        let block = body(chain.state(), 100);
+        let header = header(chain.state(), &block, &params, params.initial_target, 0);
+
+        chain
+            .append_live(&block, &header, None, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+
+        assert_eq!(chain.state().height(), 1);
+        assert_eq!(
+            chain.target_history().target_at(1),
+            Some(params.initial_target)
+        );
+        assert_eq!(
+            chain.cumulative_work(),
+            block_work(params.initial_target).unwrap()
+        );
+    }
+
+    #[test]
+    fn second_block_must_link_the_accepted_pow_digest_not_just_the_body_parent() {
+        let params = params();
+        let mut chain = PrivateTestnetChain::new(state(), params.clone()).unwrap();
+        let first = body(chain.state(), 100);
+        let first_header = header(chain.state(), &first, &params, params.initial_target, 1);
+        chain
+            .append_live(
+                &first,
+                &first_header,
+                None,
+                &EmptyAuthenticator,
+                &FixedClock,
+            )
+            .unwrap();
+
+        let second = body(chain.state(), 101);
+        let mut wrong_link = header(chain.state(), &second, &params, params.initial_target, 2);
+        // The helper defaults to the BLK2 state tip; this is not necessarily the accepted PoW digest.
+        assert_ne!(
+            wrong_link.previous_consensus_hash,
+            chain.chain_tip().tip_hash
+        );
+        let before = chain.clone();
+        assert_eq!(
+            chain.append_live(&second, &wrong_link, None, &EmptyAuthenticator, &FixedClock),
+            Err(PrivateConsensusError::HeaderBodyMismatch(
+                "previous_consensus_hash"
+            ))
+        );
+        assert_eq!(chain, before);
+
+        wrong_link.previous_consensus_hash = chain.chain_tip().tip_hash;
+        chain
+            .append_live(&second, &wrong_link, None, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+        assert_eq!(chain.state().height(), 2);
+    }
+
+    #[test]
+    fn driver_requires_measured_duration_only_after_a_full_window() {
+        let params = params();
+        let initial_target = params.initial_target;
+        let expected = params.target_block_time_secs * params.difficulty_window_blocks;
+        let mut history = TargetHistory::new(params).unwrap();
+        for height in 1..=2_016 {
+            history.record_next(height, initial_target).unwrap();
+        }
+        assert_eq!(
+            history.expected_target(2_017, None),
+            Err(PrivateConsensusError::Consensus(
+                ConsensusError::MissingRetargetObservation
+            ))
+        );
+        assert_eq!(
+            history
+                .expected_target(2_017, Some(expected / 2))
+                .unwrap()
+                .to_be_bytes()[31],
+            0xff
+        );
+    }
+
+    #[test]
+    fn fork_clones_state_and_work_then_deterministically_compares() {
+        let params = params();
+        let mut left = PrivateTestnetChain::new(state(), params.clone()).unwrap();
+        let mut right = left.fork();
+
+        let left_block = body(left.state(), 100);
+        let left_header = header(left.state(), &left_block, &params, params.initial_target, 0);
+        left.append_live(
+            &left_block,
+            &left_header,
+            None,
+            &EmptyAuthenticator,
+            &FixedClock,
+        )
+        .unwrap();
+
+        let right_block = body(right.state(), 100);
+        let right_header = header(
+            right.state(),
+            &right_block,
+            &params,
+            params.initial_target,
+            1,
+        );
+        right
+            .append_live(
+                &right_block,
+                &right_header,
+                None,
+                &EmptyAuthenticator,
+                &FixedClock,
+            )
+            .unwrap();
+
+        // Same work/height; hash tie-break must be deterministic.
+        assert_ne!(left.chain_tip().tip_hash, right.chain_tip().tip_hash);
+        assert!(matches!(
+            left.compare_to(&right),
+            std::cmp::Ordering::Less | std::cmp::Ordering::Greater
+        ));
+    }
+
+    #[test]
+    fn rejected_candidate_does_not_mutate_driver_state() {
+        let params = params();
+        let mut chain = PrivateTestnetChain::new(state(), params.clone()).unwrap();
+        let block = body(chain.state(), 100);
+        let mut bad = header(chain.state(), &block, &params, params.initial_target, 0);
+        bad.state_root[0] ^= 1;
+        let before = chain.clone();
+
+        assert!(matches!(
+            chain.append_live(&block, &bad, None, &EmptyAuthenticator, &FixedClock,),
+            Err(PrivateConsensusError::HeaderBodyMismatch("state_root"))
+        ));
+        assert_eq!(chain, before);
+    }
+
+    #[test]
+    fn state_error_remains_the_final_body_gate() {
+        let params = params();
+        let mut chain = PrivateTestnetChain::new(state(), params.clone()).unwrap();
+        let mut block = body(chain.state(), 100);
+        block.timestamp = 0;
+        let header = header(chain.state(), &block, &params, params.initial_target, 0);
+        let before = chain.clone();
+
+        assert_eq!(
+            chain.append_live(&block, &header, None, &EmptyAuthenticator, &FixedClock,),
+            Err(PrivateConsensusError::Admission(
+                ChainAdmissionError::State(StateError::InvalidBlockTimestamp)
+            ))
+        );
+        assert_eq!(chain, before);
+    }
+
+    #[test]
+    fn monetary_chain_validates_pow_and_credits_the_exact_scheduled_reward() {
+        let params = params();
+        let genesis = monetary_state();
+        let mut chain = PrivateTestnetChain::new_monetary(genesis, params.clone()).unwrap();
+        let before_work = chain.cumulative_work();
+        let state_before = chain.monetary_state().unwrap().clone();
+        let block = monetary_block(&state_before, 100, [3; 32]);
+        let header = monetary_header(&chain, &block, &params, 7);
+
+        let (receipt, digest) = chain
+            .append_monetary_live(&block, &header, None, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+
+        assert_eq!(receipt.summary.height, 1);
+        assert_eq!(receipt.summary.state_root, block.body.state_root);
+        assert_eq!(chain.state().height(), 1);
+        assert_eq!(chain.chain_tip().tip_hash, digest);
+        assert_eq!(
+            chain.cumulative_work(),
+            before_work.saturating_add(block_work(params.initial_target).unwrap())
+        );
+        let monetary = chain.monetary_state().unwrap();
+        assert_eq!(
+            monetary.total_mined_atoms(),
+            block.claimed_subsidy_atoms as u128
+        );
+        assert_eq!(
+            monetary.ledger().account(&[3; 32]).unwrap().balance,
+            block.claimed_subsidy_atoms
+        );
+        assert_eq!(
+            monetary.total_value().unwrap(),
+            monetary.ledger().total_value().unwrap()
+        );
+    }
+
+    #[test]
+    fn monetary_and_legacy_block_paths_cannot_be_mixed() {
+        let params = params();
+        let monetary_genesis = monetary_state();
+        let mut monetary_chain =
+            PrivateTestnetChain::new_monetary(monetary_genesis.clone(), params.clone()).unwrap();
+        let candidate = monetary_block(&monetary_genesis, 100, [3; 32]);
+        let legacy_block = Block {
+            height: 1,
+            timestamp: 100,
+            parent_hash: monetary_genesis.tip_hash(),
+            state_root: [0; 32],
+            transactions: Vec::new(),
+        };
+        let legacy_header = monetary_header(&monetary_chain, &candidate, &params, 0);
+        let before_monetary = monetary_chain.clone();
+        assert_eq!(
+            monetary_chain.append_live(
+                &legacy_block,
+                &legacy_header,
+                None,
+                &EmptyAuthenticator,
+                &FixedClock,
+            ),
+            Err(PrivateConsensusError::LegacyBlockOnMonetaryChain)
+        );
+        assert_eq!(monetary_chain, before_monetary);
+
+        let mut legacy_chain = PrivateTestnetChain::new(state(), params.clone()).unwrap();
+        let before_legacy = legacy_chain.clone();
+        assert_eq!(
+            legacy_chain.append_monetary_live(
+                &candidate,
+                &legacy_header,
+                None,
+                &EmptyAuthenticator,
+                &FixedClock,
+            ),
+            Err(PrivateConsensusError::MonetaryBlockOnLegacyChain)
+        );
+        assert_eq!(legacy_chain, before_legacy);
+    }
+}
