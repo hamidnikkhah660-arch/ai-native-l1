@@ -1,7 +1,7 @@
 # CP-0344 - Public White Paper, Roadmap and Website Refresh
 Date: 2026-10-20
 Parent: local CP-0343 technical source review.
-Status: Documentation update staged on a dedicated public branch; public merge and Pages publication are to be verified separately.
+Status: HISTORICAL planning checkpoint. The publication was subsequently merged and independently verified in CP-0345; this file preserves the intended scope, not the current publication status.
 
 ## Owner allocation direction reflected
 

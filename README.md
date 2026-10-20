@@ -7,11 +7,14 @@
 - **Engineering white paper:** [QuantumZXB Native Coin White Paper v0.2](docs/QUANTUMZXB_NATIVE_COIN_WHITEPAPER_V02.md)
 - **Master roadmap:** [QuantumZXB Engineering & Ecosystem Roadmap v0.2](docs/QUANTUMZXB_MASTER_ROADMAP_V02.md)
 - **Technical review and test evidence:** [CP-0343 report](docs/CP_0343_TECHNICAL_REVIEW_AND_TEST_RESULTS.md)
-- **Current public documentation manifest:** [v0.2 manifest](docs/PUBLIC_RELEASE_MANIFEST_V03_2026-10-20.md)
+- **Current public documentation manifest:** [v0.4 manifest](docs/PUBLIC_RELEASE_MANIFEST_V04_2026-10-20.md)
 - **Publication checkpoint:** [CP-0344](docs/CP_0344_PUBLIC_DOCUMENTATION_REFRESH_2026-10-20.md)
 - **Founder/sponsor/contributor economics:** [Allocation policy v0.3](docs/FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V03.md)
 - **Current curated source baseline:** [v0.1.1-source](https://github.com/hamidnikkhah660-arch/ai-native-l1/releases/tag/v0.1.1-source)
+- **Founder profile and collaboration contact:** [Founder / AI research profile](docs/FOUNDER_PROFILE_AND_COLLABORATION.md) - email: [hamidnikkhah660@gmail.com](mailto:hamidnikkhah660@gmail.com?subject=QuantumZXB%20collaboration)
+- **Mining, halving and performance evidence:** [Candidate parameters and benchmark methodology](docs/MINING_HALVING_PERFORMANCE_AND_SCALING_V01.md)
 - **Sponsorship and contributor discussion:** [Public issue #1](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/1)
+- **Previous public documentation release:** [v0.2.0-docs](https://github.com/hamidnikkhah660-arch/ai-native-l1/releases/tag/v0.2.0-docs)
 
 ## Engineering highlights
 
@@ -37,9 +40,10 @@ The current design targets a maximum of **10,000,000,000 native coins**, with 4B
 
 The owner direction is that the 4B founder allocation remains freely transferable with no protocol lock or time vesting. A future sponsor may qualify for up to **1,000,000,000 coins (10% of the total cap)** from inside the founder tranche only after fulfilling written, agreed sponsorship milestones. A proposed **1%-10% contributor/professional pool** is likewise drawn from that same founder allocation and tied to accepted work. If both pools reach 1B, at least 2B (20% of total cap) remains the founder's direct discretionary allocation. No sponsor is currently claimed as selected or contracted, and these designations are not a guarantee of value or return.
 
-The arithmetic invariant helper can be run using Python:
+The arithmetic invariant helper and the public documentation preflight can be run using Python:
 
     python simulations/sponsor_allocation_checker.py
+    python simulations/public_docs_refresh_checker.py
 
 ## Current engineering validation
 
@@ -62,4 +66,12 @@ The complete maintainer checkout is larger than this curated public release tree
 6. Grow through sponsor-funded engineering, developer tooling, integration services and later verifiable AI/compute applications.
 7. Make the production and market-launch decision against measured evidence and the intended product scope.
 
-The source tree is a curated public selection. Review specific files, reproduce commands in the relevant package, and use the [release manifest](docs/PUBLIC_RELEASE_MANIFEST_V02_2026-10-20.md) to identify the versioned public baseline. The public white paper and roadmap describe the engineering plan; they do not assert that future integrations are already operating on native Mainnet.
+## Founder background and direct proposals
+
+The founder profile summarises the AI, quantum-machine-learning, fuzzy/evolutionary optimisation, and post-quantum blockchain research described in the current CV and the engineering demonstrated in this repository. Sponsors, Rust/protocol engineers, cryptography reviewers, EVM developers, AI/LLM researchers, academic groups, grant programmes, infrastructure providers, exchanges and market-data platforms can send a concrete proposal to [hamidnikkhah660@gmail.com](mailto:hamidnikkhah660@gmail.com?subject=QuantumZXB%20collaboration). Exchange or data-platform contact is for technical diligence/readiness discussion only; no listing or market is represented as live.
+
+## Mining and performance status
+
+The current 10B design cap assigns 3B to the mining/network-security envelope. A shared research candidate uses 8 decimal places, a 30-second target, 2,016-block difficulty window, Argon2id v1.3 (64 MiB, one iteration, one lane), and a 4,204,800-block halving interval with a 356.73515981-coin initial subsidy. These are candidate arithmetic values, not frozen production rules; Gate 2 remains open and the reward path is not yet integrated through canonical block production/import, Genesis, reorganisation, snapshots and state roots. The project has no validated end-to-end native TPS or public-network latency benchmark. See the mining/performance report for the single-host candidate screens, their limitations, and the exact benchmark plan.
+
+The source tree is a curated public selection. Review specific files, reproduce commands in the relevant package, and use the [current public release manifest](docs/PUBLIC_RELEASE_MANIFEST_V04_2026-10-20.md) to identify the versioned public baseline. The public white paper and roadmap describe the engineering plan; they do not assert that future integrations are already operating on native Mainnet.
