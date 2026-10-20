@@ -7,7 +7,8 @@
 - **Engineering white paper:** [QuantumZXB Native Coin White Paper v0.2](docs/QUANTUMZXB_NATIVE_COIN_WHITEPAPER_V02.md)
 - **Master roadmap:** [QuantumZXB Engineering & Ecosystem Roadmap v0.2](docs/QUANTUMZXB_MASTER_ROADMAP_V02.md)
 - **Technical review and test evidence:** [CP-0343 report](docs/CP_0343_TECHNICAL_REVIEW_AND_TEST_RESULTS.md)
-- **Current public documentation manifest:** [v0.4 manifest](docs/PUBLIC_RELEASE_MANIFEST_V04_2026-10-20.md)
+- **Latest public curated checkout validation:** [CP-0347](docs/CP_0347_PUBLIC_CURATED_CHECKOUT_VALIDATION_2026-10-21.md)
+- **Current public documentation manifest:** [v0.5 manifest](docs/PUBLIC_RELEASE_MANIFEST_V05_2026-10-21.md)
 - **Publication checkpoint:** [CP-0344](docs/CP_0344_PUBLIC_DOCUMENTATION_REFRESH_2026-10-20.md)
 - **Founder/sponsor/contributor economics:** [Allocation policy v0.3](docs/FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V03.md)
 - **Current curated source baseline:** [v0.1.1-source](https://github.com/hamidnikkhah660-arch/ai-native-l1/releases/tag/v0.1.1-source)
@@ -55,6 +56,10 @@ On the maintainer's complete working checkout at review time:
 - npm test in contracts/launch-asset - PASS for the fixed-supply local EVM, wallet-console and loopback server suites.
 
 The complete maintainer checkout is larger than this curated public release tree; these counts describe the working checkout used for the review, not a claim that every internal historical fixture is included here. They are engineering regression evidence, not an independent security audit or a TPS/latency benchmark. The separate contracts/vm-lab Rust 1.99 toolchain test suite was not rerun in the current review environment.
+
+## Latest curated public checkout validation (2026-10-21)
+
+The public curated tree at source commit c3a5474aea60d3925f45ccc5f964f1229e4565e8 was independently rebuilt and tested on Windows with Rust/Cargo 1.82.0: cargo fmt --all -- --check, cargo check --all-targets --locked --offline, and cargo test --all-targets --locked --offline all exited 0. The public checkout library suite passed 735/735 tests, and the remaining targets completed with no failures. This is separate from the larger maintainer checkout earlier 736/736 count; see [CP-0347](docs/CP_0347_PUBLIC_CURATED_CHECKOUT_VALIDATION_2026-10-21.md). Existing unused/dead-code warnings remain. These checks are regression evidence, not a security audit or throughput benchmark.
 
 ## Roadmap
 
