@@ -1,96 +1,118 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="QuantumZXB — AI-Native L1 research. Open source for deterministic state, authenticated transport, durable recovery and post-quantum signature experiments.">
-  <meta name="theme-color" content="#101827">
-  <title>QuantumZXB — AI-Native L1 Global Open Research</title>
-  <style>
-    :root { color-scheme: dark; --bg: #0b1220; --panel: #121d30; --text: #edf3ff; --muted: #aebbd0; --line: #2a3b54; --accent: #7dd3fc; }
-    * { box-sizing: border-box; }
-    body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; line-height: 1.6; background: radial-gradient(ellipse at top, #182942 0%, var(--bg) 55%); color: var(--text); }
-    a { color: var(--accent); }
-    .wrap { width: min(1060px, calc(100% - 32px)); margin: 0 auto; }
-    header { padding: 26px 0; border-bottom: 1px solid var(--line); }
-    .nav { display:flex; justify-content:space-between; align-items:center; gap:20px; flex-wrap:wrap; }
-    .brand { font-weight: 750; letter-spacing:.02em; }
-    .nav a { margin-left: 14px; text-decoration:none; color:var(--muted); }
-    main { padding: 62px 0 40px; }
-    .eyebrow { color:var(--accent); text-transform:uppercase; letter-spacing:.16em; font-size:.78rem; font-weight:700; }
-    h1 { font-size:clamp(2.5rem, 7vw, 5rem); line-height:1.03; max-width:900px; margin:14px 0 20px; letter-spacing:-.04em; }
-    .lead { max-width:760px; color:var(--muted); font-size:1.18rem; }
-    .actions { display:flex; flex-wrap:wrap; gap:12px; margin:28px 0 36px; }
-    .button { display:inline-block; border:1px solid var(--line); border-radius:9px; padding:11px 16px; text-decoration:none; font-weight:650; }
-    .primary { background:var(--accent); color:#07111f; border-color:var(--accent); }
-    .notice { border:1px solid #755a29; background:#33281388; color:#ffe7b0; padding:14px 16px; border-radius:10px; margin:26px 0 40px; }
-    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:14px; margin:22px 0 50px; }
-    .card { padding:20px; background:#121d30d9; border:1px solid var(--line); border-radius:12px; }
-    .card h3 { margin:0 0 8px; }
-    .card p { margin:0; color:var(--muted); }
-    h2 { margin-top:45px; font-size:1.65rem; letter-spacing:-.02em; }
-    .status { display:grid; grid-template-columns:minmax(140px, .5fr) 1fr; gap:8px 18px; border-top:1px solid var(--line); padding-top:14px; max-width:820px; }
-    .status dt { color:var(--muted); }
-    .status dd { margin:0; }
-    footer { border-top:1px solid var(--line); padding:26px 0 42px; color:var(--muted); font-size:.92rem; }
-    @media(max-width:620px) { main { padding-top:42px; } .nav a { margin-left:0; margin-right:12px; } .status { grid-template-columns:1fr; gap:2px; } .status dd { margin-bottom:12px; } }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="QuantumZXB is an independently developed native Layer-1 engineering project spanning deterministic ledgers, EVM-compatible smart-contract research, ML-DSA hybrid-signature experiments, resilient networking and an AI-native ecosystem roadmap.">
+<meta name="theme-color" content="#0b1220">
+<title>QuantumZXB | Native Layer-1 &amp; Programmable Ecosystem</title>
+<style>
+:root{color-scheme:dark;--bg:#09111f;--panel:#101d30;--text:#edf4ff;--muted:#b4c2d6;--line:#2a3b54;--accent:#8be0ff;--accent2:#b4a2ff;--good:#a7f3d0}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.65;background:radial-gradient(ellipse at 50% -10%,#1e3656 0,transparent 52%),var(--bg);color:var(--text)}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}.wrap{width:min(1140px,calc(100% - 36px));margin:auto}
+header{border-bottom:1px solid var(--line);background:#09111fcc;backdrop-filter:blur(14px)}.nav{display:flex;justify-content:space-between;align-items:center;gap:20px;padding:19px 0;flex-wrap:wrap}.brand{font-weight:800;letter-spacing:.02em}.brand span{color:var(--accent)}nav{display:flex;gap:18px;flex-wrap:wrap}nav a{font-size:.93rem;color:var(--muted)}
+main{padding:64px 0 58px}.eyebrow{text-transform:uppercase;letter-spacing:.16em;font-weight:750;color:var(--accent);font-size:.77rem}.hero{max-width:940px}h1{font-size:clamp(2.7rem,7.3vw,5.8rem);line-height:1.02;letter-spacing:-.055em;margin:16px 0 22px}.hero p{font-size:clamp(1.08rem,2vw,1.3rem);color:var(--muted);max-width:850px}.actions{display:flex;gap:12px;flex-wrap:wrap;margin:28px 0 22px}.button{display:inline-flex;align-items:center;justify-content:center;border:1px solid #3b526f;border-radius:10px;padding:10px 15px;font-weight:700;color:var(--text);background:#10223a}.button.primary{background:var(--accent);color:#071321;border-color:var(--accent)}.button:hover{text-decoration:none;filter:brightness(1.07)}
+.pillrow{display:flex;gap:9px;flex-wrap:wrap;margin:27px 0 0}.pill{border:1px solid var(--line);background:#0e1a2c;color:#dbeafe;padding:5px 10px;border-radius:999px;font-size:.85rem}
+.section{margin-top:62px}h2{font-size:clamp(1.7rem,3vw,2.2rem);letter-spacing:-.035em;margin:0 0 12px}h3{margin:0 0 9px;font-size:1.15rem}.intro{max-width:780px;color:var(--muted);margin:0 0 25px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(245px,1fr));gap:15px}.card{padding:22px;border:1px solid var(--line);border-radius:15px;background:linear-gradient(150deg,#14263dd9,#0e1929e8)}.card p{margin:0;color:var(--muted);font-size:.96rem}.tag{font-size:.77rem;text-transform:uppercase;letter-spacing:.1em;color:var(--good);font-weight:750;display:block;margin-bottom:10px}
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-top:24px}.metric{padding:18px;border:1px solid var(--line);border-radius:12px;background:#0c1929}.metric strong{display:block;font-size:1.55rem;letter-spacing:-.03em}.metric span{display:block;color:var(--muted);font-size:.88rem}
+.split{display:grid;grid-template-columns:1.1fr .9fr;gap:20px}.panel{padding:24px;border:1px solid var(--line);background:var(--panel);border-radius:15px}.panel p,.panel li{color:var(--muted)}.panel p+p{margin-top:10px}
+.tablewrap{overflow:auto;border:1px solid var(--line);border-radius:12px}table{border-collapse:collapse;width:100%;min-width:590px;background:#0c1929}th,td{text-align:left;padding:13px 15px;border-bottom:1px solid var(--line)}th{color:var(--accent);font-weight:750;background:#14243a}td{color:var(--muted)}tr:last-child td{border-bottom:0}
+.note{padding:16px 18px;border-left:3px solid var(--accent2);background:#171932;border-radius:0 10px 10px 0;color:var(--muted);margin-top:20px}.roadmap{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.phase{padding:19px;border:1px solid var(--line);border-radius:13px;background:#0d1929}.phase b{color:var(--accent);display:block;margin-bottom:6px}.phase p{margin:0;color:var(--muted);font-size:.94rem}
+footer{border-top:1px solid var(--line);padding:27px 0 42px;color:var(--muted);font-size:.9rem}.foot{display:flex;gap:25px;justify-content:space-between;flex-wrap:wrap}.small{font-size:.88rem;color:var(--muted)}
+@media(max-width:720px){main{padding-top:44px}.split{grid-template-columns:1fr}nav{gap:12px}.section{margin-top:46px}}
+</style>
 </head>
 <body>
-  <header>
-    <div class="wrap nav">
-      <div class="brand">QuantumZXB · AI-Native L1</div>
-      <nav aria-label="Primary">
-        <a href="README.md">Source</a>
-        <a href="docs/PUBLIC_RELEASE_MANIFEST_V02_2026-10-20.md">Release v0.1.1</a>
-        <a href="docs/BRAND_IDENTITY_DECISION_V02_2026-10-20.md">Name &amp; ticker</a>
-        <a href="docs/MARKET_DISCOVERY_AND_LISTING_READINESS_V01_2026-10-20.md">CMC / TradingView</a>
-        <a href="docs/NATIVE_GATE2_GATE8_CLOSURE_PLAN_V01_2026-10-20.md">Gate 2 &amp; 8</a>
-        <a href="sbom/native-pow-bench.cdx.json">SBOM</a>
-        <a href="SECURITY.md">Security</a>
-      </nav>
-    </div>
-  </header>
-  <main class="wrap">
-    <div class="eyebrow">QuantumZXB · open research · public source</div>
-    <h1>A verifiable native Layer‑1, built one test at a time.</h1>
-    <p class="lead">QuantumZXB is the selected public working identity for AI-Native L1. The proposed native-asset ticker is QZXB, but it is not deployed, listed or trademark-cleared. The project explores deterministic state transitions, authenticated peer transport, durable recovery, fixed-supply policy candidates and post-quantum signature experiments.</p>
-    <div class="actions">
-      <a class="button primary" href="https://github.com/hamidnikkhah660-arch/ai-native-l1">Browse public source on GitHub</a>
-      <a class="button" href="README.md">Build and test locally</a>
-      <a class="button" href="docs/BRAND_IDENTITY_DECISION_V02_2026-10-20.md">Name / ticker status</a>
-      <a class="button" href="docs/MARKET_DISCOVERY_AND_LISTING_READINESS_V01_2026-10-20.md">CMC / TradingView readiness</a>
-    </div>
-    <div class="notice"><strong>Research status:</strong> no native Mainnet, trading market, price feed or CMC/TradingView listing exists yet. QZXB is only a proposed ticker and has not been cleared in official trademark registers. The separate EVM candidate remains the old QX-labelled Sepolia testnet asset; it is not the native coin. No sale, liquidity pool, live price, revenue or independent security audit is claimed.</div>
-    <h2>What is in the source</h2>
-    <div class="grid">
-      <section class="card"><h3>Native research crate</h3><p>Rust experiments for proof-of-work policy, transaction/state validation, authenticated networking, recovery, and reproducible test vectors.</p></section>
-      <section class="card"><h3>Independent test fixtures</h3><p>Cross-language vectors and mutation cases check encoding, monetary arithmetic, state commitments and fail-closed behavior.</p></section>
-      <section class="card"><h3>Separate EVM candidate</h3><p>A fixed-supply ERC-20 test asset with an isolated local-EVM suite; it is not the native L1 coin and is not approved for sale.</p></section>
-      <section class="card"><h3>Open contribution path</h3><p>Review the scope notes, open an issue or submit a focused pull request with reproducible results and clear limitations.</p></section>
-    </div>
-    <h2>Honest release status</h2>
-    <dl class="status">
-      <dt>Source access</dt><dd>Public repository intended for unrestricted worldwide reading, cloning and forking.</dd>
-      <dt>Working identity / ticker</dt><dd>QuantumZXB is the unified public working name. QZXB is a proposed ticker only; the search found an existing ZXB token and other nearby symbols, so uniqueness/trademark clearance is not claimed. The word “Quantum” is not a quantum-resistance guarantee.</dd>
-      <dt>CMC / TradingView</dt><dd>Not listed. The native asset has no Mainnet, explorer, trading pair or authentic market data. See the published readiness plan.</dd>
-      <dt>Gate 2 — canonical issuance</dt><dd>Open: native canonical issuance, Genesis and runtime integration still need a release-grade freeze and independent verification.</dd>
-      <dt>Gate 8 — anti-rollback trust</dt><dd>Open: an independent monotonic trust domain, canonical integration and external multi-host/power-loss qualification have not been established. See the closure plan.</dd>
-      <dt>Security</dt><dd>Local test suites are available; independent external protocol/cryptographic audit is not complete. ML-DSA experiments are not proof of end-to-end quantum resistance.</dd>
-      <dt>License</dt><dd>Apache-2.0 for scoped project-authored material, subject to file-level exceptions and third-party notices. See <a href="LICENSES/README.md">license scope</a>.</dd>
-    </dl>
-    <h2>Join the engineering effort</h2>
-    <p class="lead">Independent reviewers, developers, test operators and potential research partners are welcome to evaluate the code, reproduce results and challenge assumptions. Support or funding arrangements are not yet established; no return or token value is promised.</p>
-    <div class="actions">
-      <a class="button primary" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/1">Contributors / sponsors</a>
-      <a class="button" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/2">Gate 2</a>
-      <a class="button" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/3">Gate 8</a>
-      <a class="button" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/4">CMC / TradingView</a>
-      <a class="button" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/5">Brand review</a>
-      <a class="button" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/CONTRIBUTING.md">Contribute</a>
-      <a class="button" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/docs/TESTNET_DEPLOYMENT_STATUS.md">Testnet facts</a>
-    </div>
-  </main>
-  <footer><div class="wrap">Open source research · transparent limits · no promises of price, profit, audit, listing, or regulatory approval. Check the repository for current, verifiable status.</div></footer>
+<header><div class="wrap nav">
+<a class="brand" href="#top" aria-label="QuantumZXB home">Quantum<span>ZXB</span></a>
+<nav aria-label="Primary navigation"><a href="#technology">Technology</a><a href="#coin">Native coin</a><a href="#roadmap">Roadmap</a><a href="#research">Research</a><a href="https://github.com/hamidnikkhah660-arch/ai-native-l1">GitHub</a></nav>
+</div></header>
+<main class="wrap" id="top">
+<section class="hero">
+<div class="eyebrow">Native Layer-1 - Verifiable execution - AI-native ecosystem</div>
+<h1>Infrastructure for a more programmable, verifiable digital economy.</h1>
+<p>QuantumZXB is an independently developed native Layer-1 engineering project bringing together a Rust-based ledger, deterministic state and recovery research, ML-DSA hybrid-signature experiments, and an EVM-compatible smart-contract development track. The long-term vision connects native coin utility, developers and verifiable AI/compute services in one open ecosystem.</p>
+<div class="actions">
+<a class="button primary" href="https://github.com/hamidnikkhah660-arch/ai-native-l1">Explore the source</a>
+<a class="button" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/docs/QUANTUMZXB_NATIVE_COIN_WHITEPAPER_V02.md">Read the technical white paper</a>
+<a class="button" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/docs/QUANTUMZXB_MASTER_ROADMAP_V02.md">View the roadmap</a>
+</div>
+<div class="pillrow"><span class="pill">Native coin design: 10B cap</span><span class="pill">Rust protocol research</span><span class="pill">ML-DSA-65 verification</span><span class="pill">EVM compatibility lab</span><span class="pill">Open-source engineering</span></div>
+</section>
+<section class="section" id="technology">
+<h2>One ecosystem vision. Multiple engineering tracks.</h2>
+<p class="intro">The repository contains a broad engineering portfolio spanning native protocol research, cryptographic verification, storage recovery and programmable execution. Each subsystem is developed with explicit interfaces, reproducible tests and a staged integration path.</p>
+<div class="grid">
+<article class="card"><span class="tag">01 / Native protocol</span><h3>Ledger, consensus and monetary policy</h3><p>Rust research components cover proof-of-work and difficulty-adjustment candidates, deterministic state transitions, block validation, chain selection, fork/reorganisation handling, supply accounting and snapshot replay.</p></article>
+<article class="card"><span class="tag">02 / Resilient infrastructure</span><h3>Peer networking and recovery</h3><p>Authenticated session research, pinned peer identities, bounded ingress and worker queues, archive synchronisation, durable-store models and crash/restart tests support an independently operable network design.</p></article>
+<article class="card"><span class="tag">03 / Quantum readiness</span><h3>ML-DSA and hybrid identity</h3><p>A real ML-DSA-65 verification adapter is exercised against selected hash-pinned external test vectors. V4 research formats combine Ed25519 and ML-DSA-65 for a staged hybrid-authentication path.</p></article>
+<article class="card"><span class="tag">04 / Programmable execution</span><h3>EVM and Solidity research</h3><p>A separate revm-based VM lab explores contract execution, gas, storage, receipts and cross-client behaviour. Canonical execution within the native state machine is the next integration track.</p></article>
+<article class="card"><span class="tag">05 / Developer tooling</span><h3>Wallet and asset experiments</h3><p>A fixed-supply ERC-20 demonstrator and browser deployment console run in EVM testnet/local environments. This historical QX asset is separate from the proposed native QZXB coin.</p></article>
+<article class="card"><span class="tag">06 / AI-native direction</span><h3>Applications and verifiable compute</h3><p>The roadmap includes developer SDKs, agent identities and payments, provider reputation, verifiable job accounting and AI/compute coordination once each service has measurable interfaces and operating rules.</p></article>
+</div>
+<div class="metrics">
+<div class="metric"><strong>736 / 736</strong><span>Native Rust library tests passed in the reviewed maintainer checkout</span></div>
+<div class="metric"><strong>53 vectors</strong><span>Selected ML-DSA-65 external verification cases: 48 valid, 5 invalid</span></div>
+<div class="metric"><strong>10 billion</strong><span>Proposed maximum native-coin supply in the current monetary design</span></div>
+<div class="metric"><strong>3 tracks</strong><span>Native protocol, hybrid-authentication research and EVM-compatible execution</span></div>
+</div>
+<p class="small">Test counts refer to the specific maintainer working checkout and selected test fixtures at the stated review date. They are engineering regression evidence, not an independent audit or a throughput benchmark.</p>
+</section>
+<section class="section" id="coin">
+<h2>Native coin and ecosystem economics</h2>
+<p class="intro">The native coin is designed for the project's own network and is distinct from the Sepolia ERC-20 demonstrator. The monetary profile is a design target that will become an active production rule only through the canonical Genesis and state-transition implementation.</p>
+<div class="tablewrap"><table><thead><tr><th>Allocation envelope</th><th>Coins</th><th>Share of 10B cap</th><th>Intent</th></tr></thead><tbody>
+<tr><td>Founder allocation</td><td>4,000,000,000</td><td>40%</td><td>Founder-controlled; no protocol lock or time vesting under current owner direction</td></tr>
+<tr><td>Mining / network security</td><td>3,000,000,000</td><td>30%</td><td>Proposed long-horizon network-security budget</td></tr>
+<tr><td>Public goods / ecosystem</td><td>3,000,000,000</td><td>30%</td><td>Proposed ecosystem, grants and public-infrastructure budget</td></tr>
+<tr><td><strong>Total design cap</strong></td><td><strong>10,000,000,000</strong></td><td><strong>100%</strong></td><td>One inclusive cap; no additional allocation above it</td></tr>
+</tbody></table></div>
+<div class="split" style="margin-top:18px">
+<div class="panel"><h3>Strategic sponsor opportunity</h3><p>The project is open to a future financial or technical sponsor. Subject to a written agreement and verified delivery of agreed milestones, up to 1,000,000,000 native coins may be designated from within the founder's existing 4B allocation. That equals 10% of the overall design cap and 25% of the founder tranche.</p><p>No sponsor is represented as currently selected or contracted, and the proposal does not promise a market value or return.</p><a href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/docs/FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V03.md">Sponsor allocation policy -></a></div>
+<div class="panel"><h3>Developer and professional contribution pool</h3><p>A proposal of 1%-10% of the total design cap may be designated from the same founder tranche for accepted work by developers, security contributors and other scoped professionals. Awards require defined deliverables and recorded acceptance. At least 2B coins (20% of total cap) remain the founder's direct discretionary allocation if the maximum sponsor and contributor pools are both used.</p><a href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/docs/FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V03.md">Allocation rules -></a></div>
+</div>
+</section>
+<section class="section" id="research">
+<h2>Research with measurable evidence</h2>
+<div class="grid">
+<article class="card"><h3>State and replay consistency</h3><p>Regression targets include canonical byte encoding, state-root vectors, branch selection, snapshot validation, replay, reorganisation and crash-recovery models.</p></article>
+<article class="card"><h3>Hybrid signature experiments</h3><p>The selected ML-DSA-65 corpus is hash-pinned and contains expected positive and negative cases. Full default-path hybrid activation and whole-network post-quantum claims require further integration.</p></article>
+<article class="card"><h3>Smart-contract interoperability</h3><p>The isolated EVM lab measures selected execution and state behaviours against another client. Native account, gas, receipt, storage and state-root integration are explicitly scoped in the roadmap.</p></article>
+</div>
+<p class="note">Architecture principle: every public capability statement maps to source, test vectors or an explicitly labelled roadmap milestone. The research portfolio remains open to independent reproduction and technical collaboration.</p>
+<div class="actions">
+<a class="button" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/docs/CP_0343_TECHNICAL_REVIEW_AND_TEST_RESULTS.md">Read the engineering review</a>
+<a class="button" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/docs/NATIVE_GATE2_GATE8_CLOSURE_PLAN_V01_2026-10-20.md">Protocol integration plan</a>
+<a class="button" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/docs/TESTNET_DEPLOYMENT_STATUS.md">EVM testnet record</a>
+</div>
+</section>
+<section class="section" id="roadmap">
+<h2>Engineering roadmap</h2>
+<p class="intro">The roadmap focuses on integrating the strongest existing components into one deterministic, independently reproducible release path.</p>
+<div class="roadmap">
+<div class="phase"><b>Phase 1 - Native protocol</b><p>Freeze Genesis, monetary rules and one canonical execution profile; verify issuance and state commitments through the full chain lifecycle.</p></div>
+<div class="phase"><b>Phase 2 - Hybrid trust</b><p>Integrate the selected ML-DSA/hybrid transaction profile and independently protected recovery trust, then qualify multi-host failure scenarios.</p></div>
+<div class="phase"><b>Phase 3 - Native EVM</b><p>Freeze the VM fork and gas schedule, integrate accounts/code/storage/receipts, then validate RPC and cross-node contract execution.</p></div>
+<div class="phase"><b>Phase 4 - Public devnet</b><p>Operate independent nodes with a native wallet, RPC and explorer; test peer churn, upgrades, recovery and real network measurements.</p></div>
+<div class="phase"><b>Phase 5 - Release qualification</b><p>Reproducible build, dependency provenance, external protocol/cryptography review, remediation and signed release materials.</p></div>
+<div class="phase"><b>Phase 6 - Ecosystem &amp; revenue</b><p>Deliver sponsor-funded engineering, integration services and developer tools; later pilot verified AI/compute coordination with real service evidence.</p></div>
+</div>
+<div class="actions">
+<a class="button primary" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/docs/QUANTUMZXB_MASTER_ROADMAP_V02.md">Open full roadmap</a>
+<a class="button" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/docs/QUANTUMZXB_NATIVE_COIN_WHITEPAPER_V02.md">Open full white paper</a>
+<a class="button" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/1">Discuss sponsorship or contribution</a>
+</div>
+</section>
+<section class="section">
+<h2>Public release identity</h2>
+<div class="panel">
+<p><strong>Project:</strong> QuantumZXB. <strong>Proposed native coin ticker:</strong> QZXB. The ticker remains a working proposal and is not claimed as deployed or listed.</p>
+<p><strong>Current public release:</strong> curated source and research release v0.1.1-source. This white paper and roadmap expand the public engineering description and integration plan.</p>
+<p><strong>Native network:</strong> the native mainnet profile, production Genesis and full EVM execution integration are the upcoming engineering milestones. The Sepolia QX contract is a different testnet asset, not the native coin.</p>
+<p><strong>Market status:</strong> no public native market price or liquidity is asserted. Sponsor allocations are conditional proposals from the existing founder tranche, not an issued guarantee of value.</p>
+</div>
+</section>
+</main>
+<footer><div class="wrap foot"><span>QuantumZXB - Open protocol research and engineering</span><span><a href="https://github.com/hamidnikkhah660-arch/ai-native-l1">GitHub source</a> - <a href="https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/1">Sponsors &amp; contributors</a> - <a href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/SECURITY.md">Security</a></span></div><div class="wrap small">Technical material is published to support review and reproduction. Coin supply and sponsor allocations are design/proposal terms until implemented and awarded; no market value or return is promised.</div></footer>
 </body>
 </html>
