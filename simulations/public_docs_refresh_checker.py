@@ -142,8 +142,22 @@ def main() -> int:
     readme_links = check_markdown_links(errors)
     profile = (ROOT / "docs" / "FOUNDER_PROFILE_AND_COLLABORATION.md").read_text(encoding="utf-8")
     mining = (ROOT / "docs" / "MINING_HALVING_PERFORMANCE_AND_SCALING_V01.md").read_text(encoding="utf-8")
-    if EMAIL not in html or EMAIL not in profile or EMAIL not in (ROOT / "README.md").read_text(encoding="utf-8"):
+    market_path = ROOT / "docs" / "LIQUIDITY_MARKET_DATA_AND_PUBLIC_LAUNCH_READINESS_V01.md"
+    market = market_path.read_text(encoding="utf-8") if market_path.exists() else ""
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    if EMAIL not in html or EMAIL not in profile or EMAIL not in readme:
         errors.append("direct founder email is not consistently present")
+    if "Ph.D. in Artificial Intelligence" not in profile or "2024" not in profile:
+        errors.append("founder-confirmed Ph.D. credential/year missing from profile")
+    if "Ph.D. in Artificial Intelligence in 2024" not in html:
+        errors.append("founder-confirmed Ph.D. credential/year missing from the public site")
+    if not market_path.exists() or "LIQUIDITY" not in market.upper():
+        errors.append("market-data and public-launch readiness report is missing")
+    if "market-data" not in parser.ids:
+        errors.append("HTML market-data section/anchor is missing")
+    for platform in ("CoinMarketCap", "CoinGecko", "DEX Screener", "TradingView"):
+        if platform not in market or platform not in html:
+            errors.append(f"market readiness section is missing platform coverage: {platform}")
     for token in ("4,204,800", "35,673,515,981", "2,999,999,999.139264", "Gate 2 remains open"):
         if token not in mining:
             errors.append(f"mining report is missing expected candidate disclosure: {token}")
