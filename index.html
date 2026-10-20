@@ -3,9 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="AI-Native L1: an open research project exploring a native Layer-1 prototype, authenticated transport, deterministic state and post-quantum signature experiments.">
+  <meta name="description" content="QuantumZXB — AI-Native L1 research. Open source for deterministic state, authenticated transport, durable recovery and post-quantum signature experiments.">
   <meta name="theme-color" content="#101827">
-  <title>AI-Native L1 — Global Open Research</title>
+  <title>QuantumZXB — AI-Native L1 Global Open Research</title>
   <style>
     :root { color-scheme: dark; --bg: #0b1220; --panel: #121d30; --text: #edf3ff; --muted: #aebbd0; --line: #2a3b54; --accent: #7dd3fc; }
     * { box-sizing: border-box; }
@@ -39,25 +39,29 @@
 <body>
   <header>
     <div class="wrap nav">
-      <div class="brand">AI-Native L1</div>
+      <div class="brand">QuantumZXB · AI-Native L1</div>
       <nav aria-label="Primary">
         <a href="README.md">Source</a>
-        <a href="docs/PUBLIC_RELEASE_MANIFEST_V01_2026-10-20.md">Release notes</a>
+        <a href="docs/PUBLIC_RELEASE_MANIFEST_V02_2026-10-20.md">Release v0.1.1</a>
+        <a href="docs/BRAND_IDENTITY_DECISION_V02_2026-10-20.md">Name &amp; ticker</a>
+        <a href="docs/MARKET_DISCOVERY_AND_LISTING_READINESS_V01_2026-10-20.md">CMC / TradingView</a>
+        <a href="docs/NATIVE_GATE2_GATE8_CLOSURE_PLAN_V01_2026-10-20.md">Gate 2 &amp; 8</a>
         <a href="sbom/native-pow-bench.cdx.json">SBOM</a>
         <a href="SECURITY.md">Security</a>
       </nav>
     </div>
   </header>
   <main class="wrap">
-    <div class="eyebrow">Open research · public source</div>
-    <h1>Building a verifiable native Layer‑1, one test at a time.</h1>
-    <p class="lead">AI-Native L1 is a research project exploring deterministic state transitions, authenticated peer transport, durable recovery, fixed-supply policy candidates, and post-quantum signature experiments. Source is openly available for worldwide technical review and collaboration.</p>
+    <div class="eyebrow">QuantumZXB · open research · public source</div>
+    <h1>A verifiable native Layer‑1, built one test at a time.</h1>
+    <p class="lead">QuantumZXB is the selected public working identity for AI-Native L1. The proposed native-asset ticker is QZXB, but it is not deployed, listed or trademark-cleared. The project explores deterministic state transitions, authenticated peer transport, durable recovery, fixed-supply policy candidates and post-quantum signature experiments.</p>
     <div class="actions">
       <a class="button primary" href="https://github.com/hamidnikkhah660-arch/ai-native-l1">Browse public source on GitHub</a>
       <a class="button" href="README.md">Build and test locally</a>
-      <a class="button" href="docs/DEPENDENCY_SBOM_STATUS_V01_2026-10-20.md">Dependency/SBOM details</a>
+      <a class="button" href="docs/BRAND_IDENTITY_DECISION_V02_2026-10-20.md">Name / ticker status</a>
+      <a class="button" href="docs/MARKET_DISCOVERY_AND_LISTING_READINESS_V01_2026-10-20.md">CMC / TradingView readiness</a>
     </div>
-    <div class="notice"><strong>Research status:</strong> this is not a production mainnet or an investment offering. No native mainnet launch, token sale, liquidity pool, exchange listing, live market price, revenue, or independent security audit is claimed here. The separate EVM candidate is a Sepolia testnet asset only.</div>
+    <div class="notice"><strong>Research status:</strong> no native Mainnet, trading market, price feed or CMC/TradingView listing exists yet. QZXB is only a proposed ticker and has not been cleared in official trademark registers. The separate EVM candidate remains the old QX-labelled Sepolia testnet asset; it is not the native coin. No sale, liquidity pool, live price, revenue or independent security audit is claimed.</div>
     <h2>What is in the source</h2>
     <div class="grid">
       <section class="card"><h3>Native research crate</h3><p>Rust experiments for proof-of-work policy, transaction/state validation, authenticated networking, recovery, and reproducible test vectors.</p></section>
@@ -68,16 +72,21 @@
     <h2>Honest release status</h2>
     <dl class="status">
       <dt>Source access</dt><dd>Public repository intended for unrestricted worldwide reading, cloning and forking.</dd>
-      <dt>Working codename</dt><dd>“Quantum ZX” is provisional only. ZX/QZX have existing ecosystem uses; no ticker or trademark clearance is claimed.</dd>
+      <dt>Working identity / ticker</dt><dd>QuantumZXB is the unified public working name. QZXB is a proposed ticker only; the search found an existing ZXB token and other nearby symbols, so uniqueness/trademark clearance is not claimed. The word “Quantum” is not a quantum-resistance guarantee.</dd>
+      <dt>CMC / TradingView</dt><dd>Not listed. The native asset has no Mainnet, explorer, trading pair or authentic market data. See the published readiness plan.</dd>
       <dt>Gate 2 — canonical issuance</dt><dd>Open: native canonical issuance, Genesis and runtime integration still need a release-grade freeze and independent verification.</dd>
-      <dt>Gate 8 — anti-rollback trust</dt><dd>Open: a production-independent trust domain and power-loss/recovery qualification have not been established.</dd>
+      <dt>Gate 8 — anti-rollback trust</dt><dd>Open: an independent monotonic trust domain, canonical integration and external multi-host/power-loss qualification have not been established. See the closure plan.</dd>
       <dt>Security</dt><dd>Local test suites are available; independent external protocol/cryptographic audit is not complete. ML-DSA experiments are not proof of end-to-end quantum resistance.</dd>
       <dt>License</dt><dd>Apache-2.0 for scoped project-authored material, subject to file-level exceptions and third-party notices. See <a href="LICENSES/README.md">license scope</a>.</dd>
     </dl>
     <h2>Join the engineering effort</h2>
     <p class="lead">Independent reviewers, developers, test operators and potential research partners are welcome to evaluate the code, reproduce results and challenge assumptions. Support or funding arrangements are not yet established; no return or token value is promised.</p>
     <div class="actions">
-      <a class="button primary" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/issues">Discuss an issue</a>
+      <a class="button primary" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/1">Contributors / sponsors</a>
+      <a class="button" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/2">Gate 2</a>
+      <a class="button" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/3">Gate 8</a>
+      <a class="button" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/4">CMC / TradingView</a>
+      <a class="button" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/5">Brand review</a>
       <a class="button" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/CONTRIBUTING.md">Contribute</a>
       <a class="button" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/docs/TESTNET_DEPLOYMENT_STATUS.md">Testnet facts</a>
     </div>

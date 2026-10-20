@@ -14,7 +14,7 @@ AI_NATIVE_L1 is a research prototype. Contributions should improve reproducibili
 
 Contributions intended for inclusion in project-owned source and documentation are submitted under Apache-2.0 by default, unless a different arrangement is agreed in writing with the project owner. By submitting a contribution, you confirm that you have the right to submit it under those terms. Preserve third-party notices and provide provenance/license information for copied or adapted content. Do not submit code, images, fonts, datasets or documentation whose rights you cannot establish.
 
-The repository root LICENSE and LICENSES/README.md explain the project license scope and exceptions. The Qanvoryx brand assets are excluded from the default license.
+The repository root LICENSE and LICENSES/README.md explain the project license scope and exceptions. Legacy Qanvoryx artwork and other project brand assets are excluded from the default license; the QuantumZXB working name and proposed QZXB ticker are not granted trademark clearance by contributing to this repository.
 
 No Contributor License Agreement is currently required. This does not waive the contributor's responsibility to own or have permission for their submission.
 

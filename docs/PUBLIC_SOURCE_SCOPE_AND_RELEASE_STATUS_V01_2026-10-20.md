@@ -2,7 +2,7 @@
 
 Date: 2026-10-20  
 Artifact: globally accessible public source release (curated file set)  
-Identity: “Quantum ZX” is a working codename only; ticker and trademark clearance are not claimed.
+Historical identity at initial v0.1.0 source release: “Quantum ZX”. This is superseded as the current working name by `docs/BRAND_IDENTITY_DECISION_V02_2026-10-20.md`, which selects QuantumZXB with QZXB as an un-cleared ticker proposal.
 
 ## Release contents
 

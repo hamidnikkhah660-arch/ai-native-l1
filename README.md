@@ -1,28 +1,52 @@
-# AI-Native L1 — Quantum ZX Open Research Source
+# QuantumZXB — AI-Native L1 Research
 
-**Globally accessible open-source research release — not a production network, investment offer, or authorization to use real funds.**
+Latest documentation release: [v0.1.1-source](https://github.com/hamidnikkhah660-arch/ai-native-l1/releases/tag/v0.1.1-source) (identity and readiness documentation; no runtime code changes).
 
-“Quantum ZX” is a provisional working codename only. The public brand and ticker have not been cleared. A preliminary search found existing use of **ZX** in Zeta X's Solana rollup/trading project, and **QZX** in already-deployed BNB Chain token listings. Do not treat either as an available/unique market ticker. “Quantum” is not a claim that the native protocol is quantum-resistant or post-quantum secure. See `docs/PUBLIC_SOURCE_SCOPE_AND_RELEASE_STATUS_V01_2026-10-20.md`.
+**Global open-source research project.** The selected public working identity is **QuantumZXB** (display form “Quantum ZXB”); **QZXB** is a proposed native-asset ticker only, not a deployed or listed token.
 
-## What is in this release
+- [Global project page](https://hamidnikkhah660-arch.github.io/ai-native-l1/)
+- [Latest public source release — v0.1.1-source](https://github.com/hamidnikkhah660-arch/ai-native-l1/releases/tag/v0.1.1-source)
+- [Original code/test release — v0.1.0-source](https://github.com/hamidnikkhah660-arch/ai-native-l1/releases/tag/v0.1.0-source)
+- [Brand identity decision and collision findings](docs/BRAND_IDENTITY_DECISION_V02_2026-10-20.md)
+- [CMC/TradingView readiness and ethical adoption plan](docs/MARKET_DISCOVERY_AND_LISTING_READINESS_V01_2026-10-20.md)
+- [Gate 2 and Gate 8 engineering closure plan](docs/NATIVE_GATE2_GATE8_CLOSURE_PLAN_V01_2026-10-20.md)
+- [v0.1.1 source release manifest](docs/PUBLIC_RELEASE_MANIFEST_V02_2026-10-20.md)
+- [Open call for reviewers, contributors and research sponsorship](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/1)
 
-- `src/native/pow_bench`: Rust proof-of-work, authenticated-transport and related research/benchmark harnesses.
+## Identity and ticker are not market clearance
+
+The name is now unified as **QuantumZXB** per the project owner's delegated naming instruction. An initial web search for the exact string `QZXB` did not surface an obvious exact crypto listing, but the existing Ethereum ERC-20 `ZXB` (ZxbCoin) and a `ZBX` token are collision signals. Therefore `QZXB` remains a proposed ticker, not a globally unique/registered/cleared symbol. See the brand decision for links and scope. No trademark filing, permission or domain right is claimed.
+
+“Quantum” is branding only. It does not claim end-to-end post-quantum security. The existence of ML-DSA research/benchmark code does not prove quantum-resistant transaction signatures, wallets, consensus and peer networking across the whole protocol.
+
+## What is in this source tree
+
+- `src/native/pow_bench`: Rust proof-of-work, authenticated transport, deterministic state, monetary-policy candidates, recovery and research/benchmark harnesses.
 - `src/prototype`: small Python network/chain models.
-- `contracts/launch-asset`: a separate fixed-supply ERC-20 research candidate and tests.
-- `tools/evm_testnet_wallet*.html`: browser-console source for isolated testnet experiments.
-- `docs/TESTNET_DEPLOYMENT_STATUS.md`: factual status of the historical Sepolia deployment for the distinct EVM candidate.
+- `simulations/`: the specific language-neutral test vectors and upstream data required for reproducible source tests.
+- `contracts/launch-asset`: a separate fixed-supply ERC-20 research candidate with isolated local-EVM tests.
+- `tools/evm_testnet_wallet*.html`: browser console sources for isolated testnet experiments.
+- `sbom/`: CycloneDX inventories for the native Cargo crate and separate EVM candidate.
+- `docs/`: release scope, testnet status, third-party notices, brand decision, market-readiness plan and Gate 2/Gate 8 work plan.
 
-This is a **curated public release tree** from the owner's larger working repository. Public access is unrestricted: anyone worldwide can browse, clone, fork and review it without login once the repository is public. It excludes the broad historical simulation/VM corpus beyond exact fixtures referenced by this crate, project logo/brand artwork, owner-only notes, deployment secrets/private keys, and the original full commit history. The specific ASERT and Wycheproof vector files required for local verification are included with source/license notices. Nothing here grants rights in excluded material.
+This is a **curated public release tree** from the larger working repository. Anyone worldwide can browse, clone, fork and review it without login. It excludes the full owner workspace/history, owner-only records, deployment secrets/private keys, brand artwork and broad unrelated historical fixture corpora. The exact fixtures referenced by this release's tests are included with available provenance/license notices. This is not a claim that every file in the owner's private working tree is released.
 
-## Critical network and asset distinction
+## Critical distinction: native L1 vs Sepolia ERC-20
 
-The EVM ERC-20 in `contracts/launch-asset` is **not** the native L1 coin. Its recorded deployment is on Ethereum Sepolia only; all initial 40/30/30 allocation tranches are transferable and have no contract-enforced vesting. It is not approved for mainnet, a sale, liquidity, or real-value use.
+The EVM asset in `contracts/launch-asset` is **not the native QuantumZXB coin**. The historical Ethereum Sepolia contract records the name `Qanvoryx Launch Candidate` and symbol `QX`; its immutable contract metadata is not renamed by this source-repository naming decision. It is testnet-only. It is not QZXB, a production token, or an invitation to buy/transfer valuable assets.
 
-The native L1 is a research prototype, not a verified public network. Canonical issuance/Genesis/transaction-runtime integration (Gate 2), independently trusted anti-rollback storage and recovery (Gate 8), independent protocol/security review, and public-offer analysis have not been completed. Local test suites do not by themselves close those gates.
+The native L1 is still a research prototype. No native Mainnet, public native trading pair, verified native explorer, production price feed, exchange listing, liquidity pool or revenue is active or claimed here.
 
-The presence of ML-DSA in a research/benchmark dependency graph does not prove end-to-end post-quantum protection for transaction signatures, wallet keys, consensus, networking, or the native protocol. Do not market this project as “quantum-proof” or “quantum-resistant” until the actual protocol integration is specified, implemented, independently tested, and reviewed against suitable post-quantum standards.
+## Gates and trading-platform readiness
 
-## Reproduce local checks
+- **Gate 2 — canonical issuance/Genesis/runtime: OPEN.** Candidate modules and tests exist, but a single frozen monetary profile is not yet integrated and independently verified through canonical producer/importer, fork-choice, store/replay and state transition with end-to-end supply invariants.
+- **Gate 8 — independent anti-rollback/recovery: OPEN.** Models and local/process-termination tests exist; an independent trust domain/CAS, canonical integration, independent multi-host and physical-failure qualification, and external review remain outstanding.
+- **CoinMarketCap: not submitted.** Its tracked-listing guidelines call for a functioning website and block explorer, plus real public trading on at least one CMC-tracked exchange with material volume. The native asset has no live mainnet, explorer or market yet. Do not submit the unrelated Sepolia QX contract as QZXB.
+- **TradingView: no native symbol/data feed yet.** TradingView says unsupported instruments cannot be directly added by an ordinary user; real market data needs a supported data source/exchange path. Do not create fictitious candles, prices or volumes.
+
+See [the evidence-based market/listing plan](docs/MARKET_DISCOVERY_AND_LISTING_READINESS_V01_2026-10-20.md) and [Gate 2/Gate 8 acceptance plan](docs/NATIVE_GATE2_GATE8_CLOSURE_PLAN_V01_2026-10-20.md).
+
+## Reproducible local checks
 
 Rust research crate (locked dependencies; Rust 1.82-compatible):
 
@@ -30,6 +54,7 @@ Rust research crate (locked dependencies; Rust 1.82-compatible):
 Set-Location .\src\native\pow_bench
 cargo fmt --all -- --check
 cargo check --all-targets --locked --offline
+cargo test --all-targets --locked --offline
 ```
 
 Separate EVM candidate (Node.js/npm):
@@ -41,18 +66,17 @@ npm run compile
 npm test
 ```
 
-The EVM tests use an ephemeral local development chain and do not contact a public network. Do not run a deployment script as part of routine verification.
+The EVM tests use an ephemeral local chain and do not contact a public network. Do not run a deployment script against a live network or valuable asset as routine verification.
 
-## License scope
+## License
 
-Original project-authored content in this curated preview is offered under Apache-2.0 to the extent the project owner has authority to license it. `contracts/launch-asset/contracts/FixedSupplyLaunchAsset.sol` explicitly carries its own MIT license and remains MIT. Package dependencies keep their own licenses and notices; their source distributions are not bundled here. The root `LICENSE` and `LICENSES/README.md` state the scope and exceptions.
+Original project-authored material in this curated tree is offered under Apache-2.0 only within the scope in `LICENSE`, `NOTICE` and `LICENSES/README.md`, and only to the extent the project owner has authority to license it. The Solidity file retains its own MIT license. Third-party data and dependencies keep their own notices/terms. No trademark, ticker, logo or domain license is granted by the source license.
 
-No trademark, ticker, domain, token-name, or logo license is granted. This preview intentionally contains no logo artwork.
+## Collaboration and sustainable funding
 
-## Software bill of materials (SBOM)
+Independent Rust developers, protocol/cryptography reviewers, test operators and research sponsors are invited to propose concrete, scoped work through [public issue #1](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/1). No sponsor agreement, grant, payment route or funding receipt is currently claimed. New owner cash spend remains capped at USD 0.00.
 
-Machine-readable CycloneDX dependency inventories are in `sbom/`: one for the Rust native research crate and one for the separate EVM candidate. Their exact scope and metadata limitations are documented in `docs/DEPENDENCY_SBOM_STATUS_V01_2026-10-20.md`. They are not a full SBOM for the owner's entire workstation or a legal compatibility opinion.
+There are no promised returns or target price increases. The project prohibits fake volume, wash trading, undisclosed paid promotion and pump/dump campaigns. Adoption metrics are real users, reproducible builds, independently operated nodes, meaningful contributions, issue resolution, uptime and transparent market integrity after a genuine market exists.
 
-## Status
-
-This is an invitation for technical review and collaboration, not an announcement of a native mainnet, public token sale, listing, liquidity, price, revenue, completed audit, regulatory approval, or sponsor commitment. Real-money operation requires separate verified engineering, security, custody, and activity-specific compliance work.
+---
+**Release boundary:** public source code does not mean production Mainnet or approval to offer/sell an asset. Gates 2, 8, independent audit, public zero-value devnet/operator qualification and the activity-specific public-offer review remain open.
