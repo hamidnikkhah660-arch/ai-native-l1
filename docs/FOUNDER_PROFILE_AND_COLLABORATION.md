@@ -63,7 +63,7 @@ QuantumZXB welcomes direct proposals from:
 6. Universities, research groups, grant programmes, infrastructure providers, exchanges and market-data platforms interested in research collaboration, technical diligence or future integration readiness.
 
 **Email:** hamidnikkhah660@gmail.com
-Use the subject line “QuantumZXB collaboration”, “QuantumZXB sponsorship”, “Protocol/cryptography review”, “AI/LLM research” or “Exchange/platform technical inquiry”. Include the organisation, relevant prior work, the opportunity, deliverables, timeline, proposed funding or resource commitment, and the evidence that would constitute acceptance.
+Suggested subject lines: QuantumZXB collaboration; QuantumZXB sponsorship; Protocol/cryptography review; AI/LLM research; Exchange/platform technical inquiry. Include the organisation, relevant prior work, the opportunity, deliverables, timeline, proposed funding or resource commitment, and the evidence that would constitute acceptance.
 
 Potential sponsor and contributor allocations are conditional proposals, not existing awards. The current policy proposes up to 1B native coins for a sponsor and a 0.1B-1B contributor/professional pool, both carved out of the founder's existing 4B design envelope, conditional on written milestones and accepted work. No return, token price or award is promised.
 
