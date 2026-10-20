@@ -1,82 +1,65 @@
-# QuantumZXB — AI-Native L1 Research
+# QuantumZXB - AI-Native Layer-1 Engineering Project
 
-Latest documentation release: [v0.1.1-source](https://github.com/hamidnikkhah660-arch/ai-native-l1/releases/tag/v0.1.1-source) (identity and readiness documentation; no runtime code changes).
+**QuantumZXB** is the public working identity of an independently developed native Layer-1 and programmable-ecosystem project. The source combines a Rust-native ledger research programme, deterministic state/recovery candidates, ML-DSA-65 and hybrid-identity research, an isolated EVM/revm smart-contract laboratory, and a roadmap toward an AI-native developer ecosystem.
 
-**Global open-source research project.** The selected public working identity is **QuantumZXB** (display form “Quantum ZXB”); **QZXB** is a proposed native-asset ticker only, not a deployed or listed token.
+- **Global project site:** https://hamidnikkhah660-arch.github.io/ai-native-l1/
+- **Source and contribution issues:** https://github.com/hamidnikkhah660-arch/ai-native-l1
+- **Engineering white paper:** [QuantumZXB Native Coin White Paper v0.2](docs/QUANTUMZXB_NATIVE_COIN_WHITEPAPER_V02.md)
+- **Master roadmap:** [QuantumZXB Engineering & Ecosystem Roadmap v0.2](docs/QUANTUMZXB_MASTER_ROADMAP_V02.md)
+- **Technical review and test evidence:** [CP-0343 report](docs/CP_0343_TECHNICAL_REVIEW_AND_TEST_RESULTS.md)
+- **Current public documentation manifest:** [v0.2 manifest](docs/PUBLIC_RELEASE_MANIFEST_V03_2026-10-20.md)
+- **Publication checkpoint:** [CP-0344](docs/CP_0344_PUBLIC_DOCUMENTATION_REFRESH_2026-10-20.md)
+- **Founder/sponsor/contributor economics:** [Allocation policy v0.3](docs/FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V03.md)
+- **Current curated source baseline:** [v0.1.1-source](https://github.com/hamidnikkhah660-arch/ai-native-l1/releases/tag/v0.1.1-source)
+- **Sponsorship and contributor discussion:** [Public issue #1](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/1)
 
-- [Global project page](https://hamidnikkhah660-arch.github.io/ai-native-l1/)
-- [Latest public source release — v0.1.1-source](https://github.com/hamidnikkhah660-arch/ai-native-l1/releases/tag/v0.1.1-source)
-- [Original code/test release — v0.1.0-source](https://github.com/hamidnikkhah660-arch/ai-native-l1/releases/tag/v0.1.0-source)
-- [Brand identity decision and collision findings](docs/BRAND_IDENTITY_DECISION_V02_2026-10-20.md)
-- [CMC/TradingView readiness and ethical adoption plan](docs/MARKET_DISCOVERY_AND_LISTING_READINESS_V01_2026-10-20.md)
-- [Gate 2 and Gate 8 engineering closure plan](docs/NATIVE_GATE2_GATE8_CLOSURE_PLAN_V01_2026-10-20.md)
-- [v0.1.1 source release manifest](docs/PUBLIC_RELEASE_MANIFEST_V02_2026-10-20.md)
-- [Open call for reviewers, contributors and research sponsorship](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/1)
+## Engineering highlights
 
-## Identity and ticker are not market clearance
+### Native Layer-1
 
-The name is now unified as **QuantumZXB** per the project owner's delegated naming instruction. An initial web search for the exact string `QZXB` did not surface an obvious exact crypto listing, but the existing Ethereum ERC-20 `ZXB` (ZxbCoin) and a `ZBX` token are collision signals. Therefore `QZXB` remains a proposed ticker, not a globally unique/registered/cleared symbol. See the brand decision for links and scope. No trademark filing, permission or domain right is claimed.
+The Rust working tree includes research and candidate components for proof-of-work and difficulty adjustment, deterministic transaction/state validation, chain selection and reorganisation, state-root commitments, snapshot validation, durable storage and archive recovery. The next release milestone integrates one frozen monetary/Genesis profile through the canonical producer, validator/importer, fork-choice, persistence, replay and state-root paths.
 
-“Quantum” is branding only. It does not claim end-to-end post-quantum security. The existence of ML-DSA research/benchmark code does not prove quantum-resistant transaction signatures, wallets, consensus and peer networking across the whole protocol.
+### Post-quantum and hybrid-signature research
 
-## What is in this source tree
+The project has a real Libcrux ML-DSA-65 verification adapter, selected hash-pinned external verification vectors, differential-testing artefacts and V4 hybrid identity/transaction candidates that combine Ed25519 with ML-DSA-65. The selected external fixture includes 53 cases (48 expected-valid and 5 expected-invalid). The selected hybrid profile still needs full production-path integration and independent deployment/security qualification before any end-to-end post-quantum claim.
 
-- `src/native/pow_bench`: Rust proof-of-work, authenticated transport, deterministic state, monetary-policy candidates, recovery and research/benchmark harnesses.
-- `src/prototype`: small Python network/chain models.
-- `simulations/`: the specific language-neutral test vectors and upstream data required for reproducible source tests.
-- `contracts/launch-asset`: a separate fixed-supply ERC-20 research candidate with isolated local-EVM tests.
-- `tools/evm_testnet_wallet*.html`: browser console sources for isolated testnet experiments.
-- `sbom/`: CycloneDX inventories for the native Cargo crate and separate EVM candidate.
-- `docs/`: release scope, testnet status, third-party notices, brand decision, market-readiness plan and Gate 2/Gate 8 work plan.
+### Smart contracts and EVM compatibility
 
-This is a **curated public release tree** from the larger working repository. Anyone worldwide can browse, clone, fork and review it without login. It excludes the full owner workspace/history, owner-only records, deployment secrets/private keys, brand artwork and broad unrelated historical fixture corpora. The exact fixtures referenced by this release's tests are included with available provenance/license notices. This is not a claim that every file in the owner's private working tree is released.
+An isolated EVM lab pins revm and explores call/create, storage, gas, rollback and cross-client execution behaviour. The separate QX ERC-20 candidate is deployed on Ethereum Sepolia and has a testnet-only wallet/deployment console. **QX is a distinct Sepolia test asset, not the proposed native QZXB coin.** The revm lab is not yet the canonical VM dependency of the native node; native EVM account/code/storage state, receipts, gas rules and RPC integration are defined in the roadmap.
 
-## Critical distinction: native L1 vs Sepolia ERC-20
+### Infrastructure and resource safety
 
-The EVM asset in `contracts/launch-asset` is **not the native QuantumZXB coin**. The historical Ethereum Sepolia contract records the name `Qanvoryx Launch Candidate` and symbol `QX`; its immutable contract metadata is not renamed by this source-repository naming decision. It is testnet-only. It is not QZXB, a production token, or an invitation to buy/transfer valuable assets.
+The codebase covers bounded wire parsing and ingress/worker queues, authenticated peer-session research, state-commitment candidates, fork/reorg history replay, archive paging, snapshot/store recovery models and process-crash tests. The next qualification stage adds an independently administered monotonic trust provider and tests across independently operated hosts and storage-failure conditions.
 
-The native L1 is still a research prototype. No native Mainnet, public native trading pair, verified native explorer, production price feed, exchange listing, liquidity pool or revenue is active or claimed here.
+## Native coin design and sponsor proposal
 
-## Gates and trading-platform readiness
+The current design targets a maximum of **10,000,000,000 native coins**, with 4B founder (40%), 3B mining/network-security (30%) and 3B public-goods/ecosystem (30%) allocation envelopes. These are monetary design terms until the selected canonical production profile and Genesis are frozen.
 
-- **Gate 2 — canonical issuance/Genesis/runtime: OPEN.** Candidate modules and tests exist, but a single frozen monetary profile is not yet integrated and independently verified through canonical producer/importer, fork-choice, store/replay and state transition with end-to-end supply invariants.
-- **Gate 8 — independent anti-rollback/recovery: OPEN.** Models and local/process-termination tests exist; an independent trust domain/CAS, canonical integration, independent multi-host and physical-failure qualification, and external review remain outstanding.
-- **CoinMarketCap: not submitted.** Its tracked-listing guidelines call for a functioning website and block explorer, plus real public trading on at least one CMC-tracked exchange with material volume. The native asset has no live mainnet, explorer or market yet. Do not submit the unrelated Sepolia QX contract as QZXB.
-- **TradingView: no native symbol/data feed yet.** TradingView says unsupported instruments cannot be directly added by an ordinary user; real market data needs a supported data source/exchange path. Do not create fictitious candles, prices or volumes.
+The owner direction is that the 4B founder allocation remains freely transferable with no protocol lock or time vesting. A future sponsor may qualify for up to **1,000,000,000 coins (10% of the total cap)** from inside the founder tranche only after fulfilling written, agreed sponsorship milestones. A proposed **1%-10% contributor/professional pool** is likewise drawn from that same founder allocation and tied to accepted work. If both pools reach 1B, at least 2B (20% of total cap) remains the founder's direct discretionary allocation. No sponsor is currently claimed as selected or contracted, and these designations are not a guarantee of value or return.
 
-See [the evidence-based market/listing plan](docs/MARKET_DISCOVERY_AND_LISTING_READINESS_V01_2026-10-20.md) and [Gate 2/Gate 8 acceptance plan](docs/NATIVE_GATE2_GATE8_CLOSURE_PLAN_V01_2026-10-20.md).
+The arithmetic invariant helper can be run using Python:
 
-## Reproducible local checks
+    python simulations/sponsor_allocation_checker.py
 
-Rust research crate (locked dependencies; Rust 1.82-compatible):
+## Current engineering validation
 
-```powershell
-Set-Location .\src\native\pow_bench
-cargo fmt --all -- --check
-cargo check --all-targets --locked --offline
-cargo test --all-targets --locked --offline
-```
+On the maintainer's complete working checkout at review time:
 
-Separate EVM candidate (Node.js/npm):
+- cargo fmt --all -- --check - PASS.
+- cargo check --all-targets --locked --offline - PASS.
+- cargo test --all-targets --locked --offline - PASS, 736/736 library tests and no failures across remaining test targets.
+- npm test in contracts/launch-asset - PASS for the fixed-supply local EVM, wallet-console and loopback server suites.
 
-```powershell
-Set-Location .\contracts\launch-asset
-npm ci
-npm run compile
-npm test
-```
+The complete maintainer checkout is larger than this curated public release tree; these counts describe the working checkout used for the review, not a claim that every internal historical fixture is included here. They are engineering regression evidence, not an independent security audit or a TPS/latency benchmark. The separate contracts/vm-lab Rust 1.99 toolchain test suite was not rerun in the current review environment.
 
-The EVM tests use an ephemeral local chain and do not contact a public network. Do not run a deployment script against a live network or valuable asset as routine verification.
+## Roadmap
 
-## License
+1. Freeze and integrate the canonical native Genesis, monetary profile and end-to-end supply invariants.
+2. Integrate the selected hybrid identity/signature profile and an independent anti-rollback trust domain.
+3. Integrate EVM gas/fork/account/state/receipt semantics and RPC in the canonical native node.
+4. Operate a zero-value devnet with independent nodes, native wallet, RPC and explorer.
+5. Complete reproducible-release qualification and independent protocol/cryptography review.
+6. Grow through sponsor-funded engineering, developer tooling, integration services and later verifiable AI/compute applications.
+7. Make the production and market-launch decision against measured evidence and the intended product scope.
 
-Original project-authored material in this curated tree is offered under Apache-2.0 only within the scope in `LICENSE`, `NOTICE` and `LICENSES/README.md`, and only to the extent the project owner has authority to license it. The Solidity file retains its own MIT license. Third-party data and dependencies keep their own notices/terms. No trademark, ticker, logo or domain license is granted by the source license.
-
-## Collaboration and sustainable funding
-
-Independent Rust developers, protocol/cryptography reviewers, test operators and research sponsors are invited to propose concrete, scoped work through [public issue #1](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/1). No sponsor agreement, grant, payment route or funding receipt is currently claimed. New owner cash spend remains capped at USD 0.00.
-
-There are no promised returns or target price increases. The project prohibits fake volume, wash trading, undisclosed paid promotion and pump/dump campaigns. Adoption metrics are real users, reproducible builds, independently operated nodes, meaningful contributions, issue resolution, uptime and transparent market integrity after a genuine market exists.
-
----
-**Release boundary:** public source code does not mean production Mainnet or approval to offer/sell an asset. Gates 2, 8, independent audit, public zero-value devnet/operator qualification and the activity-specific public-offer review remain open.
+The source tree is a curated public selection. Review specific files, reproduce commands in the relevant package, and use the [release manifest](docs/PUBLIC_RELEASE_MANIFEST_V02_2026-10-20.md) to identify the versioned public baseline. The public white paper and roadmap describe the engineering plan; they do not assert that future integrations are already operating on native Mainnet.
