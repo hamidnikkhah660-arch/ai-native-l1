@@ -25,7 +25,7 @@ footer{border-top:1px solid var(--line);padding:27px 0 42px;color:var(--muted);f
 <body>
 <header><div class="wrap nav">
 <a class="brand" href="#top" aria-label="QuantumZXB home">Quantum<span>ZXB</span></a>
-<nav aria-label="Primary navigation"><a href="#technology">Technology</a><a href="#coin">Native coin</a><a href="#roadmap">Roadmap</a><a href="#research">Research</a><a href="https://github.com/hamidnikkhah660-arch/ai-native-l1">GitHub</a></nav>
+<nav aria-label="Primary navigation"><a href="#technology">Technology</a><a href="#coin">Native coin</a><a href="#roadmap">Roadmap</a><a href="#mining">Mining &amp; performance</a><a href="#research">Research</a><a href="#collaborate">Founder &amp; contact</a><a href="https://github.com/hamidnikkhah660-arch/ai-native-l1">GitHub</a></nav>
 </div></header>
 <main class="wrap" id="top">
 <section class="hero">
@@ -103,16 +103,41 @@ footer{border-top:1px solid var(--line);padding:27px 0 42px;color:var(--muted);f
 <a class="button" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/1">Discuss sponsorship or contribution</a>
 </div>
 </section>
+<section class="section" id="mining">
+<h2>Mining, halving and measured performance</h2>
+<p class="intro">QuantumZXB has a concrete mining/emission research profile, but the numeric profile is still a candidate. The next release gate is to integrate one reward schedule into canonical Genesis and every block/state path, then publish independent performance measurements.</p>
+<div class="tablewrap"><table><thead><tr><th>Parameter</th><th>Research candidate</th><th>Status</th></tr></thead><tbody>
+<tr><td>Maximum native supply</td><td>10,000,000,000 coins</td><td>High-level design cap; not an active production mint rule</td></tr>
+<tr><td>Mining / network-security envelope</td><td>3,000,000,000 coins (30%)</td><td>Allocation design envelope, not pre-mined supply</td></tr>
+<tr><td>Proof-of-work</td><td>Argon2id v1.3; 64 MiB; 1 iteration; 1 lane; 32-byte output</td><td>Candidate only; no ASIC-resistance claim</td></tr>
+<tr><td>Target block interval</td><td>30 seconds</td><td>Target assumption, not measured live block timing</td></tr>
+<tr><td>Difficulty window</td><td>2,016 blocks; 1/4x to 4x retarget clamp</td><td>Candidate; timestamp/security rules still need qualification</td></tr>
+<tr><td>Halving interval</td><td>4,204,800 blocks (about four years at the 30-second target)</td><td>Research candidate, not ratified production consensus</td></tr>
+<tr><td>Initial block subsidy</td><td>356.73515981 coins</td><td>Integer-arithmetic candidate; canonical reward path not yet integrated</td></tr>
+<tr><td>Single-host candidate PoW screen</td><td>13.395 H/s at 64 MiB on one Intel Core i7-8565U host</td><td>Limited screen; not network hashrate or profitability</td></tr>
+<tr><td>Native network throughput</td><td>No comparable end-to-end TPS benchmark yet</td><td>Do not claim TPS/finality until reproducible multi-node measurement</td></tr>
+</tbody></table></div>
+<div class="note">The candidate four-year halving schedule emits 2,999,999,999.139264 coins over the modeled integer schedule, leaving 0.860736 coins within the 3B mining/security envelope due to integer rounding. Gate 2 remains open; this calculation does not prove that 3B is mined, issued or on-chain.</div>
+<div class="actions"><a class="button primary" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/docs/MINING_HALVING_PERFORMANCE_AND_SCALING_V01.md">Full mining and benchmark report</a><a class="button" href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/docs/NATIVE_GATE2_GATE8_CLOSURE_PLAN_V01_2026-10-20.md">Canonical protocol closure plan</a></div>
+</section>
+<section class="section" id="collaborate">
+<h2>Founder, research and collaboration</h2>
+<p class="intro">QuantumZXB is founder-led and open to direct proposals from sponsors, engineers, researchers and ecosystem partners. The profile below is based on the research topics and education in the current CV plus the public project record.</p>
+<div class="split">
+<div class="panel"><h3>Hamid Nikkhah - Founder / AI Researcher</h3><p>Research interests include machine learning, quantum machine learning, fuzzy and evolutionary optimisation, pattern recognition, cognitive science and post-quantum blockchain security. The founder's CV lists an M.Sc. in Artificial Intelligence (2020) and a B.Sc. in Computer Science (2015), as well as research using Python, NumPy, SciPy, TensorFlow, PyTorch, MATLAB, C++ and Qiskit. The current profile does not claim a production LLM model; LLM/agent integration remains a collaboration and roadmap area.</p><p><a href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/docs/FOUNDER_PROFILE_AND_COLLABORATION.md">Read the founder profile and research summary</a></p></div>
+<div class="panel"><h3>Direct contact for proposals</h3><p>Financial or infrastructure sponsorship, Rust/protocol contributions, cryptography/security review, EVM/Solidity integration, AI/LLM research, university partnerships, grant programmes and exchange/market-data technical inquiries are welcome.</p><p><strong>Email the founder directly:</strong> <a href="mailto:hamidnikkhah660@gmail.com?subject=QuantumZXB%20collaboration">hamidnikkhah660@gmail.com</a></p><p>Please include the organisation, relevant examples, proposed deliverables, expected timeline, resource/budget scope and measurable acceptance criteria. No sponsor is currently represented as contracted and no listing or market is claimed as live.</p><p><a href="https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/1">Public sponsor and contributor discussion</a></p></div>
+</div>
+</section>
 <section class="section">
 <h2>Public release identity</h2>
 <div class="panel">
 <p><strong>Project:</strong> QuantumZXB. <strong>Proposed native coin ticker:</strong> QZXB. The ticker remains a working proposal and is not claimed as deployed or listed.</p>
-<p><strong>Current public release:</strong> curated source and research release v0.1.1-source. This white paper and roadmap expand the public engineering description and integration plan.</p>
+<p><strong>Source baseline:</strong> curated source release v0.1.1-source. Documentation/site release v0.2.0-docs records the published white paper and roadmap; see versioned release manifests for newer documentation updates.</p>
 <p><strong>Native network:</strong> the native mainnet profile, production Genesis and full EVM execution integration are the upcoming engineering milestones. The Sepolia QX contract is a different testnet asset, not the native coin.</p>
 <p><strong>Market status:</strong> no public native market price or liquidity is asserted. Sponsor allocations are conditional proposals from the existing founder tranche, not an issued guarantee of value.</p>
 </div>
 </section>
 </main>
-<footer><div class="wrap foot"><span>QuantumZXB - Open protocol research and engineering</span><span><a href="https://github.com/hamidnikkhah660-arch/ai-native-l1">GitHub source</a> - <a href="https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/1">Sponsors &amp; contributors</a> - <a href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/SECURITY.md">Security</a></span></div><div class="wrap small">Technical material is published to support review and reproduction. Coin supply and sponsor allocations are design/proposal terms until implemented and awarded; no market value or return is promised.</div></footer>
+<footer><div class="wrap foot"><span>QuantumZXB - Open protocol research and engineering</span><span><a href="https://github.com/hamidnikkhah660-arch/ai-native-l1">GitHub source</a> - <a href="https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/1">Sponsors &amp; contributors</a> - <a href="mailto:hamidnikkhah660@gmail.com?subject=QuantumZXB%20collaboration">Email the founder</a> - <a href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/SECURITY.md">Security</a></span></div><div class="wrap small">Technical material is published to support review and reproduction. Coin supply and sponsor allocations are design/proposal terms until implemented and awarded; no market value or return is promised.</div></footer>
 </body>
 </html>
