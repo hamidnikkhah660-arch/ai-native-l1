@@ -171,6 +171,15 @@ def main() -> int:
     if budget_atoms - total_atoms != 86_073_600:
         errors.append(f"candidate rounding remainder mismatch: {budget_atoms - total_atoms}")
 
+    curve_check = subprocess.run(
+        [sys.executable, str(ROOT / "simulations" / "candidate_halving_curve.py")],
+        cwd=ROOT, capture_output=True, text=True, check=False,
+    )
+    if curve_check.returncode != 0:
+        errors.append(f"candidate halving curve checker failed: {curve_check.stdout}{curve_check.stderr}")
+    elif "HALVING_CURVE_CSV=PASS" not in curve_check.stdout or "HALVING_CURVE_HTML=PASS" not in curve_check.stdout:
+        errors.append("candidate halving curve checker did not report both PASS markers")
+
     checksummed = check_checksums(errors)
     if errors:
         print("PUBLIC_DOCS_PREFLIGHT=FAIL")
