@@ -3100,6 +3100,83 @@ mod tests {
     }
 
     #[test]
+    fn monetary_genesis_snapshot_matches_independent_python_byte_vector() {
+        use sha2::{Digest, Sha256};
+        use std::path::PathBuf;
+
+        fn decode_hex(value: &str) -> Vec<u8> {
+            assert_eq!(value.len() % 2, 0);
+            (0..value.len())
+                .step_by(2)
+                .map(|index| {
+                    u8::from_str_radix(&value[index..index + 2], 16)
+                        .expect("snapshot vector hex byte")
+                })
+                .collect()
+        }
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../simulations/cp0361_monetary_genesis_snapshot_vectors.tsv");
+        let contents = std::fs::read_to_string(path).expect("read CP-0361 snapshot vector");
+        let rows: Vec<_> = contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+        assert_eq!(rows.len(), 1, "exactly one frozen vector is expected");
+        let fields: Vec<_> = rows[0].split('|').collect();
+        assert_eq!(fields.len(), 14);
+        assert_eq!(fields[0], "MONETARY_GENESIS_SNAPSHOT_V1");
+
+        let network_id: NetworkId = decode_hex(fields[1]).try_into().expect("network ID width");
+        let founder_account: AccountId = decode_hex(fields[2])
+            .try_into()
+            .expect("founder account width");
+        let founder_atoms: u64 = fields[3].parse().expect("founder atoms");
+        let public_goods_account: AccountId = decode_hex(fields[4])
+            .try_into()
+            .expect("public-goods account width");
+        let public_goods_atoms: u64 = fields[5].parse().expect("public-goods atoms");
+        let expected_ledger_snapshot = decode_hex(fields[6]);
+        let expected_monetary_snapshot = decode_hex(fields[7]);
+
+        let state = MonetaryLedgerState::genesis(
+            network_id,
+            founder_account,
+            vec![(public_goods_account, public_goods_atoms)],
+        )
+        .expect("independent vector Genesis must be valid");
+        assert_eq!(
+            state.ledger().account(&founder_account).unwrap().balance,
+            founder_atoms
+        );
+
+        let ledger_snapshot = state.ledger().encode_snapshot().unwrap();
+        let monetary_snapshot = state.encode_snapshot().unwrap();
+        assert_eq!(ledger_snapshot, expected_ledger_snapshot);
+        assert_eq!(monetary_snapshot, expected_monetary_snapshot);
+        assert_eq!(
+            Sha256::digest(&ledger_snapshot).to_vec(),
+            decode_hex(fields[8])
+        );
+        assert_eq!(
+            Sha256::digest(&monetary_snapshot).to_vec(),
+            decode_hex(fields[9])
+        );
+        assert_eq!(state.ledger().state_root().to_vec(), decode_hex(fields[10]));
+        assert_eq!(
+            monetary_policy_fingerprint().to_vec(),
+            decode_hex(fields[11])
+        );
+        assert_eq!(state.state_root().to_vec(), decode_hex(fields[12]));
+        assert_eq!(state.total_value().unwrap().to_string(), fields[13]);
+        assert_eq!(
+            MonetaryLedgerState::decode_snapshot(&expected_monetary_snapshot, &network_id).unwrap(),
+            state
+        );
+    }
+
+    #[test]
     fn monetary_genesis_requires_exact_founder_and_public_goods_budgets() {
         let state = monetary_genesis();
         assert_eq!(state.total_mined_atoms(), 0);

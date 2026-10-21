@@ -33,6 +33,9 @@ jobs:
           rustc +stable --version
           cargo +stable --version
 
+      - name: Verify independent monetary Genesis snapshot oracle
+        run: python3 ../../../simulations/cp0361_monetary_genesis_snapshot_oracle.py
+
       - name: Check formatting
         run: cargo +stable fmt --all -- --check
 
