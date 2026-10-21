@@ -47,6 +47,18 @@ Runner assertion output:
 
 Test artifacts are in a temporary directory on the authorized developer machine and are not committed.
 
+### Fresh rerun on main commit e2af2ad (after multiline-log matcher fix)
+
+The runner was repeated against the current main checkout. The first attempt stopped before node launch because the harness's regular expressions assumed the ready-event fields were all on one line; the node emitted the same event across multiple log lines. The matcher was corrected with PowerShell single-line regex mode `(?s)`, then the end-to-end run passed:
+
+- Exit code 0; runtime 41.38 seconds.
+- Mutated-signature request rejected with HTTP 422.
+- Valid fixture transaction ID: `f3c8785755e3e681c68e314b389004a327485027be61e0d22af87bbdecdf6f98`; HTTP 202 accepted.
+- Node A broadcast height 1 with state root `83124fed5c4a42ca20e3730dfc61df8c8527c82c358a208d77b445e94de273fa` and tip `40f067778d5914b3206cd4eaceeea7e2839363c544d55207e1ba1a5b19028612`; node B matched both values.
+- Consensus assertion passed at height 1; both PFM4 nodes stopped with `replay=matched`.
+
+This rerun only changes test-runner log matching; no Rust runtime or wire behavior changed. The full terminal output was captured during the run, and the temporary artifact directory was `%TEMP%\ain1_cp0363_txn4_two_node_8da66c270a8f4319b09c24e485d26554`.
+
 ## Boundaries and decision
 
 - Same-host Windows loopback only; not a public testnet, independently administered multi-host run or independent-client implementation agreement.

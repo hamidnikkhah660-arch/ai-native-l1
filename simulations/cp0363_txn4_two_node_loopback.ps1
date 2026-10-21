@@ -129,7 +129,7 @@ try {
         '--run-seconds', '40'
     )
     $nodeB = Start-Process -FilePath $nodeExe -ArgumentList $argsB -RedirectStandardOutput $stdB -RedirectStandardError $logB -PassThru
-    if (-not (Wait-Pattern $logB 'event=monetary_v4_peer_smoke_ready.*height=0.*profile_scope=loopback_diagnostic.*wire=PMT4' 20000)) {
+    if (-not (Wait-Pattern $logB '(?s)event=monetary_v4_peer_smoke_ready.*height=0.*profile_scope=loopback_diagnostic.*wire=PMT4' 20000)) {
         throw ("CP-0363 receiving node B did not become ready: " + (Get-Text $stdB) + (Get-Text $logB))
     }
 
@@ -150,12 +150,12 @@ try {
         '--run-seconds', '35'
     )
     $nodeA = Start-Process -FilePath $nodeExe -ArgumentList $argsA -RedirectStandardOutput $stdA -RedirectStandardError $logA -PassThru
-    if (-not (Wait-Pattern $logA 'event=monetary_v4_peer_smoke_ready.*height=0.*profile_scope=loopback_diagnostic.*tx_submit_listen=127\.0\.0\.1:' 20000)) {
+    if (-not (Wait-Pattern $logA '(?s)event=monetary_v4_peer_smoke_ready.*height=0.*profile_scope=loopback_diagnostic.*tx_submit_listen=127\.0\.0\.1:' 20000)) {
         throw ("CP-0363 submitting node A did not become ready: " + (Get-Text $stdA) + (Get-Text $logA))
     }
 
-    $readyA = [regex]::Match((Get-Text $logA), 'event=monetary_v4_peer_smoke_ready .*manifest=([0-9a-f]{64})')
-    $readyB = [regex]::Match((Get-Text $logB), 'event=monetary_v4_peer_smoke_ready .*manifest=([0-9a-f]{64})')
+    $readyA = [regex]::Match((Get-Text $logA), '(?s)event=monetary_v4_peer_smoke_ready .*manifest=([0-9a-f]{64})')
+    $readyB = [regex]::Match((Get-Text $logB), '(?s)event=monetary_v4_peer_smoke_ready .*manifest=([0-9a-f]{64})')
     if (-not ($readyA.Success -and $readyB.Success)) { throw 'CP-0363 did not find both PMT4 manifest IDs in node logs' }
     if ($readyA.Groups[1].Value -ne $fixtureManifest -or $readyB.Groups[1].Value -ne $fixtureManifest) {
         throw ("CP-0363 manifest mismatch: fixture=$fixtureManifest nodeA=$($readyA.Groups[1].Value) nodeB=$($readyB.Groups[1].Value)")
@@ -179,14 +179,14 @@ try {
     Write-Host "CP-0363 TXN4_SUBMIT_PASS txid=$expectedTxid http=202"
     Write-Host 'CP-0364 INVALID_THEN_VALID_MEMPOOL_PASS count=1'
 
-    if (-not (Wait-Pattern $logA 'event=monetary_v4_peer_broadcast_complete height=1 .*transactions=1' 16000)) {
+    if (-not (Wait-Pattern $logA '(?s)event=monetary_v4_peer_broadcast_complete height=1 .*transactions=1' 16000)) {
         throw ("CP-0363 node A did not mine and broadcast a one-transaction block: " + (Get-Text $logA))
     }
-    if (-not (Wait-Pattern $logB 'event=monetary_v4_peer_ack_sent .*ack=MTA4 status=0 candidate_height=1' 16000)) {
+    if (-not (Wait-Pattern $logB '(?s)event=monetary_v4_peer_ack_sent .*ack=MTA4 status=0 candidate_height=1' 16000)) {
         throw ("CP-0363 node B did not accept the propagated PMT4 block: " + (Get-Text $logB))
     }
 
-    $broadcast = [regex]::Match((Get-Text $logA), 'event=monetary_v4_peer_broadcast_complete height=1 digest=[0-9a-f]{64} state_root=([0-9a-f]{64}) tip=([0-9a-f]{64}) peers=1 transactions=1')
+    $broadcast = [regex]::Match((Get-Text $logA), '(?s)event=monetary_v4_peer_broadcast_complete height=1 digest=[0-9a-f]{64} state_root=([0-9a-f]{64}) tip=([0-9a-f]{64}) peers=1 transactions=1')
     if (-not $broadcast.Success) { throw 'CP-0363 node A broadcast did not contain a height-1 state root and tip' }
     $expectedRoot = $broadcast.Groups[1].Value
     $expectedTip = $broadcast.Groups[2].Value
