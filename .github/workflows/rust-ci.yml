@@ -36,6 +36,9 @@ jobs:
       - name: Verify independent monetary Genesis snapshot oracle
         run: python3 ../../../simulations/cp0361_monetary_genesis_snapshot_oracle.py
 
+      - name: Verify independent candidate issuance schedule oracle
+        run: python3 ../../../simulations/cp0366_monetary_issuance_oracle_candidate.py --check
+
       - name: Check formatting
         run: cargo +stable fmt --all -- --check
 
