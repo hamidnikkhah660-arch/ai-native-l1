@@ -1,0 +1,45 @@
+name: Rust validation
+
+on:
+  push:
+    branches: [main, "ci/**", "public/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-validation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Format, check, and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: src/native/pow_bench
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install stable formatter
+        run: |
+          rustup update stable
+          rustup component add rustfmt --toolchain stable
+          rustc +stable --version
+          cargo +stable --version
+
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+
+      - name: Check every target
+        run: cargo +stable check --all-targets --locked
+
+      - name: Test every target
+        # Serialize in-process tests: some filesystem-lock/recovery probes spawn child processes
+        # and must not race with other lock probes on constrained hosted runners.
+        run: cargo +stable test --all-targets --locked -- --test-threads=1
