@@ -3320,6 +3320,82 @@ mod tests {
     }
 
     #[test]
+    fn monetary_issuance_matches_independent_python_candidate_vectors() {
+        const ORACLE: &str =
+            include_str!("../../../../simulations/cp0366_monetary_issuance_vectors_candidate.tsv");
+
+        let mut miner_budget = None;
+        let mut initial_subsidy = None;
+        let mut blocks_per_halving = None;
+        let mut rows = 0usize;
+
+        for line in ORACLE.lines() {
+            if let Some(value) = line.strip_prefix("# miner_budget_atoms=") {
+                miner_budget = Some(value.parse::<u128>().expect("valid oracle miner budget"));
+                continue;
+            }
+            if let Some(value) = line.strip_prefix("# initial_subsidy_atoms=") {
+                initial_subsidy =
+                    Some(value.parse::<u128>().expect("valid oracle initial subsidy"));
+                continue;
+            }
+            if let Some(value) = line.strip_prefix("# blocks_per_halving=") {
+                blocks_per_halving =
+                    Some(value.parse::<u64>().expect("valid oracle halving interval"));
+                continue;
+            }
+            if line.is_empty() || line.starts_with('#') || line.starts_with("block_height\t") {
+                continue;
+            }
+
+            let fields: Vec<_> = line.split('\t').collect();
+            assert_eq!(fields.len(), 4, "malformed oracle vector row: {line}");
+            let block_height = fields[0].parse::<u64>().expect("valid block height");
+            let expected_prior = fields[1].parse::<u128>().expect("valid prior issuance");
+            let expected_reward = fields[2].parse::<u128>().expect("valid reward");
+            let expected_after = fields[3].parse::<u128>().expect("valid total issuance");
+
+            let actual_prior = monetary_issuance_after_blocks(block_height - 1);
+            assert_eq!(
+                actual_prior, expected_prior,
+                "prior issuance mismatch at block height {block_height}"
+            );
+            assert_eq!(
+                monetary_reward_for_height(block_height, actual_prior),
+                Ok(expected_reward),
+                "block reward mismatch at height {block_height}"
+            );
+            assert_eq!(
+                monetary_issuance_after_blocks(block_height),
+                expected_after,
+                "cumulative issuance mismatch after block height {block_height}"
+            );
+            assert_eq!(
+                expected_after.checked_sub(expected_prior),
+                Some(expected_reward),
+                "oracle issuance delta mismatch at block height {block_height}"
+            );
+            rows += 1;
+        }
+
+        assert_eq!(miner_budget, Some(MONETARY_MINER_BUDGET_ATOMS));
+        assert_eq!(initial_subsidy, Some(MONETARY_INITIAL_SUBSIDY_ATOMS));
+        assert_eq!(blocks_per_halving, Some(MONETARY_BLOCKS_PER_HALVING));
+        assert_eq!(rows, 17, "expected all independent candidate vectors");
+
+        assert_eq!(
+            monetary_reward_for_height(1, MONETARY_MINER_BUDGET_ATOMS),
+            Ok(0),
+            "a fully consumed miner budget must not issue additional coins"
+        );
+        assert_eq!(
+            monetary_reward_for_height(1, MONETARY_MINER_BUDGET_ATOMS + 1),
+            Err(StateError::MinerBudgetExceeded),
+            "a current mined supply above the miner budget must fail closed"
+        );
+    }
+
+    #[test]
     fn monetary_issuance_schedule_has_exact_boundaries_and_never_exceeds_miner_budget() {
         assert_eq!(monetary_issuance_after_blocks(0), 0);
         assert_eq!(
