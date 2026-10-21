@@ -19,6 +19,14 @@
 - **Sponsorship and contributor discussion:** [Public issue #1](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/1)
 - **Previous public documentation release:** [v0.2.0-docs](https://github.com/hamidnikkhah660-arch/ai-native-l1/releases/tag/v0.2.0-docs)
 
+## Support QuantumZXB's open-source development
+
+QuantumZXB has a live direct fundraising page on Giveth. Donations are voluntary support for public-benefit open-source engineering, reproducible testing, technical documentation, developer tools, and independent technical review when resources are available.
+
+**[Support QuantumZXB on Giveth](https://giveth.io/project/quantumzxb)**
+
+Transparency note: the native QZXB mainnet and a liquid native-coin market have not launched. Donations are not a purchase of QZXB tokens or an investment; no token rewards, profits, financial returns, or guaranteed outcomes are promised. As of the initial campaign check on 2026-10-21, Giveth showed the direct project page as active with donations enabled, public directory review still pending, and GIVbacks status not eligible. These platform statuses may change; consult the live campaign page for current status. No donations are claimed here.
+
 ## Engineering highlights
 
 ### Native Layer-1
