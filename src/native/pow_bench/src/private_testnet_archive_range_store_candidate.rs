@@ -1216,10 +1216,11 @@ mod tests {
         assert_eq!(fs::metadata(&path).unwrap().len(), 0);
         store.commit_page(&pages[0]).unwrap();
         drop(store);
-        assert!(matches!(
-            ArchiveRangeWalCandidate::open(&path, limits(), [0x99; 32], 5, 15),
-            Err(ArchiveRangeStoreError::InvalidPage(_))
-        ));
+        match ArchiveRangeWalCandidate::open(&path, limits(), [0x99; 32], 5, 15) {
+            Err(ArchiveRangeStoreError::InvalidPage(_)) => {}
+            Err(error) => panic!("wrong snapshot should fail as InvalidPage, got: {error}"),
+            Ok(_) => panic!("wrong snapshot commitment was accepted"),
+        }
     }
 
     #[test]
