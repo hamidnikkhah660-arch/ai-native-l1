@@ -8286,7 +8286,8 @@ mod signed_identity_runtime_tests {
     }
 
     #[test]
-    fn monetary_v4_import_refuses_pmt3_without_mutation_then_commits_pmt4_idempotently() {
+    fn monetary_v4_import_refuses_pmt3_and_overclaimed_reward_without_mutation_then_commits_pmt4_idempotently(
+    ) {
         let root = root();
         let network = [0x78; 32];
         let profile = DevnetProfileCandidate::new(network).unwrap();
@@ -8309,6 +8310,14 @@ mod signed_identity_runtime_tests {
         )
         .unwrap();
         let initial_anchor = store.manifest_anchor().unwrap();
+        let initial_archive_len = store.archive().archive_len();
+        let initial_state_snapshot = store
+            .archive()
+            .canonical_chain()
+            .monetary_state()
+            .unwrap()
+            .encode_snapshot()
+            .unwrap();
         assert!(monetary_v4_archive_snapshot_is_current(&store, &initial_anchor).unwrap());
         let startup_snapshot =
             build_monetary_v4_archive_range_server(&store, network, &manifest_id, &params, 1)
@@ -8337,6 +8346,49 @@ mod signed_identity_runtime_tests {
             0,
         )
         .unwrap();
+
+        // A PMT4 envelope with a non-scheduled subsidy must fail before changing any durable
+        // state. Preserve the real PoW header and block state-root field so the state transition's
+        // reward-schedule check is the rejection boundary under test.
+        let decoded_candidate = decode_candidate_v4_hybrid_monetary_network_block(&pmt4).unwrap();
+        let mut overclaimed_block = decoded_candidate.block.clone();
+        overclaimed_block.claimed_subsidy_atoms = overclaimed_block
+            .claimed_subsidy_atoms
+            .checked_add(1)
+            .unwrap();
+        let overclaimed_pmt4 = encode_candidate_v4_hybrid_monetary_network_block(
+            &decoded_candidate.header,
+            &overclaimed_block,
+        )
+        .unwrap();
+        let overclaim_error = import_v4_hybrid_monetary_payload(
+            &overclaimed_pmt4,
+            &mut store,
+            &params,
+            &verifier,
+            &clock,
+        )
+        .unwrap_err();
+        let rendered_error = format!("{overclaim_error:?}");
+        assert!(
+            rendered_error.contains("MinerRewardMismatch")
+                || rendered_error.to_ascii_lowercase().contains("reward"),
+            "overclaimed PMT4 block failed for an unexpected reason: {rendered_error}"
+        );
+        assert_eq!(store.canonical_height(), 0);
+        assert_eq!(store.manifest_anchor().unwrap(), initial_anchor);
+        assert_eq!(store.archive().archive_len(), initial_archive_len);
+        assert_eq!(
+            store
+                .archive()
+                .canonical_chain()
+                .monetary_state()
+                .unwrap()
+                .encode_snapshot()
+                .unwrap(),
+            initial_state_snapshot
+        );
+
         let (status, outcome) =
             import_v4_hybrid_monetary_payload(&pmt4, &mut store, &params, &verifier, &clock)
                 .unwrap();
