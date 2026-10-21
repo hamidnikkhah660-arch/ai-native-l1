@@ -66,3 +66,7 @@ jobs:
       - name: Run signed TXN4 submit, invalid-signature rejection, peer propagation and replay
         shell: pwsh
         run: ./simulations/cp0363_txn4_two_node_loopback.ps1
+
+      - name: Run PFM4 paged archive sync with inter-page reorg and stale-cursor rejection
+        shell: pwsh
+        run: ./simulations/cp0362_pfm4_page2_cursor_reorg.ps1
