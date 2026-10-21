@@ -18,7 +18,18 @@ Command:
 powershell -NoProfile -ExecutionPolicy Bypass -File simulations/cp0363_txn4_two_node_loopback.ps1
 ```
 
-Observed result: **PASS**, exit code 0, runtime 41.79 seconds. PowerShell AST parse passed. Release builds of `devnet_node`, `noise_key_provisioner`, and `txn4_loopback_fixture` completed; existing unused/dead-code compiler warnings were non-fatal.
+Observed initial result: **PASS**, exit code 0, runtime 41.79 seconds. PowerShell AST parse passed. Release builds of `devnet_node`, `noise_key_provisioner`, and `txn4_loopback_fixture` completed; existing unused/dead-code compiler warnings were non-fatal.
+
+### Repeat run on current main (commit `866737881c16b1bb1e297bb59d8af8a1068a43e1`)
+
+A new execution of the same runner passed on 2026-10-21 with exit code 0 in 44.71 seconds. This commit also contains the invalid-signature HTTP regression. Additional assertions confirmed:
+
+- A copy of the signed TXN4 wire with the final byte flipped was rejected by `/tx/submit` with HTTP 422 and `transaction_rejected`.
+- Immediately submitting the untouched valid wire returned HTTP 202, the expected TXN4 ID `5af7df1b9a524d9fed4dd7cf4bee767a7d228d843042a29cafc314b29ececa72`, and `mempool_count=1`.
+- Node A broadcast one transaction in height 1 (`peers=1`, `duplicate_broadcast=false`), with block/tip `a0e109d1607baf3607099684fa3790b2448803b3f541225a65b99286b198ed36` and state root `5b36cb42a56c144359f4fee104068622d661880bcbfb0644425348066b150e7f`.
+- Node B's acknowledgement and `/status` state matched the broadcast root/tip; both nodes then reported `height=1 ... replay=matched`.
+
+This is still same-host loopback evidence; the new Windows CI job in the accompanying change will make the scenario repeatable on hosted Windows runners.
 
 Assertions observed:
 
