@@ -1216,6 +1216,5 @@ mod tests {
         );
     }
 
-    #[path = "../../v4_migration_persistence_fault_harness.rs"]
     mod cp0237_migration_persistence_fault_harness;
 }
