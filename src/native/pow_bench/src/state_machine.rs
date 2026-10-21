@@ -953,26 +953,39 @@ fn monetary_policy_fingerprint() -> [u8; 32] {
     )
 }
 
+/// Use the shared issuance-schedule implementation for the monetary ledger candidate.
+/// The budget/subsidy/halving constants above remain provisional design inputs; this wiring
+/// prevents candidate state execution from drifting away from the reusable schedule model.
+fn monetary_issuance_parameters() -> crate::issuance_schedule::IssuanceParameters {
+    crate::issuance_schedule::IssuanceParameters::new(
+        MONETARY_MINER_BUDGET_ATOMS,
+        MONETARY_INITIAL_SUBSIDY_ATOMS,
+        MONETARY_BLOCKS_PER_HALVING,
+    )
+    .expect("monetary candidate constants must remain valid")
+}
+
 fn monetary_issuance_after_blocks(blocks_mined: u64) -> u128 {
-    let mut remaining_blocks = blocks_mined;
-    let mut total = 0u128;
-    for era in 0..u128::BITS {
-        if remaining_blocks == 0 || total == MONETARY_MINER_BUDGET_ATOMS {
-            break;
-        }
-        let subsidy = MONETARY_INITIAL_SUBSIDY_ATOMS >> era;
-        if subsidy == 0 {
-            break;
-        }
-        let blocks_in_era = remaining_blocks.min(MONETARY_BLOCKS_PER_HALVING) as u128;
-        let remaining_budget = MONETARY_MINER_BUDGET_ATOMS - total;
-        if subsidy > remaining_budget / blocks_in_era {
-            return MONETARY_MINER_BUDGET_ATOMS;
-        }
-        total += subsidy * blocks_in_era;
-        remaining_blocks -= blocks_in_era as u64;
-    }
-    total
+    monetary_issuance_parameters().cumulative_issuance_after_blocks(blocks_mined)
+}
+
+/// Derive the subsidy for a 1-based native block height from the shared issuance model.
+/// Current mined supply comes only from the already-validated monetary ledger state.
+fn monetary_reward_for_height(
+    block_height: u64,
+    current_mined_atoms: u128,
+) -> Result<u128, StateError> {
+    let schedule_height = block_height
+        .checked_sub(1)
+        .ok_or(StateError::InvalidHeight)?;
+    monetary_issuance_parameters()
+        .reward_for_block(schedule_height, current_mined_atoms)
+        .map_err(|error| match error {
+            crate::issuance_schedule::IssuanceError::CurrentSupplyAboveMaximum => {
+                StateError::MinerBudgetExceeded
+            }
+            _ => StateError::InvariantViolation,
+        })
 }
 
 /// Encode a versioned monetary envelope around a canonical BLK2 transaction body.
@@ -1271,10 +1284,7 @@ impl MonetaryLedgerState {
             .height()
             .checked_add(1)
             .ok_or(StateError::InvalidHeight)?;
-        let next_mined = monetary_issuance_after_blocks(next_height);
-        let reward = next_mined
-            .checked_sub(self.total_mined_atoms)
-            .ok_or(StateError::InvariantViolation)?;
+        let reward = monetary_reward_for_height(next_height, self.total_mined_atoms)?;
         u64::try_from(reward).map_err(|_| StateError::InvariantViolation)
     }
 
@@ -1287,9 +1297,8 @@ impl MonetaryLedgerState {
         encode_monetary_block(block)?;
         let (mut next, fees_collected) =
             self.ledger.prepare_candidate(&block.body, authenticator)?;
-        let expected_reward = monetary_issuance_after_blocks(block.body.height)
-            .checked_sub(self.total_mined_atoms)
-            .ok_or(StateError::InvariantViolation)?;
+        let expected_reward =
+            monetary_reward_for_height(block.body.height, self.total_mined_atoms)?;
         let claimed_reward = block.claimed_subsidy_atoms as u128;
         if claimed_reward != expected_reward {
             return Err(StateError::MinerRewardMismatch {
@@ -1410,9 +1419,7 @@ impl MonetaryLedgerState {
                 .ok_or(StateError::FeeOverflow)?;
         }
 
-        let expected_reward = monetary_issuance_after_blocks(block.height)
-            .checked_sub(self.total_mined_atoms)
-            .ok_or(StateError::InvariantViolation)?;
+        let expected_reward = monetary_reward_for_height(block.height, self.total_mined_atoms)?;
         if block.claimed_subsidy_atoms as u128 != expected_reward {
             return Err(StateError::MinerRewardMismatch {
                 expected: u64::try_from(expected_reward).unwrap_or(u64::MAX),
@@ -3284,6 +3291,32 @@ mod tests {
             state.ledger().account(&account(3)).unwrap().balance,
             half_budget
         );
+    }
+
+    #[test]
+    fn monetary_reward_at_height_matches_cumulative_schedule_boundaries() {
+        let heights = [
+            1,
+            2,
+            MONETARY_BLOCKS_PER_HALVING - 1,
+            MONETARY_BLOCKS_PER_HALVING,
+            MONETARY_BLOCKS_PER_HALVING + 1,
+            MONETARY_BLOCKS_PER_HALVING * 2 - 1,
+            MONETARY_BLOCKS_PER_HALVING * 2,
+            MONETARY_BLOCKS_PER_HALVING * 2 + 1,
+            MONETARY_BLOCKS_PER_HALVING * 8,
+            u64::MAX,
+        ];
+
+        for height in heights {
+            let current_mined_atoms = monetary_issuance_after_blocks(height - 1);
+            let expected_reward = monetary_issuance_after_blocks(height) - current_mined_atoms;
+            assert_eq!(
+                monetary_reward_for_height(height, current_mined_atoms),
+                Ok(expected_reward),
+                "reward model diverged from cumulative schedule at block height {height}"
+            );
+        }
     }
 
     #[test]
