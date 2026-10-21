@@ -161,14 +161,23 @@ try {
         throw ("CP-0363 manifest mismatch: fixture=$fixtureManifest nodeA=$($readyA.Groups[1].Value) nodeB=$($readyB.Groups[1].Value)")
     }
 
+    $badTxBytes = [byte[]]$txBytes.Clone()
+    $badTxBytes[$badTxBytes.Length - 1] = [byte]($badTxBytes[$badTxBytes.Length - 1] -bxor 1)
+    $badResponse = Submit-Txn4 -Port $txPort -Bytes $badTxBytes
+    if ($badResponse -notmatch '^HTTP/1\.1 422') { throw ("CP-0364 invalid TXN4 signature was not rejected with HTTP 422: " + $badResponse) }
+    if ($badResponse -notmatch 'transaction_rejected') { throw ("CP-0364 invalid TXN4 response omitted rejection code: " + $badResponse) }
+    Write-Host 'CP-0364 INVALID_SIGNATURE_HTTP_REJECT_PASS http=422'
+
     $response = Submit-Txn4 -Port $txPort -Bytes $txBytes
     if ($response -notmatch '^HTTP/1\.1 202 Accepted') { throw ("CP-0363 TXN4 submission was not HTTP 202: " + $response) }
     if ($response -notmatch '"status":"accepted"') { throw ("CP-0363 response did not report accepted: " + $response) }
+    if ($response -notmatch '"mempool_count":1') { throw ("CP-0364 rejected signature corrupted mempool admission state: " + $response) }
     $responseId = [regex]::Match($response, '"transaction_id":"([0-9a-f]{64})"')
     if (-not $responseId.Success -or $responseId.Groups[1].Value -ne $expectedTxid) {
         throw ("CP-0363 mempool TXID mismatch: expected=$expectedTxid response=$response")
     }
     Write-Host "CP-0363 TXN4_SUBMIT_PASS txid=$expectedTxid http=202"
+    Write-Host 'CP-0364 INVALID_THEN_VALID_MEMPOOL_PASS count=1'
 
     if (-not (Wait-Pattern $logA 'event=monetary_v4_peer_broadcast_complete height=1 .*transactions=1' 16000)) {
         throw ("CP-0363 node A did not mine and broadcast a one-transaction block: " + (Get-Text $logA))
