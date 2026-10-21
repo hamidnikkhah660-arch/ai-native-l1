@@ -40,4 +40,6 @@ jobs:
         run: cargo +stable check --all-targets --locked
 
       - name: Test every target
-        run: cargo +stable test --all-targets --locked
+        # Serialize in-process tests: some filesystem-lock/recovery probes spawn child processes
+        # and must not race with other lock probes on constrained hosted runners.
+        run: cargo +stable test --all-targets --locked -- --test-threads=1
