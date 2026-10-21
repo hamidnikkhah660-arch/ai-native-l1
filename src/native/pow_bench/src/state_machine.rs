@@ -3139,6 +3139,77 @@ mod tests {
     }
 
     #[test]
+    fn monetary_genesis_rejects_invalid_network_zero_and_duplicate_allocations() {
+        let public_goods_total = MONETARY_PUBLIC_GOODS_BUDGET_ATOMS as u64;
+        let zero = [0u8; 32];
+
+        assert_eq!(
+            MonetaryLedgerState::genesis(zero, account(1), vec![(account(2), public_goods_total)]),
+            Err(StateError::InvalidNetworkId)
+        );
+        assert_eq!(
+            MonetaryLedgerState::genesis(
+                TEST_NETWORK_ID,
+                zero,
+                vec![(account(2), public_goods_total)]
+            ),
+            Err(StateError::InvalidAccountId)
+        );
+        assert_eq!(
+            MonetaryLedgerState::genesis(
+                TEST_NETWORK_ID,
+                account(1),
+                vec![(zero, public_goods_total)]
+            ),
+            Err(StateError::InvalidAccountId)
+        );
+        assert_eq!(
+            MonetaryLedgerState::genesis(TEST_NETWORK_ID, account(1), vec![(account(2), 0)]),
+            Err(StateError::InvalidMonetaryAllocation)
+        );
+        assert_eq!(
+            MonetaryLedgerState::genesis(
+                TEST_NETWORK_ID,
+                account(1),
+                vec![(account(2), 1), (account(2), public_goods_total - 1),]
+            ),
+            Err(StateError::DuplicateGenesisAccount)
+        );
+        assert_eq!(
+            MonetaryLedgerState::genesis(
+                TEST_NETWORK_ID,
+                account(1),
+                vec![(account(2), public_goods_total), (account(3), 1),]
+            ),
+            Err(StateError::InvalidMonetaryAllocation)
+        );
+    }
+
+    #[test]
+    fn monetary_genesis_accepts_exact_public_goods_budget_split_across_accounts() {
+        let half_budget = (MONETARY_PUBLIC_GOODS_BUDGET_ATOMS / 2) as u64;
+        let state = MonetaryLedgerState::genesis(
+            TEST_NETWORK_ID,
+            account(1),
+            vec![(account(2), half_budget), (account(3), half_budget)],
+        )
+        .expect("valid exact-budget split across distinct accounts");
+
+        assert_eq!(
+            state.total_value().unwrap(),
+            MONETARY_FOUNDER_ALLOCATION_ATOMS + MONETARY_PUBLIC_GOODS_BUDGET_ATOMS
+        );
+        assert_eq!(
+            state.ledger().account(&account(2)).unwrap().balance,
+            half_budget
+        );
+        assert_eq!(
+            state.ledger().account(&account(3)).unwrap().balance,
+            half_budget
+        );
+    }
+
+    #[test]
     fn monetary_issuance_schedule_has_exact_boundaries_and_never_exceeds_miner_budget() {
         assert_eq!(monetary_issuance_after_blocks(0), 0);
         assert_eq!(
