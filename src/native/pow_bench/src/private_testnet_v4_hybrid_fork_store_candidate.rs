@@ -303,6 +303,9 @@ impl PrivateTestnetV4HybridForkStore {
         V: crate::v4_fat1_trust_candidate::MlDsa65Verifier,
         A: MlDsa65Verifier,
     {
+        if !client.is_pinned_to(pin) {
+            return Err(V4HybridForkStoreError::ExternalAnchorMismatch);
+        }
         let network_id = genesis.ledger().network_id();
         let profile = profile_fingerprint(&genesis, &params, &expected_manifest_id)?;
         let empty = PrivateTestnetV4HybridForkChoice::new(
@@ -687,6 +690,9 @@ impl PrivateTestnetV4HybridForkStore {
         V: crate::v4_fat1_trust_candidate::MlDsa65Verifier,
         A: MlDsa65Verifier,
     {
+        if !client.is_pinned_to(pin) {
+            return Err(V4HybridForkStoreError::ExternalAnchorMismatch);
+        }
         let pending_path = self.directory.join(PENDING_MANIFEST_NAME);
         if pending_path.exists() {
             return Err(V4HybridForkStoreError::PendingManifestExists);
@@ -1580,6 +1586,23 @@ mod tests {
             VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
                 .unwrap();
 
+        // A separately supplied trust pin must not disagree with the key that verifies receipts.
+        let mut mismatched_pin = pin.clone();
+        mismatched_pin.receipt_key_id = [0x76; 32];
+        assert!(matches!(
+            store.submit_with_external_anchor(
+                &envelope,
+                &verifier,
+                &FixedClock,
+                &mismatched_pin,
+                &mut client,
+                &bootstrap,
+                1,
+            ),
+            Err(V4HybridForkStoreError::ExternalAnchorMismatch)
+        ));
+        assert!(!directory.join(PENDING_MANIFEST_NAME).exists());
+
         let committed = store
             .submit_with_external_anchor(
                 &envelope,
@@ -1822,6 +1845,25 @@ mod tests {
         let mut client =
             VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
                 .unwrap();
+        let mut mismatched_pin = pin.clone();
+        mismatched_pin.receipt_key_id = [0x88; 32];
+        assert!(matches!(
+            PrivateTestnetV4HybridForkStore::open_with_external_cas(
+                &directory,
+                genesis.clone(),
+                params.clone(),
+                MANIFEST,
+                &verifier,
+                &FixedClock,
+                &mismatched_pin,
+                &mut client,
+                Some(&bootstrap),
+                1,
+            ),
+            Err(V4HybridForkStoreError::ExternalAnchorMismatch)
+        ));
+        assert!(directory.join(PENDING_MANIFEST_NAME).exists());
+
         let (recovered, observed, object_generation) =
             PrivateTestnetV4HybridForkStore::open_with_external_cas(
                 &directory,
