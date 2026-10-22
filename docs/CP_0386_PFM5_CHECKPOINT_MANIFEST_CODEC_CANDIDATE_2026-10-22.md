@@ -19,7 +19,7 @@ Scope: standalone canonical PFM5 v1 manifest encoder/decoder and a checkpoint-me
 - `python simulations/verify_cp0386_pfm5_manifest_vector.py` independently re-encodes the deterministic synthetic manifest and reproduces the 412-byte Rust fixture byte-for-byte. It also verifies the PCP4 source fixture checksum, computes the PCP4 checkpoint commitment, then computes and checks the PFM5 checksum and commitment.
 - `cargo fmt --all -- --check`: PASS.
 - `cargo check --all-targets --locked --offline`: PASS; the checkout emits existing unused/dead-code warnings in unrelated modules.
-- A full all-target test run and GitHub Actions validation are required for this candidate before merge. A passing focused suite is not equivalent to an all-target run or independent protocol review.
+- Final-head GitHub Actions run `39821573441` passed both required jobs before PR #55 merged. The Linux `Format, check, and test` job ran all targets; the library reported 769/769 passing, `devnet_node` reported 36/36, and `private_testnet_node` reported 36/36. The Windows PMT4/TXN4 two-node loopback also passed (3m38s). Test evidence is not an independent protocol/security review or production deployment result.
 
 ## Explicit trust boundary
 
