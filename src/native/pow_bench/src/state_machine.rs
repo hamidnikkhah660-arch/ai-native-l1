@@ -898,7 +898,19 @@ const MAX_ENCODED_MONETARY_BLOCK_BYTES: usize =
 const MONETARY_SNAPSHOT_VERSION: u16 = 3;
 const MONETARY_SNAPSHOT_CHECKSUM_DOMAIN: &[u8] = b"AIN1-MONETARY-SNAPSHOT-CHECK-V3\0";
 const MONETARY_STATE_ROOT_DOMAIN: &[u8] = b"AIN1-MONETARY-STATE-ROOT-V3\0";
-const MONETARY_POLICY_DOMAIN: &[u8] = b"AIN1-MONETARY-POLICY-CANDIDATE-V3\0";
+const MONETARY_POLICY_DOMAIN: &[u8] = b"AIN1-MONETARY-POLICY-CANDIDATE-V4\0";
+/// Fees are debited from the sender and accumulate in the ledger fee pool; they are not
+/// automatically added to the miner subsidy or paid directly to a block beneficiary.
+const MONETARY_FEE_POLICY_ID: &[u8] =
+    b"AIN1-MONETARY-FEE-SENDER-PAYS-FEE-POOL-NO-MINER-PAYOUT-V1\0";
+/// The height/cumulative-issuance schedule is verified internally; only the block's committed
+/// miner account receives the exact scheduled subsidy, never a peer-selected arbitrary amount.
+const MONETARY_REWARD_BENEFICIARY_POLICY_ID: &[u8] =
+    b"AIN1-MONETARY-REWARD-HEIGHT-SCHEDULE-CREDIT-BLOCK-MINER-V1\0";
+/// Legacy/candidate formats are never silently converted or downgraded. A migration requires
+/// a separately versioned and explicitly activated network/profile decision.
+const MONETARY_ACTIVATION_POLICY_ID: &[u8] =
+    b"AIN1-MONETARY-ACTIVATION-EXPLICIT-PROFILE-NO-IMPLICIT-MIGRATION-V1\0";
 const MONETARY_SNAPSHOT_OVERHEAD: usize = 4 + 2 + 32 + 16 + 4 + 32;
 const MAX_ENCODED_MONETARY_SNAPSHOT_BYTES: usize =
     MAX_ENCODED_SNAPSHOT_BYTES + MONETARY_SNAPSHOT_OVERHEAD;
@@ -949,6 +961,9 @@ fn monetary_policy_fingerprint() -> [u8; 32] {
             &subsidy,
             &halving,
             &decimals,
+            MONETARY_FEE_POLICY_ID,
+            MONETARY_REWARD_BENEFICIARY_POLICY_ID,
+            MONETARY_ACTIVATION_POLICY_ID,
         ],
     )
 }
@@ -3180,6 +3195,29 @@ mod tests {
         assert_eq!(
             MonetaryLedgerState::decode_snapshot(&expected_monetary_snapshot, &network_id).unwrap(),
             state
+        );
+    }
+
+    #[test]
+    fn prior_monetary_policy_snapshot_is_rejected_without_implicit_migration() {
+        let state = monetary_genesis();
+        let network_id = state.ledger().network_id();
+        let mut stale_snapshot = state.encode_snapshot().unwrap();
+
+        // Recreate a checksum-valid snapshot whose serialized policy commitment does not match
+        // the currently frozen fee/reward/activation rule IDs. A valid checksum alone must not
+        // permit an implicit migration across monetary policy versions.
+        stale_snapshot[6..38].copy_from_slice(&[0xA5; 32]);
+        let checksum_start = stale_snapshot.len() - 32;
+        let checksum = hash_domain(
+            MONETARY_SNAPSHOT_CHECKSUM_DOMAIN,
+            &[&stale_snapshot[..checksum_start]],
+        );
+        stale_snapshot[checksum_start..].copy_from_slice(&checksum);
+
+        assert_eq!(
+            MonetaryLedgerState::decode_snapshot(&stale_snapshot, &network_id),
+            Err(StateError::MonetaryPolicyMismatch)
         );
     }
 

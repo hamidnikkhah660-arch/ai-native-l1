@@ -22,6 +22,14 @@ MAX_SUPPLY_ATOMS = 1_000_000_000_000_000_000
 MINER_BUDGET_ATOMS = 300_000_000_000_000_000
 INITIAL_SUBSIDY_ATOMS = 35_673_515_981
 BLOCKS_PER_HALVING = 4_204_800
+MONETARY_POLICY_DOMAIN = b"AIN1-MONETARY-POLICY-CANDIDATE-V4\0"
+MONETARY_FEE_POLICY_ID = b"AIN1-MONETARY-FEE-SENDER-PAYS-FEE-POOL-NO-MINER-PAYOUT-V1\0"
+MONETARY_REWARD_BENEFICIARY_POLICY_ID = (
+    b"AIN1-MONETARY-REWARD-HEIGHT-SCHEDULE-CREDIT-BLOCK-MINER-V1\0"
+)
+MONETARY_ACTIVATION_POLICY_ID = (
+    b"AIN1-MONETARY-ACTIVATION-EXPLICIT-PROFILE-NO-IMPLICIT-MIGRATION-V1\0"
+)
 
 def sha256_domain(domain: bytes, *parts: bytes) -> bytes:
     digest = hashlib.sha256()
@@ -32,7 +40,7 @@ def sha256_domain(domain: bytes, *parts: bytes) -> bytes:
 
 def policy_fingerprint() -> bytes:
     return sha256_domain(
-        b"AIN1-MONETARY-POLICY-CANDIDATE-V3\0",
+        MONETARY_POLICY_DOMAIN,
         MAX_SUPPLY_ATOMS.to_bytes(16, "big"),
         FOUNDER_ATOMS.to_bytes(16, "big"),
         MINER_BUDGET_ATOMS.to_bytes(16, "big"),
@@ -40,6 +48,9 @@ def policy_fingerprint() -> bytes:
         INITIAL_SUBSIDY_ATOMS.to_bytes(16, "big"),
         BLOCKS_PER_HALVING.to_bytes(8, "big"),
         (8).to_bytes(2, "big"),
+        MONETARY_FEE_POLICY_ID,
+        MONETARY_REWARD_BENEFICIARY_POLICY_ID,
+        MONETARY_ACTIVATION_POLICY_ID,
     )
 
 def encode_ledger_snapshot(network_id: bytes, accounts: list[tuple[bytes, int]]) -> bytes:
