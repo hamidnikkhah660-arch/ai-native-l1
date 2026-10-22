@@ -79,6 +79,8 @@ pub mod private_testnet_monetary_fork_choice;
 pub mod private_testnet_monetary_fork_store;
 /// Candidate-only PMT3 framing for MBK3 monetary blocks; not connected to live Devnet.
 pub mod private_testnet_monetary_wire;
+/// Candidate-only verifier for binding PFM5 metadata to a fully replayed Genesis archive.
+pub mod private_testnet_pfm5_archive_binding_candidate;
 /// Candidate-only durable PFM3 store for PMT3 monetary branch archives.
 /// Candidate-only PFM5 manifest codec; not integrated with durable storage or archive replay.
 pub mod private_testnet_pfm5_manifest_candidate;

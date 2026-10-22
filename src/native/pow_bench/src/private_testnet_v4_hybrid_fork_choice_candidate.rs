@@ -120,6 +120,18 @@ impl PrivateTestnetV4HybridForkChoice {
     pub fn expected_manifest_id(&self) -> [u8; 32] {
         self.expected_manifest_id
     }
+
+    /// Configured consensus parameters used to validate every replayed branch.
+    pub fn params(&self) -> &ConsensusParameters {
+        &self.params
+    }
+
+    /// Fingerprint of the configured consensus profile for checkpoint/archive binding.
+    pub fn profile_fingerprint(
+        &self,
+    ) -> Result<[u8; 32], crate::private_testnet_checkpoint_candidate::Pcp4CheckpointError> {
+        crate::private_testnet_checkpoint_candidate::consensus_profile_fingerprint(&self.params)
+    }
     pub fn canonical_chain(&self) -> &PrivateTestnetChain {
         &self.canonical
     }
