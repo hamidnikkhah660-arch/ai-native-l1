@@ -76,10 +76,12 @@ pub mod private_testnet_fork_store;
 pub mod private_testnet_mempool_candidate;
 /// Candidate-only MBK3 fork choice/replay; not yet connected to PFS2/P2P/runtime.
 pub mod private_testnet_monetary_fork_choice;
-/// Candidate-only durable PFM3 store for PMT3 monetary branch archives.
 pub mod private_testnet_monetary_fork_store;
 /// Candidate-only PMT3 framing for MBK3 monetary blocks; not connected to live Devnet.
 pub mod private_testnet_monetary_wire;
+/// Candidate-only durable PFM3 store for PMT3 monetary branch archives.
+/// Candidate-only PFM5 manifest codec; not integrated with durable storage or archive replay.
+pub mod private_testnet_pfm5_manifest_candidate;
 pub mod private_testnet_v4_hybrid_fork_choice_candidate;
 pub mod private_testnet_v4_hybrid_fork_store_candidate;
 /// Candidate-only PTB2 envelope for linked PoW headers + canonical block-body transport.
