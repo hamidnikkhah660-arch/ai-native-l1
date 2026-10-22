@@ -2201,6 +2201,95 @@ mod tests {
     }
 
     #[test]
+    fn pfm4_rejects_valid_pow_under_wrong_target_without_publishing_manifest_or_branch() {
+        let directory = path("wrong-target-atomic");
+        let genesis = genesis();
+        let params = params();
+        let verifier = LibcruxMlDsa65VerifierCandidate;
+        let mut store = PrivateTestnetV4HybridForkStore::open(
+            &directory,
+            genesis.clone(),
+            params.clone(),
+            MANIFEST,
+            &verifier,
+            &FixedClock,
+        )
+        .unwrap();
+
+        let genesis_tip = store.canonical_tip();
+        let committed_anchor = store.manifest_anchor().unwrap();
+        let valid_envelope = first_block_envelope(&genesis, &params);
+        let candidate = decode_candidate_v4_hybrid_monetary_network_block(&valid_envelope).unwrap();
+        let forged_target = Uint256::from_be_bytes([0x7F; 32]);
+        assert_ne!(forged_target, params.initial_target);
+        assert!(forged_target <= params.pow_limit);
+
+        // The nonce must satisfy the peer-supplied target. This isolates expected-target binding
+        // from a simple insufficient-work rejection: consensus must still reject the header
+        // because the active network profile expects params.initial_target.
+        let wrong_target_envelope = (0..256u64)
+            .find_map(|nonce| {
+                let mut header = candidate.header;
+                header.target = forged_target;
+                header.nonce = nonce;
+                let digest = crate::consensus::pow_digest(&header, params.pow).unwrap();
+                (Uint256::from_be_bytes(digest) <= forged_target).then(|| {
+                    crate::private_testnet_monetary_wire::encode_candidate_v4_hybrid_monetary_network_block(
+                        &header,
+                        &candidate.block,
+                    )
+                    .unwrap()
+                })
+            })
+            .expect("a nonce meeting the half-range forged target should be found");
+
+        let decoded =
+            decode_candidate_v4_hybrid_monetary_network_block(&wrong_target_envelope).unwrap();
+        assert_eq!(decoded.header.target, forged_target);
+        assert_ne!(decoded.header.target, params.initial_target);
+        assert!(
+            Uint256::from_be_bytes(
+                crate::consensus::pow_digest(&decoded.header, params.pow).unwrap()
+            ) <= decoded.header.target
+        );
+
+        assert!(store
+            .submit(&wrong_target_envelope, &verifier, &FixedClock)
+            .is_err());
+        assert_eq!(store.canonical_height(), 0);
+        assert_eq!(store.canonical_tip(), genesis_tip);
+        assert_eq!(store.archive().archive_len(), 0);
+        assert_eq!(store.manifest_anchor().unwrap(), committed_anchor);
+        let branch_count = fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with(BRANCH_PREFIX) && name.ends_with(BRANCH_SUFFIX)
+            })
+            .count();
+        assert_eq!(branch_count, 0);
+
+        drop(store);
+        let reopened = PrivateTestnetV4HybridForkStore::open(
+            &directory,
+            genesis,
+            params,
+            MANIFEST,
+            &verifier,
+            &FixedClock,
+        )
+        .unwrap();
+        assert_eq!(reopened.canonical_height(), 0);
+        assert_eq!(reopened.canonical_tip(), genesis_tip);
+        assert_eq!(reopened.archive().archive_len(), 0);
+        assert_eq!(reopened.manifest_anchor().unwrap(), committed_anchor);
+        drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn pfm4_rejects_bad_pow_without_publishing_manifest_or_branch() {
         let directory = path("invalid-pow-atomic");
         let genesis = genesis();
