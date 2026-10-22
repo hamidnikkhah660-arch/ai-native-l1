@@ -437,6 +437,67 @@ mod tests {
     }
 
     #[test]
+    fn archive_rebuild_rejects_pow_that_only_meets_a_peer_forged_target() {
+        let p = params();
+        let g = genesis();
+        let verifier = LibcruxMlDsa65VerifierCandidate;
+        let parent = PrivateTestnetChain::new_monetary(g.clone(), p.clone()).unwrap();
+        let block = candidate_block(&g, 100, [3; 32]);
+        let valid = envelope(&parent, &block, &p, 11);
+        let candidate =
+            crate::private_testnet_monetary_wire::decode_candidate_v4_hybrid_monetary_network_block(
+                &valid,
+            )
+            .unwrap();
+        let forged_target = Uint256::from_be_bytes([0x7F; 32]);
+        assert_ne!(forged_target, parent.expected_target(None).unwrap());
+        assert!(forged_target <= p.pow_limit);
+
+        // This envelope models a persisted archive entry that a peer/disk editor rewrote:
+        // the nonce really meets its easier target, but the header target isn't the chain's
+        // consensus-derived target. Recovery must replay consensus, not trust the self-described
+        // target or a locally recomputed block digest/checksum.
+        let forged = (0..256u64)
+            .find_map(|nonce| {
+                let mut header = candidate.header;
+                header.target = forged_target;
+                header.nonce = nonce;
+                let digest = crate::consensus::pow_digest(&header, p.pow).unwrap();
+                (Uint256::from_be_bytes(digest) <= forged_target).then(|| {
+                    encode_candidate_v4_hybrid_monetary_network_block(&header, &candidate.block)
+                        .unwrap()
+                })
+            })
+            .expect("a nonce meeting the half-range forged target should be found");
+
+        let replay_candidate =
+            crate::private_testnet_monetary_wire::decode_candidate_v4_hybrid_monetary_network_block(
+                &forged,
+            )
+            .unwrap();
+        assert_eq!(replay_candidate.header.target, forged_target);
+        assert!(
+            Uint256::from_be_bytes(
+                crate::consensus::pow_digest(&replay_candidate.header, p.pow).unwrap()
+            ) <= replay_candidate.header.target
+        );
+
+        let replay = PrivateTestnetV4HybridForkChoice::rebuild_from_envelopes(
+            g,
+            p,
+            MANIFEST,
+            vec![forged],
+            &verifier,
+        );
+        assert!(matches!(
+            replay,
+            Err(V4HybridForkChoiceError::Consensus(
+                crate::private_testnet_consensus::PrivateConsensusError::ExpectedTargetMismatch
+            ))
+        ));
+    }
+
+    #[test]
     fn pmt4_fork_choice_selects_heavier_branch_and_deterministically_replays_archive() {
         let p = params();
         let g = genesis();
