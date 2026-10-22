@@ -16,17 +16,74 @@ use crate::{
         Block, LedgerState, MonetaryBlock, MonetaryLedgerState, TransactionAuthenticator,
     },
 };
+use std::collections::VecDeque;
+
+/// Candidate safety ceiling for serialized checkpoint target-history entries. This is a
+/// parser/resource guard, not a consensus parameter or a production profile selection.
+pub const MAX_TARGET_HISTORY_CHECKPOINT_ENTRIES: usize = 65_536;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetHistoryCheckpointEntry {
+    pub height: u64,
+    pub target: Uint256,
+    pub timestamp: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetHistoryCheckpoint {
+    pub logical_height: u64,
+    pub start_height: u64,
+    pub entries: Vec<TargetHistoryCheckpointEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetHistoryCheckpointError {
+    InvalidProfile,
+    EntryBudgetExceeded,
+    NonCanonicalRange,
+    EntryHeightMismatch,
+    InvalidGenesisEntry,
+    InvalidTarget,
+    MissingTimestamp,
+    TimestampNotMonotonic,
+    RetargetHistoryInvalid,
+}
+
+impl std::fmt::Display for TargetHistoryCheckpointError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::InvalidProfile => "checkpoint target history has invalid consensus parameters",
+            Self::EntryBudgetExceeded => "checkpoint target history exceeds its entry budget",
+            Self::NonCanonicalRange => "checkpoint target history has a noncanonical height range",
+            Self::EntryHeightMismatch => "checkpoint target history entries are not contiguous",
+            Self::InvalidGenesisEntry => "checkpoint genesis target/timestamp entry is invalid",
+            Self::InvalidTarget => "checkpoint target is zero or above the proof-of-work limit",
+            Self::MissingTimestamp => "checkpoint target history is missing a block timestamp",
+            Self::TimestampNotMonotonic => {
+                "checkpoint target timestamps are not strictly increasing"
+            }
+            Self::RetargetHistoryInvalid => {
+                "checkpoint target history does not match the retarget rules"
+            }
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for TargetHistoryCheckpointError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetHistory {
     params: ConsensusParameters,
-    /// target_after_height[h] is the target used for blocks at height h; index 0 is
-    /// the configured genesis/initial target carried into the first block.
-    targets: Vec<Uint256>,
-    /// Header timestamps indexed by height. The genesis timestamp is intentionally unknown:
-    /// the first retarget window starts at block 1 and uses one nominal target interval to
-    /// account for the interval before that first block.
-    timestamps: Vec<Option<u64>>,
+    /// First logical height represented by both vectors. This is nonzero after restore from a
+    /// bounded checkpoint; vector offsets must never be confused with chain heights.
+    start_height: u64,
+    /// Current logical height, independent of retained vector length after checkpoint restore.
+    logical_height: u64,
+    /// Contiguous target/timestamp records; the front is dropped after each complete window.
+    targets: VecDeque<Uint256>,
+    /// Height zero deliberately has no timestamp; every accepted block height has one.
+    timestamps: VecDeque<Option<u64>>,
 }
 
 impl TargetHistory {
@@ -35,8 +92,10 @@ impl TargetHistory {
         let initial_target = params.initial_target;
         Ok(Self {
             params,
-            targets: vec![initial_target],
-            timestamps: vec![None],
+            start_height: 0,
+            logical_height: 0,
+            targets: VecDeque::from([initial_target]),
+            timestamps: VecDeque::from([None]),
         })
     }
 
@@ -45,11 +104,167 @@ impl TargetHistory {
     }
 
     pub fn height(&self) -> u64 {
-        self.targets.len().saturating_sub(1) as u64
+        self.logical_height
     }
 
     pub fn target_at(&self, height: u64) -> Option<Uint256> {
-        self.targets.get(height as usize).copied()
+        let offset = height.checked_sub(self.start_height)?;
+        let index = usize::try_from(offset).ok()?;
+        self.targets.get(index).copied()
+    }
+
+    fn timestamp_at(&self, height: u64) -> Option<Option<u64>> {
+        let offset = height.checked_sub(self.start_height)?;
+        let index = usize::try_from(offset).ok()?;
+        self.timestamps.get(index).copied()
+    }
+
+    /// Return the canonical bounded target/timestamp suffix needed to resume this consensus
+    /// profile. It does not mutate live history or authenticate a checkpoint by itself.
+    pub fn checkpoint_snapshot(
+        &self,
+    ) -> Result<TargetHistoryCheckpoint, TargetHistoryCheckpointError> {
+        self.params
+            .validate()
+            .map_err(|_| TargetHistoryCheckpointError::InvalidProfile)?;
+        let window = self.params.difficulty_window_blocks;
+        if window > MAX_TARGET_HISTORY_CHECKPOINT_ENTRIES as u64 {
+            return Err(TargetHistoryCheckpointError::EntryBudgetExceeded);
+        }
+        let start_height = if self.logical_height >= window {
+            self.logical_height - window + 1
+        } else {
+            0
+        };
+        let entry_count = self
+            .logical_height
+            .checked_sub(start_height)
+            .and_then(|span| span.checked_add(1))
+            .ok_or(TargetHistoryCheckpointError::NonCanonicalRange)?;
+        if entry_count > MAX_TARGET_HISTORY_CHECKPOINT_ENTRIES as u64 {
+            return Err(TargetHistoryCheckpointError::EntryBudgetExceeded);
+        }
+        let entry_count = usize::try_from(entry_count)
+            .map_err(|_| TargetHistoryCheckpointError::EntryBudgetExceeded)?;
+        let mut entries = Vec::with_capacity(entry_count);
+        for offset in 0..entry_count {
+            let height = start_height
+                .checked_add(offset as u64)
+                .ok_or(TargetHistoryCheckpointError::NonCanonicalRange)?;
+            let target = self
+                .target_at(height)
+                .ok_or(TargetHistoryCheckpointError::NonCanonicalRange)?;
+            let timestamp = self
+                .timestamp_at(height)
+                .ok_or(TargetHistoryCheckpointError::NonCanonicalRange)?;
+            entries.push(TargetHistoryCheckpointEntry {
+                height,
+                target,
+                timestamp,
+            });
+        }
+        Ok(TargetHistoryCheckpoint {
+            logical_height: self.logical_height,
+            start_height,
+            entries,
+        })
+    }
+
+    /// Restore only the bounded target/timestamp history. Callers must independently authenticate
+    /// the enclosing checkpoint, state root, tip digest, chainwork and profile before using it.
+    pub fn from_checkpoint_snapshot(
+        params: ConsensusParameters,
+        snapshot: &TargetHistoryCheckpoint,
+    ) -> Result<Self, TargetHistoryCheckpointError> {
+        params
+            .validate()
+            .map_err(|_| TargetHistoryCheckpointError::InvalidProfile)?;
+        let window = params.difficulty_window_blocks;
+        if window > MAX_TARGET_HISTORY_CHECKPOINT_ENTRIES as u64 {
+            return Err(TargetHistoryCheckpointError::EntryBudgetExceeded);
+        }
+        let expected_start = if snapshot.logical_height >= window {
+            snapshot.logical_height - window + 1
+        } else {
+            0
+        };
+        if snapshot.start_height != expected_start {
+            return Err(TargetHistoryCheckpointError::NonCanonicalRange);
+        }
+        let expected_count = snapshot
+            .logical_height
+            .checked_sub(expected_start)
+            .and_then(|span| span.checked_add(1))
+            .ok_or(TargetHistoryCheckpointError::NonCanonicalRange)?;
+        if expected_count > MAX_TARGET_HISTORY_CHECKPOINT_ENTRIES as u64
+            || usize::try_from(expected_count).ok() != Some(snapshot.entries.len())
+        {
+            return Err(TargetHistoryCheckpointError::EntryBudgetExceeded);
+        }
+
+        let mut previous_timestamp = None;
+        for (offset, entry) in snapshot.entries.iter().enumerate() {
+            let expected_height = expected_start
+                .checked_add(offset as u64)
+                .ok_or(TargetHistoryCheckpointError::NonCanonicalRange)?;
+            if entry.height != expected_height {
+                return Err(TargetHistoryCheckpointError::EntryHeightMismatch);
+            }
+            if entry.target.is_zero() || entry.target > params.pow_limit {
+                return Err(TargetHistoryCheckpointError::InvalidTarget);
+            }
+            if entry.height == 0 {
+                if snapshot.start_height != 0
+                    || entry.timestamp.is_some()
+                    || entry.target != params.initial_target
+                {
+                    return Err(TargetHistoryCheckpointError::InvalidGenesisEntry);
+                }
+            } else {
+                let timestamp = entry
+                    .timestamp
+                    .ok_or(TargetHistoryCheckpointError::MissingTimestamp)?;
+                if previous_timestamp.is_some_and(|previous| timestamp <= previous) {
+                    return Err(TargetHistoryCheckpointError::TimestampNotMonotonic);
+                }
+                previous_timestamp = Some(timestamp);
+            }
+        }
+
+        // Before the first retarget, the checkpoint still carries the complete prefix from
+        // genesis, so it can be independently checked against the selected rules. Once the
+        // prefix has been pruned, authenticating the checkpoint is an external caller duty.
+        if expected_start == 0 {
+            let mut restored =
+                Self::new(params).map_err(|_| TargetHistoryCheckpointError::InvalidProfile)?;
+            for entry in snapshot.entries.iter().skip(1) {
+                let timestamp = entry
+                    .timestamp
+                    .ok_or(TargetHistoryCheckpointError::MissingTimestamp)?;
+                let expected = restored
+                    .expected_target(entry.height, None)
+                    .map_err(|_| TargetHistoryCheckpointError::RetargetHistoryInvalid)?;
+                if entry.target != expected {
+                    return Err(TargetHistoryCheckpointError::RetargetHistoryInvalid);
+                }
+                restored
+                    .record_next(entry.height, entry.target, timestamp)
+                    .map_err(|_| TargetHistoryCheckpointError::RetargetHistoryInvalid)?;
+            }
+            return Ok(restored);
+        }
+
+        Ok(Self {
+            params,
+            start_height: snapshot.start_height,
+            logical_height: snapshot.logical_height,
+            targets: snapshot.entries.iter().map(|entry| entry.target).collect(),
+            timestamps: snapshot
+                .entries
+                .iter()
+                .map(|entry| entry.timestamp)
+                .collect(),
+        })
     }
 
     pub fn expected_target(
@@ -103,18 +318,18 @@ impl TargetHistory {
             .ok_or(PrivateConsensusError::Consensus(
                 ConsensusError::InvalidNextBlockHeight,
             ))?;
-        let first_index = usize::try_from(first_height).map_err(|_| {
-            PrivateConsensusError::Consensus(ConsensusError::InvalidNextBlockHeight)
-        })?;
-        let last_index = usize::try_from(last_height).map_err(|_| {
-            PrivateConsensusError::Consensus(ConsensusError::InvalidNextBlockHeight)
-        })?;
-        let first_timestamp = self.timestamps.get(first_index).copied().flatten().ok_or(
-            PrivateConsensusError::Consensus(ConsensusError::MissingRetargetObservation),
-        )?;
-        let last_timestamp = self.timestamps.get(last_index).copied().flatten().ok_or(
-            PrivateConsensusError::Consensus(ConsensusError::MissingRetargetObservation),
-        )?;
+        let first_timestamp =
+            self.timestamp_at(first_height)
+                .flatten()
+                .ok_or(PrivateConsensusError::Consensus(
+                    ConsensusError::MissingRetargetObservation,
+                ))?;
+        let last_timestamp =
+            self.timestamp_at(last_height)
+                .flatten()
+                .ok_or(PrivateConsensusError::Consensus(
+                    ConsensusError::MissingRetargetObservation,
+                ))?;
         let observed = last_timestamp
             .checked_sub(first_timestamp)
             .ok_or(PrivateConsensusError::InvalidRetargetTimestampRange)?;
@@ -158,7 +373,7 @@ impl TargetHistory {
         }
         if self
             .timestamps
-            .last()
+            .back()
             .copied()
             .flatten()
             .is_some_and(|previous| timestamp <= previous)
@@ -175,8 +390,21 @@ impl TargetHistory {
         timestamp: u64,
     ) -> Result<(), PrivateConsensusError> {
         self.validate_next(height, target, timestamp)?;
-        self.targets.push(target);
-        self.timestamps.push(Some(timestamp));
+        self.targets.push_back(target);
+        self.timestamps.push_back(Some(timestamp));
+        self.logical_height = height;
+        // Keep enough accepted records for the next retarget window, but don't grow the
+        // per-chain history forever. Retain W entries at heights H-W+1..=H once H >= W.
+        if self.targets.len() as u64 > self.params.difficulty_window_blocks {
+            self.targets.pop_front();
+            self.timestamps.pop_front();
+            self.start_height =
+                self.start_height
+                    .checked_add(1)
+                    .ok_or(PrivateConsensusError::Consensus(
+                        ConsensusError::InvalidNextBlockHeight,
+                    ))?;
+        }
         Ok(())
     }
 }
@@ -859,7 +1087,7 @@ mod tests {
         // A missing timestamp in the branch history must not be overridden by an operator's
         // supplied elapsed value, even if that value would otherwise be a valid duration.
         let mut incomplete = history.clone();
-        incomplete.timestamps[1] = None;
+        incomplete.timestamps[0] = None;
         assert_eq!(
             incomplete.expected_target(window + 1, Some(expected)),
             Err(PrivateConsensusError::Consensus(
@@ -916,10 +1144,142 @@ mod tests {
 
         // Each branch must retain monotonically increasing timestamps in its own history.
         let mut malformed = history.clone();
-        malformed.timestamps[window as usize] = Some(first_timestamp - 1);
+        malformed.timestamps[window as usize - 1] = Some(first_timestamp - 1);
         assert_eq!(
             malformed.expected_target(window + 1, None),
             Err(PrivateConsensusError::InvalidRetargetTimestampRange)
+        );
+
+        // Once H=W, live history itself is bounded to logical heights 1..=W.
+        assert_eq!(history.start_height, 1);
+        assert_eq!(history.targets.len(), window as usize);
+        assert_eq!(history.timestamps[0], Some(first_timestamp));
+        assert_eq!(
+            history.timestamps[window as usize - 1],
+            Some(last_timestamp)
+        );
+
+        // A bounded checkpoint at H=W retains logical heights 1..=W. Restore must
+        // preserve absolute heights, including the first default retarget at W+1.
+        let checkpoint = history.checkpoint_snapshot().unwrap();
+        assert_eq!(checkpoint.logical_height, window);
+        assert_eq!(checkpoint.start_height, 1);
+        assert_eq!(checkpoint.entries.len(), window as usize);
+        assert_eq!(checkpoint.entries.first().unwrap().height, 1);
+        assert_eq!(checkpoint.entries.last().unwrap().height, window);
+        let mut restored =
+            TargetHistory::from_checkpoint_snapshot(params.clone(), &checkpoint).unwrap();
+        assert_eq!(restored.height(), window);
+        assert_eq!(restored.target_at(window), history.target_at(window));
+        assert_eq!(
+            restored.expected_target(window + 1, None),
+            history.expected_target(window + 1, None)
+        );
+
+        // Continue both timelines with identical accepted timestamps; target decisions must
+        // remain equal through the second default retarget boundary after another restore.
+        for height in (window + 1)..=(2 * window) {
+            let expected_original = history.expected_target(height, None).unwrap();
+            let expected_restored = restored.expected_target(height, None).unwrap();
+            assert_eq!(expected_restored, expected_original, "height {height}");
+            let timestamp = first_epoch + height * timestamp_step;
+            history
+                .record_next(height, expected_original, timestamp)
+                .unwrap();
+            restored
+                .record_next(height, expected_restored, timestamp)
+                .unwrap();
+        }
+        assert_eq!(restored.start_height, window + 1);
+        assert_eq!(restored.targets.len(), window as usize);
+        assert_eq!(restored.timestamps.len(), window as usize);
+        let second_checkpoint = restored.checkpoint_snapshot().unwrap();
+        assert_eq!(second_checkpoint.start_height, window + 1);
+        assert_eq!(second_checkpoint.entries.len(), window as usize);
+        let restored_again =
+            TargetHistory::from_checkpoint_snapshot(params.clone(), &second_checkpoint).unwrap();
+        assert_eq!(restored_again.height(), 2 * window);
+        assert_eq!(
+            restored_again.expected_target(2 * window + 1, None),
+            history.expected_target(2 * window + 1, None)
+        );
+    }
+
+    #[test]
+    fn target_history_checkpoint_rejects_noncanonical_or_malformed_entries() {
+        let mut params = params();
+        params.difficulty_window_blocks = 8;
+
+        // Before the first window is complete, keep the genesis entry and independently
+        // replay the complete prefix when restoring. A forged historical target must reject.
+        let mut short_history = TargetHistory::new(params.clone()).unwrap();
+        for height in 1..=3 {
+            let expected = short_history.expected_target(height, None).unwrap();
+            short_history
+                .record_next(height, expected, 10 + height)
+                .unwrap();
+        }
+        let short_checkpoint = short_history.checkpoint_snapshot().unwrap();
+        assert_eq!(short_checkpoint.start_height, 0);
+        assert_eq!(short_checkpoint.entries.len(), 4);
+        let restored_short =
+            TargetHistory::from_checkpoint_snapshot(params.clone(), &short_checkpoint).unwrap();
+        assert_eq!(restored_short.height(), 3);
+        assert_eq!(restored_short.target_at(3), short_history.target_at(3));
+        let mut forged_prefix = short_checkpoint.clone();
+        forged_prefix.entries[1].target = Uint256::from_be_bytes([0x01; 32]);
+        assert_eq!(
+            TargetHistory::from_checkpoint_snapshot(params.clone(), &forged_prefix),
+            Err(TargetHistoryCheckpointError::RetargetHistoryInvalid)
+        );
+
+        let mut history = TargetHistory::new(params.clone()).unwrap();
+        for height in 1..=8 {
+            let expected = history.expected_target(height, None).unwrap();
+            history.record_next(height, expected, 100 + height).unwrap();
+        }
+        let good = history.checkpoint_snapshot().unwrap();
+        assert_eq!(good.start_height, 1);
+
+        let mut wrong_start = good.clone();
+        wrong_start.start_height = 0;
+        assert_eq!(
+            TargetHistory::from_checkpoint_snapshot(params.clone(), &wrong_start),
+            Err(TargetHistoryCheckpointError::NonCanonicalRange)
+        );
+
+        let mut wrong_height = good.clone();
+        wrong_height.entries[0].height += 1;
+        assert_eq!(
+            TargetHistory::from_checkpoint_snapshot(params.clone(), &wrong_height),
+            Err(TargetHistoryCheckpointError::EntryHeightMismatch)
+        );
+
+        let mut missing_timestamp = good.clone();
+        missing_timestamp.entries[0].timestamp = None;
+        assert_eq!(
+            TargetHistory::from_checkpoint_snapshot(params.clone(), &missing_timestamp),
+            Err(TargetHistoryCheckpointError::MissingTimestamp)
+        );
+
+        let mut zero_target = good.clone();
+        zero_target.entries[0].target = Uint256::ZERO;
+        assert_eq!(
+            TargetHistory::from_checkpoint_snapshot(params.clone(), &zero_target),
+            Err(TargetHistoryCheckpointError::InvalidTarget)
+        );
+
+        let mut nonmonotonic = good.clone();
+        nonmonotonic.entries[1].timestamp = nonmonotonic.entries[0].timestamp;
+        assert_eq!(
+            TargetHistory::from_checkpoint_snapshot(params.clone(), &nonmonotonic),
+            Err(TargetHistoryCheckpointError::TimestampNotMonotonic)
+        );
+
+        params.difficulty_window_blocks = (MAX_TARGET_HISTORY_CHECKPOINT_ENTRIES as u64) + 1;
+        assert_eq!(
+            TargetHistory::from_checkpoint_snapshot(params, &good),
+            Err(TargetHistoryCheckpointError::EntryBudgetExceeded)
         );
     }
 

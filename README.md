@@ -12,6 +12,7 @@
 - **Current public documentation manifest:** [v1.5 manifest](docs/PUBLIC_RELEASE_MANIFEST_V15_2026-10-22.md)
 - **Gate 2 bounded checkpoint/replay reachability finding:** [CP-0379](docs/CP_0379_GATE2_PFM4_BOUNDED_CHECKPOINT_DESIGN_2026-10-22.md) — durable logical height, retained archive, retarget history, halving, and trust requirements; no production cap changes.
 - **Gate 2 checkpoint schema and trust-boundary proposal:** [CP-0380](docs/CP_0380_GATE2_CHECKPOINT_SCHEMA_THREAT_MODEL_2026-10-22.md) - proposed PCP4/PFM5 record layout, logical-height retarget-history requirements, rollback/freshness assumptions and adversarial acceptance criteria; design only, no runtime implementation.
+- **Gate 2 bounded target-history snapshot candidate (CP-0381):** [Snapshot/restore tests and limits](docs/CP_0381_BOUNDED_TARGET_HISTORY_SNAPSHOT_2026-10-22.md) - in-memory support only; no PCP4 codec, durable checkpoint persistence, integrated canonical fork-choice/reorg, or independent trust proof.
 - **Publication checkpoint:** [CP-0344](docs/CP_0344_PUBLIC_DOCUMENTATION_REFRESH_2026-10-20.md)
 - **Founder/sponsor/contributor economics:** [Allocation policy v0.3](docs/FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V03.md)
 - **Current curated source baseline:** [v0.1.1-source](https://github.com/hamidnikkhah660-arch/ai-native-l1/releases/tag/v0.1.1-source)
