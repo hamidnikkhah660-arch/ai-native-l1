@@ -349,6 +349,7 @@ pub enum ConsensusError {
     InvalidProtocolVersion,
     InvalidNetworkId,
     InvalidTarget,
+    InvalidBlockHeight,
     TargetAbovePowLimit,
     InvalidPowMemory,
     InvalidPowParameters,
@@ -372,6 +373,7 @@ impl std::fmt::Display for ConsensusError {
             Self::InvalidProtocolVersion => write!(f, "protocol version must be non-zero"),
             Self::InvalidNetworkId => write!(f, "network ID must be non-zero"),
             Self::InvalidTarget => write!(f, "target must be non-zero"),
+            Self::InvalidBlockHeight => write!(f, "native block height must be positive"),
             Self::TargetAbovePowLimit => write!(f, "target exceeds the configured PoW limit"),
             Self::InvalidPowMemory => write!(f, "PoW memory parameter is below the minimum"),
             Self::InvalidPowParameters => write!(f, "PoW parameters are invalid"),
@@ -480,16 +482,22 @@ pub fn retarget_target(
     Ok(adjusted.min(params.pow_limit))
 }
 
-/// Expected canonical block subsidy at a given height from validated supply state.
+/// Expected subsidy for a 1-based native block height and validated pre-block total supply.
+///
+/// The shared schedule indexes its first era at height 0, while native blocks begin at height 1
+/// after Genesis. Convert exactly once here so halving boundaries align with MonetaryLedgerState.
 pub fn expected_block_subsidy(
     block_height: u64,
     current_supply_atoms: u128,
     params: &ConsensusParameters,
 ) -> Result<u128, ConsensusError> {
     params.validate()?;
+    let schedule_height = block_height
+        .checked_sub(1)
+        .ok_or(ConsensusError::InvalidBlockHeight)?;
     params
         .issuance
-        .reward_for_block(block_height, current_supply_atoms)
+        .reward_for_block(schedule_height, current_supply_atoms)
         .map_err(ConsensusError::Issuance)
 }
 
@@ -861,19 +869,36 @@ mod tests {
     }
 
     #[test]
-    fn issuance_is_wired_to_the_explicit_consensus_profile() {
+    fn issuance_is_wired_to_one_based_native_heights_and_exact_halving_boundaries() {
         let params = ConsensusParameters::candidate_testnet().unwrap();
+        let genesis_supply = crate::state_machine::MONETARY_FOUNDER_ALLOCATION_ATOMS
+            + crate::state_machine::MONETARY_PUBLIC_GOODS_BUDGET_ATOMS;
+        let initial = crate::state_machine::MONETARY_INITIAL_SUBSIDY_ATOMS;
+        let halving = crate::state_machine::MONETARY_BLOCKS_PER_HALVING;
+
+        // Height 1 is the first block after Genesis. Height H still belongs to era 0;
+        // the first halved reward belongs to height H+1.
         assert_eq!(
-            expected_block_subsidy(0, 0, &params).unwrap(),
-            35_673_515_981
+            expected_block_subsidy(1, genesis_supply, &params),
+            Ok(initial)
+        );
+        let supply_before_last_full_reward = genesis_supply + initial * (halving as u128 - 1);
+        assert_eq!(
+            expected_block_subsidy(halving, supply_before_last_full_reward, &params),
+            Ok(initial)
+        );
+        let supply_after_first_era = genesis_supply + initial * halving as u128;
+        assert_eq!(
+            expected_block_subsidy(halving + 1, supply_after_first_era, &params),
+            Ok(initial / 2)
         );
         assert_eq!(
-            expected_block_subsidy(4_204_800, 0, &params).unwrap(),
-            17_836_757_990
+            expected_block_subsidy(1, params.issuance.maximum_supply(), &params),
+            Ok(0)
         );
         assert_eq!(
-            expected_block_subsidy(0, params.issuance.maximum_supply(), &params).unwrap(),
-            0
+            expected_block_subsidy(0, genesis_supply, &params),
+            Err(ConsensusError::InvalidBlockHeight)
         );
     }
 
