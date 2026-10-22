@@ -15,6 +15,7 @@
 - **Founder profile and collaboration contact:** [Founder / AI research profile](docs/FOUNDER_PROFILE_AND_COLLABORATION.md) - email: [hamidnikkhah660@gmail.com](mailto:hamidnikkhah660@gmail.com?subject=QuantumZXB%20collaboration)
 - **Fixed-scope paid engineering offer (G1):** [Rust/protocol reproducibility and AI/ML sprint, deliverables, acceptance criteria, and payment terms](docs/ENGINEERING_SERVICE_OFFER_V01.md)
 - **Public launch compliance / G0 readiness (not legal advice):** [MiCAR, donation status, payout and owner-side verification checklist](docs/CP_0372_G0_PUBLIC_LAUNCH_COMPLIANCE_CHECKLIST_2026-10-22.md)
+- **Mainnet architecture boundary (Gate 2 / Gate 8):** [PMT4/PFM4 runtime, loopback-only smoke limits and production prerequisites](docs/CP_0373_GATE2_PFM4_RUNTIME_PRODUCTION_BOUNDARY_2026-10-22.md)
 - **Mining, halving and performance evidence:** [Candidate parameters and benchmark methodology](docs/MINING_HALVING_PERFORMANCE_AND_SCALING_V01.md)
 - **Liquidity, market-data and public launch readiness:** [Platform prerequisites, cash-flow options and launch blockers](docs/LIQUIDITY_MARKET_DATA_AND_PUBLIC_LAUNCH_READINESS_V01.md)
 - **Owner's zero-budget launch and liquidity directive:** [Persistent launch gate and fresh-session handoff](docs/OWNER_DIRECTIVE_ZERO_BUDGET_LAUNCH_AND_LIQUIDITY_GATE_V01_2026-10-21.md) - [live execution issue #12](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/12)
@@ -23,7 +24,7 @@
 
 ## Support QuantumZXB's open-source development
 
-QuantumZXB has a live direct fundraising page on Giveth. Donations are voluntary support for public-benefit open-source engineering, reproducible testing, technical documentation, developer tools, and independent technical review when resources are available.
+QuantumZXB has a project page on Giveth; check the [official campaign page](https://giveth.io/project/quantumzxb) directly for its current status and any available donation options. Wallet control, actual receipts, payout access, gas or third-party costs, and tax treatment are not certified by this repository. Donations, if available, are voluntary support for public-benefit open-source engineering, reproducible testing, technical documentation, developer tools, and independent technical review when resources are available.
 
 **[Support QuantumZXB on Giveth](https://giveth.io/project/quantumzxb)**
 
