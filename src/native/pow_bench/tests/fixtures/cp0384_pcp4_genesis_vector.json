@@ -1,0 +1,48 @@
+{
+    "schema_version":  1,
+    "network_id_hex":  "8181818181818181818181818181818181818181818181818181818181818181",
+    "genesis_fingerprint_hex":  "744045b15bfe3eea58c1774d9b1f43e0d005812d9a995cc34a607c24586e8d6a",
+    "profile_fingerprint_hex":  "c0b338a015e11f1adcf85c4ce6cb4aa8505ffe17601151d9dc14ea85337e3020",
+    "transaction_manifest_id_hex":  "4444444444444444444444444444444444444444444444444444444444444444",
+    "logical_height":  0,
+    "consensus_tip_digest_hex":  "0000000000000000000000000000000000000000000000000000000000000000",
+    "ledger_tip_hash_hex":  "0000000000000000000000000000000000000000000000000000000000000000",
+    "monetary_state_root_hex":  "074c14c27b2b2888df066d8836d828c7e3be546afdf1dcd54c85bf3e42fd78bf",
+    "total_mined_atoms":  0,
+    "cumulative_chainwork_hex":  "0000000000000000000000000000000000000000000000000000000000000000",
+    "parent_checkpoint_commitment_hex":  "0000000000000000000000000000000000000000000000000000000000000000",
+    "monetary_snapshot_hex":  "4d5354330003b69472fed8a6f48791ecb1ee62079c1efe49211b9edd5939fe98c4ce5dd8024c00000000000000000000000000000000000000e253545632000281818181818181818181818181818181818181818181818181818181818181810000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000021111111111111111111111111111111111111111111111111111111111111111058d15e176280000000000000000000022222222222222222222222222222222222222222222222222222222222222220429d069189e000000000000000000005c856e04f30fc3c018d21f75364852ad369d009dca992b438fb3d57cffca3e0fa986dbc778f26917497909b0d8c4b1ec322bbc343aa3a49c05d4a3abf493fb16",
+    "target_history_start_height":  0,
+    "target_history":  [
+                           {
+                               "timestamp":  0,
+                               "target_hex":  "007fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                               "timestamp_present":  0,
+                               "height":  0
+                           }
+                       ],
+    "profile":  {
+                    "monetary_initial_subsidy_atoms":  "35673515981",
+                    "difficulty_max_ratio":  4,
+                    "pow_memory_kib":  65536,
+                    "issuance_maximum_supply_atoms":  "1000000000000000000",
+                    "target_block_time_secs":  30,
+                    "protocol_version":  1,
+                    "issuance_blocks_per_halving":  4204800,
+                    "atoms_per_coin":  "100000000",
+                    "pow_output_bytes":  32,
+                    "miner_budget_atoms":  "300000000000000000",
+                    "founder_allocation_atoms":  "400000000000000000",
+                    "pow_lanes":  1,
+                    "pow_algorithm_id":  1,
+                    "public_goods_budget_atoms":  "300000000000000000",
+                    "difficulty_min_ratio_divisor":  4,
+                    "pow_limit_hex":  "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    "initial_target_hex":  "007fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    "maximum_supply_atoms":  "1000000000000000000",
+                    "difficulty_window_blocks":  2016,
+                    "pow_iterations":  1,
+                    "monetary_blocks_per_halving":  4204800,
+                    "issuance_initial_subsidy_atoms":  "35673515981"
+                }
+}
