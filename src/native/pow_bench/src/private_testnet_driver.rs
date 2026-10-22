@@ -118,6 +118,9 @@ impl PrivateTestnetChain {
         state: MonetaryLedgerState,
         params: ConsensusParameters,
     ) -> Result<Self, ConsensusError> {
+        // State transitions currently consume the frozen candidate constants in state_machine;
+        // reject a PoW profile that would claim different issuance economics in its fingerprint.
+        params.validate_monetary_execution_compatibility()?;
         let ledger_view = state.ledger().clone();
         let tip_consensus_hash = state.tip_hash();
         Ok(Self {

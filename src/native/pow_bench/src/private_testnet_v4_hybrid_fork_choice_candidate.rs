@@ -98,7 +98,7 @@ impl PrivateTestnetV4HybridForkChoice {
         expected_manifest_id: [u8; 32],
     ) -> Result<Self, V4HybridForkChoiceError> {
         params
-            .validate()
+            .validate_monetary_execution_compatibility()
             .map_err(V4HybridForkChoiceError::InvalidPow)?;
         if expected_manifest_id.iter().all(|byte| *byte == 0) {
             return Err(V4HybridForkChoiceError::ReplayIncomplete);
@@ -380,6 +380,22 @@ mod tests {
         )
         .unwrap()
     }
+    #[test]
+    fn fork_choice_refuses_issuance_profile_not_bound_to_monetary_state_machine() {
+        let mut mismatched = params();
+        mismatched.issuance = crate::issuance_schedule::IssuanceParameters::new(
+            mismatched.issuance.maximum_supply(),
+            mismatched.issuance.initial_subsidy() + 1,
+            mismatched.issuance.blocks_per_halving(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            PrivateTestnetV4HybridForkChoice::new(genesis(), mismatched, MANIFEST).unwrap_err(),
+            V4HybridForkChoiceError::InvalidPow(ConsensusError::MonetaryIssuanceProfileMismatch)
+        );
+    }
+
     fn candidate_block(
         state: &MonetaryLedgerState,
         timestamp: u64,
