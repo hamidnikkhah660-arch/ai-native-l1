@@ -64,6 +64,8 @@ pub mod private_testnet_archive_range_server_candidate;
 pub mod private_testnet_archive_range_store_candidate;
 /// Research-only bounded paginated archive planner; not wired into node or public wire.
 pub mod private_testnet_archive_sync_candidate;
+/// Candidate-only canonical PCP4 snapshot codec; not yet durable-store or fork-choice integrated.
+pub mod private_testnet_checkpoint_candidate;
 pub mod private_testnet_consensus;
 pub mod private_testnet_driver;
 /// Candidate-only bounded branch archive and cumulative-work fork-choice/replay.
