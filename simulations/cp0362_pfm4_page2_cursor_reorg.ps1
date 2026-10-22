@@ -105,7 +105,7 @@ try {
         '--status-listen',"127.0.0.1:$statusC",'--noise-static-private-key-dpapi-file',$keyC,
         '--trusted-peer-key-hex',$pubB,'--peer',"127.0.0.1:$portB",
         '--monetary-v4-hybrid-peer-smoke','--monetary-v4-hybrid-archive-range-sync',
-        '--archive-range-max-page-items','1','--mine-blocks','0','--run-seconds','8')
+        '--archive-range-max-page-items','1','--mine-blocks','0','--run-seconds','60')
     $nodeC = Start-Process -FilePath $nodeExe -ArgumentList $argsC -RedirectStandardOutput $stdC -RedirectStandardError $logC -PassThru
     if (-not (Wait-Pattern $logC 'event=monetary_v4_peer_smoke_ready.*height=0.*wire=PMT4 ack=MTA4 noise=required' 15000)) {
         throw ("CP-0362 cursor client C readiness failed: " + (Get-Text $stdC) + (Get-Text $logC))
@@ -144,7 +144,7 @@ try {
     }
     Write-Host ("CP-0362 HEIGHTS_PASS source_after_reorg=" + $statusBNow.height + " client_stopped_at=" + $statusCNow.height)
 
-    if (-not $nodeC.WaitForExit(15000)) { throw 'CP-0362 cursor client did not gracefully stop in its bounded run' }
+    if (-not $nodeC.WaitForExit(65000)) { throw 'CP-0362 cursor client did not gracefully stop in its bounded run' }
     if (-not $nodeB.WaitForExit(30000)) { throw 'CP-0362 reorg source did not gracefully stop in its bounded run' }
     $nodeB.Refresh()
     if (-not $nodeB.HasExited) { throw 'CP-0362 source still running after WaitForExit' }

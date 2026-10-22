@@ -2201,6 +2201,95 @@ mod tests {
     }
 
     #[test]
+    fn pfm4_rejects_bad_pow_without_publishing_manifest_or_branch() {
+        let directory = path("invalid-pow-atomic");
+        let genesis = genesis();
+        let mut params = params();
+        let mut target_bytes = [0u8; 32];
+        target_bytes[31] = 1;
+        params.initial_target = Uint256::from_be_bytes(target_bytes);
+        params.pow_limit = Uint256::MAX;
+        params.validate().unwrap();
+
+        let verifier = LibcruxMlDsa65VerifierCandidate;
+        let mut store = PrivateTestnetV4HybridForkStore::open(
+            &directory,
+            genesis.clone(),
+            params.clone(),
+            MANIFEST,
+            &verifier,
+            &FixedClock,
+        )
+        .unwrap();
+        let genesis_tip = store.canonical_tip();
+        let committed_anchor = store.manifest_anchor().unwrap();
+        let candidate = decode_candidate_v4_hybrid_monetary_network_block(&first_block_envelope(
+            &genesis, &params,
+        ))
+        .unwrap();
+
+        // Keep the body, state root, target and ancestry valid, but deliberately choose a nonce
+        // whose digest is above the expected target. This isolates the PoW gate from body checks.
+        let invalid_pow_envelope = (0..256u64)
+            .find_map(|nonce| {
+                let mut header = candidate.header;
+                header.nonce = nonce;
+                let digest = pow_digest(&header, params.pow).unwrap();
+                (Uint256::from_be_bytes(digest) > header.target).then(|| {
+                    crate::private_testnet_monetary_wire::encode_candidate_v4_hybrid_monetary_network_block(
+                        &header,
+                        &candidate.block,
+                    )
+                    .unwrap()
+                })
+            })
+            .expect("a nonce above target 1 must be found in the bounded search");
+
+        let decoded =
+            decode_candidate_v4_hybrid_monetary_network_block(&invalid_pow_envelope).unwrap();
+        assert_eq!(decoded.header.target, Uint256::from_be_bytes(target_bytes));
+        assert!(
+            Uint256::from_be_bytes(pow_digest(&decoded.header, params.pow).unwrap())
+                > decoded.header.target
+        );
+
+        assert!(store
+            .submit(&invalid_pow_envelope, &verifier, &FixedClock)
+            .is_err());
+        assert_eq!(store.canonical_height(), 0);
+        assert_eq!(store.canonical_tip(), genesis_tip);
+        assert_eq!(store.archive().archive_len(), 0);
+        assert_eq!(store.manifest_anchor().unwrap(), committed_anchor);
+        let branch_count = fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with(BRANCH_PREFIX) && name.ends_with(BRANCH_SUFFIX)
+            })
+            .count();
+        assert_eq!(branch_count, 0);
+
+        drop(store);
+        let reopened = PrivateTestnetV4HybridForkStore::open(
+            &directory,
+            genesis,
+            params,
+            MANIFEST,
+            &verifier,
+            &FixedClock,
+        )
+        .unwrap();
+        assert_eq!(reopened.canonical_height(), 0);
+        assert_eq!(reopened.canonical_tip(), genesis_tip);
+        assert_eq!(reopened.archive().archive_len(), 0);
+        assert_eq!(reopened.manifest_anchor().unwrap(), committed_anchor);
+        drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn pfm4_reorg_winner_and_state_survive_restart_and_parent_first_replay() {
         let directory = path("reorg-reopen");
         let genesis = genesis();
