@@ -34,7 +34,7 @@ pub const MAX_PCP4_MONETARY_SNAPSHOT_BYTES: usize =
     MAX_ENCODED_SNAPSHOT_BYTES + MONETARY_SNAPSHOT_OVERHEAD;
 pub const MAX_PCP4_RECORD_BYTES: usize = 9 * 1024 * 1024;
 // Includes header, all fixed metadata, variable snapshot/history, and trailing checksum.
-const PCP4_FIXED_RECORD_BYTES: usize = 372;
+pub const PCP4_FIXED_RECORD_BYTES: usize = 372;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pcp4CheckpointError {

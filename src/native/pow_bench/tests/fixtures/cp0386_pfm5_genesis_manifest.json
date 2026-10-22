@@ -1,0 +1,10 @@
+{
+    "schema_version":  1,
+    "generation":  1,
+    "parent_manifest_commitment_hex":  "0000000000000000000000000000000000000000000000000000000000000000",
+    "canonical_tip_height":  0,
+    "canonical_tip_digest_hex":  "0000000000000000000000000000000000000000000000000000000000000000",
+    "branch_digests_hex":  [
+
+                           ]
+}
