@@ -131,3 +131,17 @@ A larger nominal reward does not mean larger real-world earnings. Miner profitab
 3. Integrate the chosen EVM execution path into canonical state and RPC, with matching receipts/state roots across independent nodes.
 4. Operate a zero-value multi-operator devnet and publish reproducible TPS, latency, CPU/RAM, sync and uptime measurements.
 5. Complete independent protocol/cryptography review before describing any of the above as production-qualified.
+
+## 11. Reproducible candidate curve chart
+
+The public site now includes two clearly labelled, modelled SVG charts: per-block subsidy across halving eras (log2-scale steps) and cumulative mining-budget emission. These charts are not live telemetry, a price chart, a circulating-supply series, or a production consensus guarantee.
+
+Regenerate the per-era data and SVG section from the integer candidate profile:
+
+    python simulations/candidate_halving_curve.py --write
+
+Check that the committed CSV and rendered HTML match the arithmetic:
+
+    python simulations/candidate_halving_curve.py
+
+The script writes simulations/candidate_halving_curve.csv with every nonzero subsidy epoch, inclusive height boundaries, per-block subsidy, per-era issuance and cumulative modeled issuance. Decimal values are formatted from integer atomic units, not floating-point calculations. The data remains a candidate simulation until Gate 2 closes.
