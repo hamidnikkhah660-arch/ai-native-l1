@@ -23,9 +23,9 @@ The fixture under `src/native/pow_bench/tests/fixtures/` uses only deterministic
 - The six focused PCP4 tests cover Genesis and non-Genesis encode/decode round trips, monetary metadata binding to the embedded snapshot, checksum/length/version/flags rejection, network/manifest/profile/Genesis binding, history/genesis consistency, and pre-allocation history range enforcement.
 - `cargo fmt --all -- --check` passed on the local Windows checkout.
 - `cargo check --lib --locked --offline` passed on the local Windows checkout (with existing unrelated unused/dead-code warnings).
-- `cargo test --all-targets --locked --offline -- --test-threads=1` exited 0 on Windows; the library reports 766 passed, 0 failed, in 435.70 seconds. `devnet_node` passed 36/36, `private_testnet_node` passed 36/36, and all other binary, integration/vector and example targets completed successfully. The full process runtime was 626.22 seconds.
+- Historical local Windows run: `cargo test --all-targets --locked --offline -- --test-threads=1` exited 0 before the sixth, non-Genesis focused test was added. At that revision the library reported 766 passed, 0 failed, in 435.70 seconds; `devnet_node` and `private_testnet_node` each reported 36/36, and the other targets completed. Full process runtime was 626.22 seconds. This count is historical and is not presented as the final-head count.
 - `python simulations/verify_cp0384_pcp4_golden_vector.py` passed: the independent Python encoder reproduced the checked-in 737-byte Rust golden vector exactly.
-- The GitHub Actions test matrix for the CP-0384 PR must also pass before merge. Local tests do not constitute independent protocol/security review or production deployment evidence.
+- Final-head GitHub Actions run `39813210390` passed both required jobs before PR #53 was merged. The Linux `Format, check, and test` job ran `cargo +stable test --all-targets --locked -- --test-threads=1`; the library reported 764 passed, 0 failed (including the non-Genesis PCP4 test), and `private_testnet_node` reported 36/36. The Windows PMT4/TXN4 two-node loopback job also passed. Local/CI tests do not constitute independent protocol/security review or production deployment evidence.
 
 ## Trust boundary - not a launch feature
 
