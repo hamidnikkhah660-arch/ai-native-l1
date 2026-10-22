@@ -4,17 +4,23 @@
 //! validates it through ChainAdmissionBoundary, commits the canonical snapshot, and
 //! only then publishes the new in-memory state. Research/testbed integration only.
 
+use crate::v4_account_identity_candidate::MlDsa65Verifier;
 use crate::{
     chain_admission::{
         BlockAdmissionReceipt, ChainAdmissionBoundary, ChainAdmissionError, ReferenceTimeProvider,
     },
     snapshot_store::{self, SnapshotStoreError},
     state_machine::{
-        decode_block, LedgerState, StateError, TransactionAuthenticator, MAX_ENCODED_BLOCK_BYTES,
+        decode_block, decode_v4_hybrid_monetary_block, LedgerState, MonetaryLedgerState,
+        StateError, TransactionAuthenticator, V4HybridMonetaryBlock, MAX_ENCODED_BLOCK_BYTES,
+        MAX_ENCODED_SNAPSHOT_BYTES,
     },
 };
+use sha2::{Digest, Sha256};
 use std::{
     fmt,
+    fs::File,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -23,6 +29,9 @@ pub enum ChainImportError {
     State(StateError),
     Admission(ChainAdmissionError),
     Storage(SnapshotStoreError),
+    InvalidMonetaryProfile,
+    MonetaryProfileMismatch,
+    MonetaryGenesisMismatch,
 }
 
 impl fmt::Display for ChainImportError {
@@ -31,6 +40,24 @@ impl fmt::Display for ChainImportError {
             Self::State(error) => write!(f, "block decode failed: {error:?}"),
             Self::Admission(error) => write!(f, "block admission rejected: {error:?}"),
             Self::Storage(error) => write!(f, "durable snapshot commit failed: {error}"),
+            Self::InvalidMonetaryProfile => {
+                write!(
+                    f,
+                    "the MBK4 import profile needs Genesis at height zero and non-zero network and manifest IDs"
+                )
+            }
+            Self::MonetaryProfileMismatch => {
+                write!(
+                    f,
+                    "the persisted snapshot is bound to a different network or manifest"
+                )
+            }
+            Self::MonetaryGenesisMismatch => {
+                write!(
+                    f,
+                    "the persisted snapshot was initialized from a different Genesis state"
+                )
+            }
         }
     }
 }
@@ -142,6 +169,300 @@ where
     }
 }
 
+/// Candidate-only durable state importer for the explicit MBK4/TXN4 monetary profile.
+///
+/// Unlike the legacy BLK2 importer above, this service persists the monetary issuance counter,
+/// network ID, manifest ID, and a fingerprint of the exact supplied Genesis state. It validates
+/// a staged state, atomically commits its profile-bound snapshot, and only then publishes memory.
+/// This layer does not verify PoW headers, chainwork, or fork choice; callers must validate those
+/// first. Its checksum detects accidental corruption, not malicious tampering, and it has no
+/// external anti-rollback anchor. The canonical TCP node is not dispatched to this service.
+const MCS4_SNAPSHOT_MAGIC: [u8; 4] = *b"MCS4";
+const MCS4_SNAPSHOT_VERSION: u16 = 1;
+const MCS4_SNAPSHOT_CHECKSUM_DOMAIN: &[u8] = b"AIN1-MCS4-PROFILE-SNAPSHOT-CHECK-V1\0";
+const MCS4_GENESIS_FINGERPRINT_DOMAIN: &[u8] = b"AIN1-MCS4-GENESIS-SNAPSHOT-FINGERPRINT-V1\0";
+const MCS4_SNAPSHOT_HEADER_LEN: usize = 4 + 2 + 32 + 32 + 32 + 4;
+const MCS4_SNAPSHOT_CHECKSUM_LEN: usize = 32;
+const MONETARY_SNAPSHOT_INNER_OVERHEAD: usize = 4 + 2 + 32 + 16 + 4 + 32;
+const MAX_MCS4_SNAPSHOT_BYTES: usize = MAX_ENCODED_SNAPSHOT_BYTES
+    + MONETARY_SNAPSHOT_INNER_OVERHEAD
+    + MCS4_SNAPSHOT_HEADER_LEN
+    + MCS4_SNAPSHOT_CHECKSUM_LEN;
+
+fn mcs4_snapshot_checksum(payload: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(MCS4_SNAPSHOT_CHECKSUM_DOMAIN);
+    hasher.update(payload);
+    hasher.finalize().into()
+}
+
+fn mcs4_genesis_fingerprint(genesis_snapshot: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(MCS4_GENESIS_FINGERPRINT_DOMAIN);
+    hasher.update(genesis_snapshot);
+    hasher.finalize().into()
+}
+
+fn encode_mcs4_snapshot(
+    state: &MonetaryLedgerState,
+    expected_manifest_id: &[u8; 32],
+    genesis_fingerprint: &[u8; 32],
+) -> Result<Vec<u8>, ChainImportError> {
+    let network_id = state.ledger().network_id();
+    if network_id.iter().all(|byte| *byte == 0)
+        || expected_manifest_id.iter().all(|byte| *byte == 0)
+    {
+        return Err(ChainImportError::InvalidMonetaryProfile);
+    }
+    let nested = state.encode_snapshot()?;
+    let nested_len = u32::try_from(nested.len()).map_err(|_| StateError::Malformed)?;
+    let mut bytes =
+        Vec::with_capacity(MCS4_SNAPSHOT_HEADER_LEN + nested.len() + MCS4_SNAPSHOT_CHECKSUM_LEN);
+    bytes.extend_from_slice(&MCS4_SNAPSHOT_MAGIC);
+    bytes.extend_from_slice(&MCS4_SNAPSHOT_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&network_id);
+    bytes.extend_from_slice(expected_manifest_id);
+    bytes.extend_from_slice(genesis_fingerprint);
+    bytes.extend_from_slice(&nested_len.to_be_bytes());
+    bytes.extend_from_slice(&nested);
+    let checksum = mcs4_snapshot_checksum(&bytes);
+    bytes.extend_from_slice(&checksum);
+
+    let restored = decode_mcs4_snapshot(
+        &bytes,
+        &network_id,
+        expected_manifest_id,
+        genesis_fingerprint,
+    )?;
+    if restored != *state {
+        return Err(StateError::SnapshotNonCanonical.into());
+    }
+    Ok(bytes)
+}
+
+fn decode_mcs4_snapshot(
+    bytes: &[u8],
+    expected_network_id: &[u8; 32],
+    expected_manifest_id: &[u8; 32],
+    expected_genesis_fingerprint: &[u8; 32],
+) -> Result<MonetaryLedgerState, ChainImportError> {
+    if bytes.len() > MAX_MCS4_SNAPSHOT_BYTES {
+        return Err(StateError::Oversize {
+            actual: bytes.len(),
+            limit: MAX_MCS4_SNAPSHOT_BYTES,
+        }
+        .into());
+    }
+    if bytes.len() < MCS4_SNAPSHOT_HEADER_LEN + MCS4_SNAPSHOT_CHECKSUM_LEN {
+        return Err(StateError::Malformed.into());
+    }
+    let payload_len = bytes.len() - MCS4_SNAPSHOT_CHECKSUM_LEN;
+    let actual_checksum = mcs4_snapshot_checksum(&bytes[..payload_len]);
+    if bytes[payload_len..] != actual_checksum[..] {
+        return Err(StateError::MonetarySnapshotChecksumMismatch.into());
+    }
+    if bytes[..4] != MCS4_SNAPSHOT_MAGIC {
+        return Err(StateError::BadMagic.into());
+    }
+    let version = u16::from_be_bytes([bytes[4], bytes[5]]);
+    if version != MCS4_SNAPSHOT_VERSION {
+        return Err(StateError::UnsupportedVersion(version).into());
+    }
+    let network_id: [u8; 32] = bytes[6..38].try_into().map_err(|_| StateError::Malformed)?;
+    if &network_id != expected_network_id {
+        return Err(StateError::SnapshotNetworkMismatch.into());
+    }
+    let manifest_id: [u8; 32] = bytes[38..70]
+        .try_into()
+        .map_err(|_| StateError::Malformed)?;
+    if &manifest_id != expected_manifest_id {
+        return Err(ChainImportError::MonetaryProfileMismatch);
+    }
+    let genesis_fingerprint: [u8; 32] = bytes[70..102]
+        .try_into()
+        .map_err(|_| StateError::Malformed)?;
+    if &genesis_fingerprint != expected_genesis_fingerprint {
+        return Err(ChainImportError::MonetaryGenesisMismatch);
+    }
+    let nested_len = u32::from_be_bytes(
+        bytes[102..106]
+            .try_into()
+            .map_err(|_| StateError::Malformed)?,
+    ) as usize;
+    let nested_start = MCS4_SNAPSHOT_HEADER_LEN;
+    let nested_end = nested_start
+        .checked_add(nested_len)
+        .ok_or(StateError::Malformed)?;
+    if nested_end != payload_len || nested_len == 0 {
+        return Err(StateError::Malformed.into());
+    }
+    let restored = MonetaryLedgerState::decode_snapshot(
+        &bytes[nested_start..nested_end],
+        expected_network_id,
+    )?;
+    if restored.ledger().network_id() != *expected_network_id {
+        return Err(StateError::SnapshotNetworkMismatch.into());
+    }
+    Ok(restored)
+}
+
+fn load_mcs4_snapshot(
+    path: &Path,
+    expected_network_id: &[u8; 32],
+    expected_manifest_id: &[u8; 32],
+    expected_genesis_fingerprint: &[u8; 32],
+) -> Result<MonetaryLedgerState, ChainImportError> {
+    let file = File::open(path).map_err(SnapshotStoreError::from)?;
+    let length = file.metadata().map_err(SnapshotStoreError::from)?.len();
+    if length > MAX_MCS4_SNAPSHOT_BYTES as u64 {
+        return Err(StateError::Oversize {
+            actual: usize::try_from(length).unwrap_or(usize::MAX),
+            limit: MAX_MCS4_SNAPSHOT_BYTES,
+        }
+        .into());
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    file.take(MAX_MCS4_SNAPSHOT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(SnapshotStoreError::from)?;
+    decode_mcs4_snapshot(
+        &bytes,
+        expected_network_id,
+        expected_manifest_id,
+        expected_genesis_fingerprint,
+    )
+}
+
+fn save_mcs4_snapshot(
+    path: &Path,
+    state: &MonetaryLedgerState,
+    expected_manifest_id: &[u8; 32],
+    genesis_fingerprint: &[u8; 32],
+) -> Result<(), ChainImportError> {
+    let bytes = encode_mcs4_snapshot(state, expected_manifest_id, genesis_fingerprint)?;
+    snapshot_store::atomic_write_bytes_with_hook(path, &bytes, |_| Ok(()))?;
+    Ok(())
+}
+
+/// Linear canonical-profile admission plus profile-bound durable recovery for MBK4/TXN4.
+///
+/// Fork selection remains the responsibility of the selected branch/fork-choice layer. This
+/// service only admits the candidate canonical successor; it is deliberately not node-wired.
+pub struct V4HybridMonetaryImportService<C, V> {
+    state: MonetaryLedgerState,
+    admission: ChainAdmissionBoundary,
+    verifier: V,
+    expected_manifest_id: [u8; 32],
+    genesis_fingerprint: [u8; 32],
+    clock: C,
+    snapshot_path: PathBuf,
+    _writer_lock: snapshot_store::SnapshotWriterLock,
+}
+
+impl<C, V> V4HybridMonetaryImportService<C, V>
+where
+    C: ReferenceTimeProvider,
+    V: MlDsa65Verifier,
+{
+    /// Open only if the supplied state, network and manifest form one explicit non-zero profile.
+    /// Existing snapshots from a different network or manifest are rejected, never migrated.
+    pub fn open(
+        initial_state: MonetaryLedgerState,
+        admission: ChainAdmissionBoundary,
+        expected_manifest_id: [u8; 32],
+        verifier: V,
+        clock: C,
+        snapshot_path: impl AsRef<Path>,
+    ) -> Result<Self, ChainImportError> {
+        let snapshot_path = snapshot_path.as_ref().to_path_buf();
+        let network_id = initial_state.ledger().network_id();
+        if network_id.iter().all(|byte| *byte == 0)
+            || expected_manifest_id.iter().all(|byte| *byte == 0)
+            || initial_state.height() != 0
+        {
+            return Err(ChainImportError::InvalidMonetaryProfile);
+        }
+        // The snapshot must remain tied to the exact Genesis allocation/state, not only to
+        // caller-supplied network and manifest labels.
+        let genesis_snapshot = initial_state.encode_snapshot()?;
+        let genesis_fingerprint = mcs4_genesis_fingerprint(&genesis_snapshot);
+        let writer_lock = snapshot_store::SnapshotWriterLock::acquire(&snapshot_path)?;
+        let state = if snapshot_path.exists() {
+            load_mcs4_snapshot(
+                &snapshot_path,
+                &network_id,
+                &expected_manifest_id,
+                &genesis_fingerprint,
+            )?
+        } else {
+            save_mcs4_snapshot(
+                &snapshot_path,
+                &initial_state,
+                &expected_manifest_id,
+                &genesis_fingerprint,
+            )?;
+            initial_state
+        };
+        Ok(Self {
+            state,
+            admission,
+            verifier,
+            expected_manifest_id,
+            genesis_fingerprint,
+            clock,
+            snapshot_path,
+            _writer_lock: writer_lock,
+        })
+    }
+
+    /// Decode and apply one MBK4 body after the caller has validated its PoW header and
+    /// selected the canonical branch. On rejection or a failed durable write, memory is unchanged.
+    /// This method alone is not a complete consensus or anti-rollback decision.
+    pub fn import_bytes(
+        &mut self,
+        bytes: &[u8],
+        mode: ImportMode,
+    ) -> Result<BlockAdmissionReceipt, ChainImportError> {
+        let block: V4HybridMonetaryBlock = decode_v4_hybrid_monetary_block(bytes)?;
+        let mut staged = self.state.clone();
+        let receipt = match mode {
+            ImportMode::Live => self.admission.admit_live_v4_hybrid_monetary(
+                &mut staged,
+                &block,
+                &self.expected_manifest_id,
+                &self.verifier,
+                &self.clock,
+            )?,
+            ImportMode::HistoricalReplay => self.admission.replay_v4_hybrid_monetary(
+                &mut staged,
+                &block,
+                &self.expected_manifest_id,
+                &self.verifier,
+            )?,
+        };
+        save_mcs4_snapshot(
+            &self.snapshot_path,
+            &staged,
+            &self.expected_manifest_id,
+            &self.genesis_fingerprint,
+        )?;
+        self.state = staged;
+        Ok(receipt)
+    }
+
+    pub fn state(&self) -> &MonetaryLedgerState {
+        &self.state
+    }
+
+    pub fn snapshot_path(&self) -> &Path {
+        &self.snapshot_path
+    }
+
+    pub fn expected_manifest_id(&self) -> &[u8; 32] {
+        &self.expected_manifest_id
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,8 +471,12 @@ mod tests {
             ChainAdmissionConfig, ChainAdmissionError, ReferenceTimeError, ReferenceTimeProvenance,
             ReferenceTimeSample, ReferenceTimeSourcePolicy,
         },
-        state_machine::{AccountId, Block, NetworkId},
+        state_machine::{
+            AccountId, Block, MonetaryLedgerState, NetworkId, V4HybridMonetaryBlock,
+            MONETARY_PUBLIC_GOODS_BUDGET_ATOMS,
+        },
         timestamp_policy::TimestampPolicy,
+        v4_fat1_mldsa65_candidate::LibcruxMlDsa65VerifierCandidate,
     };
     use std::{
         fs,
@@ -197,6 +522,36 @@ mod tests {
         LedgerState::genesis(NETWORK, vec![([0x11; 32], 1_000_000)]).unwrap()
     }
 
+    fn monetary_genesis() -> MonetaryLedgerState {
+        MonetaryLedgerState::genesis(
+            NETWORK,
+            [0x21; 32],
+            vec![([0x22; 32], MONETARY_PUBLIC_GOODS_BUDGET_ATOMS as u64)],
+        )
+        .unwrap()
+    }
+
+    fn v4_monetary_candidate(
+        state: &MonetaryLedgerState,
+        timestamp: u64,
+        manifest_id: &[u8; 32],
+    ) -> V4HybridMonetaryBlock {
+        let verifier = LibcruxMlDsa65VerifierCandidate;
+        let mut block = V4HybridMonetaryBlock {
+            height: state.height() + 1,
+            timestamp,
+            parent_hash: state.tip_hash(),
+            state_root: [0; 32],
+            transactions: Vec::new(),
+            miner: [0x33; 32],
+            claimed_subsidy_atoms: state.expected_miner_reward().unwrap(),
+        };
+        block.state_root = state
+            .preview_v4_hybrid_state_root_after(&block, manifest_id, &verifier)
+            .unwrap();
+        block
+    }
+
     fn candidate(state: &LedgerState, timestamp: u64) -> Block {
         let mut block = Block {
             height: state.height() + 1,
@@ -209,6 +564,130 @@ mod tests {
             .preview_state_root_after(&block, &NoTransactionsAuthenticator)
             .unwrap();
         block
+    }
+
+    #[test]
+    fn mbk4_import_commits_manifest_bound_snapshot_and_reopens_same_state() {
+        let dir = dir();
+        let path = dir.join("monetary.snapshot");
+        let manifest_id = [0xD4; 32];
+        let verifier = LibcruxMlDsa65VerifierCandidate;
+        let mut service = V4HybridMonetaryImportService::open(
+            monetary_genesis(),
+            boundary(),
+            manifest_id,
+            verifier,
+            FixedClock(1_000, "shared-ntp"),
+            &path,
+        )
+        .unwrap();
+
+        let block = v4_monetary_candidate(service.state(), 1_120, &manifest_id);
+        let bytes = crate::state_machine::encode_v4_hybrid_monetary_block(&block).unwrap();
+        let receipt = service.import_bytes(&bytes, ImportMode::Live).unwrap();
+        assert_eq!(receipt.summary.height, 1);
+        assert_eq!(service.state().height(), 1);
+        assert_eq!(service.expected_manifest_id(), &manifest_id);
+
+        let committed_bytes = fs::read(&path).unwrap();
+        assert!(committed_bytes.starts_with(&MCS4_SNAPSHOT_MAGIC));
+        let expected_state = service.state().clone();
+        drop(service);
+
+        let reopened = V4HybridMonetaryImportService::open(
+            monetary_genesis(),
+            boundary(),
+            manifest_id,
+            LibcruxMlDsa65VerifierCandidate,
+            FixedClock(1_000, "shared-ntp"),
+            &path,
+        )
+        .unwrap();
+        assert_eq!(reopened.state(), &expected_state);
+        assert_eq!(fs::read(&path).unwrap(), committed_bytes);
+        drop(reopened);
+
+        let mismatch = V4HybridMonetaryImportService::open(
+            monetary_genesis(),
+            boundary(),
+            [0xD5; 32],
+            LibcruxMlDsa65VerifierCandidate,
+            FixedClock(1_000, "shared-ntp"),
+            &path,
+        );
+        assert!(matches!(
+            mismatch,
+            Err(ChainImportError::MonetaryProfileMismatch)
+        ));
+
+        let wrong_genesis = MonetaryLedgerState::genesis(
+            NETWORK,
+            [0x23; 32],
+            vec![([0x24; 32], MONETARY_PUBLIC_GOODS_BUDGET_ATOMS as u64)],
+        )
+        .unwrap();
+        let genesis_mismatch = V4HybridMonetaryImportService::open(
+            wrong_genesis,
+            boundary(),
+            manifest_id,
+            LibcruxMlDsa65VerifierCandidate,
+            FixedClock(1_000, "shared-ntp"),
+            &path,
+        );
+        assert!(matches!(
+            genesis_mismatch,
+            Err(ChainImportError::MonetaryGenesisMismatch)
+        ));
+
+        let mut corrupted = committed_bytes.clone();
+        corrupted[12] ^= 0x80;
+        fs::write(&path, corrupted).unwrap();
+        let checksum_mismatch = V4HybridMonetaryImportService::open(
+            monetary_genesis(),
+            boundary(),
+            manifest_id,
+            LibcruxMlDsa65VerifierCandidate,
+            FixedClock(1_000, "shared-ntp"),
+            &path,
+        );
+        assert!(matches!(
+            checksum_mismatch,
+            Err(ChainImportError::State(
+                StateError::MonetarySnapshotChecksumMismatch
+            ))
+        ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejected_mbk4_live_import_preserves_memory_and_profile_snapshot() {
+        let dir = dir();
+        let path = dir.join("monetary.snapshot");
+        let manifest_id = [0xD6; 32];
+        let mut service = V4HybridMonetaryImportService::open(
+            monetary_genesis(),
+            boundary(),
+            manifest_id,
+            LibcruxMlDsa65VerifierCandidate,
+            FixedClock(1_000, "shared-ntp"),
+            &path,
+        )
+        .unwrap();
+        let before_state = service.state().clone();
+        let before_snapshot = fs::read(&path).unwrap();
+
+        // The block has a valid candidate state root, but its timestamp exceeds the configured
+        // live future-window by one second, so admission must fail before either commit occurs.
+        let block = v4_monetary_candidate(service.state(), 1_121, &manifest_id);
+        let bytes = crate::state_machine::encode_v4_hybrid_monetary_block(&block).unwrap();
+        assert!(matches!(
+            service.import_bytes(&bytes, ImportMode::Live),
+            Err(ChainImportError::Admission(_))
+        ));
+        assert_eq!(service.state(), &before_state);
+        assert_eq!(fs::read(&path).unwrap(), before_snapshot);
+        drop(service);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
