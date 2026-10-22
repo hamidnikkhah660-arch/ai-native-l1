@@ -19,6 +19,8 @@ pub enum PrivateConsensusError {
     HeaderBodyMismatch(&'static str),
     NetworkMismatch,
     ExpectedTargetMismatch,
+    RetargetObservationMismatch,
+    InvalidRetargetTimestampRange,
     LegacyBlockOnMonetaryChain,
     MonetaryBlockOnLegacyChain,
 }
@@ -33,6 +35,13 @@ impl std::fmt::Display for PrivateConsensusError {
             }
             Self::NetworkMismatch => write!(f, "PoW network ID does not match chain state"),
             Self::ExpectedTargetMismatch => write!(f, "PoW target does not match expected target"),
+            Self::RetargetObservationMismatch => write!(
+                f,
+                "caller-supplied retarget duration does not match the branch-derived duration"
+            ),
+            Self::InvalidRetargetTimestampRange => {
+                write!(f, "branch timestamps cannot form a valid retarget duration")
+            }
             Self::LegacyBlockOnMonetaryChain => {
                 write!(f, "legacy BLK2 block is forbidden on a monetary chain")
             }

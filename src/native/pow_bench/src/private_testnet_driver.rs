@@ -23,6 +23,10 @@ pub struct TargetHistory {
     /// target_after_height[h] is the target used for blocks at height h; index 0 is
     /// the configured genesis/initial target carried into the first block.
     targets: Vec<Uint256>,
+    /// Header timestamps indexed by height. The genesis timestamp is intentionally unknown:
+    /// the first retarget window starts at block 1 and uses one nominal target interval to
+    /// account for the interval before that first block.
+    timestamps: Vec<Option<u64>>,
 }
 
 impl TargetHistory {
@@ -32,6 +36,7 @@ impl TargetHistory {
         Ok(Self {
             params,
             targets: vec![initial_target],
+            timestamps: vec![None],
         })
     }
 
@@ -55,16 +60,87 @@ impl TargetHistory {
         let previous_target = self.target_at(next_height.saturating_sub(1)).ok_or(
             PrivateConsensusError::Consensus(ConsensusError::InvalidNextBlockHeight),
         )?;
+        let branch_elapsed = self.observed_window_elapsed_secs(next_height)?;
+        let effective_elapsed = match (branch_elapsed, measured_window_elapsed_secs) {
+            (Some(derived), Some(supplied)) if derived != supplied => {
+                return Err(PrivateConsensusError::RetargetObservationMismatch);
+            }
+            (Some(derived), _) => Some(derived),
+            (None, supplied) => supplied,
+        };
         crate::private_testnet_consensus::target_for_next_block(
             previous_target,
             next_height,
-            measured_window_elapsed_secs,
+            effective_elapsed,
             &self.params,
         )
     }
 
-    fn record_next(&mut self, height: u64, target: Uint256) -> Result<(), PrivateConsensusError> {
-        let expected_height = self.height().saturating_add(1);
+    /// Derive the retarget observation exclusively from this branch's accepted block timestamps.
+    ///
+    /// At a boundary for next_height=N, the window covers heights N-window..=N-1. The
+    /// timestamp difference contains window-1 intervals, so one configured target interval is
+    /// added to obtain the window's window-block duration without relying on a node-local clock
+    /// or an operator-supplied elapsed value. For the first 2,016-block window, this is
+    /// timestamp[2,016] - timestamp[1] + target_block_time_secs.
+    fn observed_window_elapsed_secs(
+        &self,
+        next_height: u64,
+    ) -> Result<Option<u64>, PrivateConsensusError> {
+        let window = self.params.difficulty_window_blocks;
+        if next_height <= window || (next_height - 1) % window != 0 {
+            return Ok(None);
+        }
+
+        let first_height =
+            next_height
+                .checked_sub(window)
+                .ok_or(PrivateConsensusError::Consensus(
+                    ConsensusError::InvalidNextBlockHeight,
+                ))?;
+        let last_height = next_height
+            .checked_sub(1)
+            .ok_or(PrivateConsensusError::Consensus(
+                ConsensusError::InvalidNextBlockHeight,
+            ))?;
+        let first_index = usize::try_from(first_height).map_err(|_| {
+            PrivateConsensusError::Consensus(ConsensusError::InvalidNextBlockHeight)
+        })?;
+        let last_index = usize::try_from(last_height).map_err(|_| {
+            PrivateConsensusError::Consensus(ConsensusError::InvalidNextBlockHeight)
+        })?;
+        let first_timestamp = self.timestamps.get(first_index).copied().flatten().ok_or(
+            PrivateConsensusError::Consensus(ConsensusError::MissingRetargetObservation),
+        )?;
+        let last_timestamp = self.timestamps.get(last_index).copied().flatten().ok_or(
+            PrivateConsensusError::Consensus(ConsensusError::MissingRetargetObservation),
+        )?;
+        let observed = last_timestamp
+            .checked_sub(first_timestamp)
+            .ok_or(PrivateConsensusError::InvalidRetargetTimestampRange)?;
+        let elapsed = observed
+            .checked_add(self.params.target_block_time_secs)
+            .ok_or(PrivateConsensusError::Consensus(
+                ConsensusError::DifficultyOverflow,
+            ))?;
+        Ok(Some(elapsed))
+    }
+
+    /// Validate the next history record before a state transition is applied. Keeping this
+    /// check separate prevents a rejected timestamp/height/target from leaving chain state
+    /// advanced while target history and the consensus tip remain at the parent.
+    fn validate_next(
+        &self,
+        height: u64,
+        target: Uint256,
+        timestamp: u64,
+    ) -> Result<(), PrivateConsensusError> {
+        let expected_height =
+            self.height()
+                .checked_add(1)
+                .ok_or(PrivateConsensusError::Consensus(
+                    ConsensusError::InvalidNextBlockHeight,
+                ))?;
         if height != expected_height {
             return Err(PrivateConsensusError::HeaderBodyMismatch(
                 "target_history_height",
@@ -80,7 +156,27 @@ impl TargetHistory {
                 ConsensusError::TargetAbovePowLimit,
             ));
         }
+        if self
+            .timestamps
+            .last()
+            .copied()
+            .flatten()
+            .is_some_and(|previous| timestamp <= previous)
+        {
+            return Err(PrivateConsensusError::InvalidRetargetTimestampRange);
+        }
+        Ok(())
+    }
+
+    fn record_next(
+        &mut self,
+        height: u64,
+        target: Uint256,
+        timestamp: u64,
+    ) -> Result<(), PrivateConsensusError> {
+        self.validate_next(height, target, timestamp)?;
         self.targets.push(target);
+        self.timestamps.push(Some(timestamp));
         Ok(())
     }
 }
@@ -193,6 +289,8 @@ impl PrivateTestnetChain {
         if pow_header.target != expected_target {
             return Err(PrivateConsensusError::ExpectedTargetMismatch);
         }
+        self.target_history
+            .validate_next(next_height, pow_header.target, pow_header.timestamp)?;
 
         let (receipt, digest) = admit_candidate_live(
             &mut self.state,
@@ -206,7 +304,7 @@ impl PrivateTestnetChain {
 
         let work = block_work(pow_header.target)?;
         self.target_history
-            .record_next(next_height, pow_header.target)?;
+            .record_next(next_height, pow_header.target, pow_header.timestamp)?;
         self.cumulative_work = self.cumulative_work.saturating_add(work);
         self.tip_consensus_hash = digest;
 
@@ -265,6 +363,8 @@ impl PrivateTestnetChain {
         if pow_header.target != expected_target {
             return Err(PrivateConsensusError::ExpectedTargetMismatch);
         }
+        self.target_history
+            .validate_next(next_height, pow_header.target, pow_header.timestamp)?;
 
         let digest = crate::consensus::verify_pow(pow_header, &self.target_history.params)?;
         let receipt = ChainAdmissionBoundary::testnet()
@@ -279,7 +379,7 @@ impl PrivateTestnetChain {
             .clone();
         let work = block_work(pow_header.target)?;
         self.target_history
-            .record_next(next_height, pow_header.target)?;
+            .record_next(next_height, pow_header.target, pow_header.timestamp)?;
         self.cumulative_work = self.cumulative_work.saturating_add(work);
         self.tip_consensus_hash = digest;
         Ok((receipt, digest))
@@ -338,6 +438,8 @@ impl PrivateTestnetChain {
         if pow_header.target != expected_target {
             return Err(PrivateConsensusError::ExpectedTargetMismatch);
         }
+        self.target_history
+            .validate_next(next_height, pow_header.target, pow_header.timestamp)?;
 
         let digest = crate::consensus::verify_pow(pow_header, &self.target_history.params)?;
         let receipt = ChainAdmissionBoundary::testnet()
@@ -352,7 +454,7 @@ impl PrivateTestnetChain {
             .clone();
         let work = block_work(pow_header.target)?;
         self.target_history
-            .record_next(next_height, pow_header.target)?;
+            .record_next(next_height, pow_header.target, pow_header.timestamp)?;
         self.cumulative_work = self.cumulative_work.saturating_add(work);
         self.tip_consensus_hash = digest;
         Ok((receipt, digest))
@@ -422,6 +524,8 @@ impl PrivateTestnetChain {
         if pow_header.target != expected_target {
             return Err(PrivateConsensusError::ExpectedTargetMismatch);
         }
+        self.target_history
+            .validate_next(next_height, pow_header.target, pow_header.timestamp)?;
 
         let digest = crate::consensus::verify_pow(pow_header, &self.target_history.params)?;
         let receipt = ChainAdmissionBoundary::testnet()
@@ -442,7 +546,7 @@ impl PrivateTestnetChain {
             .clone();
         let work = block_work(pow_header.target)?;
         self.target_history
-            .record_next(next_height, pow_header.target)?;
+            .record_next(next_height, pow_header.target, pow_header.timestamp)?;
         self.cumulative_work = self.cumulative_work.saturating_add(work);
         self.tip_consensus_hash = digest;
         Ok((receipt, digest))
@@ -511,6 +615,8 @@ impl PrivateTestnetChain {
         if pow_header.target != expected_target {
             return Err(PrivateConsensusError::ExpectedTargetMismatch);
         }
+        self.target_history
+            .validate_next(next_height, pow_header.target, pow_header.timestamp)?;
 
         let digest = crate::consensus::verify_pow(pow_header, &self.target_history.params)?;
         let receipt = ChainAdmissionBoundary::testnet()
@@ -525,7 +631,7 @@ impl PrivateTestnetChain {
             .clone();
         let work = block_work(pow_header.target)?;
         self.target_history
-            .record_next(next_height, pow_header.target)?;
+            .record_next(next_height, pow_header.target, pow_header.timestamp)?;
         self.cumulative_work = self.cumulative_work.saturating_add(work);
         self.tip_consensus_hash = digest;
         Ok((receipt, digest))
@@ -725,27 +831,356 @@ mod tests {
     }
 
     #[test]
-    fn driver_requires_measured_duration_only_after_a_full_window() {
+    fn driver_derives_retarget_duration_from_branch_timestamps_and_rejects_override() {
         let params = params();
         let initial_target = params.initial_target;
-        let expected = params.target_block_time_secs * params.difficulty_window_blocks;
+        let target_block_time = params.target_block_time_secs;
+        let window = params.difficulty_window_blocks;
+        let expected = target_block_time * window;
         let mut history = TargetHistory::new(params).unwrap();
-        for height in 1..=2_016 {
-            history.record_next(height, initial_target).unwrap();
+        for height in 1..=window {
+            history
+                .record_next(height, initial_target, height * target_block_time)
+                .unwrap();
         }
         assert_eq!(
-            history.expected_target(2_017, None),
+            history.expected_target(window + 1, None),
+            Ok(initial_target)
+        );
+        assert_eq!(
+            history.expected_target(window + 1, Some(expected)),
+            Ok(initial_target)
+        );
+        assert_eq!(
+            history.expected_target(window + 1, Some(expected / 2)),
+            Err(PrivateConsensusError::RetargetObservationMismatch)
+        );
+
+        // A missing timestamp in the branch history must not be overridden by an operator's
+        // supplied elapsed value, even if that value would otherwise be a valid duration.
+        let mut incomplete = history.clone();
+        incomplete.timestamps[1] = None;
+        assert_eq!(
+            incomplete.expected_target(window + 1, Some(expected)),
             Err(PrivateConsensusError::Consensus(
                 ConsensusError::MissingRetargetObservation
             ))
         );
-        assert_eq!(
+    }
+
+    #[test]
+    fn driver_retargets_from_branch_timestamp_window_deterministically() {
+        let mut params = params();
+        let initial_target = Uint256::from_be_bytes([0x7F; 32]);
+        params.initial_target = initial_target;
+        params.pow_limit = Uint256::MAX;
+        let target_block_time = params.target_block_time_secs;
+        let window = params.difficulty_window_blocks;
+        let first_epoch = 10_000u64;
+        let timestamp_step = target_block_time / 2;
+        let mut history = TargetHistory::new(params.clone()).unwrap();
+
+        for height in 1..=window {
             history
-                .expected_target(2_017, Some(expected / 2))
-                .unwrap()
-                .to_be_bytes()[31],
-            0xff
+                .record_next(
+                    height,
+                    initial_target,
+                    first_epoch + height * timestamp_step,
+                )
+                .unwrap();
+        }
+
+        // Window N..=1 + the configured virtual initial interval gives exactly N intervals.
+        let first_timestamp = first_epoch + timestamp_step;
+        let last_timestamp = first_epoch + window * timestamp_step;
+        let elapsed = last_timestamp
+            .checked_sub(first_timestamp)
+            .unwrap()
+            .checked_add(target_block_time)
+            .unwrap();
+        assert_eq!(elapsed, (window - 1) * timestamp_step + target_block_time);
+
+        let independent_expected =
+            crate::consensus::retarget_target(initial_target, elapsed, &params).unwrap();
+        let derived = history.expected_target(window + 1, None).unwrap();
+        assert_eq!(derived, independent_expected);
+        assert_ne!(derived, initial_target);
+        assert_eq!(
+            history.expected_target(window + 1, Some(elapsed)),
+            Ok(independent_expected)
         );
+        assert_eq!(
+            history.expected_target(window + 1, Some(elapsed + 1)),
+            Err(PrivateConsensusError::RetargetObservationMismatch)
+        );
+
+        // Each branch must retain monotonically increasing timestamps in its own history.
+        let mut malformed = history.clone();
+        malformed.timestamps[window as usize] = Some(first_timestamp - 1);
+        assert_eq!(
+            malformed.expected_target(window + 1, None),
+            Err(PrivateConsensusError::InvalidRetargetTimestampRange)
+        );
+    }
+
+    #[test]
+    fn v4_historical_timestamp_history_rejection_is_atomic_before_state_replay() {
+        let mut params = params();
+        params.pow.memory_kib = 8;
+        let manifest = [0xC4; 32];
+        let verifier = crate::v4_fat1_mldsa65_candidate::LibcruxMlDsa65VerifierCandidate;
+        let mut chain =
+            PrivateTestnetChain::new_monetary(monetary_state(), params.clone()).unwrap();
+
+        let first_state = chain.monetary_state().unwrap().clone();
+        let mut first_block = crate::state_machine::V4HybridMonetaryBlock {
+            height: 1,
+            timestamp: 100,
+            parent_hash: first_state.tip_hash(),
+            state_root: [0; 32],
+            transactions: Vec::new(),
+            miner: [3; 32],
+            claimed_subsidy_atoms: first_state.expected_miner_reward().unwrap(),
+        };
+        first_block.state_root = first_state
+            .preview_v4_hybrid_state_root_after(&first_block, &manifest, &verifier)
+            .unwrap();
+        let first_header = crate::consensus::PowHeader {
+            protocol_version: params.protocol_version,
+            network_id: first_state.ledger().network_id(),
+            height: 1,
+            timestamp: first_block.timestamp,
+            parent_hash: first_block.parent_hash,
+            previous_consensus_hash: chain.chain_tip().tip_hash,
+            state_root: first_block.state_root,
+            target: params.initial_target,
+            nonce: 0,
+        };
+        chain
+            .append_v4_hybrid_monetary_historical(
+                &first_block,
+                &first_header,
+                None,
+                &manifest,
+                &verifier,
+            )
+            .unwrap();
+
+        // Simulate a recovered/corrupted target-history timestamp that disagrees with the
+        // accepted ledger tip. The next body timestamp is valid and increasing for the ledger
+        // (100 -> 150), but it must be rejected against the branch history (200 -> 150) before
+        // replay mutates the ledger. This protects the chain even if its history invariant is
+        // damaged by a future restore/import path.
+        chain.target_history.timestamps[1] = Some(200);
+        let before_chain_tip = chain.chain_tip();
+        let before_work = chain.cumulative_work();
+        let before_state_tip = chain.monetary_state().unwrap().tip_hash();
+        let before_state_height = chain.monetary_state().unwrap().height();
+        let before_history = chain.target_history.clone();
+
+        let second_state = chain.monetary_state().unwrap().clone();
+        let mut second_block = crate::state_machine::V4HybridMonetaryBlock {
+            height: 2,
+            timestamp: 150,
+            parent_hash: second_state.tip_hash(),
+            state_root: [0; 32],
+            transactions: Vec::new(),
+            miner: [3; 32],
+            claimed_subsidy_atoms: second_state.expected_miner_reward().unwrap(),
+        };
+        second_block.state_root = second_state
+            .preview_v4_hybrid_state_root_after(&second_block, &manifest, &verifier)
+            .unwrap();
+        let second_header = crate::consensus::PowHeader {
+            protocol_version: params.protocol_version,
+            network_id: second_state.ledger().network_id(),
+            height: 2,
+            timestamp: second_block.timestamp,
+            parent_hash: second_block.parent_hash,
+            previous_consensus_hash: chain.chain_tip().tip_hash,
+            state_root: second_block.state_root,
+            target: chain.expected_target(None).unwrap(),
+            nonce: 0,
+        };
+        assert!(
+            Uint256::from_be_bytes(
+                crate::consensus::pow_digest(&second_header, params.pow).unwrap()
+            ) <= second_header.target
+        );
+        assert!(
+            second_block.timestamp > second_state.ledger().last_timestamp(),
+            "body timestamp passes the ledger's ordinary monotonic timestamp rule"
+        );
+
+        assert_eq!(
+            chain.append_v4_hybrid_monetary_historical(
+                &second_block,
+                &second_header,
+                None,
+                &manifest,
+                &verifier,
+            ),
+            Err(PrivateConsensusError::InvalidRetargetTimestampRange)
+        );
+        assert_eq!(chain.chain_tip(), before_chain_tip);
+        assert_eq!(chain.cumulative_work(), before_work);
+        assert_eq!(chain.monetary_state().unwrap().tip_hash(), before_state_tip);
+        assert_eq!(
+            chain.monetary_state().unwrap().height(),
+            before_state_height
+        );
+        assert_eq!(chain.target_history, before_history);
+    }
+
+    #[test]
+    fn v4_hybrid_historical_chain_retargets_at_first_window_boundary_from_branch_timestamps() {
+        let mut params = params();
+        // Fork-choice replay has a candidate archive-height bound of 1,024. Use a smaller
+        // explicit window here to test full envelope replay within that independent bound; the
+        // preceding TargetHistory test covers the configured 2,016-block arithmetic directly.
+        params.difficulty_window_blocks = 32;
+        params.pow.memory_kib = 8;
+        let manifest = [0xC4; 32];
+        let verifier = crate::v4_fat1_mldsa65_candidate::LibcruxMlDsa65VerifierCandidate;
+        let mut chain =
+            PrivateTestnetChain::new_monetary(monetary_state(), params.clone()).unwrap();
+
+        let window = params.difficulty_window_blocks;
+        let target_block_time = params.target_block_time_secs;
+        let step = target_block_time / 2;
+        let first_epoch = 100_000u64;
+        let mut envelopes = Vec::with_capacity((window + 1) as usize);
+        for height in 1..=window {
+            let state = chain.monetary_state().unwrap().clone();
+            let timestamp = first_epoch + height * step;
+            let mut block = crate::state_machine::V4HybridMonetaryBlock {
+                height,
+                timestamp,
+                parent_hash: state.tip_hash(),
+                state_root: [0; 32],
+                transactions: Vec::new(),
+                miner: [3; 32],
+                claimed_subsidy_atoms: state.expected_miner_reward().unwrap(),
+            };
+            block.state_root = state
+                .preview_v4_hybrid_state_root_after(&block, &manifest, &verifier)
+                .unwrap();
+            let target = chain.expected_target(None).unwrap();
+            assert_eq!(
+                target,
+                Uint256::MAX,
+                "retarget must not occur before height window + 1"
+            );
+            let header = crate::consensus::PowHeader {
+                protocol_version: params.protocol_version,
+                network_id: state.ledger().network_id(),
+                height,
+                timestamp,
+                parent_hash: block.parent_hash,
+                previous_consensus_hash: chain.chain_tip().tip_hash,
+                state_root: block.state_root,
+                target,
+                nonce: 0,
+            };
+            envelopes.push(
+                crate::private_testnet_monetary_wire::encode_candidate_v4_hybrid_monetary_network_block(
+                    &header,
+                    &block,
+                )
+                .unwrap(),
+            );
+            chain
+                .append_v4_hybrid_monetary_historical(&block, &header, None, &manifest, &verifier)
+                .unwrap();
+        }
+
+        assert_eq!(chain.chain_tip().height, window);
+        let first_timestamp = first_epoch + step;
+        let last_timestamp = first_epoch + window * step;
+        let branch_elapsed = last_timestamp - first_timestamp + target_block_time;
+        assert_eq!(branch_elapsed, (window - 1) * step + target_block_time);
+        let independent_expected =
+            crate::consensus::retarget_target(Uint256::MAX, branch_elapsed, &params).unwrap();
+        let actual = chain.expected_target(None).unwrap();
+        assert_eq!(actual, independent_expected);
+        assert_ne!(actual, Uint256::MAX);
+        assert_eq!(chain.expected_target(Some(branch_elapsed)), Ok(actual));
+        assert_eq!(
+            chain.expected_target(Some(branch_elapsed + 1)),
+            Err(PrivateConsensusError::RetargetObservationMismatch)
+        );
+
+        // Cross the boundary with an actual V4 MBK4 block whose nonce satisfies the
+        // newly derived target, not the easier pre-retarget target.
+        let next_state = chain.monetary_state().unwrap().clone();
+        let next_height = window + 1;
+        let next_timestamp = first_epoch + next_height * step;
+        let mut next_block = crate::state_machine::V4HybridMonetaryBlock {
+            height: next_height,
+            timestamp: next_timestamp,
+            parent_hash: next_state.tip_hash(),
+            state_root: [0; 32],
+            transactions: Vec::new(),
+            miner: [3; 32],
+            claimed_subsidy_atoms: next_state.expected_miner_reward().unwrap(),
+        };
+        next_block.state_root = next_state
+            .preview_v4_hybrid_state_root_after(&next_block, &manifest, &verifier)
+            .unwrap();
+        let mut next_header = crate::consensus::PowHeader {
+            protocol_version: params.protocol_version,
+            network_id: next_state.ledger().network_id(),
+            height: next_height,
+            timestamp: next_timestamp,
+            parent_hash: next_block.parent_hash,
+            previous_consensus_hash: chain.chain_tip().tip_hash,
+            state_root: next_block.state_root,
+            target: actual,
+            nonce: 0,
+        };
+        let mined_header = (0..256u64)
+            .find_map(|nonce| {
+                next_header.nonce = nonce;
+                let digest = crate::consensus::pow_digest(&next_header, params.pow).unwrap();
+                (Uint256::from_be_bytes(digest) <= actual).then_some(next_header)
+            })
+            .expect("bounded mining search should find a nonce for the retargeted target");
+        envelopes.push(
+            crate::private_testnet_monetary_wire::encode_candidate_v4_hybrid_monetary_network_block(
+                &mined_header,
+                &next_block,
+            )
+            .unwrap(),
+        );
+        chain
+            .append_v4_hybrid_monetary_historical(
+                &next_block,
+                &mined_header,
+                None,
+                &manifest,
+                &verifier,
+            )
+            .unwrap();
+        assert_eq!(chain.chain_tip().height, next_height);
+        assert_eq!(chain.expected_target(None), Ok(actual));
+
+        // Archive rebuild must reconstruct the branch-derived target across the configured window boundary.
+        let rebuilt =
+            crate::private_testnet_v4_hybrid_fork_choice_candidate::PrivateTestnetV4HybridForkChoice::rebuild_from_envelopes(
+                monetary_state(),
+                params,
+                manifest,
+                envelopes,
+                &verifier,
+            )
+            .unwrap();
+        assert_eq!(rebuilt.archive_len(), (window + 1) as usize);
+        assert_eq!(rebuilt.canonical_chain().chain_tip().height, next_height);
+        assert_eq!(
+            rebuilt.canonical_chain().chain_tip().tip_hash,
+            chain.chain_tip().tip_hash
+        );
+        assert_eq!(rebuilt.canonical_chain().expected_target(None), Ok(actual));
     }
 
     #[test]
