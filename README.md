@@ -18,6 +18,7 @@
 - **Public launch compliance / G0 readiness (not legal advice):** [MiCAR, donation status, payout and owner-side verification checklist](docs/CP_0372_G0_PUBLIC_LAUNCH_COMPLIANCE_CHECKLIST_2026-10-22.md)
 - **Mainnet architecture boundary (Gate 2 / Gate 8):** [PMT4/PFM4 runtime, loopback-only smoke limits and production prerequisites](docs/CP_0373_GATE2_PFM4_RUNTIME_PRODUCTION_BOUNDARY_2026-10-22.md)
 - **PMT4/PFM4 invalid-proof-of-work regression:** [Atomic rejection without changing manifest, branch archive, or canonical tip](docs/CP_0374_GATE2_PFM4_INVALID_POW_ATOMICITY_2026-10-22.md)
+- **PMT4/PFM4 invalid miner-reward regression:** [Valid-PoW block with a wrong subsidy is rejected without durable state mutation](docs/CP_0375_GATE2_PFM4_INVALID_REWARD_ATOMICITY_2026-10-22.md)
 - **Mining, halving and performance evidence:** [Candidate parameters and benchmark methodology](docs/MINING_HALVING_PERFORMANCE_AND_SCALING_V01.md)
 - **Reproducible halving charts and data:** [Candidate curve generator](simulations/candidate_halving_curve.py) - [Per-era CSV](simulations/candidate_halving_curve.csv); candidate-only, not live supply.
 - **Liquidity, market-data and public launch readiness:** [Platform prerequisites, cash-flow options and launch blockers](docs/LIQUIDITY_MARKET_DATA_AND_PUBLIC_LAUNCH_READINESS_V01.md)

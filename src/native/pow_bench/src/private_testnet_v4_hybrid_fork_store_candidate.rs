@@ -2290,6 +2290,93 @@ mod tests {
     }
 
     #[test]
+    fn pfm4_rejects_invalid_miner_reward_without_publishing_manifest_or_branch() {
+        let directory = path("invalid-reward-atomic");
+        let genesis = genesis();
+        let params = params();
+        let verifier = LibcruxMlDsa65VerifierCandidate;
+        let mut store = PrivateTestnetV4HybridForkStore::open(
+            &directory,
+            genesis.clone(),
+            params.clone(),
+            MANIFEST,
+            &verifier,
+            &FixedClock,
+        )
+        .unwrap();
+
+        let genesis_tip = store.canonical_tip();
+        let committed_anchor = store.manifest_anchor().unwrap();
+        let valid_envelope = first_block_envelope(&genesis, &params);
+        let mut candidate =
+            decode_candidate_v4_hybrid_monetary_network_block(&valid_envelope).unwrap();
+
+        // Preserve the header, valid PoW, ancestry and header/body state-root binding, but change
+        // the miner's committed reward by one atomic unit. MBK4 admission must derive the reward
+        // from height and cumulative issuance, reject the peer claim, and leave PFM4 untouched.
+        let valid_digest = pow_digest(&candidate.header, params.pow).unwrap();
+        assert!(Uint256::from_be_bytes(valid_digest) <= candidate.header.target);
+        candidate.block.claimed_subsidy_atoms = candidate
+            .block
+            .claimed_subsidy_atoms
+            .checked_add(1)
+            .expect("the first-block subsidy is far below u64::MAX");
+        let invalid_reward_envelope =
+            crate::private_testnet_monetary_wire::encode_candidate_v4_hybrid_monetary_network_block(
+                &candidate.header,
+                &candidate.block,
+            )
+            .unwrap();
+
+        let decoded =
+            decode_candidate_v4_hybrid_monetary_network_block(&invalid_reward_envelope).unwrap();
+        assert_eq!(decoded.header, candidate.header);
+        assert_eq!(
+            decoded.block.claimed_subsidy_atoms,
+            candidate.block.claimed_subsidy_atoms
+        );
+        assert!(
+            Uint256::from_be_bytes(pow_digest(&decoded.header, params.pow).unwrap())
+                <= decoded.header.target
+        );
+
+        assert!(store
+            .submit(&invalid_reward_envelope, &verifier, &FixedClock)
+            .is_err());
+        assert_eq!(store.canonical_height(), 0);
+        assert_eq!(store.canonical_tip(), genesis_tip);
+        assert_eq!(store.archive().archive_len(), 0);
+        assert_eq!(store.manifest_anchor().unwrap(), committed_anchor);
+        let branch_count = fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with(BRANCH_PREFIX) && name.ends_with(BRANCH_SUFFIX)
+            })
+            .count();
+        assert_eq!(branch_count, 0);
+
+        drop(store);
+        let reopened = PrivateTestnetV4HybridForkStore::open(
+            &directory,
+            genesis,
+            params,
+            MANIFEST,
+            &verifier,
+            &FixedClock,
+        )
+        .unwrap();
+        assert_eq!(reopened.canonical_height(), 0);
+        assert_eq!(reopened.canonical_tip(), genesis_tip);
+        assert_eq!(reopened.archive().archive_len(), 0);
+        assert_eq!(reopened.manifest_anchor().unwrap(), committed_anchor);
+        drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn pfm4_reorg_winner_and_state_survive_restart_and_parent_first_replay() {
         let directory = path("reorg-reopen");
         let genesis = genesis();
