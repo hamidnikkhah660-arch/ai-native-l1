@@ -717,6 +717,13 @@ where
         })
     }
 
+    /// Return whether this client uses the exact out-of-band pin supplied by its caller.
+    /// The full key ID and public key are included; matching only provider/network/genesis IDs
+    /// would permit a configuration split at the receipt-verification trust boundary.
+    pub fn is_pinned_to(&self, expected: &ExternalCasPin) -> bool {
+        &self.pin == expected
+    }
+
     /// Generate a fresh challenge; callers must not replace this with a fixed or persisted nonce.
     pub fn fresh_read_request(
         &self,
