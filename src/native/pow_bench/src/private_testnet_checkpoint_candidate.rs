@@ -12,8 +12,9 @@ use crate::{
         MAX_TARGET_HISTORY_CHECKPOINT_ENTRIES,
     },
     state_machine::{
-        MonetaryLedgerState, NetworkId, ATOMS_PER_COIN, MAX_ENCODED_SNAPSHOT_BYTES,
-        MAX_TOTAL_SUPPLY_ATOMS, MONETARY_BLOCKS_PER_HALVING, MONETARY_FOUNDER_ALLOCATION_ATOMS,
+        AccountId, Block, MonetaryBlock, MonetaryLedgerState, NetworkId, TransactionAuthenticator,
+        ATOMS_PER_COIN, MAX_ENCODED_SNAPSHOT_BYTES, MAX_TOTAL_SUPPLY_ATOMS,
+        MONETARY_BLOCKS_PER_HALVING, MONETARY_FOUNDER_ALLOCATION_ATOMS,
         MONETARY_INITIAL_SUBSIDY_ATOMS, MONETARY_MINER_BUDGET_ATOMS,
         MONETARY_PUBLIC_GOODS_BUDGET_ATOMS,
     },
@@ -601,6 +602,33 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
 
+    struct TestAuthenticator;
+
+    impl TransactionAuthenticator for TestAuthenticator {
+        fn verify(&self, _: &AccountId, _: &[u8; 32], _: &[u8]) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    fn monetary_child_state(genesis: &MonetaryLedgerState) -> MonetaryLedgerState {
+        let mut state = genesis.clone();
+        let mut block = MonetaryBlock {
+            body: Block {
+                height: 1,
+                timestamp: 1,
+                parent_hash: genesis.tip_hash(),
+                state_root: [0; 32],
+                transactions: Vec::new(),
+            },
+            miner: [0x23; 32],
+            claimed_subsidy_atoms: genesis.expected_miner_reward().unwrap(),
+        };
+        block.body.state_root = genesis
+            .preview_state_root_after(&block, &TestAuthenticator)
+            .unwrap();
+        state.apply_block(&block, &TestAuthenticator).unwrap();
+        state
+    }
     fn genesis(network_id: NetworkId) -> MonetaryLedgerState {
         MonetaryLedgerState::genesis(
             network_id,
@@ -693,6 +721,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn non_genesis_record_roundtrips_and_binds_monetary_metadata_to_snapshot() {
+        let network = [0x87; 32];
+        let trusted_genesis = genesis(network);
+        let child = monetary_child_state(&trusted_genesis);
+        let params = ConsensusParameters::candidate_testnet().unwrap();
+        let manifest = [0x4a; 32];
+        let ctx = context(&network, &trusted_genesis, &params, &manifest);
+        let record = Pcp4CheckpointRecord {
+            network_id: network,
+            genesis_fingerprint: trusted_genesis_fingerprint(&ctx).unwrap(),
+            consensus_profile_fingerprint: consensus_profile_fingerprint(&params).unwrap(),
+            transaction_manifest_id: manifest,
+            logical_height: child.height(),
+            consensus_tip_digest: [0x59; 32],
+            ledger_tip_hash: child.tip_hash(),
+            monetary_state_root: child.state_root(),
+            total_mined_atoms: child.total_mined_atoms(),
+            cumulative_chainwork: Uint256::ONE,
+            parent_checkpoint_commitment: [0x5a; 32],
+            monetary_snapshot: child.encode_snapshot().unwrap(),
+            target_history: TargetHistoryCheckpoint {
+                logical_height: 1,
+                start_height: 0,
+                entries: vec![
+                    TargetHistoryCheckpointEntry {
+                        height: 0,
+                        target: params.initial_target,
+                        timestamp: None,
+                    },
+                    TargetHistoryCheckpointEntry {
+                        height: 1,
+                        target: params.initial_target,
+                        timestamp: Some(1),
+                    },
+                ],
+            },
+        };
+
+        let encoded = record.encode(&ctx).unwrap();
+        assert_eq!(Pcp4CheckpointRecord::decode(&encoded, &ctx), Ok(record));
+
+        // The total-mined field lives at bytes 244..260. Mutating the metadata and
+        // refreshing only the checksum must not detach it from the embedded state snapshot.
+        let mut mismatched_metadata = encoded;
+        mismatched_metadata[259] ^= 1;
+        refresh_checksum(&mut mismatched_metadata);
+        assert_eq!(
+            Pcp4CheckpointRecord::decode(&mismatched_metadata, &ctx),
+            Err(Pcp4CheckpointError::MonetaryMetadataMismatch)
+        );
+    }
     #[test]
     fn decoder_rejects_truncation_trailing_bytes_bad_version_flags_and_checksum() {
         let network = [0x82; 32];

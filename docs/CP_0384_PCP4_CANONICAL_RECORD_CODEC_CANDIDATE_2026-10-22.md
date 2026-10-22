@@ -20,7 +20,7 @@ The fixture under `src/native/pow_bench/tests/fixtures/` uses only deterministic
 
 - Rust test `private_testnet_checkpoint_candidate::tests::genesis_record_roundtrips_and_has_domain_separated_commitment` compares its encoded bytes byte-for-byte against the checked-in hex fixture.
 - `python simulations/verify_cp0384_pcp4_golden_vector.py` independently computes the profile fingerprint, trusted-Genesis fingerprint, record bytes and checksum. The current fixture is 737 bytes; the Python output matches the Rust golden bytes.
-- The five focused PCP4 tests cover encode/decode round trip, checksum/length/version/flags rejection, network/manifest/profile/Genesis binding, history/genesis consistency, and pre-allocation history range enforcement.
+- The six focused PCP4 tests cover Genesis and non-Genesis encode/decode round trips, monetary metadata binding to the embedded snapshot, checksum/length/version/flags rejection, network/manifest/profile/Genesis binding, history/genesis consistency, and pre-allocation history range enforcement.
 - `cargo fmt --all -- --check` passed on the local Windows checkout.
 - `cargo check --lib --locked --offline` passed on the local Windows checkout (with existing unrelated unused/dead-code warnings).
 - `cargo test --all-targets --locked --offline -- --test-threads=1` exited 0 on Windows; the library reports 766 passed, 0 failed, in 435.70 seconds. `devnet_node` passed 36/36, `private_testnet_node` passed 36/36, and all other binary, integration/vector and example targets completed successfully. The full process runtime was 626.22 seconds.
