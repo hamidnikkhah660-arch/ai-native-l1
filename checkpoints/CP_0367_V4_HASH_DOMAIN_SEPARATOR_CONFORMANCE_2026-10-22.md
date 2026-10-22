@@ -27,7 +27,11 @@ Gate 2 and Gate 8 remain OPEN. Canonical production Genesis/issuance integration
 - `cargo check --all-targets --locked --offline`: PASS.
 - `cargo fmt --all -- --check`: PASS.
 - CP-0361 independent snapshot oracle: PASS.
-- CP-0366 independent integer-issuance oracle: PASS, 17 frozen candidate vectors.
-- `git diff --check`: PASS before staging.
+- CP-0366 independent integer-issuance oracle: PASS, 17 candidate vectors.
+- `public_docs_refresh_checker.py`: PASS; canonical Git-index checksums PASS, 294 entries.
+- `git diff --cached --check`: PASS.
+- CP-0363 Windows TXN4 two-node loopback: PASS; invalid signature HTTP 422, valid submit HTTP 202, nodes matched exact state root/tip, restart/replay matched at height 1 (runner exit 0).
+- CP-0362 Windows PFM4 page-2 reorg: PASS; stale page-3 cursor rejected, source height 4, client remained at height 2, replay matched (runner exit 0).
+- PR #32 hosted Windows job for commit `17f02721a5a4ab3637e19ed9ccb1e8226a242171`: PASS, including TXN4/invalid-signature loopback and PFM4 inter-page reorg/stale-cursor checks. Hosted Rust all-target test was still running when this checkpoint update was prepared; verify hosted checks on the latest pushed commit before merge.
 
-PR CI, Windows loopback qualification after the hash change, and the canonical-index checksum rebuild remain to be recorded before merge. This checkpoint is not Mainnet conformance evidence.
+This checkpoint is not Mainnet conformance evidence.
