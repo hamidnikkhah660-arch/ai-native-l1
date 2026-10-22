@@ -190,6 +190,15 @@ fn hash_domain(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     hash.finalize().into()
 }
 
+fn v4_hybrid_transaction_id(
+    tx: &crate::v4_account_identity_candidate::V4HybridTransaction,
+) -> Result<[u8; 32], StateError> {
+    let canonical = tx
+        .encode()
+        .map_err(|_| StateError::InvalidHybridAuthorization)?;
+    Ok(hash_domain(b"AIN1-TXN4-ID-V4\0", &[&canonical]))
+}
+
 fn is_zero_account(account: &AccountId) -> bool {
     account.iter().all(|byte| *byte == 0)
 }
@@ -1206,7 +1215,7 @@ pub fn decode_v4_hybrid_monetary_block(bytes: &[u8]) -> Result<V4HybridMonetaryB
 
 pub fn v4_hybrid_monetary_block_id(block: &V4HybridMonetaryBlock) -> Result<[u8; 32], StateError> {
     let canonical = encode_v4_hybrid_monetary_block(block)?;
-    Ok(hash_domain(b"AIN1-MONETARY-BLOCK-ID-V4\\0", &[&canonical]))
+    Ok(hash_domain(b"AIN1-MONETARY-BLOCK-ID-V4\0", &[&canonical]))
 }
 
 impl MonetaryLedgerState {
@@ -1406,10 +1415,7 @@ impl MonetaryLedgerState {
                     block_timestamp: block.timestamp,
                 });
             }
-            let canonical_tx = tx
-                .encode()
-                .map_err(|_| StateError::InvalidHybridAuthorization)?;
-            let txid = hash_domain(b"AIN1-TXN4-ID-V4\\0", &[&canonical_tx]);
+            let txid = v4_hybrid_transaction_id(tx)?;
             if !local_txids.insert(txid) {
                 return Err(StateError::DuplicateTransaction);
             }
@@ -1520,7 +1526,7 @@ impl MonetaryLedgerState {
         if computed_state_root != block.state_root {
             return Err(StateError::StateRootMismatch);
         }
-        let block_hash = hash_domain(b"AIN1-MONETARY-BLOCK-ID-V4\\0", &[&canonical]);
+        let block_hash = hash_domain(b"AIN1-MONETARY-BLOCK-ID-V4\0", &[&canonical]);
         next.tip_hash = block_hash;
         let summary = BlockApplySummary {
             height: next.height,
@@ -3647,6 +3653,51 @@ mod v4_hybrid_mbk4_tests {
             miner: account(0xD0),
             claimed_subsidy_atoms: state.expected_miner_reward().unwrap(),
         }
+    }
+
+    #[test]
+    fn v4_block_and_transaction_ids_use_nul_terminated_domains() {
+        let verifier = LibcruxMlDsa65VerifierCandidate;
+        let tx = signed_tx(AccountIdentityScheme::NativeV4Hybrid, MANIFEST, 1, 1_000);
+        let canonical_tx = tx.encode().unwrap();
+
+        let mut expected_tx_hash = Sha256::new();
+        expected_tx_hash.update(b"AIN1-TXN4-ID-V4\0");
+        expected_tx_hash.update(&canonical_tx);
+        let expected_tx_id: [u8; 32] = expected_tx_hash.finalize().into();
+        assert_eq!(v4_hybrid_transaction_id(&tx).unwrap(), expected_tx_id);
+        assert_ne!(
+            expected_tx_id,
+            hash_domain(b"AIN1-TXN4-ID-V4\\0", &[&canonical_tx]),
+            "a literal backslash-zero must not replace the NUL separator"
+        );
+
+        let mut state = genesis_for(&tx);
+        let mut block = block_for(&state, vec![tx]);
+        block.state_root = state
+            .preview_v4_hybrid_state_root_after(&block, &MANIFEST, &verifier)
+            .unwrap();
+        let canonical_block = encode_v4_hybrid_monetary_block(&block).unwrap();
+
+        let mut expected_block_hash = Sha256::new();
+        expected_block_hash.update(b"AIN1-MONETARY-BLOCK-ID-V4\0");
+        expected_block_hash.update(&canonical_block);
+        let expected_block_id: [u8; 32] = expected_block_hash.finalize().into();
+        assert_eq!(
+            v4_hybrid_monetary_block_id(&block).unwrap(),
+            expected_block_id
+        );
+        assert_ne!(
+            expected_block_id,
+            hash_domain(b"AIN1-MONETARY-BLOCK-ID-V4\\0", &[&canonical_block]),
+            "a literal backslash-zero must not replace the NUL separator"
+        );
+
+        let summary = state
+            .apply_v4_hybrid_block_candidate(&block, &MANIFEST, &verifier)
+            .unwrap();
+        assert_eq!(summary.block_hash, expected_block_id);
+        assert_eq!(state.tip_hash(), expected_block_id);
     }
 
     #[test]
