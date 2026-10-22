@@ -21,6 +21,17 @@ use std::collections::VecDeque;
 /// Candidate safety ceiling for serialized checkpoint target-history entries. This is a
 /// parser/resource guard, not a consensus parameter or a production profile selection.
 pub const MAX_TARGET_HISTORY_CHECKPOINT_ENTRIES: usize = 65_536;
+fn checked_cumulative_work_after_block(
+    current: Uint256,
+    target: Uint256,
+) -> Result<Uint256, PrivateConsensusError> {
+    let work = block_work(target)?;
+    current
+        .checked_add(work)
+        .ok_or(PrivateConsensusError::Consensus(
+            ConsensusError::ChainworkOverflow,
+        ))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetHistoryCheckpointEntry {
@@ -520,6 +531,8 @@ impl PrivateTestnetChain {
         self.target_history
             .validate_next(next_height, pow_header.target, pow_header.timestamp)?;
 
+        let next_cumulative_work =
+            checked_cumulative_work_after_block(self.cumulative_work, pow_header.target)?;
         let (receipt, digest) = admit_candidate_live(
             &mut self.state,
             CandidateConsensusBlock { block, pow_header },
@@ -530,10 +543,9 @@ impl PrivateTestnetChain {
             clock,
         )?;
 
-        let work = block_work(pow_header.target)?;
         self.target_history
             .record_next(next_height, pow_header.target, pow_header.timestamp)?;
-        self.cumulative_work = self.cumulative_work.saturating_add(work);
+        self.cumulative_work = next_cumulative_work;
         self.tip_consensus_hash = digest;
 
         Ok((receipt, digest))
@@ -594,6 +606,8 @@ impl PrivateTestnetChain {
         self.target_history
             .validate_next(next_height, pow_header.target, pow_header.timestamp)?;
 
+        let next_cumulative_work =
+            checked_cumulative_work_after_block(self.cumulative_work, pow_header.target)?;
         let digest = crate::consensus::verify_pow(pow_header, &self.target_history.params)?;
         let receipt = ChainAdmissionBoundary::testnet()
             .admit_live_monetary(monetary_state, block, authenticator, clock)
@@ -605,10 +619,9 @@ impl PrivateTestnetChain {
             .expect("monetary state checked before admission")
             .ledger()
             .clone();
-        let work = block_work(pow_header.target)?;
         self.target_history
             .record_next(next_height, pow_header.target, pow_header.timestamp)?;
-        self.cumulative_work = self.cumulative_work.saturating_add(work);
+        self.cumulative_work = next_cumulative_work;
         self.tip_consensus_hash = digest;
         Ok((receipt, digest))
     }
@@ -669,6 +682,8 @@ impl PrivateTestnetChain {
         self.target_history
             .validate_next(next_height, pow_header.target, pow_header.timestamp)?;
 
+        let next_cumulative_work =
+            checked_cumulative_work_after_block(self.cumulative_work, pow_header.target)?;
         let digest = crate::consensus::verify_pow(pow_header, &self.target_history.params)?;
         let receipt = ChainAdmissionBoundary::testnet()
             .replay_monetary(monetary_state, block, authenticator)
@@ -680,10 +695,9 @@ impl PrivateTestnetChain {
             .expect("monetary state checked before replay")
             .ledger()
             .clone();
-        let work = block_work(pow_header.target)?;
         self.target_history
             .record_next(next_height, pow_header.target, pow_header.timestamp)?;
-        self.cumulative_work = self.cumulative_work.saturating_add(work);
+        self.cumulative_work = next_cumulative_work;
         self.tip_consensus_hash = digest;
         Ok((receipt, digest))
     }
@@ -755,6 +769,8 @@ impl PrivateTestnetChain {
         self.target_history
             .validate_next(next_height, pow_header.target, pow_header.timestamp)?;
 
+        let next_cumulative_work =
+            checked_cumulative_work_after_block(self.cumulative_work, pow_header.target)?;
         let digest = crate::consensus::verify_pow(pow_header, &self.target_history.params)?;
         let receipt = ChainAdmissionBoundary::testnet()
             .admit_live_v4_hybrid_monetary(
@@ -772,10 +788,9 @@ impl PrivateTestnetChain {
             .expect("monetary state checked before V4 admission")
             .ledger()
             .clone();
-        let work = block_work(pow_header.target)?;
         self.target_history
             .record_next(next_height, pow_header.target, pow_header.timestamp)?;
-        self.cumulative_work = self.cumulative_work.saturating_add(work);
+        self.cumulative_work = next_cumulative_work;
         self.tip_consensus_hash = digest;
         Ok((receipt, digest))
     }
@@ -846,6 +861,8 @@ impl PrivateTestnetChain {
         self.target_history
             .validate_next(next_height, pow_header.target, pow_header.timestamp)?;
 
+        let next_cumulative_work =
+            checked_cumulative_work_after_block(self.cumulative_work, pow_header.target)?;
         let digest = crate::consensus::verify_pow(pow_header, &self.target_history.params)?;
         let receipt = ChainAdmissionBoundary::testnet()
             .replay_v4_hybrid_monetary(monetary_state, block, expected_manifest_id, verifier)
@@ -857,10 +874,9 @@ impl PrivateTestnetChain {
             .expect("monetary state checked before V4 replay")
             .ledger()
             .clone();
-        let work = block_work(pow_header.target)?;
         self.target_history
             .record_next(next_height, pow_header.target, pow_header.timestamp)?;
-        self.cumulative_work = self.cumulative_work.saturating_add(work);
+        self.cumulative_work = next_cumulative_work;
         self.tip_consensus_hash = digest;
         Ok((receipt, digest))
     }
@@ -1019,6 +1035,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn driver_rejects_cumulative_work_overflow_before_mutating_state() {
+        let params = params();
+        let mut chain = PrivateTestnetChain::new(state(), params.clone()).unwrap();
+        chain.cumulative_work = Uint256::MAX;
+        let block = body(chain.state(), 100);
+        let candidate_header = header(chain.state(), &block, &params, params.initial_target, 0);
+        let before = chain.clone();
+
+        assert_eq!(
+            chain.append_live(
+                &block,
+                &candidate_header,
+                None,
+                &EmptyAuthenticator,
+                &FixedClock
+            ),
+            Err(PrivateConsensusError::Consensus(
+                ConsensusError::ChainworkOverflow
+            ))
+        );
+        assert_eq!(
+            chain, before,
+            "overflow must fail before state, history, or tip mutation"
+        );
+    }
     #[test]
     fn second_block_must_link_the_accepted_pow_digest_not_just_the_body_parent() {
         let params = params();
@@ -1640,7 +1682,9 @@ mod tests {
         assert_eq!(chain.chain_tip().tip_hash, digest);
         assert_eq!(
             chain.cumulative_work(),
-            before_work.saturating_add(block_work(params.initial_target).unwrap())
+            before_work
+                .checked_add(block_work(params.initial_target).unwrap())
+                .unwrap()
         );
         let monetary = chain.monetary_state().unwrap();
         assert_eq!(

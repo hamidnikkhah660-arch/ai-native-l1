@@ -168,6 +168,22 @@ impl Uint256 {
         Ok(quotient)
     }
 
+    /// Add two unsigned 256-bit values, returning None rather than wrapping on overflow.
+    pub fn checked_add(self, rhs: Self) -> Option<Self> {
+        let mut out = [0u64; 4];
+        let mut carry = 0u64;
+        for index in (0..4).rev() {
+            let (first, carry_first) = self.0[index].overflowing_add(rhs.0[index]);
+            let (sum, carry_second) = first.overflowing_add(carry);
+            out[index] = sum;
+            carry = u64::from(carry_first || carry_second);
+        }
+        if carry == 1 {
+            None
+        } else {
+            Some(Self(out))
+        }
+    }
     pub fn saturating_add(self, rhs: Self) -> Self {
         let mut out = [0u64; 4];
         let mut carry = 0u64;
@@ -360,6 +376,7 @@ pub enum ConsensusError {
     MissingRetargetObservation,
     ZeroDifficultyDenominator,
     DifficultyOverflow,
+    ChainworkOverflow,
     DivisionByZero,
     PowHashFailed,
     UnsupportedPowAlgorithm,
@@ -386,6 +403,7 @@ impl std::fmt::Display for ConsensusError {
             }
             Self::ZeroDifficultyDenominator => write!(f, "difficulty denominator must be positive"),
             Self::DifficultyOverflow => write!(f, "difficulty timing arithmetic overflowed"),
+            Self::ChainworkOverflow => write!(f, "cumulative chain work exceeds the 256-bit range"),
             Self::DivisionByZero => write!(f, "division by zero"),
             Self::PowHashFailed => write!(f, "PoW hashing failed"),
             Self::UnsupportedPowAlgorithm => write!(f, "unsupported PoW algorithm"),
@@ -526,7 +544,9 @@ pub fn block_work(target: Uint256) -> Result<Uint256, ConsensusError> {
 pub fn cumulative_chain_work(targets: &[Uint256]) -> Result<Uint256, ConsensusError> {
     let mut total = Uint256::ZERO;
     for target in targets {
-        total = total.saturating_add(block_work(*target)?);
+        total = total
+            .checked_add(block_work(*target)?)
+            .ok_or(ConsensusError::ChainworkOverflow)?;
     }
     Ok(total)
 }
@@ -567,6 +587,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn uint256_checked_add_reports_overflow_without_wrapping() {
+        assert_eq!(Uint256::ZERO.checked_add(Uint256::ONE), Some(Uint256::ONE));
+        assert_eq!(Uint256::MAX.checked_add(Uint256::ZERO), Some(Uint256::MAX));
+        assert_eq!(Uint256::MAX.checked_add(Uint256::ONE), None);
+
+        let mut low_limb_max = [0u8; 32];
+        low_limb_max[24..].fill(0xff);
+        let mut carried_value = [0u8; 32];
+        carried_value[23] = 1;
+        assert_eq!(
+            Uint256::from_be_bytes(low_limb_max).checked_add(Uint256::ONE),
+            Some(Uint256::from_be_bytes(carried_value))
+        );
+    }
     #[test]
     fn uint256_roundtrip_and_division_are_exact() {
         let value = Uint256::from_be_bytes([0x12; 32]);
@@ -835,11 +870,21 @@ mod tests {
             total,
             block_work(hard)
                 .unwrap()
-                .saturating_add(block_work(hard).unwrap())
-                .saturating_add(block_work(easy).unwrap())
+                .checked_add(block_work(hard).unwrap())
+                .unwrap()
+                .checked_add(block_work(easy).unwrap())
+                .unwrap()
         );
     }
 
+    #[test]
+    fn cumulative_chain_work_rejects_overflow_instead_of_saturating() {
+        assert_eq!(
+            cumulative_chain_work(&[Uint256::ONE, Uint256::ONE]),
+            Err(ConsensusError::ChainworkOverflow)
+        );
+        assert_eq!(cumulative_chain_work(&[Uint256::MAX]), Ok(Uint256::ONE));
+    }
     #[test]
     fn fork_choice_has_deterministic_work_height_and_hash_ties() {
         let low_hash = ChainTip {

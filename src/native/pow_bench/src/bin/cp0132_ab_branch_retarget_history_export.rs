@@ -113,7 +113,9 @@ fn build_branch(
         let target = target_for_next_block(targets[(height - 1) as usize], height, elapsed, params)
             .expect("target history transition");
         let work = block_work(target).expect("non-zero target work");
-        cumulative_work = cumulative_work.saturating_add(work);
+        cumulative_work = cumulative_work
+            .checked_add(work)
+            .expect("synthetic branch chain work must fit in Uint256");
         let tip = synthetic_tip(branch, height, timestamp, target, parent_tip);
 
         rows.push(Row {
