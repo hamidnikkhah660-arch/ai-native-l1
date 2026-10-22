@@ -21,6 +21,7 @@
 - **PMT4/PFM4 invalid miner-reward regression:** [Valid-PoW block with a wrong subsidy is rejected without durable state mutation](docs/CP_0375_GATE2_PFM4_INVALID_REWARD_ATOMICITY_2026-10-22.md)
 - **PMT4/PFM4 expected-target binding regression:** [PoW meeting a peer-forged easier target is rejected without durable mutation](docs/CP_0376_GATE2_PFM4_EXPECTED_TARGET_ATOMICITY_2026-10-22.md)
 - **PMT4/PFM4 archive-replay target regression:** [Recovery rejects a block that only meets a peer-forged easier target](docs/CP_0377_GATE2_PFM4_ARCHIVE_REPLAY_TARGET_BINDING_2026-10-22.md)
+- **Branch-derived retarget observation (Gate 2):** [Timestamp-window derivation, override rejection, and atomic replay validation](docs/CP_0378_GATE2_BRANCH_DERIVED_RETARGET_2026-10-22.md)
 - **Mining, halving and performance evidence:** [Candidate parameters and benchmark methodology](docs/MINING_HALVING_PERFORMANCE_AND_SCALING_V01.md)
 - **Reproducible halving charts and data:** [Candidate curve generator](simulations/candidate_halving_curve.py) - [Per-era CSV](simulations/candidate_halving_curve.csv); candidate-only, not live supply.
 - **Liquidity, market-data and public launch readiness:** [Platform prerequisites, cash-flow options and launch blockers](docs/LIQUIDITY_MARKET_DATA_AND_PUBLIC_LAUNCH_READINESS_V01.md)
