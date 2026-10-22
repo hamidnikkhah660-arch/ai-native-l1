@@ -286,6 +286,23 @@ impl ConsensusParameters {
         self.pow.validate()?;
         Ok(())
     }
+
+    /// Fail closed when a monetary runtime profile would execute a different issuance schedule
+    /// from the compile-time state-machine policy. The generic PoW/testnet model can still
+    /// explore arbitrary issuance parameters, but MBK3/MBK4 runtime candidates cannot silently
+    /// advertise one schedule while executing another.
+    pub fn validate_monetary_execution_compatibility(&self) -> Result<(), ConsensusError> {
+        self.validate()?;
+        if self.issuance.maximum_supply() != crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+            || self.issuance.initial_subsidy()
+                != crate::state_machine::MONETARY_INITIAL_SUBSIDY_ATOMS
+            || self.issuance.blocks_per_halving()
+                != crate::state_machine::MONETARY_BLOCKS_PER_HALVING
+        {
+            return Err(ConsensusError::MonetaryIssuanceProfileMismatch);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -346,6 +363,7 @@ pub enum ConsensusError {
     PowHashFailed,
     UnsupportedPowAlgorithm,
     Issuance(IssuanceError),
+    MonetaryIssuanceProfileMismatch,
 }
 
 impl std::fmt::Display for ConsensusError {
@@ -370,6 +388,10 @@ impl std::fmt::Display for ConsensusError {
             Self::PowHashFailed => write!(f, "PoW hashing failed"),
             Self::UnsupportedPowAlgorithm => write!(f, "unsupported PoW algorithm"),
             Self::Issuance(error) => write!(f, "issuance parameters invalid: {error}"),
+            Self::MonetaryIssuanceProfileMismatch => write!(
+                f,
+                "monetary runtime issuance profile does not match the state-machine candidate policy"
+            ),
         }
     }
 }
@@ -585,6 +607,45 @@ mod tests {
         assert_eq!(params.issuance.maximum_supply(), 1_000_000_000_000_000_000);
         assert_eq!(params.issuance.initial_subsidy(), 35_673_515_981);
         assert_eq!(params.issuance.blocks_per_halving(), 4_204_800);
+    }
+
+    #[test]
+    fn monetary_runtime_rejects_issuance_parameters_that_state_machine_would_ignore() {
+        let baseline = ConsensusParameters::candidate_testnet().unwrap();
+        baseline
+            .validate_monetary_execution_compatibility()
+            .unwrap();
+
+        let wrong_total_cap = IssuanceParameters::new(
+            baseline.issuance.maximum_supply() - 1,
+            baseline.issuance.initial_subsidy(),
+            baseline.issuance.blocks_per_halving(),
+        )
+        .unwrap();
+        let wrong_subsidy = IssuanceParameters::new(
+            baseline.issuance.maximum_supply(),
+            baseline.issuance.initial_subsidy() + 1,
+            baseline.issuance.blocks_per_halving(),
+        )
+        .unwrap();
+        let wrong_halving = IssuanceParameters::new(
+            baseline.issuance.maximum_supply(),
+            baseline.issuance.initial_subsidy(),
+            baseline.issuance.blocks_per_halving() + 1,
+        )
+        .unwrap();
+
+        for issuance in [wrong_total_cap, wrong_subsidy, wrong_halving] {
+            let mut incompatible = baseline.clone();
+            incompatible.issuance = issuance;
+            // The generic PoW research model remains parameterizable; the monetary execution
+            // path must reject a profile whose economics are not actually wired into the state.
+            incompatible.validate().unwrap();
+            assert_eq!(
+                incompatible.validate_monetary_execution_compatibility(),
+                Err(ConsensusError::MonetaryIssuanceProfileMismatch)
+            );
+        }
     }
 
     #[test]
