@@ -1,14 +1,25 @@
 //! Candidate-only durable PFM4 store for PMT4/MBK4 monetary branches.
 //!
-//! The manifest is the commit record: a branch envelope is written and synced first, then an
-//! atomically replaced manifest publishes its digest. Startup validates the frozen profile,
-//! manifest, every referenced PMT4 envelope, proof-of-work and the complete monetary ancestor
-//! graph by deterministic replay. A local checksum detects corruption; it is not an independent
-//! anti-rollback anchor. This store is not yet connected to the live devnet_node runtime.
+//! In local-only mode, a synced branch envelope followed by atomic manifest publication is the
+//! commit protocol; the local manifest checksum detects corruption but is not an independent
+//! anti-rollback anchor. The explicit external-CAS path first writes a durable pending manifest,
+//! verifies a pinned signed provider read, conditionally advances the external anchor, and only
+//! then publishes the local manifest. Restart reconciliation promotes only a pending manifest
+//! named by the freshly verified remote anchor, or discards it when the remote anchor remains on
+//! the old commit. Both modes replay and validate the complete PMT4 ancestor graph.
+//!
+//! The external provider is still an abstract transport contract/test fixture, not a deployed
+//! HTTPS service, and this store is not yet wired into the live devnet_node runtime. These
+//! candidate APIs therefore do not by themselves establish Gate 8 or Mainnet readiness.
 
 use crate::{
     chain_admission::ReferenceTimeProvider,
     consensus::{pow_digest, ConsensusParameters, PowAlgorithm},
+    external_cas_anchor_candidate::{
+        ExternalCasPin, ExternalCasProviderTransport, ExternalCasReceipt,
+        ExternalCasReceiptOutcome, ExternalCasRecord, ExternalCasWriteRequest,
+        VerifiedExternalCasClient,
+    },
     private_testnet_monetary_wire::{
         decode_candidate_v4_hybrid_monetary_network_block, V4HybridMonetaryWireError,
         MAX_PRIVATE_TESTNET_V4_HYBRID_MONETARY_ENVELOPE_BYTES,
@@ -41,6 +52,11 @@ const MAX_MANIFEST_BYTES: usize =
 const PROFILE_DOMAIN: &[u8] = b"AIN1-PMT4-STORE-PROFILE-V1\0";
 const MANIFEST_ANCHOR_DOMAIN: &[u8] = b"AIN1-PFM4-MANIFEST-ANCHOR-V1\0";
 const MANIFEST_NAME: &str = "monetary-v4-forkstore.manifest";
+const PENDING_MANIFEST_NAME: &str = "monetary-v4-forkstore.manifest.pending-cas";
+const EXTERNAL_CAS_OPERATION_DOMAIN: &[u8] = b"AIN1-PFM4-EXTERNAL-CAS-OPERATION-V1\0";
+const EXTERNAL_CAS_COMMIT_OPERATION_DOMAIN: &[u8] = b"AIN1-PFM4-EXTERNAL-CAS-COMMIT-OP-V1\0";
+const EXTERNAL_CAS_WRITE_NONCE_DOMAIN: &[u8] = b"AIN1-PFM4-EXTERNAL-CAS-WRITE-NONCE-V1\0";
+const EXTERNAL_CAS_GENESIS_DOMAIN: &[u8] = b"AIN1-PFM4-EXTERNAL-CAS-GENESIS-V1\0";
 const LOCK_NAME: &str = "monetary-v4-forkstore.lock";
 const BRANCH_PREFIX: &str = "monetary-v4-branch-";
 const BRANCH_SUFFIX: &str = ".pmt4";
@@ -76,6 +92,21 @@ pub enum V4HybridForkStoreError {
     ManifestTooLarge,
     DuplicateManifestDigest,
     ProfileEncodingInvalid,
+    ExternalAnchorMismatch,
+    ExternalAnchorRequired,
+    ExternalAnchorNoStateChange,
+    PendingManifestExists,
+    ExternalCasFailure(String),
+    ExternalCasConflict,
+    ExternalCasInvalidOutcome(ExternalCasReceiptOutcome),
+}
+
+/// Result of a PFM4 commit whose next manifest was accepted by the external CAS provider.
+#[derive(Debug)]
+pub struct V4HybridAnchoredSubmitOutcome {
+    pub block: V4HybridForkChoiceOutcome,
+    pub anchor_record: ExternalCasRecord,
+    pub receipt: ExternalCasReceipt,
 }
 
 impl std::fmt::Display for V4HybridForkStoreError {
@@ -122,6 +153,32 @@ impl std::fmt::Display for V4HybridForkStoreError {
             }
             Self::ProfileEncodingInvalid => {
                 write!(f, "monetary store consensus profile cannot be encoded")
+            }
+            Self::ExternalAnchorMismatch => write!(
+                f,
+                "external CAS anchor does not identify the currently committed PFM4 manifest"
+            ),
+            Self::ExternalAnchorRequired => write!(
+                f,
+                "this store was opened in externally anchored mode; local-only submit is disabled"
+            ),
+            Self::ExternalAnchorNoStateChange => write!(
+                f,
+                "candidate PMT4 submission does not change the committed PFM4 manifest"
+            ),
+            Self::PendingManifestExists => write!(
+                f,
+                "a pending externally anchored manifest requires signed-anchor recovery before another submit"
+            ),
+            Self::ExternalCasFailure(error) => {
+                write!(f, "external CAS provider/client error: {error}")
+            }
+            Self::ExternalCasConflict => write!(
+                f,
+                "external CAS conditional commit conflicted; pending manifest must be reconciled with a fresh signed read"
+            ),
+            Self::ExternalCasInvalidOutcome(outcome) => {
+                write!(f, "external CAS returned non-commit outcome: {outcome:?}")
             }
         }
     }
@@ -176,6 +233,7 @@ pub struct PrivateTestnetV4HybridForkStore {
     profile_fingerprint: [u8; 32],
     genesis_tip: [u8; 32],
     archive: PrivateTestnetV4HybridForkChoice,
+    external_anchor_required: bool,
     _writer_lock: StoreWriterLock,
 }
 
@@ -224,6 +282,90 @@ impl PrivateTestnetV4HybridForkStore {
         )
     }
 
+    /// Open/recover a store from a freshly verified external CAS read rather than accepting
+    /// an arbitrary caller-supplied manifest hash. If the provider is one generation ahead,
+    /// open_anchored reconciles the pending manifest with that exact signed remote state.
+    /// The caller's object-generation floor must be kept outside the rollback domain.
+    pub fn open_with_external_cas<P, V, A>(
+        directory: impl AsRef<Path>,
+        genesis: MonetaryLedgerState,
+        params: ConsensusParameters,
+        expected_manifest_id: [u8; 32],
+        verifier: &A,
+        clock: &dyn ReferenceTimeProvider,
+        pin: &ExternalCasPin,
+        client: &mut VerifiedExternalCasClient<P, V>,
+        expected_record: Option<&ExternalCasRecord>,
+        minimum_object_generation: u64,
+    ) -> Result<(Self, ExternalCasRecord, u64), V4HybridForkStoreError>
+    where
+        P: ExternalCasProviderTransport,
+        V: crate::v4_fat1_trust_candidate::MlDsa65Verifier,
+        A: MlDsa65Verifier,
+    {
+        let network_id = genesis.ledger().network_id();
+        let profile = profile_fingerprint(&genesis, &params, &expected_manifest_id)?;
+        let empty = PrivateTestnetV4HybridForkChoice::new(
+            genesis.clone(),
+            params.clone(),
+            expected_manifest_id,
+        )
+        .map_err(V4HybridForkStoreError::Fork)?;
+        let genesis_tip = empty.genesis_tip();
+        let mut genesis_hasher = Sha256::new();
+        genesis_hasher.update(EXTERNAL_CAS_GENESIS_DOMAIN);
+        genesis_hasher.update(network_id);
+        genesis_hasher.update(profile);
+        genesis_hasher.update(genesis_tip);
+        let expected_genesis_digest: [u8; 32] = genesis_hasher.finalize().into();
+        if pin.network_id != network_id || pin.genesis_digest != expected_genesis_digest {
+            return Err(V4HybridForkStoreError::ExternalAnchorMismatch);
+        }
+
+        let expected_generation = expected_record.map_or(0, |record| record.generation);
+        let mut operation_hasher = Sha256::new();
+        operation_hasher.update(EXTERNAL_CAS_OPERATION_DOMAIN);
+        operation_hasher.update(b"open-read");
+        operation_hasher.update(network_id);
+        operation_hasher.update(expected_genesis_digest);
+        operation_hasher.update(expected_manifest_id);
+        operation_hasher.update(expected_generation.to_be_bytes());
+        let operation_id: [u8; 32] = operation_hasher.finalize().into();
+        let mut request_hasher = Sha256::new();
+        request_hasher.update(b"AIN1-PFM4-EXTERNAL-CAS-OPEN-READ-REQUEST-V1\0");
+        request_hasher.update(operation_id);
+        request_hasher.update(minimum_object_generation.to_be_bytes());
+        let request_digest: [u8; 32] = request_hasher.finalize().into();
+        let read_request = client
+            .fresh_read_request(operation_id, request_digest)
+            .map_err(|error| V4HybridForkStoreError::ExternalCasFailure(error.to_string()))?;
+        let verified = client
+            .read_current(
+                &read_request,
+                expected_generation,
+                minimum_object_generation,
+                expected_record,
+            )
+            .map_err(|error| V4HybridForkStoreError::ExternalCasFailure(error.to_string()))?;
+        if verified.record.network_id != network_id
+            || verified.record.genesis_digest != expected_genesis_digest
+            || verified.record.provider_id != pin.provider_id
+        {
+            return Err(V4HybridForkStoreError::ExternalAnchorMismatch);
+        }
+
+        let store = Self::open_anchored(
+            directory,
+            genesis,
+            params,
+            expected_manifest_id,
+            verifier,
+            clock,
+            verified.record.next_state_digest,
+        )?;
+        Ok((store, verified.record, verified.object_generation))
+    }
+
     fn open_inner<V: MlDsa65Verifier>(
         directory: impl AsRef<Path>,
         genesis: MonetaryLedgerState,
@@ -250,6 +392,47 @@ impl PrivateTestnetV4HybridForkStore {
         .map_err(V4HybridForkStoreError::Fork)?;
         let genesis_tip = empty.genesis_tip();
         let manifest_path = directory.join(MANIFEST_NAME);
+        let pending_manifest_path = directory.join(PENDING_MANIFEST_NAME);
+
+        // Reconcile the narrow crash window after external CAS succeeds but before the
+        // local manifest is published. The expected anchor must come from a separately
+        // verified provider receipt. If the currently committed manifest already matches it,
+        // any pending file is an uncommitted/stale attempt and can be discarded. Otherwise,
+        // promote only a pending manifest whose exact commitment matches that verified anchor.
+        if pending_manifest_path.exists() {
+            if !pending_manifest_path.is_file() {
+                return Err(V4HybridForkStoreError::UnexpectedStoreEntry);
+            }
+            let expected_anchor =
+                expected_manifest_anchor.ok_or(V4HybridForkStoreError::ManifestAnchorMismatch)?;
+            let current_matches =
+                if manifest_path.is_file() {
+                    let current_bytes = read_bounded_file(&manifest_path, MAX_MANIFEST_BYTES)
+                        .map_err(|error| match error {
+                            BoundedReadError::Io(error) => V4HybridForkStoreError::Io(error),
+                            BoundedReadError::TooLarge => V4HybridForkStoreError::ManifestTooLarge,
+                        })?;
+                    manifest_anchor_commitment(&current_bytes) == expected_anchor
+                } else {
+                    false
+                };
+            if current_matches {
+                // A signed remote read still identifies the old local commit; CAS did not
+                // advance to this pending manifest, so drop the uncommitted proposal.
+                fs::remove_file(&pending_manifest_path)?;
+                sync_parent(&directory)?;
+            } else {
+                let pending_bytes = read_bounded_file(&pending_manifest_path, MAX_MANIFEST_BYTES)
+                    .map_err(|error| match error {
+                    BoundedReadError::Io(error) => V4HybridForkStoreError::Io(error),
+                    BoundedReadError::TooLarge => V4HybridForkStoreError::ManifestTooLarge,
+                })?;
+                if manifest_anchor_commitment(&pending_bytes) != expected_anchor {
+                    return Err(V4HybridForkStoreError::ManifestAnchorMismatch);
+                }
+                atomic_replace(&pending_manifest_path, &manifest_path)?;
+            }
+        }
 
         let (archive, known_digests) = if manifest_path.exists() {
             if !manifest_path.is_file() {
@@ -336,12 +519,25 @@ impl PrivateTestnetV4HybridForkStore {
             profile_fingerprint,
             genesis_tip,
             archive,
+            external_anchor_required: expected_manifest_anchor.is_some(),
             _writer_lock: writer_lock,
         })
     }
 
     pub fn expected_manifest_id(&self) -> [u8; 32] {
         self.expected_manifest_id
+    }
+
+    /// Stable nonzero binding for external anti-rollback configuration. Unlike the genesis tip,
+    /// which is normally zero at height zero, this commits to the network, frozen candidate
+    /// profile fingerprint, and canonical genesis-tip value.
+    pub fn external_cas_genesis_digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(EXTERNAL_CAS_GENESIS_DOMAIN);
+        hasher.update(self.genesis.ledger().network_id());
+        hasher.update(self.profile_fingerprint);
+        hasher.update(self.genesis_tip);
+        hasher.finalize().into()
     }
 
     pub fn archive(&self) -> &PrivateTestnetV4HybridForkChoice {
@@ -399,6 +595,14 @@ impl PrivateTestnetV4HybridForkStore {
         authenticator: &A,
         clock: &dyn ReferenceTimeProvider,
     ) -> Result<V4HybridForkChoiceOutcome, V4HybridForkStoreError> {
+        // A pending external-CAS manifest may represent an ambiguous remote commit. Never let
+        // the local-only path overtake it; recover using a fresh signed provider read first.
+        if self.directory.join(PENDING_MANIFEST_NAME).exists() {
+            return Err(V4HybridForkStoreError::PendingManifestExists);
+        }
+        if self.external_anchor_required {
+            return Err(V4HybridForkStoreError::ExternalAnchorRequired);
+        }
         // Refuse new commits if the already-published manifest or any committed branch file
         // has drifted since open; otherwise a fresh manifest could publish a graph with a gap.
         let _current_manifest_anchor = self.manifest_anchor()?;
@@ -454,6 +658,228 @@ impl PrivateTestnetV4HybridForkStore {
         write_manifest_atomic(&self.directory.join(MANIFEST_NAME), &manifest)?;
         self.archive = candidate_archive;
         Ok(outcome)
+    }
+
+    /// Submit a PMT4 block under an external anti-rollback commit protocol.
+    ///
+    /// Ordering is fail-closed: read/verify the current signed anchor; require that it names
+    /// the current local PFM4 manifest; durably write the branch and exact pending manifest;
+    /// submit an atomic provider CAS to the pending manifest commitment; only after a verified
+    /// Applied/AlreadyApplied receipt atomically publish the local manifest. Provider errors
+    /// are ambiguous and deliberately leave the pending file for signed-read recovery.
+    ///
+    /// pin.genesis_digest is the stable external_cas_genesis_digest() binding for this store.
+    /// The caller must retain
+    /// the returned anchor_record and receipt object generation outside this mutable store;
+    /// an in-memory floor alone is not a whole-disk rollback defense.
+    pub fn submit_with_external_anchor<P, V, A>(
+        &mut self,
+        envelope: &[u8],
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+        pin: &ExternalCasPin,
+        client: &mut VerifiedExternalCasClient<P, V>,
+        expected_record: &ExternalCasRecord,
+        minimum_object_generation: u64,
+    ) -> Result<V4HybridAnchoredSubmitOutcome, V4HybridForkStoreError>
+    where
+        P: ExternalCasProviderTransport,
+        V: crate::v4_fat1_trust_candidate::MlDsa65Verifier,
+        A: MlDsa65Verifier,
+    {
+        let pending_path = self.directory.join(PENDING_MANIFEST_NAME);
+        if pending_path.exists() {
+            return Err(V4HybridForkStoreError::PendingManifestExists);
+        }
+
+        let network_id = self.genesis.ledger().network_id();
+        let genesis_digest = self.external_cas_genesis_digest();
+        if pin.network_id != network_id
+            || pin.genesis_digest != genesis_digest
+            || expected_record.provider_id != pin.provider_id
+            || expected_record.network_id != network_id
+            || expected_record.genesis_digest != genesis_digest
+        {
+            return Err(V4HybridForkStoreError::ExternalAnchorMismatch);
+        }
+
+        let current_anchor = self.manifest_anchor()?;
+        if expected_record.next_state_digest != current_anchor {
+            return Err(V4HybridForkStoreError::ExternalAnchorMismatch);
+        }
+
+        // Build and fully validate the next canonical candidate without mutating the store.
+        let mut candidate_archive = self.archive.clone();
+        let outcome = candidate_archive.insert_encoded(envelope, authenticator, clock)?;
+        let mut digests: Vec<[u8; 32]> = candidate_archive
+            .archive_envelopes()
+            .iter()
+            .map(|bytes| {
+                let decoded = decode_candidate_v4_hybrid_monetary_network_block(bytes)
+                    .map_err(V4HybridForkStoreError::from_wire)?;
+                pow_digest(&decoded.header, self.params.pow)
+                    .map_err(|_| V4HybridForkStoreError::ProfileEncodingInvalid)
+            })
+            .collect::<Result<_, V4HybridForkStoreError>>()?;
+        digests.sort_unstable();
+        if digests.len() > MAX_V4_HYBRID_FORK_ARCHIVE_BLOCKS {
+            return Err(V4HybridForkStoreError::ManifestTooLarge);
+        }
+        let canonical_tip = candidate_archive.canonical_chain().chain_tip().tip_hash;
+        let manifest = encode_manifest(
+            &network_id,
+            &self.profile_fingerprint,
+            &self.genesis_tip,
+            &canonical_tip,
+            &digests,
+        )?;
+        let next_anchor = manifest_anchor_commitment(&manifest);
+        if next_anchor == current_anchor {
+            return Err(V4HybridForkStoreError::ExternalAnchorNoStateChange);
+        }
+
+        // The read challenge gets a stable proposal identifier. The write operation ID is
+        // derived later from the provider object generation too, so an unchanged predecessor
+        // produces the same immutable CAS request digest on retry.
+        let mut operation_hash = Sha256::new();
+        operation_hash.update(EXTERNAL_CAS_OPERATION_DOMAIN);
+        operation_hash.update(current_anchor);
+        operation_hash.update(next_anchor);
+        operation_hash.update(outcome.block_digest);
+        operation_hash.update(expected_record.generation.to_be_bytes());
+        let read_operation_id: [u8; 32] = operation_hash.finalize().into();
+
+        let read_request = client
+            .fresh_read_request(read_operation_id, current_anchor)
+            .map_err(|error| V4HybridForkStoreError::ExternalCasFailure(error.to_string()))?;
+        let verified = client
+            .read_current(
+                &read_request,
+                expected_record.generation,
+                minimum_object_generation,
+                Some(expected_record),
+            )
+            .map_err(|error| V4HybridForkStoreError::ExternalCasFailure(error.to_string()))?;
+        if verified
+            .record
+            .digest()
+            .map_err(|error| V4HybridForkStoreError::ExternalCasFailure(error.to_string()))?
+            != expected_record
+                .digest()
+                .map_err(|error| V4HybridForkStoreError::ExternalCasFailure(error.to_string()))?
+            || verified.record.next_state_digest != current_anchor
+        {
+            return Err(V4HybridForkStoreError::ExternalAnchorMismatch);
+        }
+
+        let mut commit_operation_hash = Sha256::new();
+        commit_operation_hash.update(EXTERNAL_CAS_COMMIT_OPERATION_DOMAIN);
+        commit_operation_hash.update(current_anchor);
+        commit_operation_hash.update(next_anchor);
+        commit_operation_hash.update(outcome.block_digest);
+        commit_operation_hash.update(expected_record.generation.to_be_bytes());
+        commit_operation_hash.update(verified.object_generation.to_be_bytes());
+        let operation_id: [u8; 32] = commit_operation_hash.finalize().into();
+
+        // A deterministic nonce makes the entire CAS request digest reproducible after a
+        // crash/ambiguous reply when the provider's predecessor and object generation did not
+        // change. The read above still uses a fresh cryptographic challenge nonce.
+        let mut nonce_hash = Sha256::new();
+        nonce_hash.update(EXTERNAL_CAS_WRITE_NONCE_DOMAIN);
+        nonce_hash.update(operation_id);
+        nonce_hash.update(verified.object_generation.to_be_bytes());
+        let request_nonce: [u8; 32] = nonce_hash.finalize().into();
+        if request_nonce.iter().all(|byte| *byte == 0) {
+            return Err(V4HybridForkStoreError::ExternalCasFailure(
+                "deterministic write nonce unexpectedly zero".to_string(),
+            ));
+        }
+
+        let branch_path = self.directory.join(branch_file_name(&outcome.block_digest));
+        write_branch_create_new(&branch_path, envelope)?;
+
+        let next_record = ExternalCasRecord {
+            generation: expected_record
+                .generation
+                .checked_add(1)
+                .ok_or(V4HybridForkStoreError::ExternalAnchorMismatch)?,
+            provider_id: pin.provider_id,
+            network_id,
+            genesis_digest,
+            previous_record_digest: expected_record
+                .digest()
+                .map_err(|error| V4HybridForkStoreError::ExternalCasFailure(error.to_string()))?,
+            previous_state_digest: current_anchor,
+            next_state_digest: next_anchor,
+            operation_id,
+            request_digest: [0; 32],
+        };
+        let mut write_request = ExternalCasWriteRequest {
+            request_nonce,
+            operation_id,
+            request_digest: [0; 32],
+            expected_generation: expected_record.generation,
+            expected_object_generation: verified.object_generation,
+            expected_record_digest: next_record.previous_record_digest,
+            expected_state_digest: current_anchor,
+            next_record: next_record.clone(),
+        };
+        write_request
+            .bind_request_digest(pin)
+            .map_err(|error| V4HybridForkStoreError::ExternalCasFailure(error.to_string()))?;
+        let next_record = write_request.next_record.clone();
+
+        // Persist the exact manifest before the external commit. A crash before CAS is resolved
+        // by a signed read that still names current_anchor; a crash after CAS promotes only this
+        // exact pending manifest if the signed remote state names next_anchor.
+        write_synced_new(&pending_path, &manifest).map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                V4HybridForkStoreError::PendingManifestExists
+            } else {
+                V4HybridForkStoreError::Io(error)
+            }
+        })?;
+        #[cfg(test)]
+        crash_at_pfm4_test_boundary("after_external_pending_sync_before_cas");
+
+        let receipt = client
+            .compare_and_swap(&write_request)
+            .map_err(|error| match error {
+                crate::external_cas_anchor_candidate::ExternalCasClientError::Contract(
+                    crate::external_cas_anchor_candidate::ExternalCasError::CasConflict,
+                ) => V4HybridForkStoreError::ExternalCasConflict,
+                // A transport error may mean the provider committed but the reply was lost. Do not
+                // delete pending state or guess: restart must reconcile it with a fresh signed read.
+                other => V4HybridForkStoreError::ExternalCasFailure(other.to_string()),
+            })?;
+        match receipt.outcome {
+            ExternalCasReceiptOutcome::Applied | ExternalCasReceiptOutcome::AlreadyApplied => {}
+            ExternalCasReceiptOutcome::Conflict => {
+                return Err(V4HybridForkStoreError::ExternalCasConflict)
+            }
+            other => return Err(V4HybridForkStoreError::ExternalCasInvalidOutcome(other)),
+        }
+        if receipt.generation != next_record.generation
+            || receipt.record_digest
+                != next_record.digest().map_err(|error| {
+                    V4HybridForkStoreError::ExternalCasFailure(error.to_string())
+                })?
+            || receipt.state_digest != next_anchor
+        {
+            return Err(V4HybridForkStoreError::ExternalAnchorMismatch);
+        }
+
+        #[cfg(test)]
+        crash_at_pfm4_test_boundary("after_external_cas_commit_before_manifest_replace");
+        atomic_replace(&pending_path, &self.directory.join(MANIFEST_NAME))?;
+        self.archive = candidate_archive;
+        self.external_anchor_required = true;
+
+        Ok(V4HybridAnchoredSubmitOutcome {
+            block: outcome,
+            anchor_record: next_record,
+            receipt,
+        })
     }
 }
 
@@ -848,6 +1274,7 @@ mod tests {
     use super::*;
     use crate::{
         consensus::{ConsensusParameters, PowHeader, Uint256},
+        external_cas_anchor_candidate::{ExternalCasReadRequest, ExternalCasReceiptKind},
         private_testnet_driver::PrivateTestnetChain,
         state_machine::{V4HybridMonetaryBlock, MONETARY_PUBLIC_GOODS_BUDGET_ATOMS},
         v4_account_identity_candidate::{
@@ -875,6 +1302,120 @@ mod tests {
                 provenance: crate::chain_admission::ReferenceTimeProvenance::ConfiguredProvider,
                 source_id: "pfm4-test-clock",
             })
+        }
+    }
+
+    struct MemoryCasProvider<F> {
+        pin: ExternalCasPin,
+        current: ExternalCasRecord,
+        object_generation: u64,
+        pending_manifest_path: Option<PathBuf>,
+        advance_generation_before_cas: bool,
+        sign: F,
+    }
+
+    impl<F> ExternalCasProviderTransport for MemoryCasProvider<F>
+    where
+        F: Fn(ExternalCasReceipt) -> ExternalCasReceipt,
+    {
+        type Error = String;
+
+        fn read_current(
+            &mut self,
+            request: &ExternalCasReadRequest,
+        ) -> Result<(ExternalCasRecord, ExternalCasReceipt), Self::Error> {
+            let current = self.current.clone();
+            let receipt = ExternalCasReceipt {
+                kind: ExternalCasReceiptKind::Read,
+                outcome: ExternalCasReceiptOutcome::Observed,
+                generation: current.generation,
+                object_generation: self.object_generation,
+                provider_id: current.provider_id,
+                network_id: current.network_id,
+                genesis_digest: current.genesis_digest,
+                receipt_key_id: self.pin.receipt_key_id,
+                request_nonce: request.request_nonce,
+                record_digest: current.digest().map_err(|error| error.to_string())?,
+                previous_record_digest: current.previous_record_digest,
+                previous_state_digest: current.previous_state_digest,
+                state_digest: current.next_state_digest,
+                operation_id: request.operation_id,
+                request_digest: request.request_digest,
+                signature: [0; crate::v4_fat1_trust_candidate::ML_DSA_65_SIGNATURE_BYTES],
+            };
+            Ok((current, (self.sign)(receipt)))
+        }
+
+        fn compare_and_swap(
+            &mut self,
+            request: &ExternalCasWriteRequest,
+        ) -> Result<ExternalCasReceipt, Self::Error> {
+            request
+                .validate(&self.pin)
+                .map_err(|error| error.to_string())?;
+            if let Some(pending_path) = &self.pending_manifest_path {
+                let pending_bytes = fs::read(pending_path).map_err(|error| error.to_string())?;
+                if manifest_anchor_commitment(&pending_bytes)
+                    != request.next_record.next_state_digest
+                {
+                    return Err("pending manifest was not durable before external CAS".to_string());
+                }
+            }
+            // Model a concurrent provider-side object update between signed read and CAS.
+            // The request must conflict on the object-generation precondition and must not
+            // publish the local manifest.
+            if self.advance_generation_before_cas {
+                self.object_generation = self
+                    .object_generation
+                    .checked_add(1)
+                    .ok_or_else(|| "provider object generation overflow".to_string())?;
+                self.advance_generation_before_cas = false;
+            }
+            let current_digest = self.current.digest().map_err(|error| error.to_string())?;
+            let requested_digest = request
+                .next_record
+                .digest()
+                .map_err(|error| error.to_string())?;
+            let already_applied = current_digest == requested_digest
+                && self.current.operation_id == request.operation_id
+                && self.current.request_digest == request.request_digest;
+            let can_apply = self.current.generation == request.expected_generation
+                && self.object_generation == request.expected_object_generation
+                && current_digest == request.expected_record_digest
+                && self.current.next_state_digest == request.expected_state_digest;
+
+            let outcome = if already_applied {
+                ExternalCasReceiptOutcome::AlreadyApplied
+            } else if can_apply {
+                self.current = request.next_record.clone();
+                self.object_generation = self
+                    .object_generation
+                    .checked_add(1)
+                    .ok_or_else(|| "provider object generation overflow".to_string())?;
+                ExternalCasReceiptOutcome::Applied
+            } else {
+                ExternalCasReceiptOutcome::Conflict
+            };
+            let current = self.current.clone();
+            let receipt = ExternalCasReceipt {
+                kind: ExternalCasReceiptKind::Commit,
+                outcome,
+                generation: current.generation,
+                object_generation: self.object_generation,
+                provider_id: current.provider_id,
+                network_id: current.network_id,
+                genesis_digest: current.genesis_digest,
+                receipt_key_id: self.pin.receipt_key_id,
+                request_nonce: request.request_nonce,
+                record_digest: current.digest().map_err(|error| error.to_string())?,
+                previous_record_digest: current.previous_record_digest,
+                previous_state_digest: current.previous_state_digest,
+                state_digest: current.next_state_digest,
+                operation_id: request.operation_id,
+                request_digest: request.request_digest,
+                signature: [0; crate::v4_fat1_trust_candidate::ML_DSA_65_SIGNATURE_BYTES],
+            };
+            Ok((self.sign)(receipt))
         }
     }
 
@@ -945,6 +1486,451 @@ mod tests {
             &header, &block,
         )
         .unwrap()
+    }
+
+    fn stage_pending_candidate(
+        store: &PrivateTestnetV4HybridForkStore,
+        envelope: &[u8],
+        verifier: &LibcruxMlDsa65VerifierCandidate,
+    ) -> ([u8; 32], [u8; 32]) {
+        let mut candidate_archive = store.archive.clone();
+        let outcome = candidate_archive
+            .insert_encoded(envelope, verifier, &FixedClock)
+            .unwrap();
+        let mut digests: Vec<[u8; 32]> = candidate_archive
+            .archive_envelopes()
+            .iter()
+            .map(|bytes| {
+                let decoded = decode_candidate_v4_hybrid_monetary_network_block(bytes).unwrap();
+                pow_digest(&decoded.header, store.params.pow).unwrap()
+            })
+            .collect();
+        digests.sort_unstable();
+        let manifest = encode_manifest(
+            &store.genesis.ledger().network_id(),
+            &store.profile_fingerprint,
+            &store.genesis_tip,
+            &outcome.canonical_tip,
+            &digests,
+        )
+        .unwrap();
+        write_branch_create_new(
+            &store
+                .directory
+                .join(branch_file_name(&outcome.block_digest)),
+            envelope,
+        )
+        .unwrap();
+        write_synced_new(&store.directory.join(PENDING_MANIFEST_NAME), &manifest).unwrap();
+        (manifest_anchor_commitment(&manifest), outcome.canonical_tip)
+    }
+
+    #[test]
+    fn pfm4_external_cas_is_committed_after_pending_manifest_is_durable() {
+        let directory = path("external-cas-commit");
+        let genesis = genesis();
+        let params = params();
+        let verifier = LibcruxMlDsa65VerifierCandidate;
+        let envelope = first_block_envelope(&genesis, &params);
+        let mut store = PrivateTestnetV4HybridForkStore::open(
+            &directory,
+            genesis.clone(),
+            params.clone(),
+            MANIFEST,
+            &verifier,
+            &FixedClock,
+        )
+        .unwrap();
+        let current_anchor = store.manifest_anchor().unwrap();
+        let key_pair = portable::generate_key_pair([0x51u8; 32]);
+        let pin = ExternalCasPin {
+            provider_id: [0x71; 32],
+            network_id: NETWORK,
+            genesis_digest: store.external_cas_genesis_digest(),
+            receipt_key_id: [0x72; 32],
+            receipt_public_key: *key_pair.verification_key.as_ref(),
+        };
+        let bootstrap = ExternalCasRecord {
+            generation: 0,
+            provider_id: pin.provider_id,
+            network_id: pin.network_id,
+            genesis_digest: pin.genesis_digest,
+            previous_record_digest: [0; 32],
+            previous_state_digest: [0; 32],
+            next_state_digest: current_anchor,
+            operation_id: [0x73; 32],
+            request_digest: [0x74; 32],
+        };
+        let sign = |mut receipt: ExternalCasReceipt| {
+            let digest = receipt.signing_digest().unwrap();
+            receipt.signature = *portable::sign(&key_pair.signing_key, &digest, &[], [0x75u8; 32])
+                .unwrap()
+                .as_ref();
+            receipt
+        };
+        let provider = MemoryCasProvider {
+            pin: pin.clone(),
+            current: bootstrap.clone(),
+            object_generation: 1,
+            pending_manifest_path: Some(directory.join(PENDING_MANIFEST_NAME)),
+            advance_generation_before_cas: false,
+            sign,
+        };
+        let mut client =
+            VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
+                .unwrap();
+
+        let committed = store
+            .submit_with_external_anchor(
+                &envelope,
+                &verifier,
+                &FixedClock,
+                &pin,
+                &mut client,
+                &bootstrap,
+                1,
+            )
+            .unwrap();
+        assert_eq!(committed.block.canonical_height, 1);
+        assert_eq!(
+            committed.receipt.outcome,
+            ExternalCasReceiptOutcome::Applied
+        );
+        assert_eq!(committed.anchor_record.generation, 1);
+        assert_eq!(committed.receipt.object_generation, 2);
+        assert_eq!(
+            store.manifest_anchor().unwrap(),
+            committed.anchor_record.next_state_digest
+        );
+        assert!(!directory.join(PENDING_MANIFEST_NAME).exists());
+        let second = child_envelope(
+            store.archive().canonical_chain(),
+            &params,
+            [0x64; 32],
+            101,
+            42,
+        );
+        assert!(matches!(
+            store.submit(&second, &verifier, &FixedClock),
+            Err(V4HybridForkStoreError::ExternalAnchorRequired)
+        ));
+        drop(store);
+
+        // Reopen succeeds only after a fresh signed provider read of the next-state commitment.
+        let (reopened, observed_record, observed_object_generation) =
+            PrivateTestnetV4HybridForkStore::open_with_external_cas(
+                &directory,
+                genesis,
+                params,
+                MANIFEST,
+                &verifier,
+                &FixedClock,
+                &pin,
+                &mut client,
+                Some(&committed.anchor_record),
+                committed.receipt.object_generation,
+            )
+            .unwrap();
+        assert_eq!(observed_record, committed.anchor_record);
+        assert_eq!(
+            observed_object_generation,
+            committed.receipt.object_generation
+        );
+        assert_eq!(reopened.canonical_height(), 1);
+        assert_eq!(reopened.canonical_tip(), committed.block.canonical_tip);
+        drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pfm4_external_cas_conflict_leaves_pending_and_recovery_discards_it_when_remote_is_old() {
+        let directory = path("external-cas-conflict");
+        let genesis = genesis();
+        let params = params();
+        let verifier = LibcruxMlDsa65VerifierCandidate;
+        let envelope = first_block_envelope(&genesis, &params);
+        let mut store = PrivateTestnetV4HybridForkStore::open(
+            &directory,
+            genesis.clone(),
+            params.clone(),
+            MANIFEST,
+            &verifier,
+            &FixedClock,
+        )
+        .unwrap();
+        let old_anchor = store.manifest_anchor().unwrap();
+        let key_pair = portable::generate_key_pair([0x91u8; 32]);
+        let pin = ExternalCasPin {
+            provider_id: [0xA1; 32],
+            network_id: NETWORK,
+            genesis_digest: store.external_cas_genesis_digest(),
+            receipt_key_id: [0xA2; 32],
+            receipt_public_key: *key_pair.verification_key.as_ref(),
+        };
+        let bootstrap = ExternalCasRecord {
+            generation: 0,
+            provider_id: pin.provider_id,
+            network_id: pin.network_id,
+            genesis_digest: pin.genesis_digest,
+            previous_record_digest: [0; 32],
+            previous_state_digest: [0; 32],
+            next_state_digest: old_anchor,
+            operation_id: [0xA3; 32],
+            request_digest: [0xA4; 32],
+        };
+        let sign = |mut receipt: ExternalCasReceipt| {
+            let digest = receipt.signing_digest().unwrap();
+            receipt.signature = *portable::sign(&key_pair.signing_key, &digest, &[], [0xA5u8; 32])
+                .unwrap()
+                .as_ref();
+            receipt
+        };
+        let provider = MemoryCasProvider {
+            pin: pin.clone(),
+            current: bootstrap.clone(),
+            object_generation: 1,
+            pending_manifest_path: Some(directory.join(PENDING_MANIFEST_NAME)),
+            advance_generation_before_cas: true,
+            sign,
+        };
+        let mut client =
+            VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
+                .unwrap();
+
+        assert!(matches!(
+            store.submit_with_external_anchor(
+                &envelope,
+                &verifier,
+                &FixedClock,
+                &pin,
+                &mut client,
+                &bootstrap,
+                1,
+            ),
+            Err(V4HybridForkStoreError::ExternalCasConflict)
+        ));
+        assert_eq!(store.canonical_height(), 0);
+        assert_eq!(store.manifest_anchor().unwrap(), old_anchor);
+        assert!(directory.join(PENDING_MANIFEST_NAME).is_file());
+        assert!(matches!(
+            store.submit(&envelope, &verifier, &FixedClock),
+            Err(V4HybridForkStoreError::PendingManifestExists)
+        ));
+        drop(store);
+
+        // A fresh signed read still identifies the old record, so recovery discards the proposal
+        // and its orphan branch instead of guessing that the failed CAS might have committed.
+        let (recovered, observed, object_generation) =
+            PrivateTestnetV4HybridForkStore::open_with_external_cas(
+                &directory,
+                genesis,
+                params,
+                MANIFEST,
+                &verifier,
+                &FixedClock,
+                &pin,
+                &mut client,
+                Some(&bootstrap),
+                2,
+            )
+            .unwrap();
+        assert_eq!(observed, bootstrap);
+        assert_eq!(object_generation, 2);
+        assert_eq!(recovered.canonical_height(), 0);
+        assert_eq!(recovered.manifest_anchor().unwrap(), old_anchor);
+        assert!(!directory.join(PENDING_MANIFEST_NAME).exists());
+        assert_eq!(
+            fs::read_dir(&directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(BRANCH_PREFIX))
+                .count(),
+            0
+        );
+        drop(recovered);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pfm4_open_with_signed_successor_recovers_commit_before_local_manifest_replace() {
+        let directory = path("external-cas-signed-recovery");
+        let genesis = genesis();
+        let params = params();
+        let verifier = LibcruxMlDsa65VerifierCandidate;
+        let envelope = first_block_envelope(&genesis, &params);
+        let store = PrivateTestnetV4HybridForkStore::open(
+            &directory,
+            genesis.clone(),
+            params.clone(),
+            MANIFEST,
+            &verifier,
+            &FixedClock,
+        )
+        .unwrap();
+        let old_anchor = store.manifest_anchor().unwrap();
+        let key_pair = portable::generate_key_pair([0x61u8; 32]);
+        let pin = ExternalCasPin {
+            provider_id: [0x81; 32],
+            network_id: NETWORK,
+            genesis_digest: store.external_cas_genesis_digest(),
+            receipt_key_id: [0x82; 32],
+            receipt_public_key: *key_pair.verification_key.as_ref(),
+        };
+        let bootstrap = ExternalCasRecord {
+            generation: 0,
+            provider_id: pin.provider_id,
+            network_id: pin.network_id,
+            genesis_digest: pin.genesis_digest,
+            previous_record_digest: [0; 32],
+            previous_state_digest: [0; 32],
+            next_state_digest: old_anchor,
+            operation_id: [0x83; 32],
+            request_digest: [0x84; 32],
+        };
+        let (next_anchor, expected_tip) = stage_pending_candidate(&store, &envelope, &verifier);
+        let committed_remote_record = ExternalCasRecord {
+            generation: 1,
+            provider_id: pin.provider_id,
+            network_id: pin.network_id,
+            genesis_digest: pin.genesis_digest,
+            previous_record_digest: bootstrap.digest().unwrap(),
+            previous_state_digest: old_anchor,
+            next_state_digest: next_anchor,
+            operation_id: [0x85; 32],
+            request_digest: [0x86; 32],
+        };
+        drop(store);
+
+        let sign = |mut receipt: ExternalCasReceipt| {
+            let digest = receipt.signing_digest().unwrap();
+            receipt.signature = *portable::sign(&key_pair.signing_key, &digest, &[], [0x87u8; 32])
+                .unwrap()
+                .as_ref();
+            receipt
+        };
+        let provider = MemoryCasProvider {
+            pin: pin.clone(),
+            current: committed_remote_record.clone(),
+            object_generation: 2,
+            pending_manifest_path: None,
+            advance_generation_before_cas: false,
+            sign,
+        };
+        let mut client =
+            VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
+                .unwrap();
+        let (recovered, observed, object_generation) =
+            PrivateTestnetV4HybridForkStore::open_with_external_cas(
+                &directory,
+                genesis,
+                params,
+                MANIFEST,
+                &verifier,
+                &FixedClock,
+                &pin,
+                &mut client,
+                Some(&bootstrap),
+                1,
+            )
+            .unwrap();
+        assert_eq!(observed, committed_remote_record);
+        assert_eq!(object_generation, 2);
+        assert_eq!(recovered.canonical_height(), 1);
+        assert_eq!(recovered.canonical_tip(), expected_tip);
+        assert_eq!(recovered.manifest_anchor().unwrap(), next_anchor);
+        assert!(!directory.join(PENDING_MANIFEST_NAME).exists());
+        drop(recovered);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pfm4_external_cas_recovery_promotes_only_the_pending_manifest_named_by_remote_anchor() {
+        let directory = path("external-cas-recovery-promote");
+        let genesis = genesis();
+        let params = params();
+        let verifier = LibcruxMlDsa65VerifierCandidate;
+        let envelope = first_block_envelope(&genesis, &params);
+        let store = PrivateTestnetV4HybridForkStore::open(
+            &directory,
+            genesis.clone(),
+            params.clone(),
+            MANIFEST,
+            &verifier,
+            &FixedClock,
+        )
+        .unwrap();
+        let (next_anchor, expected_tip) = stage_pending_candidate(&store, &envelope, &verifier);
+        drop(store);
+
+        let recovered = PrivateTestnetV4HybridForkStore::open_anchored(
+            &directory,
+            genesis,
+            params,
+            MANIFEST,
+            &verifier,
+            &FixedClock,
+            next_anchor,
+        )
+        .unwrap();
+        assert_eq!(recovered.canonical_height(), 1);
+        assert_eq!(recovered.canonical_tip(), expected_tip);
+        assert_eq!(recovered.manifest_anchor().unwrap(), next_anchor);
+        assert!(!directory.join(PENDING_MANIFEST_NAME).exists());
+        drop(recovered);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pfm4_external_cas_recovery_discards_pending_if_remote_still_names_old_commit() {
+        let directory = path("external-cas-recovery-discard");
+        let genesis = genesis();
+        let params = params();
+        let verifier = LibcruxMlDsa65VerifierCandidate;
+        let envelope = first_block_envelope(&genesis, &params);
+        let store = PrivateTestnetV4HybridForkStore::open(
+            &directory,
+            genesis.clone(),
+            params.clone(),
+            MANIFEST,
+            &verifier,
+            &FixedClock,
+        )
+        .unwrap();
+        let old_anchor = store.manifest_anchor().unwrap();
+        let _ = stage_pending_candidate(&store, &envelope, &verifier);
+        drop(store);
+
+        let recovered = PrivateTestnetV4HybridForkStore::open_anchored(
+            &directory,
+            genesis,
+            params,
+            MANIFEST,
+            &verifier,
+            &FixedClock,
+            old_anchor,
+        )
+        .unwrap();
+        assert_eq!(recovered.canonical_height(), 0);
+        assert_eq!(recovered.manifest_anchor().unwrap(), old_anchor);
+        assert!(!directory.join(PENDING_MANIFEST_NAME).exists());
+        assert_eq!(
+            fs::read_dir(&directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(BRANCH_PREFIX)
+                })
+                .count(),
+            0
+        );
+        drop(recovered);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
