@@ -442,7 +442,7 @@ mod tests {
     use crate::{
         consensus::ConsensusParameters,
         private_testnet_checkpoint_candidate::{trusted_genesis_fingerprint, Pcp4CheckpointRecord},
-        private_testnet_driver::TargetHistoryCheckpoint,
+        private_testnet_driver::{PrivateTestnetChain, TargetHistoryCheckpoint},
         state_machine::{MonetaryLedgerState, MONETARY_PUBLIC_GOODS_BUDGET_ATOMS},
     };
 
@@ -522,6 +522,100 @@ mod tests {
             branch_digests: Vec::new(),
         };
         (manifest, checkpoint, network, genesis, params, manifest_id)
+    }
+
+    #[test]
+    fn pfm5_checkpoint_restore_requires_external_anchor_and_restores_genesis_baseline() {
+        let (manifest, checkpoint, network, genesis, params, manifest_id) = manifest_and_context();
+        let context = Pcp4ValidationContext {
+            network_id: &network,
+            trusted_genesis: &genesis,
+            params: &params,
+            active_transaction_manifest_id: &manifest_id,
+        };
+        let anchor = manifest.commitment().unwrap();
+        let restored = PrivateTestnetChain::restore_from_pfm5_checkpoint(
+            &manifest,
+            &checkpoint,
+            &context,
+            anchor,
+            1,
+            0,
+        )
+        .unwrap();
+        assert_eq!(restored.chain_tip().height, checkpoint.logical_height);
+        assert_eq!(
+            restored.chain_tip().tip_hash,
+            checkpoint.consensus_tip_digest
+        );
+        assert_eq!(restored.cumulative_work(), checkpoint.cumulative_chainwork);
+        assert_eq!(
+            restored.monetary_state().unwrap().state_root(),
+            checkpoint.monetary_state_root
+        );
+        assert_eq!(
+            restored.target_history().checkpoint_snapshot().unwrap(),
+            checkpoint.target_history
+        );
+
+        assert_eq!(
+            PrivateTestnetChain::restore_from_pfm5_checkpoint(
+                &manifest, &checkpoint, &context, [0; 32], 1, 0,
+            ),
+            Err(crate::private_testnet_driver::Pfm5CheckpointRestoreError::MissingTrustedManifestAnchor)
+        );
+        assert_eq!(
+            PrivateTestnetChain::restore_from_pfm5_checkpoint(
+                &manifest,
+                &checkpoint,
+                &context,
+                [0x55; 32],
+                1,
+                0,
+            ),
+            Err(crate::private_testnet_driver::Pfm5CheckpointRestoreError::ManifestAnchorMismatch)
+        );
+        assert_eq!(
+            PrivateTestnetChain::restore_from_pfm5_checkpoint(
+                &manifest, &checkpoint, &context, anchor, 2, 0,
+            ),
+            Err(crate::private_testnet_driver::Pfm5CheckpointRestoreError::ManifestGenerationRollback)
+        );
+        assert_eq!(
+            PrivateTestnetChain::restore_from_pfm5_checkpoint(
+                &manifest,
+                &checkpoint,
+                &context,
+                anchor,
+                1,
+                1,
+            ),
+            Err(
+                crate::private_testnet_driver::Pfm5CheckpointRestoreError::CheckpointHeightRollback
+            )
+        );
+    }
+
+    #[test]
+    fn pfm5_checkpoint_restore_refuses_manifests_that_need_post_checkpoint_replay() {
+        let (mut manifest, checkpoint, network, genesis, params, manifest_id) =
+            manifest_and_context();
+        let context = Pcp4ValidationContext {
+            network_id: &network,
+            trusted_genesis: &genesis,
+            params: &params,
+            active_transaction_manifest_id: &manifest_id,
+        };
+        manifest.canonical_tip_height = 1;
+        manifest.canonical_tip_digest = [0x37; 32];
+        manifest.branch_digests = vec![[0x37; 32]];
+        let anchor = manifest.commitment().unwrap();
+        assert_eq!(
+            PrivateTestnetChain::restore_from_pfm5_checkpoint(
+                &manifest, &checkpoint, &context, anchor, 1, 0,
+            ),
+            Err(crate::private_testnet_driver::Pfm5CheckpointRestoreError::ManifestRequiresArchiveReplay)
+        );
     }
 
     #[test]

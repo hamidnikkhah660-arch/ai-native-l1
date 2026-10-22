@@ -1,4 +1,4 @@
-//! Private-testnet consensus chain driver for CP-W.
+﻿//! Private-testnet consensus chain driver for CP-W.
 //!
 //! This driver keeps target history, cumulative work, and canonical state together without
 //! changing the legacy BLK2 body encoding. It is deliberately small and explicit so a later
@@ -9,9 +9,11 @@ use crate::{
     consensus::{
         block_work, compare_chain_tips, ChainTip, ConsensusError, ConsensusParameters, Uint256,
     },
+    private_testnet_checkpoint_candidate::{Pcp4CheckpointRecord, Pcp4ValidationContext},
     private_testnet_consensus::{
         admit_live as admit_candidate_live, CandidateConsensusBlock, PrivateConsensusError,
     },
+    private_testnet_pfm5_manifest_candidate::Pfm5CheckpointManifest,
     state_machine::{
         Block, LedgerState, MonetaryBlock, MonetaryLedgerState, TransactionAuthenticator,
     },
@@ -420,6 +422,38 @@ impl TargetHistory {
     }
 }
 
+/// Fail-closed errors when restoring a chain baseline from an externally anchored PFM5 manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pfm5CheckpointRestoreError {
+    MissingTrustedManifestAnchor,
+    ManifestAnchorMismatch,
+    ManifestGenerationRollback,
+    CheckpointHeightRollback,
+    ManifestRequiresArchiveReplay,
+    InvalidManifest(String),
+    InvalidCheckpoint(String),
+    InvalidMonetarySnapshot(String),
+    InvalidTargetHistory(String),
+}
+
+impl std::fmt::Display for Pfm5CheckpointRestoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingTrustedManifestAnchor => f.write_str("PFM5 restore requires a nonzero manifest commitment from an independently protected trust source"),
+            Self::ManifestAnchorMismatch => f.write_str("PFM5 manifest commitment does not match the trusted external anchor"),
+            Self::ManifestGenerationRollback => f.write_str("PFM5 manifest generation is below the trusted monotonic floor"),
+            Self::CheckpointHeightRollback => f.write_str("PFM5 checkpoint height is below the trusted monotonic floor"),
+            Self::ManifestRequiresArchiveReplay => f.write_str("PFM5 manifest describes post-checkpoint branches; replay and validate them before selecting its canonical tip"),
+            Self::InvalidManifest(error) => write!(f, "PFM5 manifest rejected: {error}"),
+            Self::InvalidCheckpoint(error) => write!(f, "PCP4 checkpoint rejected: {error}"),
+            Self::InvalidMonetarySnapshot(error) => write!(f, "PCP4 monetary snapshot rejected: {error}"),
+            Self::InvalidTargetHistory(error) => write!(f, "PCP4 target-history checkpoint rejected: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for Pfm5CheckpointRestoreError {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrivateTestnetChain {
     /// Public legacy-state view retained for existing PTB2 callers. On a monetary
@@ -449,6 +483,77 @@ impl PrivateTestnetChain {
     /// Construct a PoW-driven chain over the versioned MBK3/MST3 monetary transition.
     /// This reuses the shared target history/work logic, but archive/wire/runtime persistence
     /// must still be integrated separately before this can be a production chain.
+    /// Restore a checkpoint baseline only when the exact canonical PFM5 commitment is anchored
+    /// outside the rollback domain and meets the caller's monotonic generation/height floors.
+    ///
+    /// This method intentionally refuses manifests with retained post-checkpoint branch digests:
+    /// those envelopes must first be loaded, authenticated, replayed and compared with fork choice.
+    /// It restores a baseline; it is not by itself a full PFM5 durable-store or runtime integration.
+    pub fn restore_from_pfm5_checkpoint(
+        manifest: &Pfm5CheckpointManifest,
+        checkpoint: &Pcp4CheckpointRecord,
+        context: &Pcp4ValidationContext<'_>,
+        expected_manifest_commitment: [u8; 32],
+        minimum_generation: u64,
+        minimum_checkpoint_height: u64,
+    ) -> Result<Self, Pfm5CheckpointRestoreError> {
+        if expected_manifest_commitment == [0; 32] || minimum_generation == 0 {
+            return Err(Pfm5CheckpointRestoreError::MissingTrustedManifestAnchor);
+        }
+        let commitment = manifest
+            .commitment()
+            .map_err(|error| Pfm5CheckpointRestoreError::InvalidManifest(error.to_string()))?;
+        if commitment != expected_manifest_commitment {
+            return Err(Pfm5CheckpointRestoreError::ManifestAnchorMismatch);
+        }
+        if manifest.generation < minimum_generation {
+            return Err(Pfm5CheckpointRestoreError::ManifestGenerationRollback);
+        }
+        if manifest.checkpoint_height < minimum_checkpoint_height {
+            return Err(Pfm5CheckpointRestoreError::CheckpointHeightRollback);
+        }
+        manifest
+            .validate_checkpoint(checkpoint, context)
+            .map_err(|error| Pfm5CheckpointRestoreError::InvalidCheckpoint(error.to_string()))?;
+        if !manifest.branch_digests.is_empty()
+            || manifest.canonical_tip_height != checkpoint.logical_height
+            || manifest.canonical_tip_digest != checkpoint.consensus_tip_digest
+        {
+            return Err(Pfm5CheckpointRestoreError::ManifestRequiresArchiveReplay);
+        }
+        let state =
+            MonetaryLedgerState::decode_snapshot(&checkpoint.monetary_snapshot, context.network_id)
+                .map_err(|error| {
+                    Pfm5CheckpointRestoreError::InvalidMonetarySnapshot(format!("{error:?}"))
+                })?;
+        if state.height() != checkpoint.logical_height
+            || state.tip_hash() != checkpoint.ledger_tip_hash
+            || state.state_root() != checkpoint.monetary_state_root
+            || state.total_mined_atoms() != checkpoint.total_mined_atoms
+        {
+            return Err(Pfm5CheckpointRestoreError::InvalidMonetarySnapshot(
+                "decoded state does not match PCP4 summary fields".into(),
+            ));
+        }
+        let target_history = TargetHistory::from_checkpoint_snapshot(
+            context.params.clone(),
+            &checkpoint.target_history,
+        )
+        .map_err(|error| Pfm5CheckpointRestoreError::InvalidTargetHistory(error.to_string()))?;
+        if target_history.height() != checkpoint.logical_height {
+            return Err(Pfm5CheckpointRestoreError::InvalidTargetHistory(
+                "restored target history height differs from checkpoint height".into(),
+            ));
+        }
+        Ok(Self {
+            state: state.ledger().clone(),
+            monetary_state: Some(state),
+            target_history,
+            cumulative_work: checkpoint.cumulative_chainwork,
+            tip_consensus_hash: checkpoint.consensus_tip_digest,
+        })
+    }
+
     pub fn new_monetary(
         state: MonetaryLedgerState,
         params: ConsensusParameters,
