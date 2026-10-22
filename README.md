@@ -9,8 +9,9 @@
 - **Technical review and test evidence:** [CP-0343 report](docs/CP_0343_TECHNICAL_REVIEW_AND_TEST_RESULTS.md)
 - **Latest halving visualization and emission-data checkpoint:** [CP-0349](docs/CP_0349_REPRODUCIBLE_CANDIDATE_HALVING_VISUALIZATION_2026-10-21.md)
 - **Latest full curated source validation:** [CP-0347](docs/CP_0347_PUBLIC_CURATED_CHECKOUT_VALIDATION_2026-10-21.md) - **Latest founder/market-readiness docs:** [CP-0348](docs/CP_0348_FOUNDER_CREDENTIAL_MARKET_READINESS_2026-10-21.md)
-- **Current public documentation manifest:** [v1.4 manifest](docs/PUBLIC_RELEASE_MANIFEST_V14_2026-10-22.md)
+- **Current public documentation manifest:** [v1.5 manifest](docs/PUBLIC_RELEASE_MANIFEST_V15_2026-10-22.md)
 - **Gate 2 bounded checkpoint/replay reachability finding:** [CP-0379](docs/CP_0379_GATE2_PFM4_BOUNDED_CHECKPOINT_DESIGN_2026-10-22.md) — durable logical height, retained archive, retarget history, halving, and trust requirements; no production cap changes.
+- **Gate 2 checkpoint schema and trust-boundary proposal:** [CP-0380](docs/CP_0380_GATE2_CHECKPOINT_SCHEMA_THREAT_MODEL_2026-10-22.md) - proposed PCP4/PFM5 record layout, logical-height retarget-history requirements, rollback/freshness assumptions and adversarial acceptance criteria; design only, no runtime implementation.
 - **Publication checkpoint:** [CP-0344](docs/CP_0344_PUBLIC_DOCUMENTATION_REFRESH_2026-10-20.md)
 - **Founder/sponsor/contributor economics:** [Allocation policy v0.3](docs/FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V03.md)
 - **Current curated source baseline:** [v0.1.1-source](https://github.com/hamidnikkhah660-arch/ai-native-l1/releases/tag/v0.1.1-source)
@@ -100,4 +101,4 @@ The founder profile now reflects the founder-confirmed **Ph.D. in Artificial Int
 
 The current 10B design cap assigns 3B to the mining/network-security envelope. A shared research candidate uses 8 decimal places, a 30-second target, 2,016-block difficulty window, Argon2id v1.3 (64 MiB, one iteration, one lane), and a 4,204,800-block halving interval with a 356.73515981-coin initial subsidy. These are candidate arithmetic values, not frozen production rules; Gate 2 remains open and the reward path is not yet integrated through canonical block production/import, Genesis, reorganisation, snapshots and state roots. The project has no validated end-to-end native TPS or public-network latency benchmark. See the mining/performance report for the single-host candidate screens, their limitations, and the exact benchmark plan.
 
-The source tree is a curated public selection. Review specific files, reproduce commands in the relevant package, and use the [current public release manifest](docs/PUBLIC_RELEASE_MANIFEST_V13_2026-10-22.md) to identify the versioned public baseline. The public white paper and roadmap describe the engineering plan; they do not assert that future integrations are already operating on native Mainnet.
+The source tree is a curated public selection. Review specific files, reproduce commands in the relevant package, and use the [current public release manifest](docs/PUBLIC_RELEASE_MANIFEST_V15_2026-10-22.md) to identify the versioned public baseline. The public white paper and roadmap describe the engineering plan; they do not assert that future integrations are already operating on native Mainnet.
