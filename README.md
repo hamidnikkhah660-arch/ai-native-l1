@@ -113,3 +113,6 @@ The founder profile now reflects the founder-confirmed **Ph.D. in Artificial Int
 The current 10B design cap assigns 3B to the mining/network-security envelope. A shared research candidate uses 8 decimal places, a 30-second target, 2,016-block difficulty window, Argon2id v1.3 (64 MiB, one iteration, one lane), and a 4,204,800-block halving interval with a 356.73515981-coin initial subsidy. These are candidate arithmetic values, not frozen production rules; Gate 2 remains open and the reward path is not yet integrated through canonical block production/import, Genesis, reorganisation, snapshots and state roots. The project has no validated end-to-end native TPS or public-network latency benchmark. See the mining/performance report for the single-host candidate screens, their limitations, and the exact benchmark plan.
 
 The source tree is a curated public selection. Review specific files, reproduce commands in the relevant package, and use the [current public release manifest](docs/PUBLIC_RELEASE_MANIFEST_V18_2026-10-22.md) to identify the versioned public baseline. The public white paper and roadmap describe the engineering plan; they do not assert that future integrations are already operating on native Mainnet.
+
+
+Additional candidate note: [CP-0394 — v0.4 ledger snapshot candidate](docs/CP_0394_GATE2_V04_LEDGER_SNAPSHOT_CANDIDATE_2026-10-24.md).
