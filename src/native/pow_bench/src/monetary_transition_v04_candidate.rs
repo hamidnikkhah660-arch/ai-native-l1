@@ -1,13 +1,12 @@
-//! CP-0398 candidate-only profile-bound atomic v0.4 mining transition.
+//! CP-0398/CP-0403 candidate-only profile-bound v0.4 transition contract.
 //!
-//! This module deliberately does not connect to a node, PoW admission, transaction execution,
-//! fork choice, durable storage or a network runtime. It defines a strict, separately versioned
-//! profile envelope and an issuance-only transition so those semantics can be tested before any
-//! runtime wiring is considered. Existing QZGM/QZL4 and MBK3/MBK4 bytes are not reinterpreted.
+//! QZB4 v1 remains a fixed-width mining-only candidate. QZB4 v2 adds a bounded transaction list and
+//! stages transfers, fees, locally derived miner issuance, allocation accounting and the combined
+//! state root atomically. This module remains separate from node producer/importer, PoW admission,
+//! fork choice, durable stores, and network runtime; it is not a production activation.
 //!
-//! A profile requires an explicitly constructed mining schedule. There is no consensus default.
-//! Blocks bind the profile fingerprint and miner reward; the importer derives the reward from the
-//! local parent state and commits ledger balances, accounting and mining counters atomically.
+//! A QZCP profile requires an explicitly constructed mining schedule. There is no consensus
+//! default. Existing QZGM/QZL4, BLK2 and MBK3/MBK4 bytes are not reinterpreted.
 
 use sha2::{Digest, Sha256};
 
@@ -22,7 +21,11 @@ use crate::{
         MonetaryLedgerStateV04Candidate, V04LedgerGenesisError, V04LedgerSnapshotError,
         MAX_ENCODED_V04_LEDGER_SNAPSHOT_BYTES,
     },
-    state_machine::{LedgerState, StateError},
+    state_machine::{
+        decode_transaction, encode_transaction, LedgerState, StateError, Transaction,
+        TransactionAuthenticator, MAX_ENCODED_BLOCK_BYTES, MAX_TRANSACTIONS_PER_BLOCK,
+        MAX_TRANSACTION_BYTES,
+    },
 };
 
 pub const V04_CONSENSUS_PROFILE_MAGIC: [u8; 4] = *b"QZCP";
@@ -31,6 +34,14 @@ pub const V04_MINING_BLOCK_MAGIC: [u8; 4] = *b"QZB4";
 pub const V04_MINING_BLOCK_VERSION: u16 = 1;
 pub const V04_CONSENSUS_PROFILE_BYTES: usize = 254;
 pub const V04_MINING_BLOCK_BYTES: usize = 166;
+/// QZB4 v2 is the transaction-bearing extension; QZB4 v1 remains mining-only and unchanged.
+pub const V04_EXECUTION_BLOCK_VERSION: u16 = 2;
+const V04_EXECUTION_BLOCK_FIXED_BYTES: usize = 4 + 2 + 32 + 8 + 8 + 32 + 32 + 16 + 4 + 32;
+// BLK2 transactions are bounded at MAX_ENCODED_BLOCK_BYTES with an 88-byte header.
+// QZB4 v2 uses the same transaction batch and a 170-byte fixed header.
+pub const MAX_ENCODED_V04_EXECUTION_BLOCK_BYTES: usize =
+    MAX_ENCODED_BLOCK_BYTES + (V04_EXECUTION_BLOCK_FIXED_BYTES - 88);
+const EXECUTION_BLOCK_ID_DOMAIN: &[u8] = b"QUANTUMZXB-V04-EXECUTION-BLOCK-ID-CANDIDATE-V1\0";
 /// Profile-bound restart envelope; separate from the unprofiled QZL4 format.
 pub const V04_PROFILE_BOUND_SNAPSHOT_MAGIC: [u8; 4] = *b"QZP4";
 pub const V04_PROFILE_BOUND_SNAPSHOT_VERSION: u16 = 1;
@@ -62,6 +73,9 @@ pub enum V04TransitionError {
     ProfileBindingMismatch,
     ProfileFingerprintMismatch,
     MalformedMiningBlock,
+    MalformedExecutionBlock,
+    UnsupportedExecutionBlockVersion(u16),
+    ExecutionBlockProfileMismatch,
     WrongMiningBlockMagic,
     UnsupportedMiningBlockVersion(u16),
     MiningBlockProfileMismatch,
@@ -382,6 +396,182 @@ impl V04MiningBlockCandidate {
         hash.update(canonical);
         Ok(hash.finalize().into())
     }
+}
+
+/// Canonical transaction-bearing v0.4 block. The v1 QZB4 mining-only wire stays intact;
+/// this v2 encoding binds the same profile, locally derived issuance and post-execution state root
+/// around a bounded list of canonical `Transaction` envelopes. Transaction authorization is
+/// delegated to the injected authenticator; the final production signature/key scheme is not chosen here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V04ExecutionBlockCandidate {
+    pub profile_fingerprint: [u8; 32],
+    pub height: u64,
+    pub timestamp: u64,
+    pub parent_hash: [u8; 32],
+    pub miner: [u8; 32],
+    pub claimed_subsidy_atoms: u128,
+    pub transactions: Vec<Transaction>,
+    pub state_root: [u8; 32],
+}
+
+impl V04ExecutionBlockCandidate {
+    pub fn encode(&self) -> Result<Vec<u8>, V04TransitionError> {
+        if self.height == 0
+            || self.timestamp == 0
+            || self.profile_fingerprint.iter().all(|byte| *byte == 0)
+            || self.miner.iter().all(|byte| *byte == 0)
+            || self.transactions.len() > MAX_TRANSACTIONS_PER_BLOCK
+        {
+            return Err(V04TransitionError::MalformedExecutionBlock);
+        }
+        let mut bytes = Vec::with_capacity(V04_EXECUTION_BLOCK_FIXED_BYTES);
+        bytes.extend_from_slice(&V04_MINING_BLOCK_MAGIC);
+        bytes.extend_from_slice(&V04_EXECUTION_BLOCK_VERSION.to_be_bytes());
+        bytes.extend_from_slice(&self.profile_fingerprint);
+        bytes.extend_from_slice(&self.height.to_be_bytes());
+        bytes.extend_from_slice(&self.timestamp.to_be_bytes());
+        bytes.extend_from_slice(&self.parent_hash);
+        bytes.extend_from_slice(&self.miner);
+        bytes.extend_from_slice(&self.claimed_subsidy_atoms.to_be_bytes());
+        bytes.extend_from_slice(
+            &u32::try_from(self.transactions.len())
+                .map_err(|_| V04TransitionError::MalformedExecutionBlock)?
+                .to_be_bytes(),
+        );
+        for transaction in &self.transactions {
+            let encoded = encode_transaction(transaction)?;
+            if encoded.len() > MAX_TRANSACTION_BYTES {
+                return Err(V04TransitionError::MalformedExecutionBlock);
+            }
+            bytes.extend_from_slice(
+                &u32::try_from(encoded.len())
+                    .map_err(|_| V04TransitionError::MalformedExecutionBlock)?
+                    .to_be_bytes(),
+            );
+            bytes.extend_from_slice(&encoded);
+            if bytes.len() + 32 > MAX_ENCODED_V04_EXECUTION_BLOCK_BYTES {
+                return Err(V04TransitionError::MalformedExecutionBlock);
+            }
+        }
+        bytes.extend_from_slice(&self.state_root);
+        if bytes.len() > MAX_ENCODED_V04_EXECUTION_BLOCK_BYTES {
+            return Err(V04TransitionError::MalformedExecutionBlock);
+        }
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, V04TransitionError> {
+        if bytes.len() > MAX_ENCODED_V04_EXECUTION_BLOCK_BYTES {
+            return Err(V04TransitionError::MalformedExecutionBlock);
+        }
+        if bytes.len() < 6 {
+            return Err(V04TransitionError::MalformedExecutionBlock);
+        }
+        if bytes[..4] != V04_MINING_BLOCK_MAGIC {
+            return Err(V04TransitionError::WrongMiningBlockMagic);
+        }
+        let version = u16::from_be_bytes([bytes[4], bytes[5]]);
+        if version != V04_EXECUTION_BLOCK_VERSION {
+            return Err(V04TransitionError::UnsupportedExecutionBlockVersion(
+                version,
+            ));
+        }
+        if bytes.len() < V04_EXECUTION_BLOCK_FIXED_BYTES {
+            return Err(V04TransitionError::MalformedExecutionBlock);
+        }
+        let mut cursor = 6usize;
+        let profile_fingerprint = take_v04_execution_array::<32>(bytes, &mut cursor)?;
+        let height = take_v04_execution_u64(bytes, &mut cursor)?;
+        let timestamp = take_v04_execution_u64(bytes, &mut cursor)?;
+        let parent_hash = take_v04_execution_array::<32>(bytes, &mut cursor)?;
+        let miner = take_v04_execution_array::<32>(bytes, &mut cursor)?;
+        let claimed_subsidy_atoms =
+            u128::from_be_bytes(take_v04_execution_array::<16>(bytes, &mut cursor)?);
+        let transaction_count = take_v04_execution_u32(bytes, &mut cursor)? as usize;
+        if transaction_count > MAX_TRANSACTIONS_PER_BLOCK {
+            return Err(V04TransitionError::MalformedExecutionBlock);
+        }
+        let mut transactions = Vec::with_capacity(transaction_count);
+        for _ in 0..transaction_count {
+            let length = take_v04_execution_u32(bytes, &mut cursor)? as usize;
+            if length == 0 || length > MAX_TRANSACTION_BYTES {
+                return Err(V04TransitionError::MalformedExecutionBlock);
+            }
+            let transaction_bytes = take_v04_execution_slice(bytes, &mut cursor, length)?;
+            transactions.push(decode_transaction(transaction_bytes)?);
+        }
+        let state_root = take_v04_execution_array::<32>(bytes, &mut cursor)?;
+        if cursor != bytes.len() {
+            return Err(V04TransitionError::MalformedExecutionBlock);
+        }
+        let block = Self {
+            profile_fingerprint,
+            height,
+            timestamp,
+            parent_hash,
+            miner,
+            claimed_subsidy_atoms,
+            transactions,
+            state_root,
+        };
+        if block.encode()?.as_slice() != bytes {
+            return Err(V04TransitionError::MalformedExecutionBlock);
+        }
+        Ok(block)
+    }
+
+    pub fn block_id(&self) -> Result<[u8; 32], V04TransitionError> {
+        let canonical = self.encode()?;
+        let mut hash = Sha256::new();
+        hash.update(EXECUTION_BLOCK_ID_DOMAIN);
+        hash.update(canonical);
+        Ok(hash.finalize().into())
+    }
+}
+
+fn take_v04_execution_slice<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    length: usize,
+) -> Result<&'a [u8], V04TransitionError> {
+    let end = cursor
+        .checked_add(length)
+        .ok_or(V04TransitionError::MalformedExecutionBlock)?;
+    if end > bytes.len() {
+        return Err(V04TransitionError::MalformedExecutionBlock);
+    }
+    let part = &bytes[*cursor..end];
+    *cursor = end;
+    Ok(part)
+}
+
+fn take_v04_execution_array<const N: usize>(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Result<[u8; N], V04TransitionError> {
+    take_v04_execution_slice(bytes, cursor, N)?
+        .try_into()
+        .map_err(|_| V04TransitionError::MalformedExecutionBlock)
+}
+
+fn take_v04_execution_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, V04TransitionError> {
+    Ok(u32::from_be_bytes(take_v04_execution_array(bytes, cursor)?))
+}
+
+fn take_v04_execution_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, V04TransitionError> {
+    Ok(u64::from_be_bytes(take_v04_execution_array(bytes, cursor)?))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V04ExecutionApplySummary {
+    pub height: u64,
+    pub block_id: [u8; 32],
+    pub state_root: [u8; 32],
+    pub reward_atoms: u128,
+    pub total_mined_atoms: u128,
+    pub fees_collected: u64,
+    pub transactions_applied: usize,
+    pub live_supply_atoms: u128,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -748,6 +938,158 @@ impl MonetaryLedgerStateV04TransitionCandidate {
     }
 }
 
+impl MonetaryLedgerStateV04TransitionCandidate {
+    fn stage_execution_candidate<A: TransactionAuthenticator>(
+        &self,
+        height: u64,
+        timestamp: u64,
+        parent_hash: &[u8; 32],
+        miner: &[u8; 32],
+        reward_atoms: u128,
+        transactions: Vec<Transaction>,
+        authenticator: &A,
+    ) -> Result<(Self, u64), V04TransitionError> {
+        let (ledger, fees_collected) = self.ledger.stage_v04_execution_transition(
+            height,
+            timestamp,
+            parent_hash,
+            miner,
+            reward_atoms,
+            transactions,
+            authenticator,
+        )?;
+        let mut allocation_accounting = self.allocation_accounting.clone();
+        if reward_atoms != 0 {
+            allocation_accounting
+                .record_issuance(AllocationBucket::MiningNetworkSecurity, reward_atoms)?;
+        }
+        let total_mined_atoms = self
+            .total_mined_atoms
+            .checked_add(reward_atoms)
+            .ok_or(V04TransitionError::MiningCounterOverflow)?;
+        let candidate = Self {
+            ledger,
+            allocation_accounting,
+            total_mined_atoms,
+            profile: self.profile.clone(),
+        };
+        candidate.validate()?;
+        Ok((candidate, fees_collected))
+    }
+
+    /// Build QZB4 version 2 with canonical transactions and locally-derived issuance.
+    /// The v1 mining-only QZB4 codec is unchanged. No peer-provided subsidy is trusted by builder.
+    pub fn build_next_execution_block<A: TransactionAuthenticator>(
+        &self,
+        timestamp: u64,
+        miner: [u8; 32],
+        transactions: Vec<Transaction>,
+        authenticator: &A,
+    ) -> Result<V04ExecutionBlockCandidate, V04TransitionError> {
+        self.validate()?;
+        let height = self
+            .ledger
+            .height()
+            .checked_add(1)
+            .ok_or(V04TransitionError::State(StateError::InvalidHeight))?;
+        let parent_hash = self.ledger.tip_hash();
+        let reward_atoms = self
+            .profile
+            .schedule
+            .reward_for_height(height, self.total_mined_atoms)?;
+        let (candidate, _) = self.stage_execution_candidate(
+            height,
+            timestamp,
+            &parent_hash,
+            &miner,
+            reward_atoms,
+            transactions.clone(),
+            authenticator,
+        )?;
+        Ok(V04ExecutionBlockCandidate {
+            profile_fingerprint: *self.profile.profile_fingerprint(),
+            height,
+            timestamp,
+            parent_hash,
+            miner,
+            claimed_subsidy_atoms: reward_atoms,
+            transactions,
+            state_root: candidate.compute_state_root()?,
+        })
+    }
+
+    /// Independently execute transactions and derive reward from the local parent/profile.
+    /// Accounts, fee pool, allocation counters, cumulative issuance and state root publish together
+    /// only after every validation succeeds. The outer block ID is committed last.
+    pub fn apply_execution_block<A: TransactionAuthenticator>(
+        &mut self,
+        block: &V04ExecutionBlockCandidate,
+        authenticator: &A,
+    ) -> Result<V04ExecutionApplySummary, V04TransitionError> {
+        block.encode()?;
+        self.validate()?;
+        if block.profile_fingerprint != *self.profile.profile_fingerprint() {
+            return Err(V04TransitionError::ExecutionBlockProfileMismatch);
+        }
+        let expected_height = self
+            .ledger
+            .height()
+            .checked_add(1)
+            .ok_or(V04TransitionError::State(StateError::InvalidHeight))?;
+        if block.height != expected_height {
+            return Err(V04TransitionError::State(StateError::HeightMismatch {
+                expected: expected_height,
+                actual: block.height,
+            }));
+        }
+        let expected_reward = self
+            .profile
+            .schedule
+            .reward_for_height(block.height, self.total_mined_atoms)?;
+        if block.claimed_subsidy_atoms != expected_reward {
+            return Err(V04TransitionError::MinerRewardMismatch {
+                expected: expected_reward,
+                actual: block.claimed_subsidy_atoms,
+            });
+        }
+        let mut candidate = self
+            .stage_execution_candidate(
+                block.height,
+                block.timestamp,
+                &block.parent_hash,
+                &block.miner,
+                expected_reward,
+                block.transactions.clone(),
+                authenticator,
+            )?
+            .0;
+        if candidate.compute_state_root()? != block.state_root {
+            return Err(V04TransitionError::StateRootMismatch);
+        }
+        let block_id = block.block_id()?;
+        candidate
+            .ledger
+            .commit_v04_mining_tip_hash(&block.parent_hash, block_id)?;
+        candidate.validate()?;
+        let live_supply_atoms = candidate.allocation_accounting.live_supply_atoms()?;
+        let summary = V04ExecutionApplySummary {
+            height: block.height,
+            block_id,
+            state_root: block.state_root,
+            reward_atoms: expected_reward,
+            total_mined_atoms: candidate.total_mined_atoms,
+            fees_collected: block.transactions.iter().try_fold(0u64, |sum, tx| {
+                sum.checked_add(tx.fee)
+                    .ok_or(V04TransitionError::State(StateError::FeeOverflow))
+            })?,
+            transactions_applied: block.transactions.len(),
+            live_supply_atoms,
+        };
+        *self = candidate;
+        Ok(summary)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,6 +1153,225 @@ mod tests {
         let profile = profile(&genesis, 10_000, 2);
         MonetaryLedgerStateV04TransitionCandidate::from_genesis_manifest(&genesis, &profile)
             .unwrap()
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestTransactionAuthenticator {
+        reject: bool,
+    }
+
+    impl TransactionAuthenticator for TestTransactionAuthenticator {
+        fn verify(
+            &self,
+            _sender: &[u8; 32],
+            _digest: &[u8; 32],
+            signature: &[u8],
+        ) -> Result<(), ()> {
+            if self.reject || signature.is_empty() {
+                Err(())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn valid_transfer() -> Transaction {
+        Transaction {
+            network_id: NETWORK,
+            sender: OWNER,
+            recipient: [0xB2; 32],
+            nonce: 1,
+            amount: 2_500,
+            fee: 7,
+            expires_at: 100,
+            signature: vec![0x5A],
+        }
+    }
+
+    #[test]
+    fn qzb4_v2_execution_producer_importer_and_profile_snapshot_agree() {
+        let genesis = manifest();
+        let configured_profile = profile(&genesis, 10_000, 2);
+        let mut producer = MonetaryLedgerStateV04TransitionCandidate::from_genesis_manifest(
+            &genesis,
+            &configured_profile,
+        )
+        .unwrap();
+        let mut importer = producer.clone();
+        let owner_before = producer.ledger().account(&OWNER).unwrap().balance;
+        let transfer = valid_transfer();
+        let authenticator = TestTransactionAuthenticator { reject: false };
+        let block = producer
+            .build_next_execution_block(1, MINER, vec![transfer.clone()], &authenticator)
+            .unwrap();
+        let encoded = block.encode().unwrap();
+
+        assert_eq!(&encoded[..4], &V04_MINING_BLOCK_MAGIC);
+        assert_eq!(
+            u16::from_be_bytes([encoded[4], encoded[5]]),
+            V04_EXECUTION_BLOCK_VERSION
+        );
+        assert_eq!(V04ExecutionBlockCandidate::decode(&encoded).unwrap(), block);
+        assert!(V04MiningBlockCandidate::decode(&encoded).is_err());
+        assert_eq!(
+            encoded.len().to_string(),
+            vector_value("qzb4_execution_block1_length")
+        );
+        assert_eq!(hex(&encoded), vector_value("qzb4_execution_block1_hex"));
+        assert_eq!(
+            hex(&block.state_root),
+            vector_value("qzb4_execution_block1_state_root")
+        );
+        assert_eq!(
+            hex(&block.block_id().unwrap()),
+            vector_value("qzb4_execution_block1_id")
+        );
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(
+            V04ExecutionBlockCandidate::decode(&trailing),
+            Err(V04TransitionError::MalformedExecutionBlock)
+        );
+        assert_eq!(
+            V04ExecutionBlockCandidate::decode(&encoded[..encoded.len() - 1]),
+            Err(V04TransitionError::MalformedExecutionBlock)
+        );
+        let mut excessive_count = encoded.clone();
+        excessive_count[134..138].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(
+            V04ExecutionBlockCandidate::decode(&excessive_count),
+            Err(V04TransitionError::MalformedExecutionBlock)
+        );
+        let v1_block = producer.build_next_block(1, MINER).unwrap();
+        assert_eq!(
+            V04ExecutionBlockCandidate::decode(&v1_block.encode().unwrap()),
+            Err(V04TransitionError::UnsupportedExecutionBlockVersion(
+                V04_MINING_BLOCK_VERSION
+            ))
+        );
+
+        let producer_summary = producer
+            .apply_execution_block(&block, &authenticator)
+            .unwrap();
+        let importer_summary = importer
+            .apply_execution_block(&block, &authenticator)
+            .unwrap();
+        assert_eq!(producer_summary, importer_summary);
+        assert_eq!(producer, importer);
+        assert_eq!(producer_summary.transactions_applied, 1);
+        assert_eq!(producer_summary.fees_collected, transfer.fee);
+        assert_eq!(
+            producer.ledger().account(&OWNER).unwrap().balance,
+            owner_before - transfer.amount - transfer.fee
+        );
+        assert_eq!(
+            producer
+                .ledger()
+                .account(&transfer.recipient)
+                .unwrap()
+                .balance,
+            transfer.amount
+        );
+        assert_eq!(
+            producer.ledger().account(&MINER).unwrap().balance,
+            producer_summary.reward_atoms as u64
+        );
+        assert_eq!(producer.ledger().fee_pool(), transfer.fee);
+        assert_eq!(producer.total_mined_atoms(), producer_summary.reward_atoms);
+        assert_eq!(
+            producer
+                .allocation_accounting()
+                .issued_by_bucket_atoms(AllocationBucket::MiningNetworkSecurity),
+            producer_summary.reward_atoms
+        );
+        assert_eq!(
+            producer.ledger().total_value().unwrap(),
+            producer
+                .allocation_accounting()
+                .live_supply_atoms()
+                .unwrap()
+        );
+        assert_eq!(producer.ledger().tip_hash(), block.block_id().unwrap());
+
+        let snapshot = producer.encode_snapshot().unwrap();
+        let restored = MonetaryLedgerStateV04TransitionCandidate::decode_snapshot(
+            &snapshot,
+            &genesis,
+            &configured_profile,
+        )
+        .unwrap();
+        assert_eq!(restored, producer);
+    }
+
+    #[test]
+    fn qzb4_v2_execution_rejections_are_atomic_for_bad_signature_reward_profile_and_root() {
+        let genesis = manifest();
+        let configured_profile = profile(&genesis, 10_000, 2);
+        let mut producer = MonetaryLedgerStateV04TransitionCandidate::from_genesis_manifest(
+            &genesis,
+            &configured_profile,
+        )
+        .unwrap();
+        let valid_authenticator = TestTransactionAuthenticator { reject: false };
+        let rejecting_authenticator = TestTransactionAuthenticator { reject: true };
+        let block = producer
+            .build_next_execution_block(1, MINER, vec![valid_transfer()], &valid_authenticator)
+            .unwrap();
+
+        let other_profile = profile(&genesis, 10_001, 2);
+        let mut wrong_profile_state =
+            MonetaryLedgerStateV04TransitionCandidate::from_genesis_manifest(
+                &genesis,
+                &other_profile,
+            )
+            .unwrap();
+        let wrong_profile_before = wrong_profile_state.encode_snapshot().unwrap();
+        assert_eq!(
+            wrong_profile_state.apply_execution_block(&block, &valid_authenticator),
+            Err(V04TransitionError::ExecutionBlockProfileMismatch)
+        );
+        assert_eq!(
+            wrong_profile_state.encode_snapshot().unwrap(),
+            wrong_profile_before
+        );
+
+        let before = producer.encode_snapshot().unwrap();
+        let mut forged_reward = block.clone();
+        forged_reward.claimed_subsidy_atoms += 1;
+        assert!(producer
+            .apply_execution_block(&forged_reward, &valid_authenticator)
+            .is_err());
+        assert_eq!(producer.encode_snapshot().unwrap(), before);
+
+        let mut forged_root = block.clone();
+        forged_root.state_root[0] ^= 1;
+        assert_eq!(
+            producer.apply_execution_block(&forged_root, &valid_authenticator),
+            Err(V04TransitionError::StateRootMismatch)
+        );
+        assert_eq!(producer.encode_snapshot().unwrap(), before);
+
+        assert!(producer
+            .apply_execution_block(&block, &rejecting_authenticator)
+            .is_err());
+        assert_eq!(producer.encode_snapshot().unwrap(), before);
+
+        let mut wrong_parent = block.clone();
+        wrong_parent.parent_hash[0] ^= 1;
+        assert!(producer
+            .apply_execution_block(&wrong_parent, &valid_authenticator)
+            .is_err());
+        assert_eq!(producer.encode_snapshot().unwrap(), before);
+
+        let mut expired_transfer = block.clone();
+        expired_transfer.timestamp = 100;
+        expired_transfer.transactions[0].expires_at = 100;
+        let mut expected_time_state = producer.clone();
+        // The timestamp/expiry rejection must happen before state publication.
+        assert!(expected_time_state
+            .apply_execution_block(&expired_transfer, &valid_authenticator)
+            .is_err());
+        assert_eq!(expected_time_state.encode_snapshot().unwrap(), before);
     }
 
     #[test]

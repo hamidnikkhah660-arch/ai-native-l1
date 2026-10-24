@@ -2,8 +2,8 @@
 """Independent CP-0398/CP-0400 QZCP/QZB4/QZP4 candidate vectors (standard library only).
 
 The fixture parameters are deliberately tiny test values, not approved v0.4 economics.
-This implementation independently derives the base QZGM Genesis bytes/root, QZCP profile,
-profile-bound Genesis state root, and first QZB4 mining block. It does not import Rust output.
+This implementation independently derives QZGM Genesis, QZCP profile, QZP4 Genesis snapshot,
+QZB4 v1 mining-only and QZB4 v2 transaction-bearing block bytes/roots/IDs. It imports no Rust output.
 """
 from hashlib import sha256
 from pathlib import Path
@@ -14,6 +14,7 @@ OUT = ROOT / "simulations" / "quantumzxb_v04_transition_profile_vectors.txt"
 
 NETWORK = bytes([0x31]) * 32
 OWNER = bytes([0xA7]) * 32
+RECIPIENT = bytes([0xB2]) * 32
 MINER = bytes([0xC4]) * 32
 ATOMS_PER_COIN = 100_000_000
 MAX_TOTAL_SUPPLY_ATOMS = 10_000_000_000 * ATOMS_PER_COIN
@@ -32,6 +33,7 @@ PROFILE_FP_DOMAIN = b"QUANTUMZXB-V04-CONSENSUS-PROFILE-FINGERPRINT-CANDIDATE-V1\
 PROFILE_CHECK_DOMAIN = b"QUANTUMZXB-V04-CONSENSUS-PROFILE-CHECK-CANDIDATE-V1\0"
 TRANSITION_ROOT_DOMAIN = b"QUANTUMZXB-V04-PROFILE-MONETARY-STATE-ROOT-CANDIDATE-V1\0"
 MINING_BLOCK_ID_DOMAIN = b"QUANTUMZXB-V04-MINING-BLOCK-ID-CANDIDATE-V1\0"
+EXECUTION_BLOCK_ID_DOMAIN = b"QUANTUMZXB-V04-EXECUTION-BLOCK-ID-CANDIDATE-V1\0"
 PROFILE_VERSION = 1
 SCHEDULE_VERSION = 1
 GENESIS_FORMAT_VERSION = 1
@@ -196,6 +198,62 @@ def derive():
     assert len(block_bytes) == 166
     block_id = h(MINING_BLOCK_ID_DOMAIN, block_bytes)
 
+    # Independently model QZB4 v2 transaction + fee + mining issuance in one atomic root.
+    # The Rust test authenticator accepts this nonempty fixture signature; it is not a live key.
+    transfer = bytearray(b"TXN2")
+    transfer.extend(be(2, 2))
+    transfer.extend(NETWORK)
+    transfer.extend(OWNER)
+    transfer.extend(RECIPIENT)
+    transfer.extend(be(1, 8))
+    transfer.extend(be(2_500, 8))
+    transfer.extend(be(7, 8))
+    transfer.extend(be(100, 8))
+    transfer.extend(be(1, 2))
+    transfer.append(0x5A)
+    transfer_bytes = bytes(transfer)
+    assert len(transfer_bytes) == 137
+
+    execution_accounts = [
+        (OWNER, 1_000_000_000 * ATOMS_PER_COIN - 2_507, 1),
+        (RECIPIENT, 2_500, 0),
+        (MINER, reward, 0),
+    ]
+    execution_ledger = bytearray(b"AIN1-STATE-V2\0")
+    execution_ledger.extend(NETWORK)
+    execution_ledger.extend(be(1, 8))
+    execution_ledger.extend(be(1, 8))
+    execution_ledger.extend(be(7, 8))  # Transfer fee remains in the fee pool.
+    execution_ledger.extend(be(len(execution_accounts), 4))
+    for account_id, balance, nonce in sorted(execution_accounts, key=lambda row: row[0]):
+        execution_ledger.extend(account_id)
+        execution_ledger.extend(be(balance, 8))
+        execution_ledger.extend(be(nonce, 8))
+    execution_ledger_root = h(b"AIN1-STATE-ROOT-V2\0", bytes(execution_ledger))
+
+    execution_state_preimage = bytearray(TRANSITION_ROOT_DOMAIN)
+    execution_state_preimage.extend(profile_fp)
+    execution_state_preimage.extend(execution_ledger_root)
+    execution_state_preimage.extend(block_accounting_commitment)
+    execution_state_preimage.extend(be(reward, 16))
+    execution_state_root = sha256(execution_state_preimage).digest()
+
+    execution_block = bytearray(b"QZB4")
+    execution_block.extend(be(2, 2))
+    execution_block.extend(profile_fp)
+    execution_block.extend(be(1, 8))
+    execution_block.extend(be(1, 8))
+    execution_block.extend(bytes(32))
+    execution_block.extend(MINER)
+    execution_block.extend(be(reward, 16))
+    execution_block.extend(be(1, 4))
+    execution_block.extend(be(len(transfer_bytes), 4))
+    execution_block.extend(transfer_bytes)
+    execution_block.extend(execution_state_root)
+    execution_block_bytes = bytes(execution_block)
+    assert len(execution_block_bytes) == 311
+    execution_block_id = h(EXECUTION_BLOCK_ID_DOMAIN, execution_block_bytes)
+
     # Independently build the canonical inner STV2 -> QZL4 snapshot for the same Genesis.
     ledger_snapshot_preimage = bytearray(b"STV2")
     ledger_snapshot_preimage.extend(be(2, 2))
@@ -255,12 +313,17 @@ def derive():
         ("block1_state_root", state_root1.hex()),
         ("qzb4_block1_bytes", block_bytes.hex()),
         ("qzb4_block1_id", block_id.hex()),
+        ("qzb4_execution_block1_length", str(len(execution_block_bytes))),
+        ("qzb4_execution_block1_state_root", execution_state_root.hex()),
+        ("qzb4_execution_block1_hex", execution_block_bytes.hex()),
+        ("qzb4_execution_block1_id", execution_block_id.hex()),
     ]
 
 
 def rendered_vectors():
     lines = [
         "# CP-0398/CP-0400 independent QZCP/QZB4/QZP4 vectors generated with Python standard library only.",
+        "# Includes QZB4 v2 transaction-bearing execution; test signature is not production cryptographic evidence.",
         "# Subsidy=10000 atoms and halving interval=2 are test fixtures, not approved economics.",
     ]
     lines.extend(f"{name}={value}" for name, value in derive())
@@ -276,7 +339,10 @@ def main():
             )
         print("CP0400_V04_PROFILE_BOUND_SNAPSHOT_ORACLE=PASS")
         for name, value in derive():
-            if name in ("profile_fingerprint", "qzcp_profile_length", "block1_reward_atoms", "qzb4_block1_id"):
+            if name in (
+                "profile_fingerprint", "qzcp_profile_length", "block1_reward_atoms",
+                "qzb4_block1_id", "qzb4_execution_block1_length", "qzb4_execution_block1_id",
+            ):
                 print(f"{name}={value}")
         return
     OUT.write_text(rendered_vectors(), encoding="utf-8")

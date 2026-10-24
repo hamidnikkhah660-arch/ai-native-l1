@@ -53,7 +53,7 @@ pub mod monetary_issuance_v04_candidate;
 pub mod monetary_ledger_v04_candidate;
 /// CP-0213 policy arithmetic candidate; not wired into canonical consensus or block import.
 pub mod monetary_policy_v3_candidate;
-/// CP-0398 profile-bound atomic mining-only v0.4 state transition; not wired into node runtime.
+/// CP-0398/CP-0403 profile-bound v0.4 transitions (QZB4 v1 mining-only, v2 transaction-bearing); not node-wired.
 pub mod monetary_transition_v04_candidate;
 pub mod noise_deployment_config;
 pub mod noise_issuer_registry;

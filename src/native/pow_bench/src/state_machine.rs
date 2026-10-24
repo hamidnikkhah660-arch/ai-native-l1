@@ -557,6 +557,60 @@ impl LedgerState {
         Ok(candidate)
     }
 
+    /// Stage a profile-bound execution candidate's normal transactions and locally derived
+    /// miner reward on one clone. This is crate-private: callers must validate the v0.4
+    /// allocation accounting and combined state root before committing the block tip.
+    pub(crate) fn stage_v04_execution_transition<A: TransactionAuthenticator>(
+        &self,
+        height: u64,
+        timestamp: u64,
+        expected_parent_hash: &[u8; 32],
+        miner: &[u8; 32],
+        reward_atoms: u128,
+        transactions: Vec<Transaction>,
+        authenticator: &A,
+    ) -> Result<(Self, u64), StateError> {
+        if expected_parent_hash != &self.tip_hash {
+            return Err(StateError::ParentHashMismatch);
+        }
+        let block = Block {
+            height,
+            timestamp,
+            parent_hash: *expected_parent_hash,
+            state_root: [0; 32],
+            transactions,
+        };
+        // Reuse the canonical transaction/signature/nonce/expiry checks, but leave the tip
+        // unchanged until the outer profile-bound block ID is known.
+        let (mut candidate, fees_collected) = self.prepare_candidate(&block, authenticator)?;
+        if is_zero_account(miner) {
+            return Err(StateError::InvalidAccountId);
+        }
+        let reward = u64::try_from(reward_atoms).map_err(|_| StateError::AmountOverflow)?;
+        if reward != 0 {
+            if !candidate.accounts.contains_key(miner) && candidate.accounts.len() >= MAX_ACCOUNTS {
+                return Err(StateError::TooManyAccounts);
+            }
+            let mut account = candidate
+                .accounts
+                .get(miner)
+                .copied()
+                .unwrap_or(AccountState {
+                    balance: 0,
+                    nonce: 0,
+                });
+            account.balance = account
+                .balance
+                .checked_add(reward)
+                .ok_or(StateError::BalanceOverflow)?;
+            candidate.accounts.insert(*miner, account);
+        }
+        // A transaction batch conserves supply; the miner credit is the only creation.
+        // total_value checks the global cap after both parts of the block have been staged.
+        candidate.total_value()?;
+        Ok((candidate, fees_collected))
+    }
+
     /// Finalize a previously staged CP-0398 candidate after its canonical block ID is known.
     /// The parent check prevents accidentally finalizing the clone against a different branch.
     pub(crate) fn commit_v04_mining_tip_hash(
