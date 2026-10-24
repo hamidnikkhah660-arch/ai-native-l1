@@ -5,7 +5,7 @@
 - **Global project site:** https://hamidnikkhah660-arch.github.io/ai-native-l1/
 - **Source and contribution issues:** https://github.com/hamidnikkhah660-arch/ai-native-l1
 - **Engineering white paper:** [QuantumZXB Native Coin White Paper v0.3](docs/QUANTUMZXB_NATIVE_COIN_WHITEPAPER_V03.md)
-- **Master roadmap:** [QuantumZXB Engineering & Ecosystem Roadmap v0.3](docs/QUANTUMZXB_MASTER_ROADMAP_V03.md)
+- **Master roadmap:** [QuantumZXB Engineering & Public-Launch Roadmap v0.4](docs/QUANTUMZXB_MASTER_ROADMAP_V04_2026-10-24.md) - evidence-based gates; not a launch approval.
 - **Technical review and test evidence:** [CP-0343 report](docs/CP_0343_TECHNICAL_REVIEW_AND_TEST_RESULTS.md)
 - **Latest halving visualization and emission-data checkpoint:** [CP-0349](docs/CP_0349_REPRODUCIBLE_CANDIDATE_HALVING_VISUALIZATION_2026-10-21.md)
 - **Latest full curated source validation:** [CP-0347](docs/CP_0347_PUBLIC_CURATED_CHECKOUT_VALIDATION_2026-10-21.md) - **Latest founder/market-readiness docs:** [CP-0348](docs/CP_0348_FOUNDER_CREDENTIAL_MARKET_READINESS_2026-10-21.md)
@@ -41,6 +41,7 @@
 - **v0.4 transaction + reward + Genesis contract:** [CP-0403 QZB4 v2 candidate block, independent state-root vector, and remaining runtime gates](docs/CP-0403_V04_TRANSACTION_REWARD_GENESIS_CONTRACT_2026-10-24.md)
 - **v0.4 profile dispatcher and durable import candidate:** [CP-0404 QZB4 v2 dispatch, anchor-backed snapshot recovery and fork-choice blockers](docs/CP-0404_V04_PROFILE_RUNTIME_DISPATCH_PERSISTENCE_CANDIDATE_2026-10-24.md)
 - **v0.4 PoW envelope and branch-local fork-choice candidate:** [CP-0405 QZBE header binding, cumulative-work reorg and replay limits](docs/CP-0405_QZBE_V04_POW_FORK_CHOICE_CANDIDATE_2026-10-24.md)
+- **CP-0406 local persistent QZBE branch archive:** [QZMF manifests, digest-verified branch files, restart/replay tests, and explicit no-CAS/no-Mainnet boundary](docs/CP-0406_QZBE_PERSISTENT_BRANCH_ARCHIVE_CANDIDATE_2026-10-24.md) - candidate-only; full CI still required.
 - **Owner's zero-budget launch and liquidity directive:** [Persistent launch gate and fresh-session handoff](docs/OWNER_DIRECTIVE_ZERO_BUDGET_LAUNCH_AND_LIQUIDITY_GATE_V01_2026-10-21.md) - [live execution issue #12](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/12)
 - **Sponsorship and contributor discussion:** [Public issue #1](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/1)
 - **Previous public documentation release:** [v0.2.0-docs](https://github.com/hamidnikkhah660-arch/ai-native-l1/releases/tag/v0.2.0-docs)

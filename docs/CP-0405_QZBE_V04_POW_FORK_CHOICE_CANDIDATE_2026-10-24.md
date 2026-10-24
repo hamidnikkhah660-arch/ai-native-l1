@@ -36,4 +36,4 @@ Before production use, the persistent archive/checkpoint format must bind the Ge
 - Gate 8: **open** - durable branch archive, real external anti-rollback provider, and canonical reorg/recovery integration remain incomplete.
 - Gate 12: **open** - no smart-contract execution or contract-transition validation is added here.
 
-The successful CP-0404 CI run remains evidence for commit 0847152; it is not CI evidence for CP-0405. CP-0405 must be validated and pushed as a separate commit before any new CI result can be claimed.
+GitHub Actions run 40110485321 completed with success for exact commit f201b2d4f510cf7bd881c064012307c76b317456 on 2026-10-24. Both Format, check, and test and Windows PMT4 TXN4 two-node loopback passed. This is CI evidence for that candidate commit only; it does not close Gate 2/Gate 8 or prove canonical-node integration.
