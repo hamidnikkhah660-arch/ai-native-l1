@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent CP-0398 QZCP/QZB4 candidate vectors (standard library only).
+"""Independent CP-0398/CP-0400 QZCP/QZB4/QZP4 candidate vectors (standard library only).
 
 The fixture parameters are deliberately tiny test values, not approved v0.4 economics.
 This implementation independently derives the base QZGM Genesis bytes/root, QZCP profile,
@@ -196,6 +196,46 @@ def derive():
     assert len(block_bytes) == 166
     block_id = h(MINING_BLOCK_ID_DOMAIN, block_bytes)
 
+    # Independently build the canonical inner STV2 -> QZL4 snapshot for the same Genesis.
+    ledger_snapshot_preimage = bytearray(b"STV2")
+    ledger_snapshot_preimage.extend(be(2, 2))
+    ledger_snapshot_preimage.extend(NETWORK)
+    ledger_snapshot_preimage.extend(be(0, 8))  # height
+    ledger_snapshot_preimage.extend(be(0, 8))  # next transaction nonce
+    ledger_snapshot_preimage.extend(bytes(32))  # Genesis tip
+    ledger_snapshot_preimage.extend(be(0, 8))  # timestamp
+    ledger_snapshot_preimage.extend(be(1, 4))
+    ledger_snapshot_preimage.extend(OWNER)
+    ledger_snapshot_preimage.extend(be(1_000_000_000 * ATOMS_PER_COIN, 8))
+    ledger_snapshot_preimage.extend(be(0, 8))  # account nonce
+    ledger_snapshot = bytes(ledger_snapshot_preimage) + h(
+        b"AIN1-STATE-SNAPSHOT-CHECK-V2\0", bytes(ledger_snapshot_preimage)
+    )
+    assert len(ledger_snapshot) == 178
+
+    qzl4_preimage = (
+        b"QZL4" + be(1, 2) + NETWORK + be(len(ledger_snapshot), 4)
+        + ledger_snapshot + accounting_bytes + be(0, 16) + qzgm_root
+    )
+    qzl4_snapshot = qzl4_preimage + h(
+        b"QUANTUMZXB-MONETARY-SNAPSHOT-CHECK-V04\0", qzl4_preimage
+    )
+    assert len(qzl4_snapshot) == 450
+
+    transition_genesis_root = h(
+        TRANSITION_ROOT_DOMAIN,
+        profile_fp + genesis_ledger_root + accounting_commitment + be(0, 16),
+    )
+    qzp4_preimage = (
+        b"QZP4" + be(1, 2) + NETWORK + profile_bytes
+        + be(len(qzl4_snapshot), 4) + qzl4_snapshot + transition_genesis_root
+    )
+    qzp4_snapshot = qzp4_preimage + h(
+        b"QUANTUMZXB-V04-PROFILE-BOUND-SNAPSHOT-CHECK-CANDIDATE-V1\0",
+        qzp4_preimage,
+    )
+    assert len(qzp4_snapshot) == 810
+
     return [
         ("profile_label", "TEST_ONLY_PARAMETERS_NOT_APPROVED_FOR_NETWORK"),
         ("policy_fingerprint", policy_fp.hex()),
@@ -205,7 +245,10 @@ def derive():
         ("profile_fingerprint", profile_fp.hex()),
         ("qzcp_profile_bytes", profile_bytes.hex()),
         ("qzcp_profile_length", str(len(profile_bytes))),
-        ("transition_genesis_state_root", h(TRANSITION_ROOT_DOMAIN, profile_fp + genesis_ledger_root + accounting_commitment + be(0, 16)).hex()),
+        ("transition_genesis_state_root", transition_genesis_root.hex()),
+        ("qzp4_genesis_snapshot_length", str(len(qzp4_snapshot))),
+        ("qzp4_genesis_snapshot_sha256", sha256(qzp4_snapshot).hexdigest()),
+        ("qzp4_genesis_snapshot_hex", qzp4_snapshot.hex()),
         ("block1_reward_atoms", str(reward)),
         ("block1_ledger_state_root", ledger1_root.hex()),
         ("block1_accounting_hex", block_accounting_bytes.hex()),
@@ -217,7 +260,7 @@ def derive():
 
 def rendered_vectors():
     lines = [
-        "# CP-0398 independent QZCP/QZB4 vectors generated with Python standard library only.",
+        "# CP-0398/CP-0400 independent QZCP/QZB4/QZP4 vectors generated with Python standard library only.",
         "# Subsidy=10000 atoms and halving interval=2 are test fixtures, not approved economics.",
     ]
     lines.extend(f"{name}={value}" for name, value in derive())
@@ -231,7 +274,7 @@ def main():
                 "CP-0398 fixture differs from independent Python computation; "
                 "run this script without --check to regenerate."
             )
-        print("CP0398_V04_PROFILE_TRANSITION_ORACLE=PASS")
+        print("CP0400_V04_PROFILE_BOUND_SNAPSHOT_ORACLE=PASS")
         for name, value in derive():
             if name in ("profile_fingerprint", "qzcp_profile_length", "block1_reward_atoms", "qzb4_block1_id"):
                 print(f"{name}={value}")

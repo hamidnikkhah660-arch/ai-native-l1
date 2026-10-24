@@ -47,6 +47,22 @@ pub struct MonetaryLedgerStateV04Candidate {
 }
 
 impl MonetaryLedgerStateV04Candidate {
+    /// Construct the snapshot substrate for the profile-bound transition wrapper.
+    /// This crate-private API does not expose arbitrary issuance to external callers.
+    pub(crate) fn from_transition_parts(
+        ledger: LedgerState,
+        allocation_accounting: AllocationAccounting,
+        total_mined_atoms: u128,
+    ) -> Result<Self, V04LedgerGenesisError> {
+        let candidate = Self {
+            ledger,
+            allocation_accounting,
+            total_mined_atoms,
+        };
+        candidate.validate()?;
+        Ok(candidate)
+    }
+
     /// Materialize the manifest's only initially issued bucket into the deterministic account
     /// ledger and prove that its state root equals the manifest root byte-for-byte.
     pub fn from_genesis_manifest(

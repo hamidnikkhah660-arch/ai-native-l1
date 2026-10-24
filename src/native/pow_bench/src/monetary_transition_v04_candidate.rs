@@ -18,7 +18,10 @@ use crate::{
     },
     monetary_genesis_v04_candidate::{GenesisManifestError, GenesisManifestV04},
     monetary_issuance_v04_candidate::{V04MiningIssuanceScheduleCandidate, V04MiningScheduleError},
-    monetary_ledger_v04_candidate::{MonetaryLedgerStateV04Candidate, V04LedgerGenesisError},
+    monetary_ledger_v04_candidate::{
+        MonetaryLedgerStateV04Candidate, V04LedgerGenesisError, V04LedgerSnapshotError,
+        MAX_ENCODED_V04_LEDGER_SNAPSHOT_BYTES,
+    },
     state_machine::{LedgerState, StateError},
 };
 
@@ -28,6 +31,15 @@ pub const V04_MINING_BLOCK_MAGIC: [u8; 4] = *b"QZB4";
 pub const V04_MINING_BLOCK_VERSION: u16 = 1;
 pub const V04_CONSENSUS_PROFILE_BYTES: usize = 254;
 pub const V04_MINING_BLOCK_BYTES: usize = 166;
+/// Profile-bound restart envelope; separate from the unprofiled QZL4 format.
+pub const V04_PROFILE_BOUND_SNAPSHOT_MAGIC: [u8; 4] = *b"QZP4";
+pub const V04_PROFILE_BOUND_SNAPSHOT_VERSION: u16 = 1;
+const PROFILE_BOUND_SNAPSHOT_CHECKSUM_DOMAIN: &[u8] =
+    b"QUANTUMZXB-V04-PROFILE-BOUND-SNAPSHOT-CHECK-CANDIDATE-V1\0";
+const PROFILE_BOUND_SNAPSHOT_HEADER_BYTES: usize = 4 + 2 + 32 + V04_CONSENSUS_PROFILE_BYTES + 4;
+const PROFILE_BOUND_SNAPSHOT_FIXED_OVERHEAD: usize = PROFILE_BOUND_SNAPSHOT_HEADER_BYTES + 32 + 32;
+pub const MAX_ENCODED_V04_PROFILE_BOUND_SNAPSHOT_BYTES: usize =
+    MAX_ENCODED_V04_LEDGER_SNAPSHOT_BYTES + PROFILE_BOUND_SNAPSHOT_FIXED_OVERHEAD;
 
 const PROFILE_FINGERPRINT_DOMAIN: &[u8] =
     b"QUANTUMZXB-V04-CONSENSUS-PROFILE-FINGERPRINT-CANDIDATE-V1\0";
@@ -60,6 +72,18 @@ pub enum V04TransitionError {
     LiveSupplyMismatch,
     SupplyCapExceeded,
     StateRootMismatch,
+    ProfileBoundSnapshotIncomplete,
+    ProfileBoundSnapshotTooLarge,
+    WrongProfileBoundSnapshotMagic,
+    UnsupportedProfileBoundSnapshotVersion(u16),
+    ProfileBoundSnapshotChecksumMismatch,
+    ProfileBoundSnapshotWrongLength,
+    ProfileBoundSnapshotLengthOverflow,
+    ProfileBoundSnapshotNetworkMismatch,
+    ProfileBoundSnapshotProfileMismatch,
+    ProfileBoundSnapshotStateRootMismatch,
+    NonCanonicalProfileBoundSnapshot,
+    LedgerSnapshot(V04LedgerSnapshotError),
 }
 
 impl From<GenesisManifestError> for V04TransitionError {
@@ -89,6 +113,12 @@ impl From<AllocationAccountingError> for V04TransitionError {
 impl From<V04MiningScheduleError> for V04TransitionError {
     fn from(value: V04MiningScheduleError) -> Self {
         Self::Schedule(value)
+    }
+}
+
+impl From<V04LedgerSnapshotError> for V04TransitionError {
+    fn from(value: V04LedgerSnapshotError) -> Self {
+        Self::LedgerSnapshot(value)
     }
 }
 
@@ -266,6 +296,13 @@ impl V04ConsensusProfileCandidate {
 fn profile_checksum(preimage: &[u8]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(PROFILE_CHECKSUM_DOMAIN);
+    hash.update(preimage);
+    hash.finalize().into()
+}
+
+fn profile_bound_snapshot_checksum(preimage: &[u8]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(PROFILE_BOUND_SNAPSHOT_CHECKSUM_DOMAIN);
     hash.update(preimage);
     hash.finalize().into()
 }
@@ -576,6 +613,139 @@ impl MonetaryLedgerStateV04TransitionCandidate {
         *self = candidate;
         Ok(summary)
     }
+
+    /// Encode state and its exact consensus profile in a separate QZP4 envelope.
+    /// The inner QZL4 snapshot remains byte-compatible and is not reinterpreted.
+    /// The checksums detect corruption, not authenticity or anti-rollback.
+    pub fn encode_snapshot(&self) -> Result<Vec<u8>, V04TransitionError> {
+        self.validate()?;
+        let profile_bytes = self.profile.encode()?;
+        let ledger_snapshot = MonetaryLedgerStateV04Candidate::from_transition_parts(
+            self.ledger.clone(),
+            self.allocation_accounting.clone(),
+            self.total_mined_atoms,
+        )?
+        .encode_snapshot()?;
+        let ledger_length = u32::try_from(ledger_snapshot.len())
+            .map_err(|_| V04TransitionError::ProfileBoundSnapshotLengthOverflow)?;
+        let committed_root = self.state_root()?;
+
+        let mut bytes = Vec::with_capacity(
+            PROFILE_BOUND_SNAPSHOT_FIXED_OVERHEAD
+                .checked_add(ledger_snapshot.len())
+                .ok_or(V04TransitionError::ProfileBoundSnapshotLengthOverflow)?,
+        );
+        bytes.extend_from_slice(&V04_PROFILE_BOUND_SNAPSHOT_MAGIC);
+        bytes.extend_from_slice(&V04_PROFILE_BOUND_SNAPSHOT_VERSION.to_be_bytes());
+        bytes.extend_from_slice(self.profile.network_id());
+        bytes.extend_from_slice(&profile_bytes);
+        bytes.extend_from_slice(&ledger_length.to_be_bytes());
+        bytes.extend_from_slice(&ledger_snapshot);
+        bytes.extend_from_slice(&committed_root);
+
+        let total_length = bytes
+            .len()
+            .checked_add(32)
+            .ok_or(V04TransitionError::ProfileBoundSnapshotLengthOverflow)?;
+        if total_length > MAX_ENCODED_V04_PROFILE_BOUND_SNAPSHOT_BYTES {
+            return Err(V04TransitionError::ProfileBoundSnapshotTooLarge);
+        }
+        let checksum = profile_bound_snapshot_checksum(&bytes);
+        bytes.extend_from_slice(&checksum);
+        Ok(bytes)
+    }
+
+    /// Restore only when both the expected Genesis and explicitly configured profile match.
+    /// Unknown versions, profile changes, corrupt nested snapshots and root mismatches fail closed.
+    pub fn decode_snapshot(
+        bytes: &[u8],
+        expected_manifest: &GenesisManifestV04,
+        expected_profile: &V04ConsensusProfileCandidate,
+    ) -> Result<Self, V04TransitionError> {
+        if bytes.len() > MAX_ENCODED_V04_PROFILE_BOUND_SNAPSHOT_BYTES {
+            return Err(V04TransitionError::ProfileBoundSnapshotTooLarge);
+        }
+        if bytes.len() < PROFILE_BOUND_SNAPSHOT_FIXED_OVERHEAD {
+            return Err(V04TransitionError::ProfileBoundSnapshotIncomplete);
+        }
+        expected_profile.validate_for_manifest(expected_manifest)?;
+
+        let checksum_start = bytes.len() - 32;
+        if bytes[checksum_start..] != profile_bound_snapshot_checksum(&bytes[..checksum_start]) {
+            return Err(V04TransitionError::ProfileBoundSnapshotChecksumMismatch);
+        }
+        let payload = &bytes[..checksum_start];
+        if payload[..4] != V04_PROFILE_BOUND_SNAPSHOT_MAGIC {
+            return Err(V04TransitionError::WrongProfileBoundSnapshotMagic);
+        }
+        let version = u16::from_be_bytes([payload[4], payload[5]]);
+        if version != V04_PROFILE_BOUND_SNAPSHOT_VERSION {
+            return Err(V04TransitionError::UnsupportedProfileBoundSnapshotVersion(
+                version,
+            ));
+        }
+
+        let network_id: [u8; 32] = payload[6..38]
+            .try_into()
+            .map_err(|_| V04TransitionError::ProfileBoundSnapshotWrongLength)?;
+        if network_id.iter().all(|byte| *byte == 0)
+            || &network_id != expected_profile.network_id()
+            || &network_id != expected_manifest.network_id()
+        {
+            return Err(V04TransitionError::ProfileBoundSnapshotNetworkMismatch);
+        }
+
+        let profile_start = 38;
+        let profile_end = profile_start + V04_CONSENSUS_PROFILE_BYTES;
+        let restored_profile = V04ConsensusProfileCandidate::decode(
+            &payload[profile_start..profile_end],
+            expected_manifest,
+        )?;
+        if restored_profile != *expected_profile {
+            return Err(V04TransitionError::ProfileBoundSnapshotProfileMismatch);
+        }
+
+        let length_start = profile_end;
+        let ledger_length = u32::from_be_bytes(
+            payload[length_start..length_start + 4]
+                .try_into()
+                .map_err(|_| V04TransitionError::ProfileBoundSnapshotWrongLength)?,
+        ) as usize;
+        let ledger_start = PROFILE_BOUND_SNAPSHOT_HEADER_BYTES;
+        let ledger_end = ledger_start
+            .checked_add(ledger_length)
+            .ok_or(V04TransitionError::ProfileBoundSnapshotLengthOverflow)?;
+        let expected_payload_length = ledger_end
+            .checked_add(32)
+            .ok_or(V04TransitionError::ProfileBoundSnapshotLengthOverflow)?;
+        if payload.len() != expected_payload_length {
+            return Err(V04TransitionError::ProfileBoundSnapshotWrongLength);
+        }
+
+        let ledger_snapshot = &payload[ledger_start..ledger_end];
+        let restored_ledger =
+            MonetaryLedgerStateV04Candidate::decode_snapshot(ledger_snapshot, &network_id)?;
+        if restored_ledger.encode_snapshot()?.as_slice() != ledger_snapshot {
+            return Err(V04TransitionError::NonCanonicalProfileBoundSnapshot);
+        }
+        let committed_root: [u8; 32] = payload[ledger_end..ledger_end + 32]
+            .try_into()
+            .map_err(|_| V04TransitionError::ProfileBoundSnapshotWrongLength)?;
+        let restored = Self {
+            ledger: restored_ledger.ledger().clone(),
+            allocation_accounting: restored_ledger.allocation_accounting().clone(),
+            total_mined_atoms: restored_ledger.total_mined_atoms(),
+            profile: restored_profile,
+        };
+        restored.validate()?;
+        if restored.state_root()? != committed_root {
+            return Err(V04TransitionError::ProfileBoundSnapshotStateRootMismatch);
+        }
+        if restored.encode_snapshot()?.as_slice() != bytes {
+            return Err(V04TransitionError::NonCanonicalProfileBoundSnapshot);
+        }
+        Ok(restored)
+    }
 }
 
 #[cfg(test)]
@@ -641,6 +811,145 @@ mod tests {
         let profile = profile(&genesis, 10_000, 2);
         MonetaryLedgerStateV04TransitionCandidate::from_genesis_manifest(&genesis, &profile)
             .unwrap()
+    }
+
+    #[test]
+    fn qzp4_profile_bound_snapshot_matches_independent_python_vector_and_roundtrips() {
+        let genesis = manifest();
+        let profile = profile(&genesis, 10_000, 2);
+        let state =
+            MonetaryLedgerStateV04TransitionCandidate::from_genesis_manifest(&genesis, &profile)
+                .unwrap();
+        let bytes = state.encode_snapshot().unwrap();
+
+        assert_eq!(&bytes[..4], &V04_PROFILE_BOUND_SNAPSHOT_MAGIC);
+        assert_eq!(
+            u16::from_be_bytes([bytes[4], bytes[5]]),
+            V04_PROFILE_BOUND_SNAPSHOT_VERSION
+        );
+        assert_eq!(
+            bytes.len().to_string(),
+            vector_value("qzp4_genesis_snapshot_length")
+        );
+        assert_eq!(hex(&bytes), vector_value("qzp4_genesis_snapshot_hex"));
+        assert_eq!(
+            hex(&Sha256::digest(&bytes)),
+            vector_value("qzp4_genesis_snapshot_sha256")
+        );
+
+        let restored =
+            MonetaryLedgerStateV04TransitionCandidate::decode_snapshot(&bytes, &genesis, &profile)
+                .unwrap();
+        assert_eq!(restored, state);
+        assert_eq!(restored.state_root().unwrap(), state.state_root().unwrap());
+    }
+
+    #[test]
+    fn qzp4_snapshot_restores_after_mining_with_same_profile_and_tip() {
+        let genesis = manifest();
+        let profile = profile(&genesis, 10_000, 2);
+        let mut state =
+            MonetaryLedgerStateV04TransitionCandidate::from_genesis_manifest(&genesis, &profile)
+                .unwrap();
+        let block = state.build_next_block(1, MINER).unwrap();
+        state.apply_block(&block).unwrap();
+
+        let bytes = state.encode_snapshot().unwrap();
+        let restored =
+            MonetaryLedgerStateV04TransitionCandidate::decode_snapshot(&bytes, &genesis, &profile)
+                .unwrap();
+        assert_eq!(restored, state);
+        assert_eq!(restored.ledger().tip_hash(), state.ledger().tip_hash());
+        assert_eq!(restored.state_root().unwrap(), state.state_root().unwrap());
+    }
+
+    #[test]
+    fn qzp4_snapshot_rejects_wrong_manifest_network_and_schedule() {
+        let genesis = manifest();
+        let configured_profile = profile(&genesis, 10_000, 2);
+        let state = MonetaryLedgerStateV04TransitionCandidate::from_genesis_manifest(
+            &genesis,
+            &configured_profile,
+        )
+        .unwrap();
+        let bytes = state.encode_snapshot().unwrap();
+
+        let other_schedule = profile(&genesis, 12_000, 2);
+        assert_eq!(
+            MonetaryLedgerStateV04TransitionCandidate::decode_snapshot(
+                &bytes,
+                &genesis,
+                &other_schedule,
+            ),
+            Err(V04TransitionError::ProfileBoundSnapshotProfileMismatch)
+        );
+
+        let other_genesis = GenesisManifestV04::new(NETWORK, OTHER_OWNER).unwrap();
+        let other_profile = profile(&other_genesis, 10_000, 2);
+        assert!(matches!(
+            MonetaryLedgerStateV04TransitionCandidate::decode_snapshot(
+                &bytes,
+                &other_genesis,
+                &other_profile
+            ),
+            Err(V04TransitionError::ProfileBindingMismatch)
+        ));
+
+        let other_network_genesis = GenesisManifestV04::new([0x77; 32], OWNER).unwrap();
+        let other_network_profile = profile(&other_network_genesis, 10_000, 2);
+        assert_eq!(
+            MonetaryLedgerStateV04TransitionCandidate::decode_snapshot(
+                &bytes,
+                &other_network_genesis,
+                &other_network_profile
+            ),
+            Err(V04TransitionError::ProfileBoundSnapshotNetworkMismatch)
+        );
+    }
+
+    #[test]
+    fn qzp4_snapshot_rejects_corruption_unknown_version_and_truncation() {
+        let genesis = manifest();
+        let profile = profile(&genesis, 10_000, 2);
+        let state =
+            MonetaryLedgerStateV04TransitionCandidate::from_genesis_manifest(&genesis, &profile)
+                .unwrap();
+        let bytes = state.encode_snapshot().unwrap();
+
+        let mut corrupt = bytes.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        assert_eq!(
+            MonetaryLedgerStateV04TransitionCandidate::decode_snapshot(
+                &corrupt, &genesis, &profile
+            ),
+            Err(V04TransitionError::ProfileBoundSnapshotChecksumMismatch)
+        );
+
+        let mut wrong_version = bytes.clone();
+        wrong_version[4..6].copy_from_slice(&2u16.to_be_bytes());
+        let checksum_start = wrong_version.len() - 32;
+        let checksum = profile_bound_snapshot_checksum(&wrong_version[..checksum_start]);
+        wrong_version[checksum_start..].copy_from_slice(&checksum);
+        assert_eq!(
+            MonetaryLedgerStateV04TransitionCandidate::decode_snapshot(
+                &wrong_version,
+                &genesis,
+                &profile
+            ),
+            Err(V04TransitionError::UnsupportedProfileBoundSnapshotVersion(
+                2
+            ))
+        );
+
+        assert_eq!(
+            MonetaryLedgerStateV04TransitionCandidate::decode_snapshot(
+                &bytes[..PROFILE_BOUND_SNAPSHOT_FIXED_OVERHEAD - 1],
+                &genesis,
+                &profile
+            ),
+            Err(V04TransitionError::ProfileBoundSnapshotIncomplete)
+        );
     }
 
     #[test]

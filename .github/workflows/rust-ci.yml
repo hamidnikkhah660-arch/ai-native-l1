@@ -42,7 +42,7 @@ jobs:
       - name: Verify CP-0397 v0.4 mining schedule candidate oracle
         run: python3 ../../../simulations/quantumzxb_v04_issuance_schedule_vectors.py --check
 
-      - name: Verify CP-0398 v0.4 profile and atomic transition oracle
+      - name: Verify CP-0398/CP-0400 v0.4 profile, transition and snapshot oracle
         run: python3 ../../../simulations/quantumzxb_v04_transition_profile_vectors.py --check
 
       - name: Check formatting
