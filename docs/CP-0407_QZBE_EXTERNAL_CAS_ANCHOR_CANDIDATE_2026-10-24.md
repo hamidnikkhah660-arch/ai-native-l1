@@ -2,7 +2,7 @@
 
 Date: 2026-10-24
 
-Status: **working-tree candidate; local all-target test/check and docs preflight pass; commit-specific CI pending; not Gate 8 closure**
+Status: **candidate implementation committed; local validation and CI pass on implementation SHA; not Gate 8 closure**
 
 ## Goal
 
@@ -37,7 +37,7 @@ cargo test --locked --offline --lib monetary_pow_v04_store_candidate -- --nocapt
 
 The CP-0407-specific tests cover (a) signed CAS commit and reopen, (b) a provider-side generation conflict that preserves the old active manifest and is discarded after a fresh signed read, and (c) a CAS that commits remotely but loses the response, recovered by promoting only the exact pending manifest named by the fresh signed record. They also assert that the local submission entry point is blocked while a CAS outcome remains unresolved.
 
-Local validation on the working tree: `cargo fmt --all -- --check` — PASS; `cargo test --locked --offline --lib monetary_pow_v04_store_candidate -- --nocapture` — **10 passed, 0 failed**; `cargo test --all-targets --locked --offline` — exit 0, **826 library tests passed, 0 failed**, both `devnet_node` and `private_testnet_node` suites **36 passed, 0 failed** each, all remaining targets successful; `cargo check --all-targets --locked --offline` — PASS; release checksum rebuild — PASS, **377 entries**; public docs preflight — PASS, **48 README-relative links**, `git diff --cached --check` — PASS. The new code and docs are staged for review. A commit SHA and GitHub Actions result for CP-0407 remain pending.
+Local validation on the working tree: `cargo fmt --all -- --check` — PASS; `cargo test --locked --offline --lib monetary_pow_v04_store_candidate -- --nocapture` — **10 passed, 0 failed**; `cargo test --all-targets --locked --offline` — exit 0, **826 library tests passed, 0 failed**, both `devnet_node` and `private_testnet_node` suites **36 passed, 0 failed** each, all remaining targets successful; `cargo check --all-targets --locked --offline` — PASS; release checksum rebuild — PASS, **377 entries**; public docs preflight — PASS, **48 README-relative links**, `git diff --cached --check` — PASS. The implementation and its tests are committed as `e3ad9a535bb021d3c810434622ff5207244ac840` and passed GitHub Actions run `40122352670` on that exact SHA. Both `Format, check, and test` and `Windows PMT4 TXN4 two-node loopback` completed successfully. These results validate the candidate implementation only; the provider remains an in-memory fixture and Gate 2/Gate 8 remain open.
 
 ## Limitations and launch boundary
 
