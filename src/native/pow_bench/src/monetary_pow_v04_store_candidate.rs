@@ -51,6 +51,11 @@ const BRANCH_DIR: &str = "branches";
 const MANIFEST_DIR: &str = "manifests";
 const LOCK_NAME: &str = "qzbe-store.lock";
 const PENDING_MANIFEST_NAME: &str = ".qzbe-manifest.pending-cas";
+const ANCHOR_MODE_MARKER_NAME: &str = ".qzbe-external-cas-required";
+const ANCHOR_MODE_MARKER_MAGIC: &[u8; 4] = b"QZCA";
+const ANCHOR_MODE_MARKER_VERSION: u16 = 1;
+const ANCHOR_MODE_MARKER_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-EXTERNAL-CAS-MODE-MARKER-V1\0";
+const ANCHOR_MODE_MARKER_BYTES: usize = 4 + 2 + 7 * 32 + 32;
 const MANIFEST_ANCHOR_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-MANIFEST-ANCHOR-CANDIDATE-V1\0";
 const CAS_READ_OPERATION_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-CAS-READ-CANDIDATE-V1\0";
 const CAS_WRITE_OPERATION_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-CAS-WRITE-CANDIDATE-V1\0";
@@ -174,6 +179,183 @@ struct Manifest {
     entries: Vec<([u8; 32], [u8; 32])>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnchorModeMarker {
+    provider_id: [u8; 32],
+    network_id: [u8; 32],
+    genesis_digest: [u8; 32],
+    receipt_key_id: [u8; 32],
+    receipt_key_fingerprint: [u8; 32],
+    profile_fingerprint: [u8; 32],
+    pow_fingerprint: [u8; 32],
+}
+
+/// Local operational mode latch only. This file prevents accidental plain-open writes after CAS
+/// setup, but is mutable local state and is not itself anti-rollback security evidence.
+fn decode_anchor_mode_marker(bytes: &[u8]) -> Result<AnchorModeMarker, V04ExecutionForkStoreError> {
+    if bytes.len() != ANCHOR_MODE_MARKER_BYTES
+        || &bytes[..4] != ANCHOR_MODE_MARKER_MAGIC
+        || u16::from_be_bytes([bytes[4], bytes[5]]) != ANCHOR_MODE_MARKER_VERSION
+    {
+        return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
+    }
+    let payload_end = bytes.len() - 32;
+    let mut hasher = Sha256::new();
+    hasher.update(ANCHOR_MODE_MARKER_DOMAIN);
+    hasher.update(&bytes[..payload_end]);
+    let expected: [u8; 32] = hasher.finalize().into();
+    if bytes[payload_end..] != expected {
+        return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
+    }
+    let mut cursor = 6usize;
+    let mut take32 = || {
+        let mut result = [0u8; 32];
+        result.copy_from_slice(&bytes[cursor..cursor + 32]);
+        cursor += 32;
+        result
+    };
+    let marker = AnchorModeMarker {
+        provider_id: take32(),
+        network_id: take32(),
+        genesis_digest: take32(),
+        receipt_key_id: take32(),
+        receipt_key_fingerprint: take32(),
+        profile_fingerprint: take32(),
+        pow_fingerprint: take32(),
+    };
+    if [
+        marker.provider_id,
+        marker.network_id,
+        marker.genesis_digest,
+        marker.receipt_key_id,
+        marker.receipt_key_fingerprint,
+        marker.profile_fingerprint,
+        marker.pow_fingerprint,
+    ]
+    .iter()
+    .any(|value| value.iter().all(|byte| *byte == 0))
+    {
+        return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
+    }
+    Ok(marker)
+}
+
+/// Load a marker without following symlinks. A malformed marker fails closed rather than
+/// silently converting an anchored data directory to local-only submission mode.
+fn load_anchor_mode_marker(
+    directory: &Path,
+) -> Result<Option<AnchorModeMarker>, V04ExecutionForkStoreError> {
+    let path = directory.join(ANCHOR_MODE_MARKER_NAME);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
+            }
+            let bytes = read_bounded(&path, ANCHOR_MODE_MARKER_BYTES)
+                .map_err(|_| V04ExecutionForkStoreError::ExternalAnchorMismatch)?;
+            Ok(Some(decode_anchor_mode_marker(&bytes)?))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(V04ExecutionForkStoreError::Io(error)),
+    }
+}
+
+fn compute_external_cas_genesis_digest(
+    graph: &V04ExecutionForkChoiceCandidate,
+    params: &ConsensusParameters,
+) -> Result<[u8; 32], V04ExecutionForkStoreError> {
+    let mut hash = Sha256::new();
+    hash.update(CAS_GENESIS_DOMAIN);
+    hash.update(graph.profile().network_id());
+    hash.update(graph.genesis_tip());
+    hash.update(graph.profile().profile_fingerprint());
+    hash.update(pow_consensus_profile_fingerprint(params)?);
+    Ok(hash.finalize().into())
+}
+
+fn validate_anchor_mode_marker_for_store(
+    marker: &AnchorModeMarker,
+    graph: &V04ExecutionForkChoiceCandidate,
+    params: &ConsensusParameters,
+) -> Result<(), V04ExecutionForkStoreError> {
+    if marker.network_id != *graph.profile().network_id()
+        || marker.genesis_digest != compute_external_cas_genesis_digest(graph, params)?
+        || marker.profile_fingerprint != *graph.profile().profile_fingerprint()
+        || marker.pow_fingerprint != pow_consensus_profile_fingerprint(params)?
+    {
+        return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
+    }
+    Ok(())
+}
+
+fn validate_anchor_mode_marker_pin(
+    marker: &AnchorModeMarker,
+    pin: &ExternalCasPin,
+) -> Result<(), V04ExecutionForkStoreError> {
+    let key_fingerprint: [u8; 32] = Sha256::digest(&pin.receipt_public_key).into();
+    if marker.provider_id != pin.provider_id
+        || marker.network_id != pin.network_id
+        || marker.genesis_digest != pin.genesis_digest
+        || marker.receipt_key_id != pin.receipt_key_id
+        || marker.receipt_key_fingerprint != key_fingerprint
+    {
+        return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
+    }
+    Ok(())
+}
+
+fn encode_anchor_mode_marker(
+    store: &V04ExecutionForkStoreCandidate,
+    pin: &ExternalCasPin,
+) -> Result<Vec<u8>, V04ExecutionForkStoreError> {
+    let genesis_digest = store.external_cas_genesis_digest()?;
+    if pin.network_id != *store.fork_choice.profile().network_id()
+        || pin.genesis_digest != genesis_digest
+    {
+        return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
+    }
+    let mut bytes = Vec::with_capacity(ANCHOR_MODE_MARKER_BYTES);
+    bytes.extend_from_slice(ANCHOR_MODE_MARKER_MAGIC);
+    bytes.extend_from_slice(&ANCHOR_MODE_MARKER_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&pin.provider_id);
+    bytes.extend_from_slice(&pin.network_id);
+    bytes.extend_from_slice(&pin.genesis_digest);
+    bytes.extend_from_slice(&pin.receipt_key_id);
+    let key_fingerprint: [u8; 32] = Sha256::digest(&pin.receipt_public_key).into();
+    bytes.extend_from_slice(&key_fingerprint);
+    bytes.extend_from_slice(store.fork_choice.profile().profile_fingerprint());
+    bytes.extend_from_slice(&pow_consensus_profile_fingerprint(&store.params)?);
+    let mut hasher = Sha256::new();
+    hasher.update(ANCHOR_MODE_MARKER_DOMAIN);
+    hasher.update(&bytes);
+    bytes.extend_from_slice(&<[u8; 32]>::from(hasher.finalize()));
+    if bytes.len() != ANCHOR_MODE_MARKER_BYTES {
+        return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
+    }
+    Ok(bytes)
+}
+
+/// Persist a local operational guard against accidentally reopening an externally anchored store
+/// through plain submit(). The signed remote CAS remains the anti-rollback authority; this marker
+/// is deliberately not described as tamper-resistant or an independent trust anchor.
+fn persist_anchor_mode_marker(
+    store: &V04ExecutionForkStoreCandidate,
+    pin: &ExternalCasPin,
+) -> Result<(), V04ExecutionForkStoreError> {
+    let bytes = encode_anchor_mode_marker(store, pin)?;
+    let expected = decode_anchor_mode_marker(&bytes)?;
+    let path = store.directory.join(ANCHOR_MODE_MARKER_NAME);
+    match load_anchor_mode_marker(&store.directory)? {
+        Some(existing) => {
+            if existing != expected {
+                return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
+            }
+            Ok(())
+        }
+        None => write_new_atomic(&path, &bytes),
+    }
+}
+
 /// Local-only persistent QZBE archive. Not a production consensus store or Gate 8 provider.
 ///
 /// The store serializes writers using the repository's OS-backed lock, keeps immutable manifest
@@ -258,12 +440,6 @@ impl V04ExecutionForkStoreCandidate {
     ) -> Result<Self, V04ExecutionForkStoreError> {
         let directory = directory.as_ref().to_path_buf();
         fs::create_dir_all(&directory)?;
-        let pending_path = directory.join(PENDING_MANIFEST_NAME);
-        let pending_exists = match fs::symlink_metadata(&pending_path) {
-            Ok(_) => true,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-            Err(error) => return Err(V04ExecutionForkStoreError::Io(error)),
-        };
         let writer_lock = StoreWriterLock::acquire(&directory, LOCK_NAME).map_err(|error| {
             if error.kind() == io::ErrorKind::WouldBlock {
                 V04ExecutionForkStoreError::StoreLocked
@@ -271,6 +447,15 @@ impl V04ExecutionForkStoreCandidate {
                 V04ExecutionForkStoreError::Io(error)
             }
         })?;
+        // Read mutable recovery state only after acquiring the process lock. Checking the pending
+        // CAS manifest before lock acquisition permits a stale pre-lock observation if another
+        // writer creates it while this opener waits.
+        let pending_path = directory.join(PENDING_MANIFEST_NAME);
+        let pending_exists = match fs::symlink_metadata(&pending_path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(V04ExecutionForkStoreError::Io(error)),
+        };
         let branches_dir = directory.join(BRANCH_DIR);
         let manifests_dir = directory.join(MANIFEST_DIR);
         fs::create_dir_all(&branches_dir)?;
@@ -279,6 +464,10 @@ impl V04ExecutionForkStoreCandidate {
         clean_temporary_files(&manifests_dir)?;
 
         let graph = V04ExecutionForkChoiceCandidate::new(genesis.clone(), params.clone())?;
+        let anchor_marker = load_anchor_mode_marker(&directory)?;
+        if let Some(marker) = &anchor_marker {
+            validate_anchor_mode_marker_for_store(marker, &graph, &params)?;
+        }
         let latest = latest_manifest(&manifests_dir)?;
         let (fork_choice, generation) = match latest {
             Some((filename_generation, manifest_path)) => {
@@ -348,7 +537,9 @@ impl V04ExecutionForkStoreCandidate {
             generation,
             // A local open must not silently bypass a pending external CAS operation.
             // Only open_with_external_cas can resolve this flag with a verified signed read.
-            external_anchor_required: pending_exists,
+            // Persist the mode latch so a normal reopen cannot accidentally forget that the
+            // store was placed under the external-CAS submission path.
+            external_anchor_required: pending_exists || anchor_marker.is_some(),
         })
     }
 
@@ -371,13 +562,7 @@ impl V04ExecutionForkStoreCandidate {
     /// Stable scope binding for a provider bootstrap record. The initial record must be created
     /// by the separately administered provider/operator; this method does not provision a provider.
     pub fn external_cas_genesis_digest(&self) -> Result<[u8; 32], V04ExecutionForkStoreError> {
-        let mut hash = Sha256::new();
-        hash.update(CAS_GENESIS_DOMAIN);
-        hash.update(self.fork_choice.profile().network_id());
-        hash.update(self.fork_choice.genesis_tip());
-        hash.update(self.fork_choice.profile().profile_fingerprint());
-        hash.update(pow_consensus_profile_fingerprint(&self.params)?);
-        Ok(hash.finalize().into())
+        compute_external_cas_genesis_digest(&self.fork_choice, &self.params)
     }
 
     /// Open/reconcile QZBE against a signed, pinned external anchor. A remote anchor may be the
@@ -410,6 +595,13 @@ impl V04ExecutionForkStoreCandidate {
         {
             return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
         }
+        if let Some(marker) = load_anchor_mode_marker(&directory)? {
+            validate_anchor_mode_marker_pin(&marker, pin)?;
+        }
+        // Latch anchored mode durably before contacting the provider. If this function fails,
+        // or the process later crashes after a remote CAS commit but before local publication,
+        // a plain reopen must already be blocked from local-only submission.
+        persist_anchor_mode_marker(&store, pin)?;
         let (remote, object_generation) = store.read_external_anchor(
             pin,
             client,
@@ -474,6 +666,7 @@ impl V04ExecutionForkStoreCandidate {
                 {
                     return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
                 }
+                persist_anchor_mode_marker(&reopened, pin)?;
                 reopened.external_anchor_required = true;
                 return Ok((reopened, remote, object_generation));
             } else {
@@ -486,6 +679,7 @@ impl V04ExecutionForkStoreCandidate {
             return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
         }
         prune_unreferenced_branch_files(&store)?;
+        persist_anchor_mode_marker(&store, pin)?;
         store.external_anchor_required = true;
         Ok((store, remote, object_generation))
     }
@@ -1706,6 +1900,38 @@ mod tests {
         let current_record = result.anchor_record.clone();
         let next_floor = receipt.object_generation;
         drop(store);
+
+        // A regular reopen must not forget the externally anchored mode and accidentally accept
+        // a local-only submit. A corrupted mode latch must fail closed as well.
+        assert!(path.join(ANCHOR_MODE_MARKER_NAME).is_file());
+        let mut plain_reopen = V04ExecutionForkStoreCandidate::open(
+            &path,
+            genesis_state.clone(),
+            parameters.clone(),
+            &TestAuthenticator,
+        )
+        .unwrap();
+        assert!(plain_reopen.external_anchor_required);
+        assert!(matches!(
+            plain_reopen.submit(&envelope, &TestAuthenticator),
+            Err(V04ExecutionForkStoreError::ExternalAnchorRequired)
+        ));
+        drop(plain_reopen);
+        let marker_path = path.join(ANCHOR_MODE_MARKER_NAME);
+        let marker_bytes = fs::read(&marker_path).unwrap();
+        let mut corrupt_marker = marker_bytes.clone();
+        corrupt_marker[12] ^= 0x80;
+        fs::write(&marker_path, corrupt_marker).unwrap();
+        assert!(matches!(
+            V04ExecutionForkStoreCandidate::open(
+                &path,
+                genesis_state.clone(),
+                parameters.clone(),
+                &TestAuthenticator,
+            ),
+            Err(V04ExecutionForkStoreError::ExternalAnchorMismatch)
+        ));
+        fs::write(&marker_path, marker_bytes).unwrap();
 
         let (reopened, remote, observed_floor) =
             V04ExecutionForkStoreCandidate::open_with_external_cas(

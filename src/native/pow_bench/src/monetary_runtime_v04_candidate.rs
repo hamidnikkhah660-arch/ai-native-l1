@@ -504,6 +504,7 @@ mod tests {
         fs,
         sync::atomic::{AtomicU64, Ordering},
         sync::{Arc, Mutex},
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     const NETWORK: [u8; 32] = [0x31; 32];
@@ -593,12 +594,19 @@ mod tests {
     }
 
     fn path() -> PathBuf {
+        // The PID + process-local counter can be reused by Windows after a prior test process exits,
+        // colliding with leftover snapshots from an earlier run. Include a high-resolution time
+        // component so repeated cargo test invocations cannot inherit another run's anchor state.
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "qzb4-cp0404-{}-{}",
+            "qzb4-cp0404-{}-{timestamp}-{}",
             std::process::id(),
             NEXT_DIR.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir_all(&path).unwrap();
+        fs::create_dir(&path).unwrap();
         path.join("state.qzp4")
     }
 
