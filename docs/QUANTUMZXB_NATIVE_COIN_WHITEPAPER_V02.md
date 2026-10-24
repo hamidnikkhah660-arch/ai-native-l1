@@ -1,4 +1,7 @@
 # QuantumZXB - AI-Native L1 Native Coin and Ecosystem White Paper
+
+> **Historical allocation note (2026-10-24):** This v0.2 document describes the former 4B / 3B / 3B proposal. For current allocation terms see [white paper v0.3](QUANTUMZXB_NATIVE_COIN_WHITEPAPER_V03.md) and [tokenomics policy v0.4](FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V04_2026-10-24.md). Other engineering-status statements retain their cited review dates.
+
 ## Version 0.2 - Public Technical Engineering White Paper
 
 Date: 20 October 2026
