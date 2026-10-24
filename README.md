@@ -36,6 +36,7 @@
 - **Mining, halving and performance evidence:** [Candidate parameters and benchmark methodology](docs/MINING_HALVING_PERFORMANCE_AND_SCALING_V01.md)
 - **Reproducible halving charts and data:** [Candidate curve generator](simulations/candidate_halving_curve.py) - [Per-era CSV](simulations/candidate_halving_curve.csv); candidate-only, not live supply.
 - **Liquidity, market-data and public launch readiness:** [Platform prerequisites, cash-flow options and launch blockers](docs/LIQUIDITY_MARKET_DATA_AND_PUBLIC_LAUNCH_READINESS_V01.md)
+- **Global native-coin launch and liquidity fast path:** [CP-0401 source-based readiness review and execution plan](docs/CP-0401_GLOBAL_NATIVE_COIN_LAUNCH_AND_LIQUIDITY_FASTPATH_2026-10-24.md)
 - **Owner's zero-budget launch and liquidity directive:** [Persistent launch gate and fresh-session handoff](docs/OWNER_DIRECTIVE_ZERO_BUDGET_LAUNCH_AND_LIQUIDITY_GATE_V01_2026-10-21.md) - [live execution issue #12](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/12)
 - **Sponsorship and contributor discussion:** [Public issue #1](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/1)
 - **Previous public documentation release:** [v0.2.0-docs](https://github.com/hamidnikkhah660-arch/ai-native-l1/releases/tag/v0.2.0-docs)
@@ -115,4 +116,4 @@ The current 10B design cap assigns 3B to the mining/network-security envelope. A
 The source tree is a curated public selection. Review specific files, reproduce commands in the relevant package, and use the [current public release manifest](docs/PUBLIC_RELEASE_MANIFEST_V18_2026-10-22.md) to identify the versioned public baseline. The public white paper and roadmap describe the engineering plan; they do not assert that future integrations are already operating on native Mainnet.
 
 
-Additional candidate note: [CP-0394 — v0.4 ledger snapshot candidate](docs/CP_0394_GATE2_V04_LEDGER_SNAPSHOT_CANDIDATE_2026-10-24.md).
+Additional candidate note: [CP-0394 ï¿½ v0.4 ledger snapshot candidate](docs/CP_0394_GATE2_V04_LEDGER_SNAPSHOT_CANDIDATE_2026-10-24.md).
