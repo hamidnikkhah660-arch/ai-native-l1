@@ -230,7 +230,7 @@ impl V04ConsensusProfileCandidate {
         Ok(())
     }
 
-    fn validate_for_manifest(
+    pub(crate) fn validate_for_manifest(
         &self,
         manifest: &GenesisManifestV04,
     ) -> Result<(), V04TransitionError> {
