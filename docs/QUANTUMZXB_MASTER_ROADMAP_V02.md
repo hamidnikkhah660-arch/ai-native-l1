@@ -1,4 +1,7 @@
 # QuantumZXB - Master Engineering and Ecosystem Roadmap v0.2
+
+> **Historical allocation note (2026-10-24):** This v0.2 roadmap contains the former 4B / 3B / 3B proposal. For current tokenomics see [roadmap v0.3](QUANTUMZXB_MASTER_ROADMAP_V03.md) and [tokenomics policy v0.4](FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V04_2026-10-24.md). Engineering items retain their original scope.
+
 Date: 2026-10-20
 Status: Public engineering roadmap aligned with the repository review. Milestones are evidence-based; no public-network launch date is promised.
 
