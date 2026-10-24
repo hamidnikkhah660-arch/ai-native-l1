@@ -43,8 +43,22 @@ pub mod ingress_queue_candidate;
 pub mod ingress_worker_candidate;
 pub mod issuance_schedule;
 pub mod key_provider;
+/// CP-0391 candidate accounting for the owner-directed v0.4 eight-bucket supply budgets; not runtime-wired.
+pub mod monetary_allocation_v04_candidate;
+/// CP-0392 candidate canonical Genesis manifest bound to the v0.4 allocation policy; not wired into node runtime.
+pub mod monetary_genesis_v04_candidate;
+/// CP-0397 explicit, parameterized v0.4 mining-schedule contract; no approved default or runtime callsite.
+pub mod monetary_issuance_v04_candidate;
+/// CP-0393 candidate bridge from the v0.4 manifest to the deterministic ledger substrate; no runtime integration.
+pub mod monetary_ledger_v04_candidate;
 /// CP-0213 policy arithmetic candidate; not wired into canonical consensus or block import.
 pub mod monetary_policy_v3_candidate;
+/// CP-0405 candidate QZBE PoW envelope, branch-local QZB4 v2 replay and cumulative-work fork choice; not a persistent branch store or canonical-node integration.
+pub mod monetary_pow_v04_candidate;
+/// CP-0404 candidate QZB4 v2 profile dispatcher, durable snapshot recovery and external-anchor contract; not canonical-node or PoW/fork-choice wired.
+pub mod monetary_runtime_v04_candidate;
+/// CP-0398/CP-0403 profile-bound v0.4 transitions (QZB4 v1 mining-only, v2 transaction-bearing); not node-wired.
+pub mod monetary_transition_v04_candidate;
 pub mod noise_deployment_config;
 pub mod noise_issuer_registry;
 pub mod noise_key_provisioning;
