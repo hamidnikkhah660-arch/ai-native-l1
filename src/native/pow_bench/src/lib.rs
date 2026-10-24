@@ -45,6 +45,8 @@ pub mod issuance_schedule;
 pub mod key_provider;
 /// CP-0391 candidate accounting for the owner-directed v0.4 eight-bucket supply budgets; not runtime-wired.
 pub mod monetary_allocation_v04_candidate;
+/// CP-0392 candidate canonical Genesis manifest bound to the v0.4 allocation policy; not wired into node runtime.
+pub mod monetary_genesis_v04_candidate;
 /// CP-0213 policy arithmetic candidate; not wired into canonical consensus or block import.
 pub mod monetary_policy_v3_candidate;
 pub mod noise_deployment_config;
