@@ -1,12 +1,18 @@
-//! CP-0406 candidate persistent archive for QZBE / QZB4 v2 execution forks.
+//! CP-0406/CP-0407 candidate persistent archive and injected-CAS anchoring for QZBE / QZB4 v2.
 //!
 //! This store persists bounded, individually digest-named envelopes and immutable manifest
 //! generations. On open, it verifies exact bytes and rebuilds the complete branch graph from
-//! Genesis before exposing a canonical tip. The manifest history avoids in-place replacement;
-//! it is still local state and is vulnerable to restoring the whole directory. No external CAS
-//! provider is implemented here, and this module is not wired into the live node/Mainnet.
+//! Genesis before exposing a canonical tip. CP-0407 optionally binds exact manifest bytes to the
+//! repository's signed external-CAS contract and reconciles a pending commit by a fresh read.
+//! The provider remains an injected interface/test fixture: there is no deployed provider,
+//! independent key custody, canonical-node wiring, or Mainnet launch in this module.
 use crate::{
     consensus::{pow_digest, ConsensusError, ConsensusParameters},
+    external_cas_anchor_candidate::{
+        ExternalCasClientError, ExternalCasError, ExternalCasPin, ExternalCasProviderTransport,
+        ExternalCasReceipt, ExternalCasReceiptOutcome, ExternalCasRecord, ExternalCasWriteRequest,
+        VerifiedExternalCasClient,
+    },
     monetary_pow_v04_candidate::{
         pow_consensus_profile_fingerprint, V04ExecutionForkChoiceCandidate,
         V04ExecutionForkChoiceOutcome, V04ExecutionPowEnvelope, V04ExecutionPowError,
@@ -17,6 +23,7 @@ use crate::{
     },
     state_machine::TransactionAuthenticator,
     store_writer_lock::StoreWriterLock,
+    v4_fat1_trust_candidate::MlDsa65Verifier,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -43,6 +50,12 @@ const BRANCH_SUFFIX: &str = ".qzbe";
 const BRANCH_DIR: &str = "branches";
 const MANIFEST_DIR: &str = "manifests";
 const LOCK_NAME: &str = "qzbe-store.lock";
+const PENDING_MANIFEST_NAME: &str = ".qzbe-manifest.pending-cas";
+const MANIFEST_ANCHOR_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-MANIFEST-ANCHOR-CANDIDATE-V1\0";
+const CAS_READ_OPERATION_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-CAS-READ-CANDIDATE-V1\0";
+const CAS_WRITE_OPERATION_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-CAS-WRITE-CANDIDATE-V1\0";
+const CAS_WRITE_NONCE_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-CAS-WRITE-NONCE-CANDIDATE-V1\0";
+const CAS_GENESIS_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-CAS-GENESIS-CANDIDATE-V1\0";
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
@@ -61,6 +74,14 @@ pub enum V04ExecutionForkStoreError {
     CanonicalStateMismatch,
     ArchiveCapacityExceeded,
     StoreLocked,
+    ExternalAnchorRequired,
+    ExternalAnchorMismatch,
+    PendingManifestExists,
+    PendingManifestMalformed,
+    ExternalCasFailure(String),
+    ExternalCasConflict,
+    ExternalCasInvalidOutcome(ExternalCasReceiptOutcome),
+    UnexpectedBranchFile,
 }
 
 impl std::fmt::Display for V04ExecutionForkStoreError {
@@ -87,6 +108,34 @@ impl std::fmt::Display for V04ExecutionForkStoreError {
             }
             Self::ArchiveCapacityExceeded => write!(f, "QZBE archive exceeds candidate bounds"),
             Self::StoreLocked => write!(f, "QZBE store already has a writer"),
+            Self::ExternalAnchorRequired => write!(
+                f,
+                "QZBE store is externally anchored; use submit_with_external_cas"
+            ),
+            Self::ExternalAnchorMismatch => write!(
+                f,
+                "external CAS anchor does not match the exact QZBE manifest"
+            ),
+            Self::PendingManifestExists => write!(
+                f,
+                "pending QZBE CAS manifest requires signed-anchor recovery"
+            ),
+            Self::PendingManifestMalformed => {
+                write!(f, "pending QZBE CAS manifest is malformed or inconsistent")
+            }
+            Self::ExternalCasFailure(error) => write!(f, "external QZBE CAS failure: {error}"),
+            Self::ExternalCasConflict => write!(
+                f,
+                "external QZBE CAS conditional write conflicted; recover with a fresh signed read"
+            ),
+            Self::ExternalCasInvalidOutcome(outcome) => write!(
+                f,
+                "external QZBE CAS returned non-commit outcome: {outcome:?}"
+            ),
+            Self::UnexpectedBranchFile => write!(
+                f,
+                "QZBE branch directory contains an uncommitted or non-canonical entry"
+            ),
         }
     }
 }
@@ -137,6 +186,67 @@ pub struct V04ExecutionForkStoreCandidate {
     fork_choice: V04ExecutionForkChoiceCandidate,
     params: ConsensusParameters,
     generation: u64,
+    external_anchor_required: bool,
+}
+
+/// Result of a QZBE submission whose manifest commitment was accepted by the pinned CAS contract.
+/// receipt is None only for an already-known duplicate envelope that caused no state change.
+#[derive(Debug)]
+pub struct V04ExecutionAnchoredSubmitOutcome {
+    pub block: V04ExecutionForkChoiceOutcome,
+    pub anchor_record: ExternalCasRecord,
+    pub receipt: Option<ExternalCasReceipt>,
+}
+
+fn manifest_anchor_commitment(bytes: &[u8]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(MANIFEST_ANCHOR_DOMAIN);
+    hash.update(bytes);
+    hash.finalize().into()
+}
+
+/// After the remote anchor has been verified, remove local branches that are not named by the
+/// active committed manifest. Non-regular and non-canonical branch entries are rejected.
+fn prune_unreferenced_branch_files(
+    store: &V04ExecutionForkStoreCandidate,
+) -> Result<(), V04ExecutionForkStoreError> {
+    let manifest_path = store
+        .directory
+        .join(MANIFEST_DIR)
+        .join(manifest_filename(store.generation));
+    let manifest_bytes = read_bounded(&manifest_path, MAX_MANIFEST_BYTES)?;
+    let manifest = decode_manifest(&manifest_bytes)?;
+    if manifest.generation != store.generation {
+        return Err(V04ExecutionForkStoreError::ManifestGenerationMismatch);
+    }
+    let committed: std::collections::BTreeSet<String> = manifest
+        .entries
+        .iter()
+        .map(|(digest, _)| format!("{}{}", hex(digest), BRANCH_SUFFIX))
+        .collect();
+    let branches_dir = store.directory.join(BRANCH_DIR);
+    for entry in fs::read_dir(&branches_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(BRANCH_SUFFIX) {
+            continue;
+        }
+        if !entry.file_type()?.is_file() {
+            return Err(V04ExecutionForkStoreError::UnexpectedBranchFile);
+        }
+        let digest_text = &name[..name.len() - BRANCH_SUFFIX.len()];
+        if digest_text.len() != 64
+            || !digest_text
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(V04ExecutionForkStoreError::UnexpectedBranchFile);
+        }
+        if !committed.contains(&name) {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 impl V04ExecutionForkStoreCandidate {
@@ -148,6 +258,12 @@ impl V04ExecutionForkStoreCandidate {
     ) -> Result<Self, V04ExecutionForkStoreError> {
         let directory = directory.as_ref().to_path_buf();
         fs::create_dir_all(&directory)?;
+        let pending_path = directory.join(PENDING_MANIFEST_NAME);
+        let pending_exists = match fs::symlink_metadata(&pending_path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(V04ExecutionForkStoreError::Io(error)),
+        };
         let writer_lock = StoreWriterLock::acquire(&directory, LOCK_NAME).map_err(|error| {
             if error.kind() == io::ErrorKind::WouldBlock {
                 V04ExecutionForkStoreError::StoreLocked
@@ -230,6 +346,383 @@ impl V04ExecutionForkStoreCandidate {
             fork_choice,
             params,
             generation,
+            // A local open must not silently bypass a pending external CAS operation.
+            // Only open_with_external_cas can resolve this flag with a verified signed read.
+            external_anchor_required: pending_exists,
+        })
+    }
+
+    /// Exact local manifest commitment used as the value in the external CAS chain.
+    /// The receipt-verification key and minimum object-generation floor must be provisioned
+    /// out of band; this hash is not anti-rollback protection on its own.
+    pub fn manifest_anchor(&self) -> Result<[u8; 32], V04ExecutionForkStoreError> {
+        let path = self
+            .directory
+            .join(MANIFEST_DIR)
+            .join(manifest_filename(self.generation));
+        let bytes = read_bounded(&path, MAX_MANIFEST_BYTES)?;
+        let manifest = decode_manifest(&bytes)?;
+        if manifest.generation != self.generation {
+            return Err(V04ExecutionForkStoreError::ManifestGenerationMismatch);
+        }
+        Ok(manifest_anchor_commitment(&bytes))
+    }
+
+    /// Stable scope binding for a provider bootstrap record. The initial record must be created
+    /// by the separately administered provider/operator; this method does not provision a provider.
+    pub fn external_cas_genesis_digest(&self) -> Result<[u8; 32], V04ExecutionForkStoreError> {
+        let mut hash = Sha256::new();
+        hash.update(CAS_GENESIS_DOMAIN);
+        hash.update(self.fork_choice.profile().network_id());
+        hash.update(self.fork_choice.genesis_tip());
+        hash.update(self.fork_choice.profile().profile_fingerprint());
+        hash.update(pow_consensus_profile_fingerprint(&self.params)?);
+        Ok(hash.finalize().into())
+    }
+
+    /// Open/reconcile QZBE against a signed, pinned external anchor. A remote anchor may be the
+    /// same generation as the caller's trusted record or its exact successor only; the minimum
+    /// provider object-generation floor must be persisted outside this directory.
+    pub fn open_with_external_cas<A, P, V>(
+        directory: impl AsRef<Path>,
+        genesis: MonetaryLedgerStateV04TransitionCandidate,
+        params: ConsensusParameters,
+        authenticator: &A,
+        pin: &ExternalCasPin,
+        client: &mut VerifiedExternalCasClient<P, V>,
+        expected_record: Option<&ExternalCasRecord>,
+        minimum_object_generation: u64,
+    ) -> Result<(Self, ExternalCasRecord, u64), V04ExecutionForkStoreError>
+    where
+        A: TransactionAuthenticator,
+        P: ExternalCasProviderTransport,
+        V: MlDsa65Verifier,
+    {
+        if !client.is_pinned_to(pin) {
+            return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
+        }
+        let directory = directory.as_ref().to_path_buf();
+        let mut store = Self::open(&directory, genesis.clone(), params.clone(), authenticator)?;
+        let local_anchor = store.manifest_anchor()?;
+        let genesis_digest = store.external_cas_genesis_digest()?;
+        if pin.network_id != *store.fork_choice.profile().network_id()
+            || pin.genesis_digest != genesis_digest
+        {
+            return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
+        }
+        let (remote, object_generation) = store.read_external_anchor(
+            pin,
+            client,
+            expected_record,
+            minimum_object_generation,
+            local_anchor,
+        )?;
+        let pending_path = directory.join(PENDING_MANIFEST_NAME);
+
+        if fs::symlink_metadata(&pending_path).is_ok() {
+            let pending_bytes = read_bounded(&pending_path, MAX_MANIFEST_BYTES)
+                .map_err(|_| V04ExecutionForkStoreError::PendingManifestMalformed)?;
+            let pending = decode_manifest(&pending_bytes)
+                .map_err(|_| V04ExecutionForkStoreError::PendingManifestMalformed)?;
+            let pending_anchor = manifest_anchor_commitment(&pending_bytes);
+            let next_generation = store
+                .generation
+                .checked_add(1)
+                .ok_or(V04ExecutionForkStoreError::ManifestSequenceOverflow)?;
+
+            if remote.generation == store.generation
+                && remote.next_state_digest == local_anchor
+                && pending.generation == next_generation
+            {
+                // The conditional write did not commit. The signed remote record still names
+                // the active local state, so discard the pending manifest and any uncommitted
+                // branches only after this anchor has been verified.
+                fs::remove_file(&pending_path)?;
+                prune_unreferenced_branch_files(&store)?;
+            } else if remote.generation == next_generation
+                && remote.previous_state_digest == local_anchor
+                && remote.next_state_digest == pending_anchor
+                && pending.generation == remote.generation
+            {
+                // The provider committed but the client lost the response (or crashed before
+                // publishing the final local manifest). Only this exact remote commitment may
+                // promote the pending bytes.
+                if let Some(expected) = expected_record {
+                    let expected_digest = expected.digest().map_err(|e| {
+                        V04ExecutionForkStoreError::ExternalCasFailure(e.to_string())
+                    })?;
+                    if remote.previous_record_digest != expected_digest
+                        && remote.digest().map_err(|e| {
+                            V04ExecutionForkStoreError::ExternalCasFailure(e.to_string())
+                        })? != expected_digest
+                    {
+                        return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
+                    }
+                }
+                verify_manifest_profile(&pending, &store.fork_choice, &store.params)?;
+                let target = directory
+                    .join(MANIFEST_DIR)
+                    .join(manifest_filename(remote.generation));
+                if target.exists() {
+                    return Err(V04ExecutionForkStoreError::PendingManifestMalformed);
+                }
+                fs::rename(&pending_path, &target)?;
+                drop(store);
+                let mut reopened = Self::open(&directory, genesis, params, authenticator)?;
+                if reopened.generation != remote.generation
+                    || reopened.manifest_anchor()? != remote.next_state_digest
+                {
+                    return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
+                }
+                reopened.external_anchor_required = true;
+                return Ok((reopened, remote, object_generation));
+            } else {
+                return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
+            }
+        }
+
+        let current_anchor = store.manifest_anchor()?;
+        if remote.generation != store.generation || remote.next_state_digest != current_anchor {
+            return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
+        }
+        prune_unreferenced_branch_files(&store)?;
+        store.external_anchor_required = true;
+        Ok((store, remote, object_generation))
+    }
+
+    fn read_external_anchor<P, V>(
+        &self,
+        pin: &ExternalCasPin,
+        client: &mut VerifiedExternalCasClient<P, V>,
+        expected_record: Option<&ExternalCasRecord>,
+        minimum_object_generation: u64,
+        local_anchor: [u8; 32],
+    ) -> Result<(ExternalCasRecord, u64), V04ExecutionForkStoreError>
+    where
+        P: ExternalCasProviderTransport,
+        V: MlDsa65Verifier,
+    {
+        let expected_record_digest = match expected_record {
+            Some(record) => record
+                .digest()
+                .map_err(|e| V04ExecutionForkStoreError::ExternalCasFailure(e.to_string()))?,
+            None => [0; 32],
+        };
+        let mut operation_hash = Sha256::new();
+        operation_hash.update(CAS_READ_OPERATION_DOMAIN);
+        operation_hash.update(local_anchor);
+        operation_hash.update(expected_record_digest);
+        operation_hash.update(minimum_object_generation.to_be_bytes());
+        let operation_id: [u8; 32] = operation_hash.finalize().into();
+        let mut request_hash = Sha256::new();
+        request_hash.update(CAS_READ_OPERATION_DOMAIN);
+        request_hash.update(b"request-digest\0");
+        request_hash.update(operation_id);
+        request_hash.update(local_anchor);
+        let request_digest: [u8; 32] = request_hash.finalize().into();
+        let request = client
+            .fresh_read_request(operation_id, request_digest)
+            .map_err(|e| V04ExecutionForkStoreError::ExternalCasFailure(e.to_string()))?;
+        let min_generation = expected_record.map_or(0, |record| record.generation);
+        let verified = client
+            .read_current(
+                &request,
+                min_generation,
+                minimum_object_generation,
+                expected_record,
+            )
+            .map_err(|e| V04ExecutionForkStoreError::ExternalCasFailure(e.to_string()))?;
+        if verified.record.provider_id != pin.provider_id
+            || verified.record.network_id != *self.fork_choice.profile().network_id()
+            || verified.record.genesis_digest != self.external_cas_genesis_digest()?
+        {
+            return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
+        }
+        Ok((verified.record, verified.object_generation))
+    }
+
+    /// Submit only after confirming that a fresh signed provider read names the active QZMF
+    /// manifest. The pending manifest is synced before CAS; the committed manifest is published
+    /// only after the CAS receipt is cryptographically verified. Transport ambiguity leaves the
+    /// pending record intact for open_with_external_cas recovery.
+    pub fn submit_with_external_cas<A, P, V>(
+        &mut self,
+        envelope_bytes: &[u8],
+        authenticator: &A,
+        pin: &ExternalCasPin,
+        client: &mut VerifiedExternalCasClient<P, V>,
+        expected_record: &ExternalCasRecord,
+        minimum_object_generation: u64,
+    ) -> Result<V04ExecutionAnchoredSubmitOutcome, V04ExecutionForkStoreError>
+    where
+        A: TransactionAuthenticator,
+        P: ExternalCasProviderTransport,
+        V: MlDsa65Verifier,
+    {
+        if !self.external_anchor_required || !client.is_pinned_to(pin) {
+            return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
+        }
+        let pending_path = self.directory.join(PENDING_MANIFEST_NAME);
+        if fs::symlink_metadata(&pending_path).is_ok() {
+            return Err(V04ExecutionForkStoreError::PendingManifestExists);
+        }
+        let current_anchor = self.manifest_anchor()?;
+        if expected_record.generation != self.generation
+            || expected_record.next_state_digest != current_anchor
+            || expected_record.provider_id != pin.provider_id
+            || expected_record.network_id != *self.fork_choice.profile().network_id()
+            || expected_record.genesis_digest != self.external_cas_genesis_digest()?
+        {
+            return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
+        }
+        let (remote, object_generation) = self.read_external_anchor(
+            pin,
+            client,
+            Some(expected_record),
+            minimum_object_generation,
+            current_anchor,
+        )?;
+        if remote
+            .digest()
+            .map_err(|e| V04ExecutionForkStoreError::ExternalCasFailure(e.to_string()))?
+            != expected_record
+                .digest()
+                .map_err(|e| V04ExecutionForkStoreError::ExternalCasFailure(e.to_string()))?
+            || remote.next_state_digest != current_anchor
+        {
+            return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
+        }
+
+        if envelope_bytes.len() > MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES {
+            return Err(V04ExecutionForkStoreError::ArchiveCapacityExceeded);
+        }
+        let decoded = V04ExecutionPowEnvelope::decode(
+            envelope_bytes,
+            self.fork_choice.profile(),
+            &self.params,
+        )?;
+        let digest = pow_digest(&decoded.header, self.params.pow)?;
+        let mut staged = self.fork_choice.clone();
+        let outcome = staged.insert_encoded(envelope_bytes, authenticator)?;
+        if staged.archive_len() == self.fork_choice.archive_len() {
+            return Ok(V04ExecutionAnchoredSubmitOutcome {
+                block: outcome,
+                anchor_record: remote,
+                receipt: None,
+            });
+        }
+        let archive = staged
+            .archive_envelopes_bounded(MAX_V04_EXECUTION_FORK_ARCHIVE_BLOCKS, MAX_ARCHIVE_BYTES)?;
+        if archive.iter().map(Vec::len).sum::<usize>() > MAX_ARCHIVE_BYTES {
+            return Err(V04ExecutionForkStoreError::ArchiveCapacityExceeded);
+        }
+        let branch_path =
+            self.directory
+                .join(BRANCH_DIR)
+                .join(format!("{}{}", hex(&digest), BRANCH_SUFFIX));
+        if branch_path.exists() {
+            let existing =
+                read_bounded(&branch_path, MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES)?;
+            if existing != envelope_bytes {
+                return Err(V04ExecutionForkStoreError::BranchBytesMismatch);
+            }
+        } else {
+            write_new_atomic(&branch_path, envelope_bytes)?;
+        }
+
+        let next_generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(V04ExecutionForkStoreError::ManifestSequenceOverflow)?;
+        let manifest_bytes = encode_manifest(&staged, &self.params, next_generation)?;
+        let next_anchor = manifest_anchor_commitment(&manifest_bytes);
+        let mut operation_hash = Sha256::new();
+        operation_hash.update(CAS_WRITE_OPERATION_DOMAIN);
+        operation_hash.update(current_anchor);
+        operation_hash.update(next_anchor);
+        operation_hash.update(digest);
+        operation_hash.update(expected_record.generation.to_be_bytes());
+        let operation_id: [u8; 32] = operation_hash.finalize().into();
+        let mut nonce_hash = Sha256::new();
+        nonce_hash.update(CAS_WRITE_NONCE_DOMAIN);
+        nonce_hash.update(operation_id);
+        nonce_hash.update(object_generation.to_be_bytes());
+        let request_nonce: [u8; 32] = nonce_hash.finalize().into();
+        let mut next_record = ExternalCasRecord {
+            generation: expected_record
+                .generation
+                .checked_add(1)
+                .ok_or(V04ExecutionForkStoreError::ManifestSequenceOverflow)?,
+            provider_id: pin.provider_id,
+            network_id: pin.network_id,
+            genesis_digest: pin.genesis_digest,
+            previous_record_digest: expected_record
+                .digest()
+                .map_err(|e| V04ExecutionForkStoreError::ExternalCasFailure(e.to_string()))?,
+            previous_state_digest: current_anchor,
+            next_state_digest: next_anchor,
+            operation_id,
+            request_digest: [0; 32],
+        };
+        let mut request = ExternalCasWriteRequest {
+            request_nonce,
+            operation_id,
+            request_digest: [0; 32],
+            expected_generation: expected_record.generation,
+            expected_object_generation: object_generation,
+            expected_record_digest: next_record.previous_record_digest,
+            expected_state_digest: current_anchor,
+            next_record: next_record.clone(),
+        };
+        request
+            .bind_request_digest(pin)
+            .map_err(|e| V04ExecutionForkStoreError::ExternalCasFailure(e.to_string()))?;
+        next_record = request.next_record.clone();
+
+        write_new_atomic(&pending_path, &manifest_bytes).map_err(|e| match e {
+            V04ExecutionForkStoreError::Io(ref io_error)
+                if io_error.kind() == io::ErrorKind::AlreadyExists =>
+            {
+                V04ExecutionForkStoreError::PendingManifestExists
+            }
+            other => other,
+        })?;
+        self.external_anchor_required = true;
+        let receipt = client
+            .compare_and_swap(&request)
+            .map_err(|error| match error {
+                ExternalCasClientError::Contract(ExternalCasError::CasConflict) => {
+                    V04ExecutionForkStoreError::ExternalCasConflict
+                }
+                other => V04ExecutionForkStoreError::ExternalCasFailure(other.to_string()),
+            })?;
+        if !matches!(
+            receipt.outcome,
+            ExternalCasReceiptOutcome::Applied | ExternalCasReceiptOutcome::AlreadyApplied
+        ) || receipt.generation != next_record.generation
+            || receipt.record_digest
+                != next_record
+                    .digest()
+                    .map_err(|e| V04ExecutionForkStoreError::ExternalCasFailure(e.to_string()))?
+            || receipt.state_digest != next_anchor
+        {
+            return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
+        }
+
+        let target = self
+            .directory
+            .join(MANIFEST_DIR)
+            .join(manifest_filename(next_generation));
+        if target.exists() {
+            return Err(V04ExecutionForkStoreError::ManifestGenerationMismatch);
+        }
+        fs::rename(&pending_path, &target)?;
+        self.fork_choice = staged;
+        self.generation = next_generation;
+        Ok(V04ExecutionAnchoredSubmitOutcome {
+            block: outcome,
+            anchor_record: next_record,
+            receipt: Some(receipt),
         })
     }
 
@@ -262,6 +755,9 @@ impl V04ExecutionForkStoreCandidate {
         envelope_bytes: &[u8],
         authenticator: &A,
     ) -> Result<V04ExecutionForkChoiceOutcome, V04ExecutionForkStoreError> {
+        if self.external_anchor_required || self.directory.join(PENDING_MANIFEST_NAME).exists() {
+            return Err(V04ExecutionForkStoreError::ExternalAnchorRequired);
+        }
         if envelope_bytes.len() > MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES {
             return Err(V04ExecutionForkStoreError::ArchiveCapacityExceeded);
         }
@@ -627,11 +1123,14 @@ mod tests {
     use super::*;
     use crate::{
         consensus::{ConsensusParameters, Uint256},
+        external_cas_anchor_candidate::{ExternalCasReadRequest, ExternalCasReceiptKind},
         monetary_genesis_v04_candidate::GenesisManifestV04,
         monetary_issuance_v04_candidate::V04MiningIssuanceScheduleCandidate,
         monetary_transition_v04_candidate::V04ConsensusProfileCandidate,
         state_machine::{AccountId, Transaction},
+        v4_fat1_mldsa65_candidate::LibcruxMlDsa65VerifierCandidate,
     };
+    use libcrux_ml_dsa::ml_dsa_65::portable;
     use std::{
         fs,
         path::PathBuf,
@@ -653,6 +1152,180 @@ mod tests {
                 Err(())
             }
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum CasBehavior {
+        Apply,
+        Conflict,
+        ApplyThenLoseResponse,
+    }
+
+    struct MemoryCasProvider<F> {
+        pin: ExternalCasPin,
+        current: ExternalCasRecord,
+        object_generation: u64,
+        pending_manifest_path: PathBuf,
+        behavior: CasBehavior,
+        sign: F,
+    }
+
+    impl<F> ExternalCasProviderTransport for MemoryCasProvider<F>
+    where
+        F: Fn(ExternalCasReceipt) -> ExternalCasReceipt,
+    {
+        type Error = String;
+
+        fn read_current(
+            &mut self,
+            request: &ExternalCasReadRequest,
+        ) -> Result<(ExternalCasRecord, ExternalCasReceipt), Self::Error> {
+            let current = self.current.clone();
+            let receipt = ExternalCasReceipt {
+                kind: ExternalCasReceiptKind::Read,
+                outcome: ExternalCasReceiptOutcome::Observed,
+                generation: current.generation,
+                object_generation: self.object_generation,
+                provider_id: current.provider_id,
+                network_id: current.network_id,
+                genesis_digest: current.genesis_digest,
+                receipt_key_id: self.pin.receipt_key_id,
+                request_nonce: request.request_nonce,
+                record_digest: current.digest().map_err(|e| e.to_string())?,
+                previous_record_digest: current.previous_record_digest,
+                previous_state_digest: current.previous_state_digest,
+                state_digest: current.next_state_digest,
+                operation_id: request.operation_id,
+                request_digest: request.request_digest,
+                signature: [0; crate::v4_fat1_trust_candidate::ML_DSA_65_SIGNATURE_BYTES],
+            };
+            Ok((current, (self.sign)(receipt)))
+        }
+
+        fn compare_and_swap(
+            &mut self,
+            request: &ExternalCasWriteRequest,
+        ) -> Result<ExternalCasReceipt, Self::Error> {
+            request.validate(&self.pin).map_err(|e| e.to_string())?;
+            let pending = fs::read(&self.pending_manifest_path).map_err(|e| e.to_string())?;
+            if manifest_anchor_commitment(&pending) != request.next_record.next_state_digest {
+                return Err("CAS called before the exact pending manifest was durable".into());
+            }
+            let old_record_digest = self.current.digest().map_err(|e| e.to_string())?;
+            if matches!(self.behavior, CasBehavior::Conflict) {
+                self.object_generation = self
+                    .object_generation
+                    .checked_add(1)
+                    .ok_or_else(|| "provider object generation overflow".to_string())?;
+                let current = self.current.clone();
+                let receipt = ExternalCasReceipt {
+                    kind: ExternalCasReceiptKind::Commit,
+                    outcome: ExternalCasReceiptOutcome::Conflict,
+                    generation: current.generation,
+                    object_generation: self.object_generation,
+                    provider_id: current.provider_id,
+                    network_id: current.network_id,
+                    genesis_digest: current.genesis_digest,
+                    receipt_key_id: self.pin.receipt_key_id,
+                    request_nonce: request.request_nonce,
+                    record_digest: old_record_digest,
+                    previous_record_digest: current.previous_record_digest,
+                    previous_state_digest: current.previous_state_digest,
+                    state_digest: current.next_state_digest,
+                    operation_id: request.operation_id,
+                    request_digest: request.request_digest,
+                    signature: [0; crate::v4_fat1_trust_candidate::ML_DSA_65_SIGNATURE_BYTES],
+                };
+                return Ok((self.sign)(receipt));
+            }
+            if self.current.generation != request.expected_generation
+                || self.object_generation != request.expected_object_generation
+                || old_record_digest != request.expected_record_digest
+                || self.current.next_state_digest != request.expected_state_digest
+            {
+                return Err("memory CAS exact-successor precondition failed".into());
+            }
+            self.current = request.next_record.clone();
+            self.object_generation = self
+                .object_generation
+                .checked_add(1)
+                .ok_or_else(|| "provider object generation overflow".to_string())?;
+            if matches!(self.behavior, CasBehavior::ApplyThenLoseResponse) {
+                return Err("injected lost response after durable CAS commit".into());
+            }
+            let current = self.current.clone();
+            let receipt = ExternalCasReceipt {
+                kind: ExternalCasReceiptKind::Commit,
+                outcome: ExternalCasReceiptOutcome::Applied,
+                generation: current.generation,
+                object_generation: self.object_generation,
+                provider_id: current.provider_id,
+                network_id: current.network_id,
+                genesis_digest: current.genesis_digest,
+                receipt_key_id: self.pin.receipt_key_id,
+                request_nonce: request.request_nonce,
+                record_digest: current.digest().map_err(|e| e.to_string())?,
+                previous_record_digest: current.previous_record_digest,
+                previous_state_digest: current.previous_state_digest,
+                state_digest: current.next_state_digest,
+                operation_id: request.operation_id,
+                request_digest: request.request_digest,
+                signature: [0; crate::v4_fat1_trust_candidate::ML_DSA_65_SIGNATURE_BYTES],
+            };
+            Ok((self.sign)(receipt))
+        }
+    }
+
+    fn cas_fixture(
+        path: &Path,
+        store: &V04ExecutionForkStoreCandidate,
+        behavior: CasBehavior,
+    ) -> (
+        ExternalCasPin,
+        ExternalCasRecord,
+        VerifiedExternalCasClient<
+            MemoryCasProvider<impl Fn(ExternalCasReceipt) -> ExternalCasReceipt>,
+            LibcruxMlDsa65VerifierCandidate,
+        >,
+    ) {
+        let key_pair = portable::generate_key_pair([0x51u8; 32]);
+        let pin = ExternalCasPin {
+            provider_id: [0x71; 32],
+            network_id: NETWORK,
+            genesis_digest: store.external_cas_genesis_digest().unwrap(),
+            receipt_key_id: [0x72; 32],
+            receipt_public_key: *key_pair.verification_key.as_ref(),
+        };
+        let bootstrap = ExternalCasRecord {
+            generation: 0,
+            provider_id: pin.provider_id,
+            network_id: pin.network_id,
+            genesis_digest: pin.genesis_digest,
+            previous_record_digest: [0; 32],
+            previous_state_digest: [0; 32],
+            next_state_digest: store.manifest_anchor().unwrap(),
+            operation_id: [0x73; 32],
+            request_digest: [0x74; 32],
+        };
+        let sign = move |mut receipt: ExternalCasReceipt| {
+            let digest = receipt.signing_digest().unwrap();
+            receipt.signature = *portable::sign(&key_pair.signing_key, &digest, &[], [0x75u8; 32])
+                .unwrap()
+                .as_ref();
+            receipt
+        };
+        let provider = MemoryCasProvider {
+            pin: pin.clone(),
+            current: bootstrap.clone(),
+            object_generation: 1,
+            pending_manifest_path: path.join(PENDING_MANIFEST_NAME),
+            behavior,
+            sign,
+        };
+        let client =
+            VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
+                .unwrap();
+        (pin, bootstrap, client)
     }
 
     fn profile() -> (GenesisManifestV04, V04ConsensusProfileCandidate) {
@@ -970,6 +1643,250 @@ mod tests {
             ),
             Err(V04ExecutionForkStoreError::ManifestMalformed)
         ));
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn external_cas_commits_qzbe_manifest_only_after_verified_receipt_and_reopens() {
+        let (_manifest, profile) = profile();
+        let genesis_state = genesis(&profile);
+        let parameters = params();
+        let path = temporary_directory();
+        let seed = V04ExecutionForkStoreCandidate::open(
+            &path,
+            genesis_state.clone(),
+            parameters.clone(),
+            &TestAuthenticator,
+        )
+        .unwrap();
+        let (pin, bootstrap, mut client) = cas_fixture(&path, &seed, CasBehavior::Apply);
+        drop(seed);
+
+        let (mut store, observed, object_floor) =
+            V04ExecutionForkStoreCandidate::open_with_external_cas(
+                &path,
+                genesis_state.clone(),
+                parameters.clone(),
+                &TestAuthenticator,
+                &pin,
+                &mut client,
+                None,
+                1,
+            )
+            .unwrap();
+        assert_eq!(observed, bootstrap);
+        assert_eq!(object_floor, 1);
+        assert_eq!(store.generation(), 0);
+        let envelope = store
+            .fork_choice()
+            .build_candidate_on(
+                store.canonical_tip(),
+                1,
+                MINER_A,
+                vec![],
+                1,
+                &TestAuthenticator,
+            )
+            .unwrap();
+        let result = store
+            .submit_with_external_cas(
+                &envelope,
+                &TestAuthenticator,
+                &pin,
+                &mut client,
+                &bootstrap,
+                object_floor,
+            )
+            .unwrap();
+        assert_eq!(result.anchor_record.generation, 1);
+        assert_eq!(store.generation(), 1);
+        assert_eq!(store.canonical_height(), 1);
+        let receipt = result.receipt.expect("changed state has a signed receipt");
+        assert_eq!(receipt.outcome, ExternalCasReceiptOutcome::Applied);
+        let current_record = result.anchor_record.clone();
+        let next_floor = receipt.object_generation;
+        drop(store);
+
+        let (reopened, remote, observed_floor) =
+            V04ExecutionForkStoreCandidate::open_with_external_cas(
+                &path,
+                genesis_state,
+                parameters,
+                &TestAuthenticator,
+                &pin,
+                &mut client,
+                Some(&current_record),
+                next_floor,
+            )
+            .unwrap();
+        assert_eq!(reopened.generation(), 1);
+        assert_eq!(reopened.canonical_height(), 1);
+        assert_eq!(
+            reopened.manifest_anchor().unwrap(),
+            remote.next_state_digest
+        );
+        assert_eq!(remote, current_record);
+        assert_eq!(observed_floor, next_floor);
+        drop(reopened);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn external_cas_conflict_keeps_old_manifest_and_signed_recovery_discards_pending() {
+        let (_manifest, profile) = profile();
+        let genesis_state = genesis(&profile);
+        let parameters = params();
+        let path = temporary_directory();
+        let seed = V04ExecutionForkStoreCandidate::open(
+            &path,
+            genesis_state.clone(),
+            parameters.clone(),
+            &TestAuthenticator,
+        )
+        .unwrap();
+        let (pin, bootstrap, mut client) = cas_fixture(&path, &seed, CasBehavior::Conflict);
+        drop(seed);
+        let (mut store, observed, floor) = V04ExecutionForkStoreCandidate::open_with_external_cas(
+            &path,
+            genesis_state.clone(),
+            parameters.clone(),
+            &TestAuthenticator,
+            &pin,
+            &mut client,
+            None,
+            1,
+        )
+        .unwrap();
+        assert_eq!(observed, bootstrap);
+        let envelope = store
+            .fork_choice()
+            .build_candidate_on(
+                store.canonical_tip(),
+                1,
+                MINER_A,
+                vec![],
+                1,
+                &TestAuthenticator,
+            )
+            .unwrap();
+        assert!(matches!(
+            store.submit_with_external_cas(
+                &envelope,
+                &TestAuthenticator,
+                &pin,
+                &mut client,
+                &bootstrap,
+                floor,
+            ),
+            Err(V04ExecutionForkStoreError::ExternalCasConflict)
+        ));
+        assert_eq!(store.generation(), 0);
+        assert_eq!(store.canonical_height(), 0);
+        assert!(path.join(PENDING_MANIFEST_NAME).exists());
+        assert!(matches!(
+            store.submit(&envelope, &TestAuthenticator),
+            Err(V04ExecutionForkStoreError::ExternalAnchorRequired)
+        ));
+        drop(store);
+
+        let (recovered, remote, object_generation) =
+            V04ExecutionForkStoreCandidate::open_with_external_cas(
+                &path,
+                genesis_state,
+                parameters,
+                &TestAuthenticator,
+                &pin,
+                &mut client,
+                Some(&bootstrap),
+                floor,
+            )
+            .unwrap();
+        assert_eq!(remote, bootstrap);
+        assert_eq!(object_generation, floor + 1);
+        assert_eq!(recovered.generation(), 0);
+        assert_eq!(recovered.canonical_height(), 0);
+        assert!(!path.join(PENDING_MANIFEST_NAME).exists());
+        assert_eq!(fs::read_dir(path.join(BRANCH_DIR)).unwrap().count(), 0);
+        drop(recovered);
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn lost_cas_response_promotes_only_the_pending_manifest_named_by_signed_remote_record() {
+        let (_manifest, profile) = profile();
+        let genesis_state = genesis(&profile);
+        let parameters = params();
+        let path = temporary_directory();
+        let seed = V04ExecutionForkStoreCandidate::open(
+            &path,
+            genesis_state.clone(),
+            parameters.clone(),
+            &TestAuthenticator,
+        )
+        .unwrap();
+        let (pin, bootstrap, mut client) =
+            cas_fixture(&path, &seed, CasBehavior::ApplyThenLoseResponse);
+        drop(seed);
+        let (mut store, _, floor) = V04ExecutionForkStoreCandidate::open_with_external_cas(
+            &path,
+            genesis_state.clone(),
+            parameters.clone(),
+            &TestAuthenticator,
+            &pin,
+            &mut client,
+            None,
+            1,
+        )
+        .unwrap();
+        let envelope = store
+            .fork_choice()
+            .build_candidate_on(
+                store.canonical_tip(),
+                1,
+                MINER_A,
+                vec![],
+                1,
+                &TestAuthenticator,
+            )
+            .unwrap();
+        assert!(matches!(
+            store.submit_with_external_cas(
+                &envelope,
+                &TestAuthenticator,
+                &pin,
+                &mut client,
+                &bootstrap,
+                floor,
+            ),
+            Err(V04ExecutionForkStoreError::ExternalCasFailure(_))
+        ));
+        assert_eq!(store.generation(), 0);
+        assert_eq!(store.canonical_height(), 0);
+        assert!(path.join(PENDING_MANIFEST_NAME).exists());
+        drop(store);
+
+        let (recovered, remote, object_generation) =
+            V04ExecutionForkStoreCandidate::open_with_external_cas(
+                &path,
+                genesis_state,
+                parameters,
+                &TestAuthenticator,
+                &pin,
+                &mut client,
+                Some(&bootstrap),
+                floor,
+            )
+            .unwrap();
+        assert_eq!(remote.generation, 1);
+        assert_eq!(recovered.generation(), 1);
+        assert_eq!(recovered.canonical_height(), 1);
+        assert_eq!(
+            recovered.manifest_anchor().unwrap(),
+            remote.next_state_digest
+        );
+        assert_eq!(object_generation, floor + 1);
+        assert!(!path.join(PENDING_MANIFEST_NAME).exists());
+        drop(recovered);
         fs::remove_dir_all(path).unwrap();
     }
 
