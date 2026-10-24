@@ -494,6 +494,83 @@ impl LedgerState {
         self.tip_hash
     }
 
+    /// Stage the account/height/timestamp portion of a CP-0398 v0.4 mining-only candidate.
+    /// This intentionally is not a public mint API and does not set the block tip hash: the
+    /// caller must first derive and verify the complete profile-bound post-state root and block ID.
+    pub(crate) fn stage_v04_mining_reward_transition(
+        &self,
+        height: u64,
+        timestamp: u64,
+        expected_parent_hash: &[u8; 32],
+        miner: &[u8; 32],
+        reward_atoms: u128,
+    ) -> Result<Self, StateError> {
+        let expected_height = self
+            .height
+            .checked_add(1)
+            .ok_or(StateError::InvalidHeight)?;
+        if height != expected_height {
+            return Err(StateError::HeightMismatch {
+                expected: expected_height,
+                actual: height,
+            });
+        }
+        if &self.tip_hash != expected_parent_hash {
+            return Err(StateError::ParentHashMismatch);
+        }
+        if timestamp == 0 {
+            return Err(StateError::InvalidBlockTimestamp);
+        }
+        if timestamp <= self.last_timestamp {
+            return Err(StateError::TimestampNotIncreasing {
+                previous: self.last_timestamp,
+                actual: timestamp,
+            });
+        }
+        if is_zero_account(miner) {
+            return Err(StateError::InvalidAccountId);
+        }
+
+        let reward = u64::try_from(reward_atoms).map_err(|_| StateError::AmountOverflow)?;
+        let mut candidate = self.clone();
+        if reward != 0 {
+            if !candidate.accounts.contains_key(miner) && candidate.accounts.len() >= MAX_ACCOUNTS {
+                return Err(StateError::TooManyAccounts);
+            }
+            let mut account = candidate
+                .accounts
+                .get(miner)
+                .copied()
+                .unwrap_or(AccountState {
+                    balance: 0,
+                    nonce: 0,
+                });
+            account.balance = account
+                .balance
+                .checked_add(reward)
+                .ok_or(StateError::BalanceOverflow)?;
+            candidate.accounts.insert(*miner, account);
+        }
+        candidate.height = height;
+        candidate.last_timestamp = timestamp;
+        candidate.total_value()?;
+        Ok(candidate)
+    }
+
+    /// Finalize a previously staged CP-0398 candidate after its canonical block ID is known.
+    /// The parent check prevents accidentally finalizing the clone against a different branch.
+    pub(crate) fn commit_v04_mining_tip_hash(
+        &mut self,
+        expected_parent_hash: &[u8; 32],
+        block_id: [u8; 32],
+    ) -> Result<(), StateError> {
+        if &self.tip_hash != expected_parent_hash {
+            return Err(StateError::ParentHashMismatch);
+        }
+        self.tip_hash = block_id;
+        Ok(())
+    }
+
     pub fn fee_pool(&self) -> u64 {
         self.fee_pool
     }
