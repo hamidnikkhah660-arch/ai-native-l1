@@ -4,8 +4,8 @@
 
 - **Global project site:** https://hamidnikkhah660-arch.github.io/ai-native-l1/
 - **Source and contribution issues:** https://github.com/hamidnikkhah660-arch/ai-native-l1
-- **Engineering white paper:** [QuantumZXB Native Coin White Paper v0.2](docs/QUANTUMZXB_NATIVE_COIN_WHITEPAPER_V02.md)
-- **Master roadmap:** [QuantumZXB Engineering & Ecosystem Roadmap v0.2](docs/QUANTUMZXB_MASTER_ROADMAP_V02.md)
+- **Engineering white paper:** [QuantumZXB Native Coin White Paper v0.3](docs/QUANTUMZXB_NATIVE_COIN_WHITEPAPER_V03.md)
+- **Master roadmap:** [QuantumZXB Engineering & Ecosystem Roadmap v0.3](docs/QUANTUMZXB_MASTER_ROADMAP_V03.md)
 - **Technical review and test evidence:** [CP-0343 report](docs/CP_0343_TECHNICAL_REVIEW_AND_TEST_RESULTS.md)
 - **Latest halving visualization and emission-data checkpoint:** [CP-0349](docs/CP_0349_REPRODUCIBLE_CANDIDATE_HALVING_VISUALIZATION_2026-10-21.md)
 - **Latest full curated source validation:** [CP-0347](docs/CP_0347_PUBLIC_CURATED_CHECKOUT_VALIDATION_2026-10-21.md) - **Latest founder/market-readiness docs:** [CP-0348](docs/CP_0348_FOUNDER_CREDENTIAL_MARKET_READINESS_2026-10-21.md)
@@ -19,7 +19,7 @@
 - **PFM5 full-archive replay-binding candidate (CP-0388):** [Genesis checkpoint and replay binding](docs/CP_0388_PFM5_FULL_ARCHIVE_REPLAY_BINDING_CANDIDATE_2026-10-23.md) ? recomputes every PMT4 envelope digest and checks the branch set and selected canonical tip against a replayed archive; rejects pruned non-Genesis checkpoints. Not wired into durable-store commit/startup or external anti-rollback.
 - **PFM5 externally anchored checkpoint-restore candidate (CP-0389):** [Restore checks and trust limitations](docs/CP_0389_PFM5_CHECKPOINT_BASELINE_RESTORE_CANDIDATE_2026-10-23.md) ? restores only after an exact external manifest commitment and monotonic floors match; rejects manifests that still need post-checkpoint archive replay. Not yet wired into the live PFM4 store/runtime.
 - **Publication checkpoint:** [CP-0344](docs/CP_0344_PUBLIC_DOCUMENTATION_REFRESH_2026-10-20.md)
-- **Founder/sponsor/contributor economics:** [Allocation policy v0.3](docs/FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V03.md)
+- **Founder/sponsor/contributor economics:** [Current tokenomics policy v0.4](docs/FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V04_2026-10-24.md)
 - **Current curated source baseline:** [v0.1.1-source](https://github.com/hamidnikkhah660-arch/ai-native-l1/releases/tag/v0.1.1-source)
 - **Founder profile and collaboration contact:** [Founder / AI research profile](docs/FOUNDER_PROFILE_AND_COLLABORATION.md) - email: [hamidnikkhah660@gmail.com](mailto:hamidnikkhah660@gmail.com?subject=QuantumZXB%20collaboration)
 - **Fixed-scope paid engineering offer (G1):** [Rust/protocol reproducibility and AI/ML sprint, deliverables, acceptance criteria, and payment terms](docs/ENGINEERING_SERVICE_OFFER_V01.md)
@@ -63,16 +63,18 @@ An isolated EVM lab pins revm and explores call/create, storage, gas, rollback a
 
 The codebase covers bounded wire parsing and ingress/worker queues, authenticated peer-session research, state-commitment candidates, fork/reorg history replay, archive paging, snapshot/store recovery models and process-crash tests. The next qualification stage adds an independently administered monotonic trust provider and tests across independently operated hosts and storage-failure conditions.
 
-## Native coin design and sponsor proposal
+## Native coin design and tokenomics (owner-directed policy v0.4)
 
-The current design targets a maximum of **10,000,000,000 native coins**, with 4B founder (40%), 3B mining/network-security (30%) and 3B public-goods/ecosystem (30%) allocation envelopes. These are monetary design terms until the selected canonical production profile and Genesis are frozen.
+The planned maximum native QZXB supply is **10,000,000,000 coins**: **30% mining/network-security rewards (3B); 10% community airdrop (1B); 10% exchange, market-integration and liquidity partnerships (1B); 10% major marketing partners (1B); 10% developers/security contributors (1B); 10% financial/strategic supporters (1B); 10% protocol burn reserve (1B); and 10% owner allocation (1B)**. The eight buckets total exactly 100%.
 
-The owner direction is that the 4B founder allocation remains freely transferable with no protocol lock or time vesting. A future sponsor may qualify for up to **1,000,000,000 coins (10% of the total cap)** from inside the founder tranche only after fulfilling written, agreed sponsorship milestones. A proposed **1%-10% contributor/professional pool** is likewise drawn from that same founder allocation and tied to accepted work. If both pools reach 1B, at least 2B (20% of total cap) remains the founder's direct discretionary allocation. No sponsor is currently claimed as selected or contracted, and these designations are not a guarantee of value or return.
+These are planned allocations, not active Genesis issuance, circulating supply, cash raised, signed awards, a completed airdrop or an actual burn. Exchange listing is not guaranteed; the exchange reserve is conditional on documented services/milestones, not a promise to buy a listing. Sponsor, marketing and contributor awards must be documented. The burn reserve is not burned until a verifiable burn occurs and carries no price-support promise. The owner allocation is explicitly 1B / 10%; control does not authorize hidden issuance or bypassing published consensus rules.
 
-The arithmetic invariant helper and the public documentation preflight can be run using Python:
+- **Current allocation policy:** [Tokenomics and Distribution Policy v0.4](docs/FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V04_2026-10-24.md)
+- **Current white paper:** [QuantumZXB Native Coin White Paper v0.3](docs/QUANTUMZXB_NATIVE_COIN_WHITEPAPER_V03.md)
+- **Current engineering roadmap:** [QuantumZXB Engineering & Ecosystem Roadmap v0.3](docs/QUANTUMZXB_MASTER_ROADMAP_V03.md)
+- **Production gate status:** Gate 2 and Gate 8 remain open; native QZXB mainnet and a liquid native-coin market are not launched.
 
-    python simulations/sponsor_allocation_checker.py
-    python simulations/public_docs_refresh_checker.py
+The former 4B founder / 3B mining / 3B public-goods proposal is preserved in versioned historical documents and superseded for current allocation planning by policy v0.4. The separate QX ERC-20 deployment on Ethereum Sepolia is a test asset, not the native QZXB coin or a production market.
 
 ## Current engineering validation
 
