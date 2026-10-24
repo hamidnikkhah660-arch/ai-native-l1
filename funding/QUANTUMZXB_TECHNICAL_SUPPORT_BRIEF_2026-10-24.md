@@ -1,6 +1,7 @@
 # QuantumZXB / AI_NATIVE_L1 — Technical Support Brief
 
-**Prepared:** 24 October 2026  
+**Prepared:** 24 October 2026
+
 **Purpose:** Request for scoped engineering collaboration, independent review and in-kind support. This is not an investment offer or a token-sale document.
 
 ## Project and public evidence

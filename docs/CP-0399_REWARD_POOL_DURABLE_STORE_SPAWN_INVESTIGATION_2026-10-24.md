@@ -1,6 +1,7 @@
 # CP-0399 — Windows reward-pool child-process spawn investigation
 
-**Date:** 2026-10-24  
+**Date:** 2026-10-24
+
 **Status:** Not reproduced in this controlled run; underlying cause remains undetermined.
 
 ## Incident preserved

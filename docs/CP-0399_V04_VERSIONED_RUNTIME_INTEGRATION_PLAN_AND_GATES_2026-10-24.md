@@ -1,6 +1,7 @@
 # CP-0399 — v0.4 Versioned Runtime Integration Plan and Gate Evidence
 
-**Date:** 2026-10-24  
+**Date:** 2026-10-24
+
 **Status:** Planning and evidence only. This change does not activate v0.4 in a node runtime, freeze economics, or close Gate 2 or Gate 8.
 
 ## Executive state
