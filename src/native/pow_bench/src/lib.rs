@@ -43,6 +43,8 @@ pub mod ingress_queue_candidate;
 pub mod ingress_worker_candidate;
 pub mod issuance_schedule;
 pub mod key_provider;
+/// CP-0391 candidate accounting for the owner-directed v0.4 eight-bucket supply budgets; not runtime-wired.
+pub mod monetary_allocation_v04_candidate;
 /// CP-0213 policy arithmetic candidate; not wired into canonical consensus or block import.
 pub mod monetary_policy_v3_candidate;
 pub mod noise_deployment_config;
