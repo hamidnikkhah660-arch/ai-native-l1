@@ -40,6 +40,7 @@
 - **Runtime call-site and compatibility audit:** [CP-0402 producer/importer/runtime map, cross-version no-downgrade guard and Gate 2 blockers](docs/CP-0402_RUNTIME_CALLSITE_COMPATIBILITY_AUDIT_2026-10-24.md)
 - **v0.4 transaction + reward + Genesis contract:** [CP-0403 QZB4 v2 candidate block, independent state-root vector, and remaining runtime gates](docs/CP-0403_V04_TRANSACTION_REWARD_GENESIS_CONTRACT_2026-10-24.md)
 - **v0.4 profile dispatcher and durable import candidate:** [CP-0404 QZB4 v2 dispatch, anchor-backed snapshot recovery and fork-choice blockers](docs/CP-0404_V04_PROFILE_RUNTIME_DISPATCH_PERSISTENCE_CANDIDATE_2026-10-24.md)
+- **v0.4 PoW envelope and branch-local fork-choice candidate:** [CP-0405 QZBE header binding, cumulative-work reorg and replay limits](docs/CP-0405_QZBE_V04_POW_FORK_CHOICE_CANDIDATE_2026-10-24.md)
 - **Owner's zero-budget launch and liquidity directive:** [Persistent launch gate and fresh-session handoff](docs/OWNER_DIRECTIVE_ZERO_BUDGET_LAUNCH_AND_LIQUIDITY_GATE_V01_2026-10-21.md) - [live execution issue #12](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/12)
 - **Sponsorship and contributor discussion:** [Public issue #1](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/1)
 - **Previous public documentation release:** [v0.2.0-docs](https://github.com/hamidnikkhah660-arch/ai-native-l1/releases/tag/v0.2.0-docs)
