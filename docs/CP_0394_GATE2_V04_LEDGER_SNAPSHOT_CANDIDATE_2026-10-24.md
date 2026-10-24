@@ -1,4 +1,4 @@
-﻿# CP-0394 — Gate 2 v0.4 ledger snapshot candidate — 2026-10-24
+# CP-0394 — Gate 2 v0.4 ledger snapshot candidate — 2026-10-24
 
 ## Status
 
@@ -21,12 +21,13 @@ The envelope has a fixed overhead of 272 bytes in addition to the embedded ledge
 
 ## Restore-time checks
 
-Decoding rejects oversize/truncated envelopes, checksum errors, wrong magic or version, zero/mismatched network IDs, malformed declared lengths, invalid embedded ledger snapshots, invalid accounting bytes, bucket/supply invariant violations, miner-counter mismatch, account-total/live-supply mismatch, and a recomputed monetary root that differs from the committed root. Tests cover successful byte-for-byte round-trip, checksum corruption, wrong/zero network, truncation, unsupported version, and inconsistent length.
+Decoding rejects oversize/truncated envelopes, checksum errors, wrong magic or version, zero/mismatched network IDs, malformed declared lengths, invalid embedded ledger snapshots, invalid accounting bytes, bucket/supply invariant violations, miner-counter mismatch, account-total/live-supply mismatch, and a recomputed monetary root that differs from the committed root. Tests cover successful byte-for-byte round-trip, checksum corruption, wrong/zero network, truncation, unsupported version, and inconsistent length. The independent standard-library Python generator `simulations/quantumzxb_v04_ledger_snapshot_vectors.py` writes `simulations/quantumzxb_v04_ledger_snapshot_vectors.txt`; the Rust test compares the policy fingerprint, ledger root, accounting bytes and commitment, embedded ledger snapshot, monetary root, and full 450-byte QZL4 snapshot byte-for-byte against that fixture.
 
 The outer checksum detects byte changes but is not a signature, authenticated storage, freshness proof, or anti-rollback control. A valid older snapshot can still be replayed unless a separately operated external anchor rejects rollback.
 
 ## Local validation recorded for this candidate
 
+- python simulations/quantumzxb_v04_ledger_snapshot_vectors.py: passed; produced the 450-byte independent vector and reference hashes.
 - cargo fmt --all: passed.
 - cargo test --locked --offline --lib monetary_ledger_v04_candidate -- --nocapture: 5 passed, 0 failed.
 - cargo check --all-targets --locked --offline: passed (pre-existing unused/dead-code warnings remain).

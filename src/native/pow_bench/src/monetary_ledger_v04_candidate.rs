@@ -329,6 +329,27 @@ mod tests {
 
     const NETWORK: [u8; 32] = [0x31; 32];
     const OWNER: [u8; 32] = [0xA7; 32];
+    const SNAPSHOT_VECTOR: &str =
+        include_str!("../../../../simulations/quantumzxb_v04_ledger_snapshot_vectors.txt");
+
+    fn vector_value(key: &str) -> &str {
+        SNAPSHOT_VECTOR
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .find_map(|line| {
+                let (name, value) = line.split_once('=')?;
+                (name == key).then_some(value)
+            })
+            .expect("required CP-0394 golden vector")
+    }
+
+    fn from_hex(hex: &str) -> Vec<u8> {
+        assert_eq!(hex.len() % 2, 0);
+        (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+            .collect()
+    }
 
     #[test]
     fn v04_genesis_materializes_exactly_the_manifest_owner_credit_and_state_root() {
@@ -377,6 +398,34 @@ mod tests {
             u16::from_be_bytes([encoded[4], encoded[5]]),
             V04_LEDGER_SNAPSHOT_VERSION
         );
+
+        // The Python standard-library generator computes all fields and bytes independently.
+        assert_eq!(
+            policy_fingerprint().to_vec(),
+            from_hex(vector_value("policy_fingerprint"))
+        );
+        assert_eq!(
+            state.ledger().state_root().to_vec(),
+            from_hex(vector_value("ledger_state_root"))
+        );
+        assert_eq!(
+            state.allocation_accounting().encode().unwrap().to_vec(),
+            from_hex(vector_value("accounting_hex"))
+        );
+        assert_eq!(
+            state.allocation_accounting().commitment().unwrap().to_vec(),
+            from_hex(vector_value("accounting_commitment"))
+        );
+        assert_eq!(
+            state.ledger().encode_snapshot().unwrap(),
+            from_hex(vector_value("ledger_snapshot_hex"))
+        );
+        assert_eq!(
+            state.state_root().unwrap().to_vec(),
+            from_hex(vector_value("monetary_state_root"))
+        );
+        assert_eq!(encoded, from_hex(vector_value("snapshot_hex")));
+
         let restored =
             MonetaryLedgerStateV04Candidate::decode_snapshot(&encoded, &NETWORK).unwrap();
         assert_eq!(restored, state);
