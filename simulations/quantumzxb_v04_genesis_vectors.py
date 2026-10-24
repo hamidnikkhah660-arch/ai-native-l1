@@ -17,7 +17,7 @@ PROTOCOL_VERSION = 4
 POLICY_ID = b"QUANTUMZXB-TOKENOMICS-V04-2026-10-24\0"
 POLICY_FINGERPRINT_DOMAIN = b"QUANTUMZXB-ALLOCATION-POLICY-FINGERPRINT-V04\0"
 ACCOUNTING_COMMITMENT_DOMAIN = b"QUANTUMZXB-ALLOCATION-ACCOUNTING-STATE-V01\0"
-GENESIS_STATE_ROOT_DOMAIN = b"QUANTUMZXB-GENESIS-STATE-ROOT-V04\0"
+V04_MONETARY_STATE_ROOT_DOMAIN = b"QUANTUMZXB-MONETARY-STATE-ROOT-V04\0"
 GENESIS_MANIFEST_HASH_DOMAIN = b"QUANTUMZXB-GENESIS-MANIFEST-HASH-V04\0"
 
 # Index, coins, basis points. Enum order is consensus-sensitive.
@@ -65,18 +65,23 @@ def make_vectors() -> list[tuple[str, bytes]]:
         ACCOUNTING_COMMITMENT_DOMAIN + accounting_bytes
     ).digest()
 
-    root_preimage = bytearray(GENESIS_STATE_ROOT_DOMAIN)
-    root_preimage.extend(be(PROTOCOL_VERSION, 2))
-    root_preimage.extend(be(POLICY_VERSION, 2))
-    root_preimage.extend(be(ATOMS_PER_COIN, 16))
-    root_preimage.extend(be(MAX_TOTAL_SUPPLY_ATOMS, 16))
-    root_preimage.extend(network_id)
-    root_preimage.extend(owner_account)
-    root_preimage.extend(policy_fingerprint)
-    root_preimage.extend(be(1_000_000_000 * ATOMS_PER_COIN, 16))
-    root_preimage.extend(accounting_commitment)
-    state_root = sha256(root_preimage).digest()
+    ledger_canonical = bytearray(b"AIN1-STATE-V2\0")
+    ledger_canonical.extend(network_id)
+    ledger_canonical.extend(be(0, 8))  # height
+    ledger_canonical.extend(be(0, 8))  # last timestamp
+    ledger_canonical.extend(be(0, 8))  # fee pool
+    ledger_canonical.extend(be(1, 4))  # one initial account
+    ledger_canonical.extend(owner_account)
+    ledger_canonical.extend(be(1_000_000_000 * ATOMS_PER_COIN, 8))
+    ledger_canonical.extend(be(0, 8))  # owner nonce
+    ledger_state_root = sha256(b"AIN1-STATE-ROOT-V2\0" + ledger_canonical).digest()
 
+    root_preimage = bytearray(V04_MONETARY_STATE_ROOT_DOMAIN)
+    root_preimage.extend(policy_fingerprint)
+    root_preimage.extend(ledger_state_root)
+    root_preimage.extend(accounting_commitment)
+    root_preimage.extend(be(0, 16))  # cumulative mined atoms at Genesis
+    state_root = sha256(root_preimage).digest()
     manifest = bytearray(b"QZGM")
     manifest.extend(be(GENESIS_FORMAT_VERSION, 2))
     manifest.extend(be(PROTOCOL_VERSION, 2))

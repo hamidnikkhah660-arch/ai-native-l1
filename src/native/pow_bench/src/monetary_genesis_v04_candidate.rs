@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::monetary_allocation_v04_candidate::{
     policy_fingerprint, AllocationAccounting, AllocationAccountingError, AllocationBucket,
-    ACCOUNTING_BYTES, ATOMS_PER_COIN, MAX_TOTAL_SUPPLY_ATOMS, POLICY_VERSION,
+    ACCOUNTING_BYTES,
 };
 
 pub const GENESIS_MAGIC: [u8; 4] = *b"QZGM";
@@ -18,7 +18,7 @@ pub const GENESIS_FORMAT_VERSION: u16 = 1;
 pub const NATIVE_PROTOCOL_VERSION_V04: u16 = 4;
 pub const GENESIS_MANIFEST_BYTES: usize = 4 + 2 + 2 + 32 + 32 + 32 + ACCOUNTING_BYTES + 32;
 
-const GENESIS_STATE_ROOT_DOMAIN: &[u8] = b"QUANTUMZXB-GENESIS-STATE-ROOT-V04\0";
+const V04_MONETARY_STATE_ROOT_DOMAIN: &[u8] = b"QUANTUMZXB-MONETARY-STATE-ROOT-V04\0";
 const GENESIS_MANIFEST_HASH_DOMAIN: &[u8] = b"QUANTUMZXB-GENESIS-MANIFEST-HASH-V04\0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,22 +126,24 @@ impl GenesisManifestV04 {
         policy_digest: &[u8; 32],
         accounting: &AllocationAccounting,
     ) -> Result<[u8; 32], GenesisManifestError> {
+        let owner_balance = u64::try_from(AllocationBucket::OwnerAllocation.budget().atoms())
+            .map_err(|_| GenesisManifestError::InvalidInitialAllocation)?;
+        let ledger = crate::state_machine::LedgerState::genesis(
+            *network_id,
+            vec![(*owner_account, owner_balance)],
+        )
+        .map_err(|_| GenesisManifestError::InvalidInitialAllocation)?;
+        let ledger_root = ledger.state_root();
         let accounting_commitment = accounting.commitment()?;
-        let initial_owner_balance = AllocationBucket::OwnerAllocation.budget().atoms();
+        let mined = 0u128.to_be_bytes();
         let mut hash = Sha256::new();
-        hash.update(GENESIS_STATE_ROOT_DOMAIN);
-        hash.update(NATIVE_PROTOCOL_VERSION_V04.to_be_bytes());
-        hash.update(POLICY_VERSION.to_be_bytes());
-        hash.update(ATOMS_PER_COIN.to_be_bytes());
-        hash.update(MAX_TOTAL_SUPPLY_ATOMS.to_be_bytes());
-        hash.update(network_id);
-        hash.update(owner_account);
+        hash.update(V04_MONETARY_STATE_ROOT_DOMAIN);
         hash.update(policy_digest);
-        hash.update(initial_owner_balance.to_be_bytes());
+        hash.update(ledger_root);
         hash.update(accounting_commitment);
+        hash.update(mined);
         Ok(hash.finalize().into())
     }
-
     pub fn validate(&self) -> Result<(), GenesisManifestError> {
         if self.network_id.iter().all(|byte| *byte == 0) {
             return Err(GenesisManifestError::ZeroNetworkId);
@@ -256,6 +258,7 @@ fn read_array<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monetary_allocation_v04_candidate::ATOMS_PER_COIN;
 
     const NETWORK: [u8; 32] = [0x31; 32];
     const OWNER: [u8; 32] = [0xA7; 32];

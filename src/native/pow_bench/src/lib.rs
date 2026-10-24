@@ -47,6 +47,8 @@ pub mod key_provider;
 pub mod monetary_allocation_v04_candidate;
 /// CP-0392 candidate canonical Genesis manifest bound to the v0.4 allocation policy; not wired into node runtime.
 pub mod monetary_genesis_v04_candidate;
+/// CP-0393 candidate bridge from the v0.4 manifest to the deterministic ledger substrate; no runtime integration.
+pub mod monetary_ledger_v04_candidate;
 /// CP-0213 policy arithmetic candidate; not wired into canonical consensus or block import.
 pub mod monetary_policy_v3_candidate;
 pub mod noise_deployment_config;
