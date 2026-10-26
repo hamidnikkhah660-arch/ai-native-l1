@@ -24,11 +24,11 @@ This is a loopback-only candidate diagnostic. It does not expose private keys, d
 - Windows Release two-node scenario simulations/cp0414_qzbe_authenticated_transaction_loopback.ps1 passed:
   - CP-0414 READ_ONLY_RPC_GENESIS_PASS
   - CP-0414 READ_ONLY_RPC_SETTLED_STATE_PASS height=2 balance_atoms=2500
-  - CP-0414 READ_ONLY_RPC_CANONICAL_TXID_RECEIPT_PASS txid=f394ee64df4b8cd8f03be6fb34baa3460ef2fc1e50d2a978862570258aac959a block_height=1 confirmations=2
+  - CP-0414 READ_ONLY_RPC_CANONICAL_TXID_RECEIPT_PASS txid derived by the fresh native test wallet block_height=1 confirmations=2 (current wallet-submission integration is documented in CP-0433)
   - CP-0432 NATIVE_WALLET_READ_ONLY_RPC_PASS height=2 balance_atoms=2500 txid=f394ee64df4b8cd8f03be6fb34baa3460ef2fc1e50d2a978862570258aac959a confirmations=2 mainnet=false
   - CP-0414 QZBE_AUTHENTICATED_TXN_TWO_NODE_PASS ... invalid_signature=atomically_rejected replay=matched public_bind=denied
 
-The local scenario performs signed transaction creation, invalid-signature rejection, propagation, canonical inclusion, wallet-side receipt query, balance query and two-node replay. All amounts and receipts are disposable candidate state.
+The local scenario exercises wallet-side status, balance and receipt queries. Current two-node integration now signs and submits with the native wallet itself, tests live QZTS/1 admission and canonical inclusion, rejects an invalid signature, then checks wallet RPC queries and peer replay; see CP-0433. All amounts and receipts are disposable candidate state.
 
 ## Remaining release gates
 

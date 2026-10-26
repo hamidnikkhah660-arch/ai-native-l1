@@ -36,26 +36,43 @@ function Wait-Pattern([string]$Path, [string]$Pattern, [int]$Millis = 15000) {
 function Get-QzbeRpc([int]$Port, [string]$Path) {
     return Invoke-RestMethod -Uri ("http://127.0.0.1:{0}{1}" -f $Port, $Path) -Method Get -TimeoutSec 5
 }
-function Make-Signed-TestTransaction([string]$SeedPath, [string]$Network, [string]$Recipient) {
-    $seed = New-Object byte[] 32
-    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    try { $rng.GetBytes($seed) } finally { $rng.Dispose() }
-    [IO.File]::WriteAllBytes($SeedPath, $seed)
-    [Array]::Clear($seed, 0, $seed.Length)
-    try {
-        $out = @(& $txSignerExe --seed-file $SeedPath --network-id-hex $Network --recipient-id-hex $Recipient --nonce 1 --amount-atoms 2500 --fee-atoms 7 --expires-at 4102444800 2>&1)
-        $signerExit = $LASTEXITCODE
-        if ($signerExit -ne 0) { throw ("CP-0414 transaction signing helper failed: " + ($out -join [Environment]::NewLine)) }
-        $all = $out -join [Environment]::NewLine
-        $pub = [regex]::Match($all, 'tx_public_key_hex=([0-9a-f]{64})')
-        $account = [regex]::Match($all, 'tx_sender_account_id_hex=([0-9a-f]{64})')
-        $signature = [regex]::Match($all, 'tx_signature_hex=([0-9a-f]{128})')
-        $txid = [regex]::Match($all, 'tx_id_hex=([0-9a-f]{64})')
-        if (-not ($pub.Success -and $account.Success -and $signature.Success -and $txid.Success)) { throw ("CP-0414 signed transaction material / TXID missing: " + $all) }
-        return @{ PublicKey = $pub.Groups[1].Value; Sender = $account.Groups[1].Value; Signature = $signature.Groups[1].Value; TransactionId = $txid.Groups[1].Value }
+function New-SignedWalletTransaction([string]$WalletPath, [string]$Network, [string]$Recipient) {
+    $createOutput = @(& $walletExe create --output $WalletPath 2>&1)
+    $createExit = $LASTEXITCODE
+    $createText = $createOutput -join [Environment]::NewLine
+    if ($createExit -ne 0) { throw ("CP-0414 native wallet create failed: " + $createText) }
+    $walletPublic = [regex]::Match($createText, 'public_key_hex=([0-9a-f]{64})')
+    $walletAccount = [regex]::Match($createText, 'account_id_hex=([0-9a-f]{64})')
+    if (-not ($walletPublic.Success -and $walletAccount.Success) -or
+        $createText -notmatch 'wallet_format=QZKW1_Windows_CurrentUser_DPAPI' -or
+        $createText -notmatch 'mainnet_balance=not_created') {
+        throw ("CP-0414 native wallet creation identity/format mismatch: " + $createText)
     }
-    finally {
-        Remove-Item -LiteralPath $SeedPath -Force -ErrorAction SilentlyContinue
+
+    $signArgs = @('sign-transfer','--wallet',$WalletPath,'--network-id-hex',$Network,
+        '--recipient-id-hex',$Recipient,'--nonce','1','--amount-atoms','2500',
+        '--fee-atoms','7','--expires-at','4102444800','--signature-mode','self-contained')
+    $signedOutput = @(& $walletExe @signArgs 2>&1)
+    $signedExit = $LASTEXITCODE
+    $signedText = $signedOutput -join [Environment]::NewLine
+    if ($signedExit -ne 0) { throw ("CP-0414 native wallet signing failed: " + $signedText) }
+    $pub = [regex]::Match($signedText, 'tx_sender_public_key_hex=([0-9a-f]{64})')
+    $account = [regex]::Match($signedText, 'tx_sender_account_id_hex=([0-9a-f]{64})')
+    $signature = [regex]::Match($signedText, 'tx_signature_hex=([0-9a-f]{192})')
+    $txid = [regex]::Match($signedText, 'tx_id_hex=([0-9a-f]{64})')
+    if (-not ($pub.Success -and $account.Success -and $signature.Success -and $txid.Success)) {
+        throw ("CP-0414 native wallet signed transaction/TXID missing: " + $signedText)
+    }
+    if ($pub.Groups[1].Value -ne $walletPublic.Groups[1].Value -or
+        $account.Groups[1].Value -ne $walletAccount.Groups[1].Value) {
+        throw 'CP-0414 native wallet signing identity differs from its protected wallet file'
+    }
+    return @{
+        WalletPath = $WalletPath
+        PublicKey = $pub.Groups[1].Value
+        Sender = $account.Groups[1].Value
+        Signature = $signature.Groups[1].Value
+        TransactionId = $txid.Groups[1].Value
     }
 }
 function Provision-Key([string]$Path, [string]$Network) {
@@ -68,8 +85,8 @@ function Provision-Key([string]$Path, [string]$Network) {
 
 $network = 'c5' * 32
 $recipient = '44' * 32
-$txSeedFile = Join-Path $env:TEMP ("ain1_cp0414_tx_seed_" + [guid]::NewGuid().ToString('N') + '.bin')
-$tx = Make-Signed-TestTransaction $txSeedFile $network $recipient
+$txWalletPath = Join-Path $root 'candidate-test-wallet.qzw1'
+$tx = New-SignedWalletTransaction $txWalletPath $network $recipient
 $owner = $tx.Sender
 $txPublicKey = $tx.PublicKey
 $txSignature = $tx.Signature
@@ -89,9 +106,11 @@ $logB = Join-Path $root 'node-b.err.log'
 $stdB = Join-Path $root 'node-b.out.log'
 $portA = Get-FreePort
 $portB = Get-FreePort
+$txPort = Get-FreePort
 $rpcPort = Get-FreePort
 while ($portA -eq $portB) { $portB = Get-FreePort }
-while ($rpcPort -eq $portA -or $rpcPort -eq $portB) { $rpcPort = Get-FreePort }
+while ($txPort -eq $portA -or $txPort -eq $portB) { $txPort = Get-FreePort }
+while ($rpcPort -eq $portA -or $rpcPort -eq $portB -or $rpcPort -eq $txPort) { $rpcPort = Get-FreePort }
 $nodeA = $null
 $nodeB = $null
 try {
@@ -147,6 +166,7 @@ try {
         '--blocks-per-halving', $halving,
         '--data-dir', $dataA,
         '--listen', "127.0.0.1:$portA",
+        '--tx-listen', "127.0.0.1:$txPort",
         '--peer', "127.0.0.1:$portB",
         '--noise-static-private-key-dpapi-file', $keyA,
         '--trusted-peer-key-hex', $pubB,
@@ -157,11 +177,40 @@ try {
         '--tx-expires-at', '4102444800',
         '--tx-signature-hex', $txSignature,
         '--probe-invalid-signature-first',
+        '--defer-configured-transaction',
+        '--wait-for-transaction-ms', '10000',
         '--mine-blocks', '2',
         '--run-seconds', '30',
         '--exit-after-mining'
     )
     $nodeA = Start-Process -FilePath $nodeExe -ArgumentList $argsA -RedirectStandardOutput $stdA -RedirectStandardError $logA -PassThru
+    if (-not (Wait-Pattern $logA ("event=qzbe_v04_peer_smoke_ready .*tx_listen=127\.0\.0\.1:{0} .*local_only=true public_launch_approved=false" -f $txPort) 20000)) {
+        throw ("CP-0433 sender transaction-ingress listener did not become ready: " + (Get-Text $stdA) + (Get-Text $logA))
+    }
+    if ($nodeA.HasExited) {
+        throw ("CP-0433 sender exited after readiness before wallet submission: " + (Get-Text $stdA) + (Get-Text $logA))
+    }
+
+    # Submit the actual DPAPI-backed native wallet's signed transaction over QZTS/1.
+    # The node deliberately waits for ingress; the configured transaction is only the
+    # source for the invalid-signature probe and is not preloaded into its mempool.
+    $submitArgs = @('sign-transfer','--wallet',$tx.WalletPath,'--network-id-hex',$network,
+        '--recipient-id-hex',$recipient,'--nonce','1','--amount-atoms','2500',
+        '--fee-atoms','7','--expires-at','4102444800','--signature-mode','self-contained',
+        '--submit-to',"127.0.0.1:$txPort")
+    $savedSubmitErrorPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $walletSubmit = @(& $walletExe @submitArgs 2>&1)
+    $walletSubmitExit = $LASTEXITCODE
+    $ErrorActionPreference = $savedSubmitErrorPreference
+    $walletSubmitText = $walletSubmit -join [Environment]::NewLine
+    if ($walletSubmitExit -ne 0 -or
+        $walletSubmitText -notmatch ('tx_id_hex=' + $tx.TransactionId) -or
+        $walletSubmitText -notmatch 'tx_submit_status=accepted' -or
+        $walletSubmitText -notmatch ('tx_submit_transaction_id_hex=' + $tx.TransactionId)) {
+        throw ("CP-0414 native wallet submission/ACK TXID binding failed: " + $walletSubmitText + (Get-Text $logA))
+    }
+    Write-Host ("CP-0433 NATIVE_WALLET_SIGN_AND_QZTS_SUBMIT_PASS txid=" + $tx.TransactionId + " status=accepted")
 
     if (-not (Wait-Pattern $logA 'event=qzbe_v04_invalid_signature_probe_rejected height=0 .*rejected_atomically=true' 20000)) {
         throw ("CP-0414 sender did not verify atomic rejection of tampered signature: " + (Get-Text $logA) + (Get-Text $logB))

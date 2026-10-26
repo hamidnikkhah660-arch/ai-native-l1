@@ -90,6 +90,8 @@ struct Args {
     tx_public_key: [u8; 32],
     observe_account_id: [u8; 32],
     transaction: Option<Transaction>,
+    defer_configured_transaction: bool,
+    wait_for_transaction_ms: u64,
     probe_invalid_signature_first: bool,
     trusted_peer_keys: Vec<[u8; 32]>,
     noise_key_path: PathBuf,
@@ -119,7 +121,7 @@ struct PeerAck {
 }
 
 fn usage() -> &'static str {
-    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --tx-public-key-hex HEX64 --observe-account-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT [--tx-listen 127.0.0.1:PORT] [--rpc-listen 127.0.0.1:PORT] --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 [--trusted-peer-key-hex HEX64 ...] --initial-subsidy-atoms U128 --blocks-per-halving U64 [--tx-recipient-id HEX64 --tx-nonce U64 --tx-amount-atoms U64 --tx-fee-atoms U64 --tx-expires-at U64 --tx-signature-hex HEX128] [--probe-invalid-signature-first] [--test-easy-pow] [--peer 127.0.0.1:PORT ...] [--mine-blocks N | --mine-forever] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2 runtime candidate with statically pinned multi-peer loopback connections and an optional bounded QZTS/1 transaction-ingress listener. Each --peer is paired by order with the corresponding --trusted-peer-key-hex; additional trusted keys may authorize inbound peers. Canonical v0.4 Argon2id is the default. --mine-forever continuously mines and broadcasts until interrupted or --stop-after-height is reached; it requires at least one pinned peer and cannot be combined with --mine-blocks or --exit-after-mining. --test-easy-pow is for isolated loopback tests only. No public bind or Mainnet activation."
+    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --tx-public-key-hex HEX64 --observe-account-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT [--tx-listen 127.0.0.1:PORT] [--rpc-listen 127.0.0.1:PORT] --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 [--trusted-peer-key-hex HEX64 ...] --initial-subsidy-atoms U128 --blocks-per-halving U64 [--tx-recipient-id HEX64 --tx-nonce U64 --tx-amount-atoms U64 --tx-fee-atoms U64 --tx-expires-at U64 --tx-signature-hex HEX128_OR_HEX192] [--probe-invalid-signature-first] [--test-easy-pow] [--peer 127.0.0.1:PORT ...] [--mine-blocks N | --mine-forever] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2 runtime candidate with statically pinned multi-peer loopback connections and an optional bounded QZTS/1 transaction-ingress listener. Each --peer is paired by order with the corresponding --trusted-peer-key-hex; additional trusted keys may authorize inbound peers. Canonical v0.4 Argon2id is the default. --mine-forever continuously mines and broadcasts until interrupted or --stop-after-height is reached; it requires at least one pinned peer and cannot be combined with --mine-blocks or --exit-after-mining. --test-easy-pow is for isolated loopback tests only. No public bind or Mainnet activation."
 }
 
 fn parse_hex32(value: &str, name: &str) -> Result<[u8; 32], String> {
@@ -134,6 +136,16 @@ fn parse_hex32(value: &str, name: &str) -> Result<[u8; 32], String> {
             .map_err(|_| format!("{name} contains a non-hexadecimal character"))?;
     }
     Ok(output)
+}
+
+fn parse_transaction_signature(value: &str, name: &str) -> Result<Vec<u8>, String> {
+    match value.len() {
+        128 => parse_hex_bytes(value, name, 64),
+        192 => parse_hex_bytes(value, name, 96),
+        _ => Err(format!(
+            "{name} must be exactly 128 or 192 ASCII hexadecimal characters (registered or self-contained Ed25519)"
+        )),
+    }
 }
 
 fn parse_hex_bytes(value: &str, name: &str, expected_bytes: usize) -> Result<Vec<u8>, String> {
@@ -178,6 +190,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
     let mut trusted_peer_values = Vec::<String>::new();
     let mut exit_after_mining = false;
     let mut mine_forever = false;
+    let mut defer_configured_transaction = false;
     let mut probe_invalid_signature_first = false;
     let mut test_easy_pow = false;
     let mut i = 0usize;
@@ -196,6 +209,14 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
                 return Err("duplicate option: --mine-forever".into());
             }
             mine_forever = true;
+            i += 1;
+            continue;
+        }
+        if key == "--defer-configured-transaction" {
+            if defer_configured_transaction {
+                return Err("duplicate option: --defer-configured-transaction".into());
+            }
+            defer_configured_transaction = true;
             i += 1;
             continue;
         }
@@ -247,6 +268,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
                 | "--listen"
                 | "--tx-listen"
                 | "--rpc-listen"
+                | "--wait-for-transaction-ms"
                 | "--noise-static-private-key-dpapi-file"
                 | "--initial-subsidy-atoms"
                 | "--blocks-per-halving"
@@ -413,7 +435,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
             let amount = values["--tx-amount-atoms"].parse::<u64>().map_err(|_| "--tx-amount-atoms must be u64".to_string())?;
             let fee = values["--tx-fee-atoms"].parse::<u64>().map_err(|_| "--tx-fee-atoms must be u64".to_string())?;
             let expires_at = values["--tx-expires-at"].parse::<u64>().map_err(|_| "--tx-expires-at must be u64".to_string())?;
-            let signature = parse_hex_bytes(&values["--tx-signature-hex"], "--tx-signature-hex", 64)?;
+            let signature = parse_transaction_signature(&values["--tx-signature-hex"], "--tx-signature-hex")?;
             if recipient.iter().all(|byte| *byte == 0) || recipient == owner_id {
                 return Err("transaction recipient must be nonzero and distinct from the owner account".into());
             }
@@ -427,6 +449,18 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
         }
         _ => return Err("transaction requires all six fields: recipient, nonce, amount, fee, expiry and signature".into()),
     };
+    let wait_for_transaction_ms = values
+        .get("--wait-for-transaction-ms")
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| "--wait-for-transaction-ms must be an unsigned u64".to_string())
+        })
+        .transpose()?
+        .unwrap_or(0);
+    if wait_for_transaction_ms > 30_000 {
+        return Err("--wait-for-transaction-ms is capped at 30000 ms".into());
+    }
     let mine_blocks = values
         .get("--mine-blocks")
         .map(|value| {
@@ -481,6 +515,18 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
             "mining requires at least one --peer so each candidate is peer-acknowledged".into(),
         );
     }
+    if defer_configured_transaction
+        && (transaction.is_none()
+            || tx_listen.is_none()
+            || !test_easy_pow
+            || mine_blocks == 0
+            || wait_for_transaction_ms == 0)
+    {
+        return Err("--defer-configured-transaction requires a configured transaction, --tx-listen, --test-easy-pow, --mine-blocks > 0 and a positive --wait-for-transaction-ms".into());
+    }
+    if wait_for_transaction_ms > 0 && !defer_configured_transaction {
+        return Err("--wait-for-transaction-ms requires --defer-configured-transaction".into());
+    }
     if probe_invalid_signature_first
         && (transaction.is_none() || mine_blocks == 0 || peers.is_empty())
     {
@@ -507,6 +553,8 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
         tx_public_key,
         observe_account_id,
         transaction,
+        defer_configured_transaction,
+        wait_for_transaction_ms,
         probe_invalid_signature_first,
         trusted_peer_keys,
         noise_key_path,
@@ -1908,13 +1956,16 @@ fn run(args: Args) -> Result<(), String> {
         .map_err(|error| format!("configure bounded QZBE transaction mempool: {error:?}"))?;
     let mut pending_tx_connections: VecDeque<(TcpStream, SocketAddr)> = VecDeque::new();
     if let Some(transaction) = args.transaction.clone() {
-        let ledger = store.fork_choice().canonical_state().ledger();
-        let candidate_timestamp = next_block_timestamp(ledger.last_timestamp(), SystemTime::now())?;
-        mempool
-            .submit(transaction, ledger, &authenticator, candidate_timestamp)
-            .map_err(|error| {
-                format!("admit configured legacy-fixture TXN2 to bounded mempool: {error:?}")
-            })?;
+        if !args.defer_configured_transaction {
+            let ledger = store.fork_choice().canonical_state().ledger();
+            let candidate_timestamp =
+                next_block_timestamp(ledger.last_timestamp(), SystemTime::now())?;
+            mempool
+                .submit(transaction, ledger, &authenticator, candidate_timestamp)
+                .map_err(|error| {
+                    format!("admit configured legacy-fixture TXN2 to bounded mempool: {error:?}")
+                })?;
+        }
     }
     let listener = TcpListener::bind(args.listen)
         .map_err(|error| format!("bind loopback QZBE listener {}: {error}", args.listen))?;
@@ -2011,6 +2062,65 @@ fn run(args: Args) -> Result<(), String> {
             &tampered,
             &initial,
         )?;
+    }
+
+    if args.defer_configured_transaction {
+        let deadline = Instant::now() + Duration::from_millis(args.wait_for_transaction_ms);
+        loop {
+            poll_connections(
+                &listener,
+                &secret,
+                &args.trusted_peer_keys,
+                &args.network_id,
+                &profile_id,
+                &mut store,
+                &checkpoint_context,
+                &authenticator,
+                &mut mempool,
+                &args.peers,
+                &args.trusted_peer_keys,
+                &mut relayed_tx_count,
+                &mut accepted_count,
+                &mut message_count,
+            )?;
+            poll_tx_connections(
+                tx_listener.as_ref(),
+                &mut pending_tx_connections,
+                &store,
+                &authenticator,
+                &mut mempool,
+                &mut tx_submission_count,
+                &secret,
+                &args.network_id,
+                &profile_id,
+                &args.peers,
+                &args.trusted_peer_keys,
+                &mut relayed_tx_count,
+            )?;
+            poll_rpc_connections(
+                rpc_listener.as_ref(),
+                &store,
+                &mempool,
+                &params,
+                &args.network_id,
+                &genesis_id,
+                &profile_id,
+            )?;
+            reconcile_pending_mempool(&store, &authenticator, &mut mempool)?;
+            if !mempool.is_empty() {
+                eprintln!(
+                    "event=qzbe_v04_test_wallet_transaction_admitted mempool_count={} tx_submissions={} status=accepted_then_mined",
+                    mempool.len(), tx_submission_count
+                );
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(
+                    "timed out waiting for the explicit test-wallet transaction ingress".into(),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     let mine_limit = if args.mine_forever {
@@ -2330,6 +2440,8 @@ mod tests {
             tx_public_key: [0xD1; 32],
             observe_account_id: [0xB2; 32],
             transaction: None,
+            defer_configured_transaction: false,
+            wait_for_transaction_ms: 0,
             probe_invalid_signature_first: false,
             trusted_peer_keys: vec![[0xE6; 32]],
             noise_key_path: env::temp_dir().join("unused-qzbe-test-noise-key"),
@@ -2783,6 +2895,83 @@ mod tests {
         assert!(parse_args_from(collides_with_peer)
             .unwrap_err()
             .contains("read-only RPC listener"));
+    }
+
+    #[test]
+    fn transaction_signature_parser_accepts_only_registered_or_self_contained_ed25519() {
+        assert_eq!(
+            parse_transaction_signature(&"55".repeat(64), "sig")
+                .unwrap()
+                .len(),
+            64
+        );
+        assert_eq!(
+            parse_transaction_signature(&"66".repeat(96), "sig")
+                .unwrap()
+                .len(),
+            96
+        );
+        assert!(parse_transaction_signature(&"55".repeat(63), "sig").is_err());
+        assert!(parse_transaction_signature(&"55".repeat(95), "sig").is_err());
+    }
+
+    #[test]
+    fn deferred_wallet_transaction_requires_explicit_test_pow_and_bounded_wait() {
+        let mut base = parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        let observe_index = base
+            .iter()
+            .position(|item| item == "--observe-account-id")
+            .unwrap();
+        base[observe_index + 1] = "44".repeat(32);
+        base.extend([
+            "--tx-recipient-id".into(),
+            "44".repeat(32),
+            "--tx-nonce".into(),
+            "1".into(),
+            "--tx-amount-atoms".into(),
+            "2500".into(),
+            "--tx-fee-atoms".into(),
+            "7".into(),
+            "--tx-expires-at".into(),
+            "4102444800".into(),
+            "--tx-signature-hex".into(),
+            "55".repeat(96),
+            "--tx-listen".into(),
+            "127.0.0.1:49334".into(),
+            "--defer-configured-transaction".into(),
+            "--wait-for-transaction-ms".into(),
+            "5000".into(),
+            "--test-easy-pow".into(),
+            "--mine-blocks".into(),
+            "2".into(),
+        ]);
+        assert!(parse_args_from(base.clone()).is_ok());
+
+        let mut no_easy_pow = base.clone();
+        no_easy_pow.retain(|item| item != "--test-easy-pow");
+        assert!(parse_args_from(no_easy_pow)
+            .unwrap_err()
+            .contains("--test-easy-pow"));
+
+        let mut over_limit = base.clone();
+        let index = over_limit
+            .iter()
+            .position(|item| item == "--wait-for-transaction-ms")
+            .unwrap();
+        over_limit[index + 1] = "30001".into();
+        assert!(parse_args_from(over_limit)
+            .unwrap_err()
+            .contains("capped at 30000 ms"));
+
+        let mut no_listener = base;
+        let index = no_listener
+            .iter()
+            .position(|item| item == "--tx-listen")
+            .unwrap();
+        no_listener.drain(index..index + 2);
+        assert!(parse_args_from(no_listener)
+            .unwrap_err()
+            .contains("--tx-listen"));
     }
 
     #[test]

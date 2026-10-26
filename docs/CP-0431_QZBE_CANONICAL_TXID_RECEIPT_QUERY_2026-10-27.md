@@ -24,7 +24,7 @@ Confirmation depth is an observation of the currently selected candidate chain. 
   - CP-0414 PUBLIC_BIND_GUARD_PASS
   - CP-0414 READ_ONLY_RPC_GENESIS_PASS
   - CP-0414 READ_ONLY_RPC_SETTLED_STATE_PASS height=2 balance_atoms=2500
-  - CP-0414 READ_ONLY_RPC_CANONICAL_TXID_RECEIPT_PASS txid=f6930ba58d5fd06f77136ad1861ba6cef5b105d4d2e31cb28dc35d498a187a40 block_height=1 confirmations=2
+  - CP-0414 READ_ONLY_RPC_CANONICAL_TXID_RECEIPT_PASS ... block_height=1 confirmations=2 (the integration now uses a fresh native-wallet TXID per run; see CP-0433)
   - CP-0414 QZBE_AUTHENTICATED_TXN_TWO_NODE_PASS ... invalid_signature=atomically_rejected replay=matched public_bind=denied
 
 The scenario verifies initial zero balance, canonical inclusion and confirmation calculation, matching tip/state-root views, invalid-signature atomic rejection, two-node propagation, durable reopen/replay and non-loopback bind rejection.
