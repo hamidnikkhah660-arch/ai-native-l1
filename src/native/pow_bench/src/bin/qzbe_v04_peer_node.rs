@@ -10,15 +10,19 @@ use ai_native_l1_pow_bench::{
     monetary_genesis_v04_candidate::GenesisManifestV04,
     monetary_issuance_v04_candidate::V04MiningIssuanceScheduleCandidate,
     monetary_pow_v04_candidate::{
-        V04ExecutionForkChoiceOutcome, MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES,
-        MAX_QZBE_MINING_ATTEMPTS,
+        qzbe_pow_digest, V04ExecutionForkChoiceOutcome, V04ExecutionPowEnvelope,
+        MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES, MAX_QZBE_MINING_ATTEMPTS,
     },
     monetary_pow_v04_store_candidate::V04ExecutionForkStoreCandidate,
     monetary_transition_v04_candidate::{
         MonetaryLedgerStateV04TransitionCandidate, V04ConsensusProfileCandidate,
     },
     noise_key_provisioning::load_protected_noise_private_key,
-    state_machine::{AccountId, TransactionAuthenticator},
+    state_machine::{AccountId, Transaction},
+    transaction_auth::{
+        account_id_from_public_key, AccountPublicKey, Ed25519TransactionAuthenticator,
+        TransactionAuthenticatorKind,
+    },
 };
 use std::{
     collections::BTreeMap,
@@ -36,13 +40,6 @@ const MAX_MINE_BLOCKS: u64 = 32;
 const MAX_PEER_MESSAGES: u64 = 512;
 const DEFAULT_RUN_SECONDS: u64 = 30;
 
-struct RejectAllTransactions;
-impl TransactionAuthenticator for RejectAllTransactions {
-    fn verify(&self, _sender: &AccountId, _digest: &[u8; 32], _signature: &[u8]) -> Result<(), ()> {
-        Err(())
-    }
-}
-
 struct SecretKey([u8; 32]);
 impl Drop for SecretKey {
     fn drop(&mut self) {
@@ -58,6 +55,10 @@ struct Args {
     network_id: [u8; 32],
     owner_id: [u8; 32],
     miner_id: [u8; 32],
+    tx_public_key: [u8; 32],
+    observe_account_id: [u8; 32],
+    transaction: Option<Transaction>,
+    probe_invalid_signature_first: bool,
     trusted_peer_key: [u8; 32],
     noise_key_path: PathBuf,
     initial_subsidy_atoms: u128,
@@ -84,7 +85,7 @@ struct PeerAck {
 }
 
 fn usage() -> &'static str {
-    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 --initial-subsidy-atoms U128 --blocks-per-halving U64 [--peer 127.0.0.1:PORT] [--mine-blocks N] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2 authenticated loopback integration candidate only. No public bind, no public economics, no mainnet mode."
+    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --tx-public-key-hex HEX64 --observe-account-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 --initial-subsidy-atoms U128 --blocks-per-halving U64 [--tx-recipient-id HEX64 --tx-nonce U64 --tx-amount-atoms U64 --tx-fee-atoms U64 --tx-expires-at U64 --tx-signature-hex HEX128] [--probe-invalid-signature-first] [--peer 127.0.0.1:PORT] [--mine-blocks N] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2 authenticated loopback integration candidate only. Explicit Ed25519 transaction registry; no public bind, no public economics, no mainnet mode."
 }
 
 fn parse_hex32(value: &str, name: &str) -> Result<[u8; 32], String> {
@@ -97,6 +98,23 @@ fn parse_hex32(value: &str, name: &str) -> Result<[u8; 32], String> {
     for (index, byte) in output.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
             .map_err(|_| format!("{name} contains a non-hexadecimal character"))?;
+    }
+    Ok(output)
+}
+
+fn parse_hex_bytes(value: &str, name: &str, expected_bytes: usize) -> Result<Vec<u8>, String> {
+    if value.len() != expected_bytes.saturating_mul(2) || !value.is_ascii() {
+        return Err(format!(
+            "{name} must be exactly {} ASCII hexadecimal characters",
+            expected_bytes * 2
+        ));
+    }
+    let mut output = Vec::with_capacity(expected_bytes);
+    for index in 0..expected_bytes {
+        output.push(
+            u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+                .map_err(|_| format!("{name} contains a non-hexadecimal character"))?,
+        );
     }
     Ok(output)
 }
@@ -120,6 +138,7 @@ fn parse_args() -> Result<Option<Args>, String> {
     }
     let mut values = BTreeMap::<String, String>::new();
     let mut exit_after_mining = false;
+    let mut probe_invalid_signature_first = false;
     let mut i = 0usize;
     while i < tokens.len() {
         let key = tokens[i].as_str();
@@ -131,11 +150,27 @@ fn parse_args() -> Result<Option<Args>, String> {
             i += 1;
             continue;
         }
+        if key == "--probe-invalid-signature-first" {
+            if probe_invalid_signature_first {
+                return Err("duplicate option: --probe-invalid-signature-first".into());
+            }
+            probe_invalid_signature_first = true;
+            i += 1;
+            continue;
+        }
         if !matches!(
             key,
             "--network-id"
                 | "--owner-id"
                 | "--miner-id"
+                | "--tx-public-key-hex"
+                | "--observe-account-id"
+                | "--tx-recipient-id"
+                | "--tx-nonce"
+                | "--tx-amount-atoms"
+                | "--tx-fee-atoms"
+                | "--tx-expires-at"
+                | "--tx-signature-hex"
                 | "--data-dir"
                 | "--listen"
                 | "--peer"
@@ -194,13 +229,20 @@ fn parse_args() -> Result<Option<Args>, String> {
     let network_id = parse_hex32(&take("--network-id")?, "--network-id")?;
     let owner_id = parse_hex32(&take("--owner-id")?, "--owner-id")?;
     let miner_id = parse_hex32(&take("--miner-id")?, "--miner-id")?;
+    let tx_public_key = parse_hex32(&take("--tx-public-key-hex")?, "--tx-public-key-hex")?;
+    let observe_account_id = parse_hex32(&take("--observe-account-id")?, "--observe-account-id")?;
     let trusted_peer_key = parse_hex32(&take("--trusted-peer-key-hex")?, "--trusted-peer-key-hex")?;
     if network_id.iter().all(|byte| *byte == 0)
         || owner_id.iter().all(|byte| *byte == 0)
         || miner_id.iter().all(|byte| *byte == 0)
+        || tx_public_key.iter().all(|byte| *byte == 0)
+        || observe_account_id.iter().all(|byte| *byte == 0)
         || trusted_peer_key.iter().all(|byte| *byte == 0)
     {
-        return Err("network, owner, miner and trusted peer key must be nonzero".into());
+        return Err("network, owner, miner, transaction public key, observe account and trusted peer key must be nonzero".into());
+    }
+    if account_id_from_public_key(&tx_public_key) != owner_id {
+        return Err("--owner-id must equal the domain-separated account ID derived from --tx-public-key-hex".into());
     }
     if owner_id == miner_id {
         return Err("owner and miner IDs must be distinct for this integration fixture".into());
@@ -212,6 +254,40 @@ fn parse_args() -> Result<Option<Args>, String> {
     let blocks_per_halving = take("--blocks-per-halving")?
         .parse::<u64>()
         .map_err(|_| "--blocks-per-halving must be an unsigned u64".to_string())?;
+    let tx_fields = [
+        "--tx-recipient-id",
+        "--tx-nonce",
+        "--tx-amount-atoms",
+        "--tx-fee-atoms",
+        "--tx-expires-at",
+        "--tx-signature-hex",
+    ];
+    let tx_field_count = tx_fields
+        .iter()
+        .filter(|key| values.contains_key(**key))
+        .count();
+    let transaction = match tx_field_count {
+        0 => None,
+        count if count == tx_fields.len() => {
+            let recipient = parse_hex32(&values["--tx-recipient-id"], "--tx-recipient-id")?;
+            let nonce = values["--tx-nonce"].parse::<u64>().map_err(|_| "--tx-nonce must be u64".to_string())?;
+            let amount = values["--tx-amount-atoms"].parse::<u64>().map_err(|_| "--tx-amount-atoms must be u64".to_string())?;
+            let fee = values["--tx-fee-atoms"].parse::<u64>().map_err(|_| "--tx-fee-atoms must be u64".to_string())?;
+            let expires_at = values["--tx-expires-at"].parse::<u64>().map_err(|_| "--tx-expires-at must be u64".to_string())?;
+            let signature = parse_hex_bytes(&values["--tx-signature-hex"], "--tx-signature-hex", 64)?;
+            if recipient.iter().all(|byte| *byte == 0) || recipient == owner_id {
+                return Err("transaction recipient must be nonzero and distinct from the owner account".into());
+            }
+            if nonce == 0 || amount == 0 || expires_at <= 2 {
+                return Err("transaction nonce/amount must be positive and expiry must exceed the local block timestamps".into());
+            }
+            if observe_account_id != recipient {
+                return Err("--observe-account-id must equal --tx-recipient-id for this loopback fixture".into());
+            }
+            Some(Transaction { network_id, sender: owner_id, recipient, nonce, amount, fee, expires_at, signature })
+        }
+        _ => return Err("transaction requires all six fields: recipient, nonce, amount, fee, expiry and signature".into()),
+    };
     let mine_blocks = values
         .get("--mine-blocks")
         .map(|value| {
@@ -255,6 +331,14 @@ fn parse_args() -> Result<Option<Args>, String> {
     if mine_blocks > 0 && peer.is_none() {
         return Err("mining requires --peer so each candidate is peer-acknowledged".into());
     }
+    if probe_invalid_signature_first
+        && (transaction.is_none() || mine_blocks == 0 || peer.is_none())
+    {
+        return Err("--probe-invalid-signature-first requires a signed --transaction, --peer and --mine-blocks > 0".into());
+    }
+    if transaction.is_some() && mine_blocks == 0 && exit_after_mining {
+        return Err("--exit-after-mining cannot be used without mining a block".into());
+    }
     if exit_after_mining && mine_blocks == 0 {
         return Err("--exit-after-mining requires --mine-blocks greater than zero".into());
     }
@@ -268,6 +352,10 @@ fn parse_args() -> Result<Option<Args>, String> {
         network_id,
         owner_id,
         miner_id,
+        tx_public_key,
+        observe_account_id,
+        transaction,
+        probe_invalid_signature_first,
         trusted_peer_key,
         noise_key_path,
         initial_subsidy_atoms,
@@ -277,6 +365,22 @@ fn parse_args() -> Result<Option<Args>, String> {
         stop_after_height,
         exit_after_mining,
     }))
+}
+
+fn configured_authenticator(args: &Args) -> Result<Ed25519TransactionAuthenticator, String> {
+    if account_id_from_public_key(&args.tx_public_key) != args.owner_id {
+        return Err(
+            "configured transaction public key does not match Genesis owner account".into(),
+        );
+    }
+    Ed25519TransactionAuthenticator::select_by_id(
+        TransactionAuthenticatorKind::Ed25519V1 as u16,
+        [AccountPublicKey {
+            account_id: args.owner_id,
+            public_key: args.tx_public_key,
+        }],
+    )
+    .map_err(|error| format!("configure explicit Ed25519 transaction registry: {error:?}"))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -492,6 +596,94 @@ fn send_candidate(
     Ok(())
 }
 
+fn tamper_first_signature_and_remine(
+    valid_envelope: &[u8],
+    profile: &V04ConsensusProfileCandidate,
+    params: &ConsensusParameters,
+) -> Result<Vec<u8>, String> {
+    let mut envelope = V04ExecutionPowEnvelope::decode(valid_envelope, profile, params)
+        .map_err(|error| format!("decode valid QZBE probe source: {error}"))?;
+    let tx = envelope
+        .block
+        .transactions
+        .first_mut()
+        .ok_or_else(|| "invalid-signature probe requires a transaction".to_string())?;
+    let first = tx
+        .signature
+        .first_mut()
+        .ok_or_else(|| "invalid-signature probe cannot tamper an empty signature".to_string())?;
+    *first ^= 1;
+    for attempt in 0..MAX_QZBE_MINING_ATTEMPTS {
+        let digest = qzbe_pow_digest(&envelope.header, &envelope.block, params)
+            .map_err(|error| format!("hash tampered QZBE probe: {error}"))?;
+        if Uint256::from_be_bytes(digest) <= envelope.header.target {
+            return envelope
+                .encode(profile, params)
+                .map_err(|error| format!("encode tampered QZBE probe: {error}"));
+        }
+        if attempt + 1 < MAX_QZBE_MINING_ATTEMPTS {
+            envelope.header.nonce = envelope
+                .header
+                .nonce
+                .checked_add(1)
+                .ok_or_else(|| "invalid-signature probe nonce overflow".to_string())?;
+        }
+    }
+    Err("bounded PoW nonce search exhausted for invalid-signature probe".into())
+}
+
+fn send_rejection_probe(
+    address: SocketAddr,
+    local_key: &[u8; 32],
+    peer_key: &[u8; 32],
+    network_id: &[u8; 32],
+    profile: &[u8; 32],
+    bytes: &[u8],
+    expected_unchanged: &Snapshot,
+) -> Result<(), String> {
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
+        .map_err(|error| format!("connect to pinned QZBE probe peer {address}: {error}"))?;
+    stream
+        .set_nodelay(true)
+        .map_err(|error| format!("configure probe TCP_NODELAY: {error}"))?;
+    let mut session = DevnetNoiseSession::connect(&mut stream, local_key, peer_key, network_id)
+        .map_err(|error| format!("authenticate invalid-signature probe session: {error}"))?;
+    session
+        .write_record(&mut stream, bytes)
+        .map_err(|error| format!("send encrypted invalid-signature probe: {error}"))?;
+    let response = session
+        .read_record(&mut stream)
+        .map_err(|error| format!("read invalid-signature probe ACK: {error}"))?;
+    let ack = decode_ack(&response, network_id, profile)?;
+    if ack.status != 2 {
+        return Err(format!(
+            "peer did not reject invalid transaction signature (ACK status {})",
+            ack.status
+        ));
+    }
+    if ack.candidate_digest != [0; 32] {
+        return Err("rejection ACK must not report an accepted candidate digest".into());
+    }
+    if &ack.snapshot != expected_unchanged {
+        return Err(format!("invalid-signature candidate changed receiver state: expected height={} tip={} root={} generation={}, got height={} tip={} root={} generation={}",
+            expected_unchanged.height, hex(&expected_unchanged.tip), hex(&expected_unchanged.state_root), expected_unchanged.generation,
+            ack.snapshot.height, hex(&ack.snapshot.tip), hex(&ack.snapshot.state_root), ack.snapshot.generation));
+    }
+    eprintln!("event=qzbe_v04_invalid_signature_probe_rejected height={} tip={} state_root={} generation={} rejected_atomically=true",
+        ack.snapshot.height, hex(&ack.snapshot.tip), hex(&ack.snapshot.state_root), ack.snapshot.generation);
+    Ok(())
+}
+
+fn observed_balance(store: &V04ExecutionForkStoreCandidate, account: &AccountId) -> u64 {
+    store
+        .fork_choice()
+        .canonical_state()
+        .ledger()
+        .account(account)
+        .map(|state| state.balance)
+        .unwrap_or(0)
+}
+
 fn serve_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
@@ -500,6 +692,7 @@ fn serve_connection(
     network_id: &[u8; 32],
     profile: &[u8; 32],
     store: &mut V04ExecutionForkStoreCandidate,
+    authenticator: &Ed25519TransactionAuthenticator,
     accepted_count: &mut u64,
 ) -> Result<(), String> {
     stream
@@ -514,7 +707,7 @@ fn serve_connection(
     let candidate = session
         .read_record(&mut stream)
         .map_err(|error| format!("read encrypted QZBE candidate: {error}"))?;
-    let (status, digest) = match store.submit(&candidate, &RejectAllTransactions) {
+    let (status, digest) = match store.submit(&candidate, authenticator) {
         Ok(outcome) => (0u8, outcome.block_digest),
         Err(error) => {
             eprintln!(
@@ -544,6 +737,7 @@ fn poll_connections(
     network_id: &[u8; 32],
     profile: &[u8; 32],
     store: &mut V04ExecutionForkStoreCandidate,
+    authenticator: &Ed25519TransactionAuthenticator,
     accepted_count: &mut u64,
     message_count: &mut u64,
 ) -> Result<(), String> {
@@ -562,6 +756,7 @@ fn poll_connections(
                     network_id,
                     profile,
                     store,
+                    authenticator,
                     accepted_count,
                 ) {
                     eprintln!(
@@ -576,6 +771,7 @@ fn poll_connections(
     }
 }
 fn run(args: Args) -> Result<(), String> {
+    let authenticator = configured_authenticator(&args)?;
     let (manifest, profile, genesis, params) = prepare_profile(&args)?;
     require_dedicated_store_directory(&args.data_dir)?;
     let profile_id = *profile.profile_fingerprint();
@@ -590,7 +786,7 @@ fn run(args: Args) -> Result<(), String> {
         &args.data_dir,
         genesis.clone(),
         params.clone(),
-        &RejectAllTransactions,
+        &authenticator,
     )
     .map_err(|error| format!("open local QZBE candidate store: {error}"))?;
     let initial = snapshot(&store)?;
@@ -602,12 +798,49 @@ fn run(args: Args) -> Result<(), String> {
     let mut accepted_count = 0u64;
     let mut message_count = 0u64;
     let mut sent_count = 0u64;
-    eprintln!("event=qzbe_v04_peer_smoke_ready network_id={} genesis={} profile={} listen={} peer={} height={} root={} tip={} store=QZBE ack=QZA4 noise=Noise_XX_25519_ChaChaPoly_SHA256 pow_profile=LOCAL_EASY_POW_8MIB tx_policy=RejectAll local_only=true public_launch_approved=false",
+    eprintln!("event=qzbe_v04_peer_smoke_ready network_id={} genesis={} profile={} listen={} peer={} height={} root={} tip={} store=QZBE ack=QZA4 noise=Noise_XX_25519_ChaChaPoly_SHA256 pow_profile=LOCAL_EASY_POW_8MIB tx_policy=Ed25519V1_single_explicit_key local_only=true public_launch_approved=false",
         hex(&args.network_id), hex(&genesis_id), hex(&profile_id), args.listen,
         args.peer.map(|peer| peer.to_string()).unwrap_or_else(|| "inbound_only".into()),
         initial.height, hex(&initial.state_root), hex(&initial.tip));
 
-    for _ in 0..args.mine_blocks {
+    if args.probe_invalid_signature_first {
+        let peer = args
+            .peer
+            .ok_or("invalid-signature probe requires a pinned peer")?;
+        let candidate = store
+            .fork_choice()
+            .mine_candidate_on(
+                store.canonical_tip(),
+                store
+                    .canonical_height()
+                    .checked_add(1)
+                    .ok_or_else(|| "QZBE probe height overflow".to_string())?,
+                args.miner_id,
+                vec![args
+                    .transaction
+                    .clone()
+                    .ok_or("invalid-signature probe missing transaction")?],
+                store.canonical_height().saturating_add(1),
+                MAX_QZBE_MINING_ATTEMPTS,
+                &authenticator,
+                || false,
+            )
+            .map_err(|error| {
+                format!("build valid source transaction block for signature-tamper probe: {error}")
+            })?;
+        let tampered = tamper_first_signature_and_remine(&candidate, &profile, &params)?;
+        send_rejection_probe(
+            peer,
+            &secret.0,
+            &args.trusted_peer_key,
+            &args.network_id,
+            &profile_id,
+            &tampered,
+            &initial,
+        )?;
+    }
+
+    for block_index in 0..args.mine_blocks {
         poll_connections(
             &listener,
             &secret,
@@ -615,6 +848,7 @@ fn run(args: Args) -> Result<(), String> {
             &args.network_id,
             &profile_id,
             &mut store,
+            &authenticator,
             &mut accepted_count,
             &mut message_count,
         )?;
@@ -629,15 +863,19 @@ fn run(args: Args) -> Result<(), String> {
                 parent_tip,
                 next_height,
                 args.miner_id,
-                Vec::new(),
+                if block_index == 0 {
+                    args.transaction.clone().into_iter().collect()
+                } else {
+                    Vec::new()
+                },
                 next_height,
                 MAX_QZBE_MINING_ATTEMPTS,
-                &RejectAllTransactions,
+                &authenticator,
                 || false,
             )
             .map_err(|error| format!("mine bounded QZBE block at height {next_height}: {error}"))?;
         let outcome: V04ExecutionForkChoiceOutcome = store
-            .submit(&encoded, &RejectAllTransactions)
+            .submit(&encoded, &authenticator)
             .map_err(|error| format!("submit locally mined QZBE block: {error}"))?;
         if !outcome.canonical_changed || outcome.canonical_height != next_height {
             return Err(format!(
@@ -674,6 +912,7 @@ fn run(args: Args) -> Result<(), String> {
                 &args.network_id,
                 &profile_id,
                 &mut store,
+                &authenticator,
                 &mut accepted_count,
                 &mut message_count,
             )?;
@@ -694,13 +933,9 @@ fn run(args: Args) -> Result<(), String> {
     drop(store);
     drop(secret);
     // A new store instance verifies persistent manifest replay and catches any in-memory-only state.
-    let replayed = V04ExecutionForkStoreCandidate::open(
-        &args.data_dir,
-        genesis,
-        params,
-        &RejectAllTransactions,
-    )
-    .map_err(|error| format!("reopen/replay QZBE store: {error}"))?;
+    let replayed =
+        V04ExecutionForkStoreCandidate::open(&args.data_dir, genesis, params, &authenticator)
+            .map_err(|error| format!("reopen/replay QZBE store: {error}"))?;
     let final_snapshot = snapshot(&replayed)?;
     if final_snapshot != expected_final {
         return Err(format!(
@@ -708,9 +943,10 @@ fn run(args: Args) -> Result<(), String> {
             expected_final, final_snapshot
         ));
     }
-    eprintln!("event=qzbe_v04_peer_smoke_stopped network_id={} profile={} height={} state_root={} tip={} generation={} accepted_peer_blocks={} sent_peer_blocks={} replay=matched local_only=true public_launch_approved=false",
+    let recipient_balance = observed_balance(&replayed, &args.observe_account_id);
+    eprintln!("event=qzbe_v04_peer_smoke_stopped network_id={} profile={} height={} state_root={} tip={} generation={} observed_account={} observed_balance_atoms={} accepted_peer_blocks={} sent_peer_blocks={} replay=matched local_only=true public_launch_approved=false",
         hex(&args.network_id), hex(&profile_id), final_snapshot.height, hex(&final_snapshot.state_root),
-        hex(&final_snapshot.tip), final_snapshot.generation, accepted_count, sent_count);
+        hex(&final_snapshot.tip), final_snapshot.generation, hex(&args.observe_account_id), recipient_balance, accepted_count, sent_count);
     if final_snapshot.height < initial.height || final_snapshot.tip.iter().all(|byte| *byte == 0) {
         return Err("QZBE replay returned an invalid canonical snapshot".into());
     }
