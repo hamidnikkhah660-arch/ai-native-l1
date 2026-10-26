@@ -1,9 +1,9 @@
 //! CP-0397 candidate-only height-based miner issuance for allocation policy v0.4.
 //!
-//! This is a parameterized arithmetic contract, not a frozen economic policy and not wired into
-//! block production, import, Genesis, QZL4, fork choice, or a node runtime. Callers must supply an
-//! explicit initial subsidy and halving interval. The current legacy parameters are used only by
-//! tests as an illustrative comparison; they are not defaults here.
+//! This is a parameterized arithmetic contract used by the separate QZB4 v2 transition,
+//! fork-choice, persistent-store and loopback-node candidate. It is not connected to the default
+//! PTB2/PFS2 node runtime and does not by itself authorize a public Mainnet launch. Callers supply
+//! explicit parameters; the named v0.4 launch-candidate validator below rejects schedule drift.
 //!
 //! Consensus-sensitive rules in this candidate:
 //! - Genesis height is zero and the first reward-eligible block is height one;
@@ -25,6 +25,10 @@ pub const V04_MINING_SCHEDULE_VERSION: u16 = 1;
 pub const V04_FIRST_ELIGIBLE_HEIGHT: u64 = 1;
 pub const V04_MINING_BUDGET_ATOMS: u128 = AllocationBucket::MiningNetworkSecurity.budget().atoms();
 
+/// Frozen mining parameters for the v0.4 launch candidate, expressed in atomic units.
+pub const QZXB_V04_INITIAL_SUBSIDY_ATOMS: u128 = 35_673_515_981;
+pub const QZXB_V04_BLOCKS_PER_HALVING: u64 = 4_204_800;
+
 const SCHEDULE_FINGERPRINT_DOMAIN: &[u8] =
     b"QUANTUMZXB-V04-MINING-SCHEDULE-FINGERPRINT-CANDIDATE-V1\0";
 const SCHEDULE_RULES_TAG: &[u8] =
@@ -36,6 +40,7 @@ pub enum V04MiningScheduleError {
     ZeroHalvingInterval,
     InvalidBlockHeight,
     MiningIssuanceAboveBudget,
+    NonCanonicalLaunchParameters,
     InvalidParameters,
 }
 
@@ -74,6 +79,17 @@ impl V04MiningIssuanceScheduleCandidate {
             blocks_per_halving,
             parameters,
         })
+    }
+
+    /// Refuse schedule drift in the node-launch candidate while keeping the arithmetic type
+    /// parameterized for independent vectors and non-launch simulations.
+    pub fn validate_canonical_v04_launch_parameters(&self) -> Result<(), V04MiningScheduleError> {
+        if self.initial_subsidy_atoms != QZXB_V04_INITIAL_SUBSIDY_ATOMS
+            || self.blocks_per_halving != QZXB_V04_BLOCKS_PER_HALVING
+        {
+            return Err(V04MiningScheduleError::NonCanonicalLaunchParameters);
+        }
+        Ok(())
     }
 
     pub fn initial_subsidy_atoms(&self) -> u128 {
@@ -176,6 +192,31 @@ mod tests {
             vector_value("blocks_per_halving").parse().unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn launch_candidate_schedule_is_pinned_to_v04_tokenomics() {
+        let canonical = V04MiningIssuanceScheduleCandidate::new(
+            QZXB_V04_INITIAL_SUBSIDY_ATOMS,
+            QZXB_V04_BLOCKS_PER_HALVING,
+        )
+        .unwrap();
+        canonical
+            .validate_canonical_v04_launch_parameters()
+            .unwrap();
+        assert_eq!(canonical.initial_subsidy_atoms(), 35_673_515_981);
+        assert_eq!(canonical.blocks_per_halving(), 4_204_800);
+        assert_eq!(canonical.reward_for_height(1, 0).unwrap(), 35_673_515_981);
+        assert_eq!(
+            canonical.reward_for_height(4_204_801, 0).unwrap(),
+            17_836_757_990
+        );
+
+        let altered = V04MiningIssuanceScheduleCandidate::new(1_000_000, 1_000).unwrap();
+        assert_eq!(
+            altered.validate_canonical_v04_launch_parameters(),
+            Err(V04MiningScheduleError::NonCanonicalLaunchParameters)
+        );
     }
 
     #[test]

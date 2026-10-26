@@ -601,7 +601,12 @@ fn prepare_profile(
         args.initial_subsidy_atoms,
         args.blocks_per_halving,
     )
-    .map_err(|error| format!("validate explicit test issuance schedule: {error:?}"))?;
+    .map_err(|error| format!("validate explicit v0.4 issuance schedule: {error:?}"))?;
+    schedule
+        .validate_canonical_v04_launch_parameters()
+        .map_err(|error| {
+            format!("QZBE node launch schedule differs from canonical v0.4 tokenomics: {error:?}")
+        })?;
     let profile = V04ConsensusProfileCandidate::from_manifest_and_schedule(&manifest, schedule)
         .map_err(|error| format!("construct QZBE profile: {error:?}"))?;
     let genesis =
