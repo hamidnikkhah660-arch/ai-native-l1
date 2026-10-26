@@ -103,3 +103,6 @@ jobs:
       - name: Run QZXB live signed TXN2 ingress, bounded mempool, mining and replay
         shell: pwsh
         run: ./simulations/cp0426_qzxb_live_tx_ingress_mempool.ps1
+      - name: Run QZXB three-node authenticated transaction gossip and replay convergence
+        shell: pwsh
+        run: ./simulations/cp0427_qzxb_three_node_transaction_gossip.ps1

@@ -26,8 +26,9 @@ use ai_native_l1_pow_bench::{
     private_testnet_driver::TargetHistory,
     private_testnet_mempool_candidate::{BoundedMempool, MempoolError, MempoolLimits},
     qzbe_tx_ingress_candidate::{
-        decode_request_header, encode_ack as encode_tx_ingress_ack, TxIngressAck, TxIngressStatus,
-        REQUEST_HEADER_BYTES,
+        decode_ack as decode_tx_ingress_ack, decode_gossip_frame, decode_request_header,
+        encode_ack as encode_tx_ingress_ack, encode_gossip_frame, TxIngressAck, TxIngressStatus,
+        GOSSIP_MAGIC, REQUEST_HEADER_BYTES,
     },
     state_machine::{
         decode_transaction, transaction_id, AccountId, Transaction, MAX_TRANSACTION_BYTES,
@@ -39,7 +40,7 @@ use ai_native_l1_pow_bench::{
 };
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     env,
     fs::{self, OpenOptions},
     io::{self, Read, Write},
@@ -969,6 +970,104 @@ fn observed_balance(store: &V04ExecutionCheckpointForkStoreCandidate, account: &
         .unwrap_or(0)
 }
 
+fn send_transaction_gossip(
+    address: SocketAddr,
+    local_key: &[u8; 32],
+    peer_key: &[u8; 32],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    transaction_wire: &[u8],
+    expected_txid: [u8; 32],
+) -> Result<TxIngressAck, String> {
+    let frame = encode_gossip_frame(profile_id, transaction_wire)
+        .map_err(|error| format!("encode bounded QZTG/1 transaction frame: {error:?}"))?;
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
+        .map_err(|error| format!("connect to pinned transaction-gossip peer {address}: {error}"))?;
+    stream
+        .set_nodelay(true)
+        .map_err(|error| format!("configure QZTG/1 peer TCP_NODELAY: {error}"))?;
+    let mut session = DevnetNoiseSession::connect(&mut stream, local_key, peer_key, network_id)
+        .map_err(|error| format!("authenticate outbound QZTG/1 Noise session: {error}"))?;
+    session
+        .write_record(&mut stream, &frame)
+        .map_err(|error| format!("send encrypted QZTG/1 transaction frame: {error}"))?;
+    let response = session
+        .read_record(&mut stream)
+        .map_err(|error| format!("read encrypted QZTA/1 transaction ACK: {error}"))?;
+    let ack = decode_tx_ingress_ack(&response)
+        .map_err(|error| format!("decode QZTA/1 transaction ACK: {error:?}"))?;
+    if ack.transaction_id != expected_txid {
+        return Err("QZTA/1 transaction ID does not match the relayed transaction".into());
+    }
+    if ack.status == TxIngressStatus::Rejected {
+        return Err("authenticated peer rejected the QZTG/1 transaction".into());
+    }
+    Ok(ack)
+}
+
+/// Fan a newly admitted transaction out to statically pinned peers. Failures are isolated per peer;
+/// `skip_peer_key` prevents immediate echo to the authenticated sender and Duplicate ACKs stop loops.
+fn relay_transaction_to_peers(
+    transaction_wire: &[u8],
+    txid: [u8; 32],
+    local_key: &[u8; 32],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    peers: &[SocketAddr],
+    peer_keys: &[[u8; 32]],
+    skip_peer_key: Option<&[u8; 32]>,
+    relayed_count: &mut u64,
+    origin: &str,
+) {
+    for (index, address) in peers.iter().enumerate() {
+        let peer_key = &peer_keys[index];
+        if skip_peer_key.is_some_and(|skip| skip == peer_key) {
+            continue;
+        }
+        match send_transaction_gossip(
+            *address,
+            local_key,
+            peer_key,
+            network_id,
+            profile_id,
+            transaction_wire,
+            txid,
+        ) {
+            Ok(ack) => {
+                *relayed_count = relayed_count.saturating_add(1);
+                eprintln!("event=qzbe_v04_tx_gossip_sent origin={} peer={} txid={} peer_status={:?} peer_mempool_count={} relayed_count={}", origin, address, hex(&txid), ack.status, ack.mempool_count, relayed_count);
+            }
+            Err(error) => {
+                eprintln!(
+                    "event=qzbe_v04_tx_gossip_peer_failed origin={} peer={} txid={} error={}",
+                    origin,
+                    address,
+                    hex(&txid),
+                    error
+                );
+            }
+        }
+    }
+}
+
+fn write_peer_tx_ack(
+    session: &mut DevnetNoiseSession,
+    stream: &mut TcpStream,
+    status: TxIngressStatus,
+    mempool: &BoundedMempool,
+    txid: [u8; 32],
+) -> Result<(), String> {
+    let count = u32::try_from(mempool.len()).unwrap_or(u32::MAX);
+    let ack = encode_tx_ingress_ack(TxIngressAck {
+        status,
+        mempool_count: count,
+        transaction_id: txid,
+    });
+    session
+        .write_record(stream, &ack)
+        .map_err(|error| format!("send encrypted QZTA/1 transaction ACK: {error}"))
+}
+
 fn serve_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
@@ -979,6 +1078,10 @@ fn serve_connection(
     store: &mut V04ExecutionCheckpointForkStoreCandidate,
     checkpoint_context: &QzbeCheckpointValidationContext<'_>,
     authenticator: &Ed25519TransactionAuthenticator,
+    mempool: &mut BoundedMempool,
+    peers: &[SocketAddr],
+    outbound_peer_keys: &[[u8; 32]],
+    relayed_tx_count: &mut u64,
     accepted_count: &mut u64,
 ) -> Result<(), String> {
     stream
@@ -992,9 +1095,105 @@ fn serve_connection(
             "authenticated peer static key is not present in the configured trust set".into(),
         );
     }
+    let remote_peer_key = *session.remote_static_public_key();
     let candidate = session
         .read_record(&mut stream)
-        .map_err(|error| format!("read encrypted QZBE candidate: {error}"))?;
+        .map_err(|error| format!("read encrypted QZBE/QZTG peer frame: {error}"))?;
+    if candidate.starts_with(GOSSIP_MAGIC) {
+        let transaction_wire = match decode_gossip_frame(profile, &candidate) {
+            Ok(wire) => wire,
+            Err(error) => {
+                write_peer_tx_ack(
+                    &mut session,
+                    &mut stream,
+                    TxIngressStatus::Rejected,
+                    mempool,
+                    [0; 32],
+                )?;
+                eprintln!("event=qzbe_v04_tx_gossip_rejected peer={} reason=invalid_qztg_frame error={:?} rejected_atomically=true", peer_addr, error);
+                return Ok(());
+            }
+        };
+        let transaction = match decode_transaction(transaction_wire) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                write_peer_tx_ack(
+                    &mut session,
+                    &mut stream,
+                    TxIngressStatus::Rejected,
+                    mempool,
+                    [0; 32],
+                )?;
+                eprintln!("event=qzbe_v04_tx_gossip_rejected peer={} reason=invalid_txn2 error={:?} rejected_atomically=true", peer_addr, error);
+                return Ok(());
+            }
+        };
+        let txid = match transaction_id(&transaction) {
+            Ok(txid) => txid,
+            Err(error) => {
+                write_peer_tx_ack(
+                    &mut session,
+                    &mut stream,
+                    TxIngressStatus::Rejected,
+                    mempool,
+                    [0; 32],
+                )?;
+                eprintln!("event=qzbe_v04_tx_gossip_rejected peer={} reason=invalid_transaction_id error={:?} rejected_atomically=true", peer_addr, error);
+                return Ok(());
+            }
+        };
+        let admission = {
+            let ledger = store.fork_choice().canonical_state().ledger();
+            let candidate_timestamp =
+                next_block_timestamp(ledger.last_timestamp(), SystemTime::now())?;
+            mempool.submit(transaction, ledger, authenticator, candidate_timestamp)
+        };
+        match admission {
+            Ok(admitted_id) => {
+                write_peer_tx_ack(
+                    &mut session,
+                    &mut stream,
+                    TxIngressStatus::Accepted,
+                    mempool,
+                    admitted_id,
+                )?;
+                eprintln!("event=qzbe_v04_tx_gossip_admitted peer={} txid={} mempool_count={} signature_verified=true profile_bound=true", peer_addr, hex(&admitted_id), mempool.len());
+                relay_transaction_to_peers(
+                    transaction_wire,
+                    admitted_id,
+                    &local_key.0,
+                    network_id,
+                    profile,
+                    peers,
+                    outbound_peer_keys,
+                    Some(&remote_peer_key),
+                    relayed_tx_count,
+                    "peer",
+                );
+            }
+            Err(MempoolError::Duplicate) => {
+                write_peer_tx_ack(
+                    &mut session,
+                    &mut stream,
+                    TxIngressStatus::Duplicate,
+                    mempool,
+                    txid,
+                )?;
+                eprintln!("event=qzbe_v04_tx_gossip_duplicate peer={} txid={} mempool_count={} relay_suppressed=true", peer_addr, hex(&txid), mempool.len());
+            }
+            Err(error) => {
+                write_peer_tx_ack(
+                    &mut session,
+                    &mut stream,
+                    TxIngressStatus::Rejected,
+                    mempool,
+                    [0; 32],
+                )?;
+                eprintln!("event=qzbe_v04_tx_gossip_rejected peer={} txid={} reason={:?} mempool_count={} rejected_atomically=true", peer_addr, hex(&txid), error, mempool.len());
+            }
+        }
+        return Ok(());
+    }
     let (status, digest) = match store.submit(&candidate, checkpoint_context, authenticator) {
         Ok(outcome) => (0u8, outcome.block_digest),
         Err(error) => {
@@ -1027,6 +1226,10 @@ fn poll_connections(
     store: &mut V04ExecutionCheckpointForkStoreCandidate,
     checkpoint_context: &QzbeCheckpointValidationContext<'_>,
     authenticator: &Ed25519TransactionAuthenticator,
+    mempool: &mut BoundedMempool,
+    peers: &[SocketAddr],
+    outbound_peer_keys: &[[u8; 32]],
+    relayed_tx_count: &mut u64,
     accepted_count: &mut u64,
     message_count: &mut u64,
 ) -> Result<(), String> {
@@ -1047,6 +1250,10 @@ fn poll_connections(
                     store,
                     checkpoint_context,
                     authenticator,
+                    mempool,
+                    peers,
+                    outbound_peer_keys,
+                    relayed_tx_count,
                     accepted_count,
                 ) {
                     eprintln!(
@@ -1083,6 +1290,12 @@ fn serve_tx_connection(
     store: &V04ExecutionCheckpointForkStoreCandidate,
     authenticator: &Ed25519TransactionAuthenticator,
     mempool: &mut BoundedMempool,
+    local_key: &SecretKey,
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    peers: &[SocketAddr],
+    outbound_peer_keys: &[[u8; 32]],
+    relayed_tx_count: &mut u64,
 ) -> Result<(), String> {
     if !peer_addr.ip().is_loopback() {
         return Err(
@@ -1143,6 +1356,18 @@ fn serve_tx_connection(
         Ok(admitted_id) => {
             tx_ingress_ack(&mut stream, TxIngressStatus::Accepted, mempool, admitted_id)?;
             eprintln!("event=qzbe_v04_tx_admitted peer={} txid={} mempool_count={} bounded=true signature_policy=self_contained_or_registered_ed25519", peer_addr, hex(&admitted_id), mempool.len());
+            relay_transaction_to_peers(
+                &transaction_wire,
+                admitted_id,
+                &local_key.0,
+                network_id,
+                profile_id,
+                peers,
+                outbound_peer_keys,
+                None,
+                relayed_tx_count,
+                "wallet",
+            );
         }
         Err(MempoolError::Duplicate) => {
             tx_ingress_ack(&mut stream, TxIngressStatus::Duplicate, mempool, txid)?;
@@ -1161,13 +1386,68 @@ fn serve_tx_connection(
     Ok(())
 }
 
+fn accept_one_tx_connection_for_mining_interrupt(
+    listener: Option<&TcpListener>,
+    pending: &mut VecDeque<(TcpStream, SocketAddr)>,
+) -> Result<bool, String> {
+    let Some(listener) = listener else {
+        return Ok(false);
+    };
+    match listener.accept() {
+        Ok((stream, peer_addr)) => {
+            pending.push_back((stream, peer_addr));
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(format!(
+            "accept QZBE transaction ingress during PoW: {error}"
+        )),
+    }
+}
+
 fn poll_tx_connections(
     listener: Option<&TcpListener>,
+    pending: &mut VecDeque<(TcpStream, SocketAddr)>,
     store: &V04ExecutionCheckpointForkStoreCandidate,
     authenticator: &Ed25519TransactionAuthenticator,
     mempool: &mut BoundedMempool,
     submission_count: &mut u64,
+    local_key: &SecretKey,
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    peers: &[SocketAddr],
+    outbound_peer_keys: &[[u8; 32]],
+    relayed_tx_count: &mut u64,
 ) -> Result<(), String> {
+    while let Some((mut stream, peer_addr)) = pending.pop_front() {
+        *submission_count = submission_count.saturating_add(1);
+        if *submission_count > MAX_TX_SUBMISSIONS {
+            let _ = tx_ingress_ack(&mut stream, TxIngressStatus::Rejected, mempool, [0; 32]);
+            eprintln!(
+                "event=qzbe_v04_tx_rejected peer={} reason=bounded_submission_budget_exhausted",
+                peer_addr
+            );
+            continue;
+        }
+        if let Err(error) = serve_tx_connection(
+            stream,
+            peer_addr,
+            store,
+            authenticator,
+            mempool,
+            local_key,
+            network_id,
+            profile_id,
+            peers,
+            outbound_peer_keys,
+            relayed_tx_count,
+        ) {
+            eprintln!(
+                "event=qzbe_v04_tx_connection_rejected peer={} reason={}",
+                peer_addr, error
+            );
+        }
+    }
     let Some(listener) = listener else {
         return Ok(());
     };
@@ -1181,9 +1461,19 @@ fn poll_tx_connections(
                     eprintln!("event=qzbe_v04_tx_rejected peer={} reason=bounded_submission_budget_exhausted", peer_addr);
                     continue;
                 }
-                if let Err(error) =
-                    serve_tx_connection(stream, peer_addr, store, authenticator, mempool)
-                {
+                if let Err(error) = serve_tx_connection(
+                    stream,
+                    peer_addr,
+                    store,
+                    authenticator,
+                    mempool,
+                    local_key,
+                    network_id,
+                    profile_id,
+                    peers,
+                    outbound_peer_keys,
+                    relayed_tx_count,
+                ) {
                     eprintln!(
                         "event=qzbe_v04_tx_connection_rejected peer={} reason={}",
                         peer_addr, error
@@ -1259,6 +1549,7 @@ fn run(args: Args) -> Result<(), String> {
     let initial = snapshot(&store)?;
     let mut mempool = BoundedMempool::new(MempoolLimits::default())
         .map_err(|error| format!("configure bounded QZBE transaction mempool: {error:?}"))?;
+    let mut pending_tx_connections: VecDeque<(TcpStream, SocketAddr)> = VecDeque::new();
     if let Some(transaction) = args.transaction.clone() {
         let ledger = store.fork_choice().canonical_state().ledger();
         let candidate_timestamp = next_block_timestamp(ledger.last_timestamp(), SystemTime::now())?;
@@ -1292,6 +1583,7 @@ fn run(args: Args) -> Result<(), String> {
     let mut accepted_count = 0u64;
     let mut message_count = 0u64;
     let mut tx_submission_count = 0u64;
+    let mut relayed_tx_count = 0u64;
     let mut sent_count = 0u64;
     let pow_profile = if args.test_easy_pow {
         "EXPLICIT_LOCAL_TEST_EASY_POW_8MIB"
@@ -1354,7 +1646,8 @@ fn run(args: Args) -> Result<(), String> {
     } else {
         args.mine_blocks
     };
-    for _ in 0..mine_limit {
+    let mut mined_blocks = 0u64;
+    while mined_blocks < mine_limit {
         if args
             .stop_after_height
             .is_some_and(|height| store.canonical_height() >= height)
@@ -1370,15 +1663,26 @@ fn run(args: Args) -> Result<(), String> {
             &mut store,
             &checkpoint_context,
             &authenticator,
+            &mut mempool,
+            &args.peers,
+            &args.trusted_peer_keys,
+            &mut relayed_tx_count,
             &mut accepted_count,
             &mut message_count,
         )?;
         poll_tx_connections(
             tx_listener.as_ref(),
+            &mut pending_tx_connections,
             &store,
             &authenticator,
             &mut mempool,
             &mut tx_submission_count,
+            &secret,
+            &args.network_id,
+            &profile_id,
+            &args.peers,
+            &args.trusted_peer_keys,
+            &mut relayed_tx_count,
         )?;
         reconcile_pending_mempool(&store, &authenticator, &mut mempool)?;
         let parent_tip = store.canonical_tip();
@@ -1392,19 +1696,54 @@ fn run(args: Args) -> Result<(), String> {
             .map_err(|error| format!("read canonical QZBE timestamp: {error}"))?;
         let timestamp = next_block_timestamp(previous_timestamp, SystemTime::now())?;
         let block_transactions = mempool.ordered_transactions();
-        let encoded = store
-            .fork_choice()
-            .mine_candidate_on(
-                parent_tip,
-                timestamp,
-                args.miner_id,
-                block_transactions.clone(),
-                next_height,
-                MAX_QZBE_MINING_ATTEMPTS,
-                &authenticator,
-                || false,
-            )
-            .map_err(|error| format!("mine bounded QZBE block at height {next_height}: {error}"))?;
+        let mut mining_ingress_error = None;
+        let mining_result = store.fork_choice().mine_candidate_on(
+            parent_tip,
+            timestamp,
+            args.miner_id,
+            block_transactions.clone(),
+            next_height,
+            MAX_QZBE_MINING_ATTEMPTS,
+            &authenticator,
+            || match accept_one_tx_connection_for_mining_interrupt(
+                tx_listener.as_ref(),
+                &mut pending_tx_connections,
+            ) {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    mining_ingress_error = Some(error);
+                    true
+                }
+            },
+        );
+        if let Some(error) = mining_ingress_error {
+            return Err(error);
+        }
+        let encoded = match mining_result {
+            Ok(encoded) => encoded,
+            Err(ai_native_l1_pow_bench::monetary_pow_v04_candidate::V04ExecutionPowError::MiningCancelled)
+                if !pending_tx_connections.is_empty() =>
+            {
+                eprintln!("event=qzbe_v04_mining_yielded_to_transaction_ingress height={} pending_connections={}", next_height, pending_tx_connections.len());
+                poll_tx_connections(
+                    tx_listener.as_ref(),
+                    &mut pending_tx_connections,
+                    &store,
+                    &authenticator,
+                    &mut mempool,
+                    &mut tx_submission_count,
+                    &secret,
+                    &args.network_id,
+                    &profile_id,
+                    &args.peers,
+                    &args.trusted_peer_keys,
+                    &mut relayed_tx_count,
+                )?;
+                reconcile_pending_mempool(&store, &authenticator, &mut mempool)?;
+                continue;
+            }
+            Err(error) => return Err(format!("mine bounded QZBE block at height {next_height}: {error}")),
+        };
         let outcome: V04ExecutionForkChoiceOutcome = store
             .submit(&encoded, &checkpoint_context, &authenticator)
             .map_err(|error| format!("submit locally mined QZBE block: {error}"))?;
@@ -1418,6 +1757,7 @@ fn run(args: Args) -> Result<(), String> {
         if removed_transactions != block_transactions.len() {
             return Err(format!("QZBE mempool inclusion accounting mismatch: selected={} removed={removed_transactions}", block_transactions.len()));
         }
+        mined_blocks = mined_blocks.saturating_add(1);
         let current = snapshot(&store)?;
         for (index, peer) in args.peers.iter().enumerate() {
             send_candidate(
@@ -1448,15 +1788,26 @@ fn run(args: Args) -> Result<(), String> {
                 &mut store,
                 &checkpoint_context,
                 &authenticator,
+                &mut mempool,
+                &args.peers,
+                &args.trusted_peer_keys,
+                &mut relayed_tx_count,
                 &mut accepted_count,
                 &mut message_count,
             )?;
             poll_tx_connections(
                 tx_listener.as_ref(),
+                &mut pending_tx_connections,
                 &store,
                 &authenticator,
                 &mut mempool,
                 &mut tx_submission_count,
+                &secret,
+                &args.network_id,
+                &profile_id,
+                &args.peers,
+                &args.trusted_peer_keys,
+                &mut relayed_tx_count,
             )?;
             reconcile_pending_mempool(&store, &authenticator, &mut mempool)?;
             if args
