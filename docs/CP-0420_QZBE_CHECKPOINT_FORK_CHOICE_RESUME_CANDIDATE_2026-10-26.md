@@ -22,7 +22,7 @@ The focused CP-0419/0420 checkpoint test module passed **7/7** after separating 
 5. Replays that suffix from the same checkpoint and verifies identical canonical tip, state root and cumulative work.
 6. Constructs and round-trips the next checkpoint from the post-block canonical branch, checking height, state root, total-mined counter, cumulative work and target-history height against the live fork-choice state.
 
-The candidate uses a synthetic trusted checkpoint fixture; no claim is made that the preceding 2,016 QZBE proof-of-work blocks were actually produced. This checkpoint graph is in-memory only until CP-0421's separate durable suffix-store candidate is selected and integrated into the live node.
+The candidate uses a synthetic trusted checkpoint fixture; no claim is made that the preceding 2,016 QZBE proof-of-work blocks were actually produced. The checkpoint graph API is now used by CP-0421's durable suffix-store candidate in the explicit loopback QZBE runtime. The runtime currently constructs its trust base at Genesis; non-Genesis checkpoint selection and external anti-rollback anchoring remain unimplemented.
 
 cargo +stable fmt --manifest-path src/native/pow_bench/Cargo.toml --all -- --check, cargo +stable check --manifest-path src/native/pow_bench/Cargo.toml --all-targets --locked, and the independent CP-0419 Genesis checkpoint oracle all passed locally. The parent commit 9c78832123e37b5ccb646ee7cb0756c542ead155 passed exact-head GitHub Actions run 40377595429 (Linux full suite/check and Windows integration); that result does not cover the current CP-0420 edits. New exact-head CI must pass before this checkpoint is considered validated.
 

@@ -303,6 +303,12 @@ impl V04ExecutionCheckpointForkStoreCandidate {
     pub fn canonical_tip(&self) -> [u8; 32] {
         self.fork_choice.canonical_tip()
     }
+    pub fn canonical_state_root(&self) -> Result<[u8; 32], V04CheckpointForkStoreError> {
+        self.fork_choice
+            .canonical_state()
+            .state_root()
+            .map_err(|error| V04CheckpointForkStoreError::Pow(V04ExecutionPowError::from(error)))
+    }
     pub fn generation(&self) -> u64 {
         self.generation
     }

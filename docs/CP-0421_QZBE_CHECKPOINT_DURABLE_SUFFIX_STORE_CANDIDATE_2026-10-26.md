@@ -2,7 +2,7 @@
 
 Date: 2026-10-26
 
-Status: **local durable-store candidate and focused tests pass; exact-head CI pending; not integrated with the live QZBE node**
+Status: **local durable-store candidate and focused tests pass; wired to the explicit loopback QZBE runtime candidate; exact-head CI pending; no external anti-rollback provider**
 
 ## Scope
 
@@ -28,11 +28,11 @@ The checkpoint is also the root of this bounded suffix. Reorganizations that div
 
 ## Local validation target
 
-The focused store test opens a Genesis checkpoint, mines and commits one QZBE envelope, closes the store, confirms a mutated checkpoint is refused, then reopens with the exact original trusted checkpoint and asserts matching height, canonical tip and state root after durable replay. The full locked/offline all-target suite and exact-head GitHub Actions are required before the change is promoted.
+The focused store tests open a Genesis checkpoint and a synthetic height-2,016 checkpoint, commit blocks including height 2,017, and reopen/replay to matching canonical tip and state root. They also reject a mutated supplied checkpoint, a manifest with bad checksum, and tampered branch bytes. The full locked/offline all-target suite and exact-head GitHub Actions are required before the change is promoted. The QZBE loopback runtime now starts from a locally generated canonical Genesis checkpoint and uses this store for ingress, local block commit and restart/replay; it does not select a non-Genesis checkpoint from a local file.
 
 ## Still missing
 
-- Integration of checkpoint manifests into the running QZBE peer node and its startup/recovery life cycle.
+- Integration into the default PTB2/PFS2 node lifecycle and acceptance of an independently certified non-Genesis checkpoint; the store is only wired into the explicit loopback QZBE runtime candidate.
 - Independent durable provider-side compare-and-swap anchor, signed receipts, crash/timeout/lost-response and multi-host stale-restore tests.
 - A production reorg/checkpoint finality policy and tests with real competing branches around checkpoint boundaries.
 - Mainnet wallet/custody, transaction API/mempool, public ingress/discovery, multi-operator public devnet, observability and independent release/security qualification.

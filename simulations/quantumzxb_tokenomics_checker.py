@@ -44,6 +44,7 @@ checkpoint_source = load("src/native/pow_bench/src/monetary_pow_v04_checkpoint_c
 checkpoint_fork_choice = load("src/native/pow_bench/src/monetary_pow_v04_candidate.rs")
 checkpoint_store = load("src/native/pow_bench/src/monetary_pow_v04_checkpoint_store_candidate.rs")
 checkpoint_oracle = load("simulations/cp0419_qzbe_checkpoint_oracle.py")
+peer_runtime = load("src/native/pow_bench/src/bin/qzbe_v04_peer_node.rs")
 workflow = load(".github/workflows/rust-ci.yml")
 assert "pub const QZXB_V04_INITIAL_SUBSIDY_ATOMS: u128 = 35_673_515_981;" in issuance_source
 assert "pub const QZXB_V04_BLOCKS_PER_HALVING: u64 = 4_204_800;" in issuance_source
@@ -74,6 +75,12 @@ assert "pub fn submit" in checkpoint_store
 assert "checkpoint_store_commits_suffix_and_reopens_only_with_exact_trusted_checkpoint" in checkpoint_store
 assert "checkpoint_store_persists_and_replays_block_2017_from_trusted_checkpoint_2016" in checkpoint_store
 assert "monetary_pow_v04_checkpoint_store_candidate" in workflow
+assert "V04ExecutionCheckpointForkStoreCandidate::open_from_trusted_checkpoint" in peer_runtime
+assert "QzbeCheckpointRecord::from_state" in peer_runtime
+assert ".submit(&encoded, &checkpoint_context, &authenticator)" in peer_runtime
+assert "V04ExecutionForkStoreCandidate" not in peer_runtime
+assert '"branches" | "manifests" | "checkpoints"' in peer_runtime
+assert '"qzbe-store.lock" | "qzbe-checkpoint-store.lock"' in peer_runtime
 
 for label, (percent, amount) in BUCKETS.items():
     assert label in policy and f"{amount:,}" in policy, f"policy missing {label}/{amount}"
@@ -111,4 +118,4 @@ print("QZXB_TOKENOMICS_V04_CHECK=PASS")
 print(f"cap={CAP}; buckets={len(BUCKETS)}; percentages={sum(p for p, _ in BUCKETS.values())}; amounts={sum(n for _, n in BUCKETS.values())}")
 print("founder=1000000000 (10%); old_4B_policy=historical_only; gross_issuance_and_burn=distinct")
 print(f"mining_emission_atoms={cumulative_mining_atoms}; unissued_mining_residual_atoms={mining_residual_atoms}")
-print("readme_site_whitepaper_roadmap_policy=checked; rust_schedule_is_pinned; qzbe_default_pow_time_multi_peer_checkpoint_durable_replay=checked; gate_2_and_gate_8_remain_open")
+print("readme_site_whitepaper_roadmap_policy=checked; rust_schedule_is_pinned; qzbe_checkpoint_store_runtime_multi_peer_durable_replay=checked; gate_2_and_gate_8_remain_open")

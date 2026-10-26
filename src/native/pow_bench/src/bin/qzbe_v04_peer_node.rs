@@ -15,11 +15,15 @@ use ai_native_l1_pow_bench::{
         qzbe_pow_digest, V04ExecutionForkChoiceOutcome, V04ExecutionPowEnvelope,
         MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES, MAX_QZBE_MINING_ATTEMPTS,
     },
-    monetary_pow_v04_store_candidate::V04ExecutionForkStoreCandidate,
+    monetary_pow_v04_checkpoint_candidate::{
+        QzbeCheckpointRecord, QzbeCheckpointValidationContext,
+    },
+    monetary_pow_v04_checkpoint_store_candidate::V04ExecutionCheckpointForkStoreCandidate,
     monetary_transition_v04_candidate::{
         MonetaryLedgerStateV04TransitionCandidate, V04ConsensusProfileCandidate,
     },
     noise_key_provisioning::load_protected_noise_private_key,
+    private_testnet_driver::TargetHistory,
     state_machine::{AccountId, Transaction},
     transaction_auth::{
         account_id_from_public_key, AccountPublicKey, Ed25519TransactionAuthenticator,
@@ -589,13 +593,13 @@ fn require_dedicated_store_directory(
             .file_type()
             .map_err(|error| format!("inspect QZBE store entry {name}: {error}"))?;
         match name.as_str() {
-            "branches" | "manifests" => {
+            "branches" | "manifests" | "checkpoints" => {
                 if kind.is_symlink() || !kind.is_dir() {
                     return Err(format!("QZBE path {name} must be a real directory"));
                 }
                 store_artifacts_present = true;
             }
-            "qzbe-store.lock" => {
+            "qzbe-store.lock" | "qzbe-checkpoint-store.lock" => {
                 if kind.is_symlink() || !kind.is_file() {
                     return Err("QZBE store lock must be a regular non-symlink file".into());
                 }
@@ -704,7 +708,7 @@ fn prepare_profile(
     Ok((manifest, profile, genesis, params))
 }
 
-fn snapshot(store: &V04ExecutionForkStoreCandidate) -> Result<Snapshot, String> {
+fn snapshot(store: &V04ExecutionCheckpointForkStoreCandidate) -> Result<Snapshot, String> {
     Ok(Snapshot {
         height: store.canonical_height(),
         tip: store.canonical_tip(),
@@ -906,7 +910,7 @@ fn send_rejection_probe(
     Ok(())
 }
 
-fn observed_balance(store: &V04ExecutionForkStoreCandidate, account: &AccountId) -> u64 {
+fn observed_balance(store: &V04ExecutionCheckpointForkStoreCandidate, account: &AccountId) -> u64 {
     store
         .fork_choice()
         .canonical_state()
@@ -923,7 +927,8 @@ fn serve_connection(
     trusted_peer_keys: &[[u8; 32]],
     network_id: &[u8; 32],
     profile: &[u8; 32],
-    store: &mut V04ExecutionForkStoreCandidate,
+    store: &mut V04ExecutionCheckpointForkStoreCandidate,
+    checkpoint_context: &QzbeCheckpointValidationContext<'_>,
     authenticator: &Ed25519TransactionAuthenticator,
     accepted_count: &mut u64,
 ) -> Result<(), String> {
@@ -941,7 +946,7 @@ fn serve_connection(
     let candidate = session
         .read_record(&mut stream)
         .map_err(|error| format!("read encrypted QZBE candidate: {error}"))?;
-    let (status, digest) = match store.submit(&candidate, authenticator) {
+    let (status, digest) = match store.submit(&candidate, checkpoint_context, authenticator) {
         Ok(outcome) => (0u8, outcome.block_digest),
         Err(error) => {
             eprintln!(
@@ -970,7 +975,8 @@ fn poll_connections(
     trusted_peer_keys: &[[u8; 32]],
     network_id: &[u8; 32],
     profile: &[u8; 32],
-    store: &mut V04ExecutionForkStoreCandidate,
+    store: &mut V04ExecutionCheckpointForkStoreCandidate,
+    checkpoint_context: &QzbeCheckpointValidationContext<'_>,
     authenticator: &Ed25519TransactionAuthenticator,
     accepted_count: &mut u64,
     message_count: &mut u64,
@@ -990,6 +996,7 @@ fn poll_connections(
                     network_id,
                     profile,
                     store,
+                    checkpoint_context,
                     authenticator,
                     accepted_count,
                 ) {
@@ -1007,6 +1014,24 @@ fn poll_connections(
 fn run(args: Args) -> Result<(), String> {
     let authenticator = configured_authenticator(&args)?;
     let (manifest, profile, genesis, params) = prepare_profile(&args)?;
+    let checkpoint_context = QzbeCheckpointValidationContext {
+        manifest: &manifest,
+        profile: &profile,
+        params: &params,
+    };
+    let genesis_target_history = TargetHistory::new(params.clone())
+        .map_err(|error| format!("construct QZBE Genesis target history: {error}"))?
+        .checkpoint_snapshot()
+        .map_err(|error| format!("snapshot QZBE Genesis target history: {error}"))?;
+    let genesis_checkpoint = QzbeCheckpointRecord::from_state(
+        &checkpoint_context,
+        &genesis,
+        genesis.ledger().tip_hash(),
+        Uint256::ZERO,
+        [0; 32],
+        genesis_target_history,
+    )
+    .map_err(|error| format!("construct canonical QZBE Genesis checkpoint: {error}"))?;
     let profile_id = *profile.profile_fingerprint();
     let genesis_id = manifest
         .manifest_hash()
@@ -1022,13 +1047,14 @@ fn run(args: Args) -> Result<(), String> {
         .map_err(|error| format!("load protected QZBE Noise private key: {error}"))?;
     let secret = SecretKey(raw_key);
     raw_key.fill(0);
-    let mut store = V04ExecutionForkStoreCandidate::open(
+    let mut store = V04ExecutionCheckpointForkStoreCandidate::open_from_trusted_checkpoint(
         &args.data_dir,
-        genesis.clone(),
+        genesis_checkpoint.clone(),
+        &checkpoint_context,
         params.clone(),
         &authenticator,
     )
-    .map_err(|error| format!("open local QZBE candidate store: {error}"))?;
+    .map_err(|error| format!("open checkpoint-rooted local QZBE store: {error}"))?;
     let initial = snapshot(&store)?;
     let listener = TcpListener::bind(args.listen)
         .map_err(|error| format!("bind loopback QZBE listener {}: {error}", args.listen))?;
@@ -1099,6 +1125,7 @@ fn run(args: Args) -> Result<(), String> {
             &args.network_id,
             &profile_id,
             &mut store,
+            &checkpoint_context,
             &authenticator,
             &mut accepted_count,
             &mut message_count,
@@ -1131,7 +1158,7 @@ fn run(args: Args) -> Result<(), String> {
             )
             .map_err(|error| format!("mine bounded QZBE block at height {next_height}: {error}"))?;
         let outcome: V04ExecutionForkChoiceOutcome = store
-            .submit(&encoded, &authenticator)
+            .submit(&encoded, &checkpoint_context, &authenticator)
             .map_err(|error| format!("submit locally mined QZBE block: {error}"))?;
         if !outcome.canonical_changed || outcome.canonical_height != next_height {
             return Err(format!(
@@ -1167,6 +1194,7 @@ fn run(args: Args) -> Result<(), String> {
                 &args.network_id,
                 &profile_id,
                 &mut store,
+                &checkpoint_context,
                 &authenticator,
                 &mut accepted_count,
                 &mut message_count,
@@ -1188,9 +1216,14 @@ fn run(args: Args) -> Result<(), String> {
     drop(store);
     drop(secret);
     // A new store instance verifies persistent manifest replay and catches any in-memory-only state.
-    let replayed =
-        V04ExecutionForkStoreCandidate::open(&args.data_dir, genesis, params, &authenticator)
-            .map_err(|error| format!("reopen/replay QZBE store: {error}"))?;
+    let replayed = V04ExecutionCheckpointForkStoreCandidate::open_from_trusted_checkpoint(
+        &args.data_dir,
+        genesis_checkpoint,
+        &checkpoint_context,
+        params.clone(),
+        &authenticator,
+    )
+    .map_err(|error| format!("reopen/replay checkpoint-rooted QZBE store: {error}"))?;
     let final_snapshot = snapshot(&replayed)?;
     if final_snapshot != expected_final {
         return Err(format!(
