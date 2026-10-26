@@ -41,6 +41,8 @@ loopback_0414 = load("simulations/cp0414_qzbe_authenticated_transaction_loopback
 loopback_0415 = load("simulations/cp0415_devnet_qzbe_dispatch_transaction_loopback.ps1")
 loopback_0418 = load("simulations/cp0418_qzbe_three_node_multi_peer_loopback.ps1")
 checkpoint_source = load("src/native/pow_bench/src/monetary_pow_v04_checkpoint_candidate.rs")
+checkpoint_fork_choice = load("src/native/pow_bench/src/monetary_pow_v04_candidate.rs")
+checkpoint_store = load("src/native/pow_bench/src/monetary_pow_v04_checkpoint_store_candidate.rs")
 checkpoint_oracle = load("simulations/cp0419_qzbe_checkpoint_oracle.py")
 workflow = load(".github/workflows/rust-ci.yml")
 assert "pub const QZXB_V04_INITIAL_SUBSIDY_ATOMS: u128 = 35_673_515_981;" in issuance_source
@@ -61,6 +63,16 @@ assert "pub const QZBE_CHECKPOINT_SCHEMA_VERSION: u16 = 1;" in checkpoint_source
 assert "bounded_history_checkpoint_restores_exact_default_retarget_at_height_2017" in checkpoint_source
 assert "EXPECTED_COMMITMENT" in checkpoint_oracle
 assert "cp0419_qzbe_checkpoint_oracle.py" in workflow
+assert "pub fn from_checkpoint_record(" in checkpoint_fork_choice
+assert "pub fn rebuild_from_checkpoint(" in checkpoint_fork_choice
+assert "pub fn canonical_checkpoint_record(" in checkpoint_fork_choice
+assert "checkpoint_fork_choice_mines_and_accepts_actual_qzbe_block_at_height_2017" in checkpoint_source
+assert "next_checkpoint.cumulative_chainwork" in checkpoint_source
+assert "MAX_V04_CHECKPOINT_SUFFIX_ARCHIVE_BYTES" in checkpoint_fork_choice
+assert "pub fn open_from_trusted_checkpoint" in checkpoint_store
+assert "pub fn submit" in checkpoint_store
+assert "checkpoint_store_commits_suffix_and_reopens_only_with_exact_trusted_checkpoint" in checkpoint_store
+assert "monetary_pow_v04_checkpoint_store_candidate" in workflow
 
 for label, (percent, amount) in BUCKETS.items():
     assert label in policy and f"{amount:,}" in policy, f"policy missing {label}/{amount}"
@@ -98,4 +110,4 @@ print("QZXB_TOKENOMICS_V04_CHECK=PASS")
 print(f"cap={CAP}; buckets={len(BUCKETS)}; percentages={sum(p for p, _ in BUCKETS.values())}; amounts={sum(n for _, n in BUCKETS.values())}")
 print("founder=1000000000 (10%); old_4B_policy=historical_only; gross_issuance_and_burn=distinct")
 print(f"mining_emission_atoms={cumulative_mining_atoms}; unissued_mining_residual_atoms={mining_residual_atoms}")
-print("readme_site_whitepaper_roadmap_policy=checked; rust_schedule_is_pinned; qzbe_default_pow_time_multi_peer_checkpoint=checked; gate_2_and_gate_8_remain_open")
+print("readme_site_whitepaper_roadmap_policy=checked; rust_schedule_is_pinned; qzbe_default_pow_time_multi_peer_checkpoint_durable_replay=checked; gate_2_and_gate_8_remain_open")

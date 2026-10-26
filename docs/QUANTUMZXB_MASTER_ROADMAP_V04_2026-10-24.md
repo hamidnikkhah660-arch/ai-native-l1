@@ -18,6 +18,10 @@ CP-0418 extends the isolated QZBE runtime to accept a bounded static set of pinn
 
 CP-0419 adds a versioned QZBE checkpoint-record codec for profile-bound QZP4 state, QZBE tip/chainwork, and the canonical bounded target/timestamp history. A byte-level Genesis vector is checked in Rust and independently parsed/hashed by Python; six focused tests pass, including restoring the actual 2,016-block target history at height 2,016 and reproducing the expected first default retarget for height 2,017. This is not yet integrated with the QZBE durable store or pruning/reorg policy, so the 1,024 logical-height cap remains unchanged and long-term mining is not yet enabled.
 
+CP-0420 builds on the CP-0419 checkpoint record by adding a checkpoint-based in-memory QZBE fork-choice constructor, bounded suffix replay, and canonical checkpoint production from a selected branch. The new local test loads a height-2,016 state/history fixture, mines and admits a QZBE block at height 2,017, rebuilds the same suffix from the checkpoint and matches tip/root/chainwork, then creates a successor checkpoint directly from live state metadata. The test's checkpoint tip and chainwork are explicit trusted fixtures, not evidence that 2,016 preceding QZBE PoW blocks were actually mined. The persistent store still replays from Genesis and retains its absolute 1,024-height limit; no production checkpoint trust or anti-rollback provider is integrated.
+
+CP-0421 adds a separate durable QZBE suffix-store candidate rooted at a caller-supplied trusted checkpoint. It stores canonical checkpoint bytes by commitment, persists immutable QZBE envelope bytes, and commits versioned manifests binding checkpoint/profile/consensus metadata plus canonical tip/root/mined counter/chainwork and all suffix hashes. On reopen it requires the same externally supplied checkpoint, verifies the manifest and branch bytes, then replays the bounded suffix and compares canonical state. Its local test is being wired into CI. This does not add an independent external CAS provider or establish protection against whole-directory rollback; it is not wired into the running node, and checkpoint-crossing reorg/finality policy remains unresolved.
+
 Passing tests are necessary engineering evidence, not evidence that the current monetary candidate is active in the canonical node, a production network exists, or the coin has been issued or can be traded.
 
 ## Gate scoreboard
@@ -104,6 +108,8 @@ The Sepolia QX asset is a separate testnet asset, not native QZXB. The proposed 
 - [CP-0417 QZBE v0.4 default PoW and monotonic timestamp hardening](CP-0417_QZBE_V04_DEFAULT_POW_TIMESTAMP_RUNTIME_CANDIDATE_2026-10-26.md)
 - [CP-0418 QZBE three-node static multi-peer loopback](CP-0418_QZBE_THREE_NODE_STATIC_MULTI_PEER_LOOPBACK_2026-10-26.md)
 - [CP-0419 QZBE bounded checkpoint record candidate](CP-0419_QZBE_BOUNDED_CHECKPOINT_RECORD_CANDIDATE_2026-10-26.md)
+- [CP-0420 QZBE checkpoint-based fork-choice resume candidate](CP-0420_QZBE_CHECKPOINT_FORK_CHOICE_RESUME_CANDIDATE_2026-10-26.md)
+- [CP-0421 QZBE checkpoint-base durable suffix store candidate](CP-0421_QZBE_CHECKPOINT_DURABLE_SUFFIX_STORE_CANDIDATE_2026-10-26.md)
 - [G0 public-launch and compliance checklist](CP_0372_G0_PUBLIC_LAUNCH_COMPLIANCE_CHECKLIST_2026-10-22.md)
 - [Owner directive: zero-budget launch and real liquidity](OWNER_DIRECTIVE_ZERO_BUDGET_LAUNCH_AND_LIQUIDITY_GATE_V01_2026-10-21.md)
 

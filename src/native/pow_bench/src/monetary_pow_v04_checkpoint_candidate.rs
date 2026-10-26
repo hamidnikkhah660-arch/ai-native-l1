@@ -489,8 +489,17 @@ mod tests {
     use super::*;
     use crate::{
         monetary_issuance_v04_candidate::V04MiningIssuanceScheduleCandidate,
+        monetary_pow_v04_candidate::{V04ExecutionForkChoiceCandidate, MAX_QZBE_MINING_ATTEMPTS},
         monetary_transition_v04_candidate::V04ConsensusProfileCandidate,
+        state_machine::{AccountId, TransactionAuthenticator},
     };
+
+    struct NoTransactionAuth;
+    impl TransactionAuthenticator for NoTransactionAuth {
+        fn verify(&self, _: &AccountId, _: &[u8; 32], _: &[u8]) -> Result<(), ()> {
+            Err(())
+        }
+    }
 
     const NETWORK: [u8; 32] = [0x31; 32];
     const OWNER: [u8; 32] = [0xA7; 32];
@@ -700,6 +709,134 @@ mod tests {
         assert_eq!(
             restored.expected_target(2_017, None).unwrap(),
             expected_next_target
+        );
+    }
+
+    #[test]
+    fn checkpoint_fork_choice_mines_and_accepts_actual_qzbe_block_at_height_2017() {
+        let manifest = GenesisManifestV04::new(NETWORK, OWNER).unwrap();
+        let schedule = V04MiningIssuanceScheduleCandidate::new(SUBSIDY, HALVING).unwrap();
+        let profile =
+            V04ConsensusProfileCandidate::from_manifest_and_schedule(&manifest, schedule).unwrap();
+        let mut params = ConsensusParameters::candidate_testnet().unwrap();
+        params.initial_target = Uint256::from_be_bytes([0xEF; 32]);
+        params.pow_limit = Uint256::MAX;
+        params.pow.memory_kib = 8 * 1024;
+        params.validate().unwrap();
+        assert_eq!(params.difficulty_window_blocks, 2_016);
+        let ctx = context(&manifest, &profile, &params);
+
+        let mut state =
+            MonetaryLedgerStateV04TransitionCandidate::from_genesis_manifest(&manifest, &profile)
+                .unwrap();
+        let mut history = TargetHistory::new(params.clone()).unwrap();
+        for height in 1..=2_016u64 {
+            let timestamp = height * params.target_block_time_secs;
+            let block = state.build_next_block(timestamp, [0x23; 32]).unwrap();
+            state.apply_block(&block).unwrap();
+            let target = history.expected_target(height, None).unwrap();
+            history.record_next(height, target, timestamp).unwrap();
+        }
+        assert_eq!(state.ledger().height(), 2_016);
+        assert_eq!(history.height(), 2_016);
+        assert_eq!(
+            history.expected_target(2_017, None).unwrap(),
+            params.initial_target
+        );
+
+        // This is a trusted-checkpoint fixture: the test supplies its checkpoint identity and
+        // cumulative-work anchor. Production must obtain these from verified replay/external trust.
+        let checkpoint_tip = [0x91; 32];
+        let checkpoint = QzbeCheckpointRecord::from_state(
+            &ctx,
+            &state,
+            checkpoint_tip,
+            Uint256::ONE,
+            [0x42; 32],
+            history.checkpoint_snapshot().unwrap(),
+        )
+        .unwrap();
+        let mut fork_choice = V04ExecutionForkChoiceCandidate::from_checkpoint_record(
+            &checkpoint,
+            &ctx,
+            params.clone(),
+        )
+        .unwrap();
+        assert_eq!(fork_choice.canonical_height(), 2_016);
+        assert_eq!(fork_choice.genesis_tip(), [0; 32]);
+        assert_eq!(fork_choice.base_tip(), checkpoint_tip);
+        assert_eq!(fork_choice.canonical_tip(), checkpoint_tip);
+        assert_eq!(fork_choice.canonical_cumulative_work(), Uint256::ONE);
+        assert_eq!(
+            fork_choice.canonical_timestamp().unwrap(),
+            2_016 * params.target_block_time_secs
+        );
+
+        let encoded = fork_choice
+            .mine_candidate_on(
+                checkpoint_tip,
+                2_017 * params.target_block_time_secs,
+                [0x24; 32],
+                Vec::new(),
+                1,
+                MAX_QZBE_MINING_ATTEMPTS,
+                &NoTransactionAuth,
+                || false,
+            )
+            .unwrap();
+        let admitted = fork_choice
+            .insert_encoded(&encoded, &NoTransactionAuth)
+            .unwrap();
+        assert!(admitted.canonical_changed);
+        let replayed = V04ExecutionForkChoiceCandidate::rebuild_from_checkpoint(
+            &checkpoint,
+            &ctx,
+            params.clone(),
+            vec![encoded.clone()],
+            &NoTransactionAuth,
+        )
+        .unwrap();
+        assert_eq!(replayed.canonical_tip(), fork_choice.canonical_tip());
+        assert_eq!(
+            replayed.canonical_state().state_root().unwrap(),
+            fork_choice.canonical_state().state_root().unwrap()
+        );
+        assert_eq!(
+            replayed.canonical_cumulative_work(),
+            fork_choice.canonical_cumulative_work()
+        );
+        assert_eq!(admitted.canonical_height, 2_017);
+        assert_eq!(fork_choice.canonical_height(), 2_017);
+        assert_eq!(fork_choice.canonical_state().ledger().height(), 2_017);
+        assert!(
+            fork_choice.canonical_cumulative_work() > Uint256::ONE,
+            "work from the checkpoint must be retained and augmented by the new QZBE block"
+        );
+        let checkpoint_commitment = checkpoint.commitment(&ctx).unwrap();
+        let next_checkpoint = fork_choice
+            .canonical_checkpoint_record(&ctx, checkpoint_commitment)
+            .unwrap();
+        assert_eq!(next_checkpoint.logical_height, 2_017);
+        assert_eq!(
+            next_checkpoint.state_root,
+            fork_choice.canonical_state().state_root().unwrap()
+        );
+        assert_eq!(
+            next_checkpoint.total_mined_atoms,
+            fork_choice.canonical_state().total_mined_atoms()
+        );
+        assert_eq!(
+            next_checkpoint.cumulative_chainwork,
+            fork_choice.canonical_cumulative_work()
+        );
+        assert_eq!(
+            next_checkpoint.target_history.logical_height,
+            fork_choice.canonical_height()
+        );
+        let encoded_next_checkpoint = next_checkpoint.encode(&ctx).unwrap();
+        assert_eq!(
+            QzbeCheckpointRecord::decode(&encoded_next_checkpoint, &ctx).unwrap(),
+            next_checkpoint
         );
     }
 

@@ -5,6 +5,9 @@
 //! chainwork and replay rules. A caller must supply the exact monetary profile and consensus
 //! parameters; this module has no Mainnet defaults and is not a persistent branch store.
 
+use crate::monetary_pow_v04_checkpoint_candidate::{
+    QzbeCheckpointError, QzbeCheckpointRecord, QzbeCheckpointValidationContext,
+};
 use crate::{
     consensus::{
         block_work, compare_chain_tips, pow_digest, ChainTip, ConsensusError, ConsensusParameters,
@@ -36,6 +39,7 @@ pub const MAX_V04_EXECUTION_FORK_ARCHIVE_HEIGHT: u64 = 1_024;
 /// Hard cap on work performed by one candidate-mining call. Callers can use the cancellation
 /// predicate for a stricter wall-clock or operator policy.
 pub const MAX_QZBE_MINING_ATTEMPTS: u32 = 4_096;
+const MAX_V04_CHECKPOINT_SUFFIX_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum V04ExecutionPowError {
@@ -56,6 +60,8 @@ pub enum V04ExecutionPowError {
     MiningCancelled,
     MiningExhausted,
     MiningNonceOverflow,
+    Checkpoint(QzbeCheckpointError),
+    CheckpointHistory(crate::private_testnet_driver::TargetHistoryCheckpointError),
 }
 
 impl std::fmt::Display for V04ExecutionPowError {
@@ -77,6 +83,16 @@ impl From<ConsensusError> for V04ExecutionPowError {
 impl From<PrivateConsensusError> for V04ExecutionPowError {
     fn from(value: PrivateConsensusError) -> Self {
         Self::History(value)
+    }
+}
+impl From<QzbeCheckpointError> for V04ExecutionPowError {
+    fn from(value: QzbeCheckpointError) -> Self {
+        Self::Checkpoint(value)
+    }
+}
+impl From<crate::private_testnet_driver::TargetHistoryCheckpointError> for V04ExecutionPowError {
+    fn from(value: crate::private_testnet_driver::TargetHistoryCheckpointError) -> Self {
+        Self::CheckpointHistory(value)
     }
 }
 
@@ -382,10 +398,15 @@ impl StoredV04ExecutionBranch {
 /// branch storage, external anti-rollback anchoring and canonical node listener wiring remain open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V04ExecutionForkChoiceCandidate {
-    genesis: MonetaryLedgerStateV04TransitionCandidate,
+    base_state: MonetaryLedgerStateV04TransitionCandidate,
     profile: V04ConsensusProfileCandidate,
     params: ConsensusParameters,
+    /// Original monetary Genesis ledger tip; remains stable for callers even on a checkpoint base.
     genesis_tip: [u8; 32],
+    /// Trusted tip at the root of this bounded in-memory segment (Genesis or a checkpoint).
+    base_tip: [u8; 32],
+    genesis_cumulative_work: Uint256,
+    genesis_target_history: TargetHistory,
     canonical_tip: [u8; 32],
     branches: BTreeMap<[u8; 32], StoredV04ExecutionBranch>,
     reorg_count: u64,
@@ -400,12 +421,68 @@ impl V04ExecutionForkChoiceCandidate {
         params.validate()?;
         let genesis_tip = genesis.ledger().tip_hash();
         let profile = genesis.profile().clone();
+        let genesis_target_history = TargetHistory::new(params.clone())?;
         Ok(Self {
-            genesis,
+            base_state: genesis,
             profile,
             params,
             genesis_tip,
+            base_tip: genesis_tip,
+            genesis_cumulative_work: Uint256::ZERO,
+            genesis_target_history,
             canonical_tip: genesis_tip,
+            branches: BTreeMap::new(),
+            reorg_count: 0,
+        })
+    }
+
+    /// Start a bounded QZBE fork-choice segment from a fully validated checkpoint.
+    ///
+    /// The checkpoint is checked against the caller's explicit Genesis, monetary profile and PoW
+    /// parameters before accepting its state, target history, QZBE tip and chainwork. This method
+    /// does not authenticate ancestry or freshness; use it only after validating checkpoint trust
+    /// independently, such as replay from Genesis or an independently trusted checkpoint anchor.
+    pub fn from_checkpoint_record(
+        checkpoint: &QzbeCheckpointRecord,
+        context: &QzbeCheckpointValidationContext<'_>,
+        params: ConsensusParameters,
+    ) -> Result<Self, V04ExecutionPowError> {
+        checkpoint.validate(context)?;
+        params.validate()?;
+        if pow_consensus_profile_fingerprint(&params)? != checkpoint.consensus_profile_fingerprint
+            || params != *context.params
+        {
+            return Err(V04ExecutionPowError::ConsensusProfileMismatch);
+        }
+        let state = MonetaryLedgerStateV04TransitionCandidate::decode_snapshot(
+            &checkpoint.state_snapshot,
+            context.manifest,
+            context.profile,
+        )?;
+        let genesis_target_history =
+            TargetHistory::from_checkpoint_snapshot(params.clone(), &checkpoint.target_history)?;
+        if state.ledger().height() != checkpoint.logical_height
+            || genesis_target_history.height() != checkpoint.logical_height
+        {
+            return Err(V04ExecutionPowError::Checkpoint(
+                QzbeCheckpointError::StateMetadataMismatch,
+            ));
+        }
+        let genesis_state = MonetaryLedgerStateV04TransitionCandidate::from_genesis_manifest(
+            context.manifest,
+            context.profile,
+        )?;
+        let genesis_tip = genesis_state.ledger().tip_hash();
+        let profile = state.profile().clone();
+        Ok(Self {
+            base_state: state,
+            profile,
+            params,
+            genesis_tip,
+            base_tip: checkpoint.consensus_tip_digest,
+            genesis_cumulative_work: checkpoint.cumulative_chainwork,
+            genesis_target_history,
+            canonical_tip: checkpoint.consensus_tip_digest,
             branches: BTreeMap::new(),
             reorg_count: 0,
         })
@@ -423,6 +500,12 @@ impl V04ExecutionForkChoiceCandidate {
         self.genesis_tip
     }
 
+    /// Tip used as the trusted root of this in-memory segment. It may be a checkpoint and is
+    /// not necessarily the original Genesis tip returned by genesis_tip().
+    pub fn base_tip(&self) -> [u8; 32] {
+        self.base_tip
+    }
+
     pub fn canonical_height(&self) -> u64 {
         self.canonical_state().ledger().height()
     }
@@ -430,8 +513,13 @@ impl V04ExecutionForkChoiceCandidate {
     /// Timestamp of the currently selected canonical QZBE header. Genesis has timestamp zero.
     /// Values come only from previously validated envelopes retained in this branch graph.
     pub fn canonical_timestamp(&self) -> Result<u64, V04ExecutionPowError> {
-        if self.canonical_tip == self.genesis_tip {
-            return Ok(0);
+        if self.canonical_tip == self.base_tip {
+            let snapshot = self.genesis_target_history.checkpoint_snapshot()?;
+            return Ok(snapshot
+                .entries
+                .last()
+                .and_then(|entry| entry.timestamp)
+                .unwrap_or(0));
         }
         let branch = self
             .branches
@@ -443,8 +531,8 @@ impl V04ExecutionForkChoiceCandidate {
     }
 
     pub fn canonical_state(&self) -> &MonetaryLedgerStateV04TransitionCandidate {
-        if self.canonical_tip == self.genesis_tip {
-            &self.genesis
+        if self.canonical_tip == self.base_tip {
+            &self.base_state
         } else {
             &self.branches[&self.canonical_tip].state
         }
@@ -452,6 +540,52 @@ impl V04ExecutionForkChoiceCandidate {
 
     pub fn reorg_count(&self) -> u64 {
         self.reorg_count
+    }
+
+    /// Cumulative work at the selected canonical tip, including work represented by a trusted
+    /// checkpoint base when this graph was constructed from a checkpoint.
+    pub fn canonical_cumulative_work(&self) -> Uint256 {
+        self.branch_work(&self.canonical_tip)
+            .unwrap_or(self.genesis_cumulative_work)
+    }
+
+    /// Canonical branch-derived target/timestamp history needed for a bounded future checkpoint.
+    pub fn canonical_target_history_checkpoint(
+        &self,
+    ) -> Result<crate::private_testnet_driver::TargetHistoryCheckpoint, V04ExecutionPowError> {
+        if self.canonical_tip == self.base_tip {
+            Ok(self.genesis_target_history.checkpoint_snapshot()?)
+        } else {
+            self.branches
+                .get(&self.canonical_tip)
+                .ok_or(V04ExecutionPowError::UnknownParent)?
+                .target_history
+                .checkpoint_snapshot()
+                .map_err(Into::into)
+        }
+    }
+
+    /// Create a checkpoint record from the selected canonical branch without caller-supplied
+    /// state-root, total-mined, chainwork, or target-history metadata. The parent commitment is
+    /// still supplied by the store/trust layer; this method cannot authenticate checkpoint ancestry.
+    pub fn canonical_checkpoint_record(
+        &self,
+        context: &QzbeCheckpointValidationContext<'_>,
+        parent_checkpoint_commitment: [u8; 32],
+    ) -> Result<QzbeCheckpointRecord, V04ExecutionPowError> {
+        if context.params != &self.params
+            || context.profile.profile_fingerprint() != self.profile.profile_fingerprint()
+        {
+            return Err(V04ExecutionPowError::ConsensusProfileMismatch);
+        }
+        Ok(QzbeCheckpointRecord::from_state(
+            context,
+            self.canonical_state(),
+            self.canonical_tip,
+            self.canonical_cumulative_work(),
+            parent_checkpoint_commitment,
+            self.canonical_target_history_checkpoint()?,
+        )?)
     }
 
     pub fn archive_len(&self) -> usize {
@@ -493,8 +627,8 @@ impl V04ExecutionForkChoiceCandidate {
         nonce: u64,
         authenticator: &A,
     ) -> Result<Vec<u8>, V04ExecutionPowError> {
-        let (parent_state, parent_history) = if parent_tip == self.genesis_tip {
-            (&self.genesis, TargetHistory::new(self.params.clone())?)
+        let (parent_state, parent_history) = if parent_tip == self.base_tip {
+            (&self.base_state, self.genesis_target_history.clone())
         } else {
             let branch = self
                 .branches
@@ -606,7 +740,10 @@ impl V04ExecutionForkChoiceCandidate {
         authenticator: &A,
     ) -> Result<V04ExecutionForkChoiceOutcome, V04ExecutionPowError> {
         let envelope = V04ExecutionPowEnvelope::decode(bytes, &self.profile, &self.params)?;
-        if envelope.header.height > MAX_V04_EXECUTION_FORK_ARCHIVE_HEIGHT {
+        let base_height = self.base_state.ledger().height();
+        if envelope.header.height <= base_height
+            || envelope.header.height - base_height > MAX_V04_EXECUTION_FORK_ARCHIVE_HEIGHT
+        {
             return Err(V04ExecutionPowError::BranchHeightExceeded);
         }
         let digest = verify_qzbe_pow(&envelope, &self.params)?;
@@ -630,12 +767,12 @@ impl V04ExecutionForkChoiceCandidate {
 
         let parent_tip = envelope.header.previous_consensus_hash;
         let (mut staged_state, mut staged_history, parent_work, expected_parent_ledger_tip) =
-            if parent_tip == self.genesis_tip {
+            if parent_tip == self.base_tip {
                 (
-                    self.genesis.clone(),
-                    TargetHistory::new(self.params.clone())?,
-                    Uint256::ZERO,
-                    self.genesis.ledger().tip_hash(),
+                    self.base_state.clone(),
+                    self.genesis_target_history.clone(),
+                    self.genesis_cumulative_work,
+                    self.base_state.ledger().tip_hash(),
                 )
             } else {
                 let parent = self
@@ -711,7 +848,7 @@ impl V04ExecutionForkChoiceCandidate {
         let (best_tip, best_chain_tip) = self.select_best_tip();
         let _best_height = best_chain_tip.height;
         if best_tip != previous_canonical_tip {
-            if previous_canonical_tip != self.genesis_tip
+            if previous_canonical_tip != self.base_tip
                 && !self.is_ancestor(previous_canonical_tip, best_tip)
             {
                 self.reorg_count = self.reorg_count.saturating_add(1);
@@ -731,11 +868,11 @@ impl V04ExecutionForkChoiceCandidate {
 
     fn select_best_tip(&self) -> ([u8; 32], ChainTip) {
         let genesis_chain_tip = ChainTip {
-            height: self.genesis.ledger().height(),
-            cumulative_work: Uint256::ZERO,
-            tip_hash: self.genesis_tip,
+            height: self.base_state.ledger().height(),
+            cumulative_work: self.genesis_cumulative_work,
+            tip_hash: self.base_tip,
         };
-        let mut best_digest = self.genesis_tip;
+        let mut best_digest = self.base_tip;
         let mut best_tip = genesis_chain_tip;
         for (digest, branch) in &self.branches {
             let chain_tip = branch.chain_tip(*digest);
@@ -748,14 +885,14 @@ impl V04ExecutionForkChoiceCandidate {
     }
 
     fn is_ancestor(&self, ancestor: [u8; 32], mut tip: [u8; 32]) -> bool {
-        if ancestor == self.genesis_tip {
+        if ancestor == self.base_tip {
             return true;
         }
         for _ in 0..=MAX_V04_EXECUTION_FORK_ARCHIVE_HEIGHT {
             if tip == ancestor {
                 return true;
             }
-            if tip == self.genesis_tip {
+            if tip == self.base_tip {
                 return false;
             }
             let Some(branch) = self.branches.get(&tip) else {
@@ -791,20 +928,63 @@ impl V04ExecutionForkChoiceCandidate {
         Ok(fork_choice)
     }
 
+    /// Rebuild a bounded suffix from a validated checkpoint and replay every retained envelope
+    /// through ordinary QZBE admission and cumulative-work fork choice. The checkpoint itself must
+    /// already be trusted; this method is not an ancestry proof or external anti-rollback anchor.
+    pub fn rebuild_from_checkpoint(
+        checkpoint: &QzbeCheckpointRecord,
+        context: &QzbeCheckpointValidationContext<'_>,
+        params: ConsensusParameters,
+        envelopes: impl IntoIterator<Item = Vec<u8>>,
+        authenticator: &impl TransactionAuthenticator,
+    ) -> Result<Self, V04ExecutionPowError> {
+        let profile = context.profile;
+        let base_height = checkpoint.logical_height;
+        let mut ordered = Vec::new();
+        let mut total_bytes = 0usize;
+        for bytes in envelopes {
+            if ordered.len() >= MAX_V04_EXECUTION_FORK_ARCHIVE_BLOCKS
+                || bytes.len() > MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES
+            {
+                return Err(V04ExecutionPowError::ArchiveCapacityExceeded);
+            }
+            total_bytes = total_bytes
+                .checked_add(bytes.len())
+                .ok_or(V04ExecutionPowError::ArchiveCapacityExceeded)?;
+            if total_bytes > MAX_V04_CHECKPOINT_SUFFIX_ARCHIVE_BYTES {
+                return Err(V04ExecutionPowError::ArchiveCapacityExceeded);
+            }
+            let envelope = V04ExecutionPowEnvelope::decode(&bytes, profile, &params)?;
+            if envelope.header.height <= base_height
+                || envelope.header.height - base_height > MAX_V04_EXECUTION_FORK_ARCHIVE_HEIGHT
+            {
+                return Err(V04ExecutionPowError::BranchHeightExceeded);
+            }
+            let digest = qzbe_pow_digest(&envelope.header, &envelope.block, &params)?;
+            ordered.push((envelope.header.height, digest, bytes));
+        }
+        ordered.sort_by_key(|(height, digest, _)| (*height, *digest));
+        let mut fork_choice = Self::from_checkpoint_record(checkpoint, context, params)?;
+        for (_, _, bytes) in ordered {
+            fork_choice.insert_encoded(&bytes, authenticator)?;
+        }
+        Ok(fork_choice)
+    }
+
     pub fn branch_state(
         &self,
         tip: &[u8; 32],
     ) -> Option<&MonetaryLedgerStateV04TransitionCandidate> {
-        if *tip == self.genesis_tip {
-            Some(&self.genesis)
+        if *tip == self.base_tip {
+            Some(&self.base_state)
         } else {
             self.branches.get(tip).map(|branch| &branch.state)
         }
     }
 
     pub fn branch_work(&self, tip: &[u8; 32]) -> Option<Uint256> {
-        if *tip == self.genesis_tip {
-            Some(Uint256::ZERO)
+        if *tip == self.base_tip {
+            Some(self.genesis_cumulative_work)
         } else {
             self.branches.get(tip).map(|branch| branch.cumulative_work)
         }
