@@ -1,9 +1,9 @@
-> **Current-policy note (2026-10-24):** v0.3 updates allocation wording only; engineering/test statements retain their cited review dates. Native QZXB mainnet and liquid native-coin market are not represented as launched.
+> **Current-policy note (2026-10-26):** allocation wording follows policy v0.4 and the founder-directed CP-0422 decision: 10B QZXB design cap, 1B / 10% founder allocation, and seven other category ceilings. No production Genesis, mainnet, or liquid native-coin market is represented as launched. Historical engineering/test claims retain their original review dates.
 
 # QuantumZXB - AI-Native L1 Native Coin and Ecosystem White Paper
-## Version 0.2 - Public Technical Engineering White Paper
+## Version 0.3 - Public Technical Engineering White Paper and Allocation Addendum
 
-Date: 20 October 2026
+Date: 26 October 2026
 Document status: Public engineering white paper describing architecture, test evidence and integration roadmap. It is not a frozen production protocol specification or a claim that native Mainnet is active.
 
 ## Abstract
@@ -32,7 +32,7 @@ The 10B cap and 30/10/10/10/10/10/10/10 allocation are design-level monetary dec
 
 ### 2.1 Owner, sponsor and contributor allocation framework
 
-Under owner-directed policy v0.4, the owner allocation is 1B coins (10%). Separate 1B allocations are planned for financial/strategic supporters and developers/security contributors; neither is a sub-allocation of the owner bucket. The exchange/market-integration and major-marketing buckets are also separate. Awards remain conditional on written terms and verified milestones. This plan does not create an on-chain balance, cash raised or market liquidity.
+Under owner-directed policy v0.4 and the CP-0422 decision dated 26 October 2026, the founder allocation is fixed at 1B coins (10% of the 10B cap), with no protocol lock or time vesting under the latest owner direction. Separate 1B allocations are planned for financial/strategic supporters and developers/security contributors; neither is a sub-allocation of the founder bucket. The exchange/market-integration and major-marketing buckets are also separate. Awards remain conditional on written terms and verified milestones. This plan does not create an on-chain balance, cash raised or market liquidity. The decision is not activated in production Genesis or canonical runtime until Gate 2 closes. See [CP-0422 — Canonical Tokenomics Decision](CP-0422_CANONICAL_TOKENOMICS_DECISION_2026-10-26.md) and the [v0.4 Tokenomics Policy](FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V04_2026-10-24.md).
 
 No sponsor is currently confirmed, no entitlement under this proposal is already granted, and no production balance is created merely by describing the allocation. Sponsor and contributor quantities are internal proposal terms until an actual agreement, milestone evidence and final Genesis/issuance design exist. Coin allocation is not, by itself, company equity, revenue share, a redemption right or a promise of financial return. See `FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V04_2026-10-24.md`.
 
