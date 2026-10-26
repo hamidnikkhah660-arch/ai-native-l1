@@ -93,3 +93,7 @@ jobs:
       - name: Run QZBE three-node static multi-peer propagation and replay
         shell: pwsh
         run: ./simulations/cp0418_qzbe_three_node_multi_peer_loopback.ps1
+
+      - name: Run QZBE continuous mining with height-bounded stop and two-node replay convergence
+        shell: pwsh
+        run: ./simulations/cp0424_qzbe_continuous_mining_loopback.ps1

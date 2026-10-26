@@ -82,6 +82,7 @@ struct Args {
     initial_subsidy_atoms: u128,
     blocks_per_halving: u64,
     mine_blocks: u64,
+    mine_forever: bool,
     run_seconds: u64,
     stop_after_height: Option<u64>,
     exit_after_mining: bool,
@@ -104,7 +105,7 @@ struct PeerAck {
 }
 
 fn usage() -> &'static str {
-    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --tx-public-key-hex HEX64 --observe-account-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 [--trusted-peer-key-hex HEX64 ...] --initial-subsidy-atoms U128 --blocks-per-halving U64 [--tx-recipient-id HEX64 --tx-nonce U64 --tx-amount-atoms U64 --tx-fee-atoms U64 --tx-expires-at U64 --tx-signature-hex HEX128] [--probe-invalid-signature-first] [--test-easy-pow] [--peer 127.0.0.1:PORT ...] [--mine-blocks N] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2 runtime candidate with statically pinned multi-peer loopback connections. Each --peer is paired by order with the corresponding --trusted-peer-key-hex; additional trusted keys may authorize inbound peers. Canonical v0.4 Argon2id is the default. --test-easy-pow is for isolated loopback tests only. No public bind or Mainnet activation."
+    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --tx-public-key-hex HEX64 --observe-account-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 [--trusted-peer-key-hex HEX64 ...] --initial-subsidy-atoms U128 --blocks-per-halving U64 [--tx-recipient-id HEX64 --tx-nonce U64 --tx-amount-atoms U64 --tx-fee-atoms U64 --tx-expires-at U64 --tx-signature-hex HEX128] [--probe-invalid-signature-first] [--test-easy-pow] [--peer 127.0.0.1:PORT ...] [--mine-blocks N | --mine-forever] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2 runtime candidate with statically pinned multi-peer loopback connections. Each --peer is paired by order with the corresponding --trusted-peer-key-hex; additional trusted keys may authorize inbound peers. Canonical v0.4 Argon2id is the default. --mine-forever continuously mines and broadcasts until interrupted or --stop-after-height is reached; it requires at least one pinned peer and cannot be combined with --mine-blocks or --exit-after-mining. --test-easy-pow is for isolated loopback tests only. No public bind or Mainnet activation."
 }
 
 fn parse_hex32(value: &str, name: &str) -> Result<[u8; 32], String> {
@@ -162,6 +163,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
     let mut peer_values = Vec::<String>::new();
     let mut trusted_peer_values = Vec::<String>::new();
     let mut exit_after_mining = false;
+    let mut mine_forever = false;
     let mut probe_invalid_signature_first = false;
     let mut test_easy_pow = false;
     let mut i = 0usize;
@@ -172,6 +174,14 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
                 return Err("duplicate option: --exit-after-mining".into());
             }
             exit_after_mining = true;
+            i += 1;
+            continue;
+        }
+        if key == "--mine-forever" {
+            if mine_forever {
+                return Err("duplicate option: --mine-forever".into());
+            }
+            mine_forever = true;
             i += 1;
             continue;
         }
@@ -393,10 +403,19 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
     if initial_subsidy_atoms == 0 || blocks_per_halving == 0 {
         return Err("issuance schedule values must be explicit and greater than zero".into());
     }
-    if mine_blocks > MAX_MINE_BLOCKS {
+    if mine_blocks > MAX_MINE_BLOCKS && !mine_forever {
         return Err(format!(
             "--mine-blocks exceeds local candidate cap {MAX_MINE_BLOCKS}"
         ));
+    }
+    if mine_forever && mine_blocks > 0 {
+        return Err("--mine-forever cannot be combined with --mine-blocks".into());
+    }
+    if mine_forever && exit_after_mining {
+        return Err("--mine-forever cannot be combined with --exit-after-mining".into());
+    }
+    if mine_forever && values.contains_key("--run-seconds") {
+        return Err("--mine-forever has no time limit; use --stop-after-height for a controlled stop instead of --run-seconds".into());
     }
     if !(1..=3600).contains(&run_seconds) {
         return Err("--run-seconds must be between 1 and 3600".into());
@@ -404,7 +423,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
     if stop_after_height == Some(0) {
         return Err("--stop-after-height must be greater than zero".into());
     }
-    if mine_blocks > 0 && peers.is_empty() {
+    if (mine_blocks > 0 || mine_forever) && peers.is_empty() {
         return Err(
             "mining requires at least one --peer so each candidate is peer-acknowledged".into(),
         );
@@ -439,6 +458,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
         initial_subsidy_atoms,
         blocks_per_halving,
         mine_blocks,
+        mine_forever,
         run_seconds,
         stop_after_height,
         exit_after_mining,
@@ -1069,14 +1089,15 @@ fn run(args: Args) -> Result<(), String> {
     } else {
         "QZXB_V04_ARGON2ID_64MIB"
     };
-    eprintln!("event=qzbe_v04_peer_smoke_ready network_id={} genesis={} profile={} listen={} peer={} height={} root={} tip={} store=QZBE ack=QZA4 noise=Noise_XX_25519_ChaChaPoly_SHA256 pow_profile={} tx_policy=Ed25519V1_single_explicit_key local_only=true public_launch_approved=false",
+    eprintln!("event=qzbe_v04_peer_smoke_ready network_id={} genesis={} profile={} listen={} peer={} height={} root={} tip={} store=QZBE ack=QZA4 noise=Noise_XX_25519_ChaChaPoly_SHA256 pow_profile={} mining_mode={} tx_policy=Ed25519V1_single_explicit_key local_only=true public_launch_approved=false",
         hex(&args.network_id), hex(&genesis_id), hex(&profile_id), args.listen,
         if args.peers.is_empty() {
             "inbound_only".to_string()
         } else {
             args.peers.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
         },
-        initial.height, hex(&initial.state_root), hex(&initial.tip), pow_profile);
+        initial.height, hex(&initial.state_root), hex(&initial.tip), pow_profile,
+        if args.mine_forever { "continuous" } else { "bounded" });
 
     if args.probe_invalid_signature_first {
         let peer = *args
@@ -1117,7 +1138,18 @@ fn run(args: Args) -> Result<(), String> {
         )?;
     }
 
-    for block_index in 0..args.mine_blocks {
+    let mine_limit = if args.mine_forever {
+        u64::MAX
+    } else {
+        args.mine_blocks
+    };
+    for block_index in 0..mine_limit {
+        if args
+            .stop_after_height
+            .is_some_and(|height| store.canonical_height() >= height)
+        {
+            break;
+        }
         poll_connections(
             &listener,
             &secret,
@@ -1184,7 +1216,7 @@ fn run(args: Args) -> Result<(), String> {
         }
     }
 
-    if !args.exit_after_mining {
+    if !args.exit_after_mining && !args.mine_forever {
         let deadline = Instant::now() + Duration::from_secs(args.run_seconds);
         loop {
             poll_connections(
@@ -1324,6 +1356,7 @@ mod tests {
             initial_subsidy_atoms,
             blocks_per_halving,
             mine_blocks: 0,
+            mine_forever: false,
             run_seconds: 1,
             stop_after_height: None,
             exit_after_mining: true,
@@ -1432,6 +1465,40 @@ mod tests {
         assert!(parse_args_from(missing_pin)
             .unwrap_err()
             .contains("corresponding --trusted-peer-key-hex"));
+    }
+
+    #[test]
+    fn continuous_mining_is_unbounded_but_requires_explicit_pinned_peers_and_exclusive_options() {
+        let mut valid = parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        valid.push("--mine-forever".into());
+        let args = parse_args_from(valid).unwrap().unwrap();
+        assert!(args.mine_forever);
+        assert_eq!(args.mine_blocks, 0);
+
+        let mut no_peer = parser_fixture_tokens(&[]);
+        no_peer.extend(["--trusted-peer-key-hex".into(), "e6".repeat(32)]);
+        no_peer.push("--mine-forever".into());
+        assert!(parse_args_from(no_peer)
+            .unwrap_err()
+            .contains("mining requires at least one --peer"));
+
+        let mut with_blocks = parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        with_blocks.extend(["--mine-forever".into(), "--mine-blocks".into(), "1".into()]);
+        assert!(parse_args_from(with_blocks)
+            .unwrap_err()
+            .contains("cannot be combined with --mine-blocks"));
+
+        let mut with_deadline = parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        with_deadline.extend(["--mine-forever".into(), "--run-seconds".into(), "30".into()]);
+        assert!(parse_args_from(with_deadline)
+            .unwrap_err()
+            .contains("has no time limit"));
+
+        let mut duplicate = parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        duplicate.extend(["--mine-forever".into(), "--mine-forever".into()]);
+        assert!(parse_args_from(duplicate)
+            .unwrap_err()
+            .contains("duplicate option: --mine-forever"));
     }
 
     #[test]
