@@ -39,7 +39,7 @@ function Make-Signed-TestTransaction([string]$SeedPath, [string]$Network, [strin
     [IO.File]::WriteAllBytes($SeedPath, $seed)
     [Array]::Clear($seed, 0, $seed.Length)
     try {
-        $out = @(& $txSignerExe --seed-file $SeedPath --network-id-hex $Network --recipient-id-hex $Recipient --nonce 1 --amount-atoms 2500 --fee-atoms 7 --expires-at 100000 2>&1)
+        $out = @(& $txSignerExe --seed-file $SeedPath --network-id-hex $Network --recipient-id-hex $Recipient --nonce 1 --amount-atoms 2500 --fee-atoms 7 --expires-at 4102444800 2>&1)
         $signerExit = $LASTEXITCODE
         if ($signerExit -ne 0) { throw ("CP-0415 transaction signing helper failed: " + ($out -join [Environment]::NewLine)) }
         $all = $out -join [Environment]::NewLine
@@ -101,6 +101,7 @@ try {
 
     $argsB = @(
         '--qzbe-v04-peer-smoke',
+        '--test-easy-pow',
         '--network-id', $network,
         '--owner-id', $owner,
         '--miner-id', $miner,
@@ -123,6 +124,7 @@ try {
 
     $argsA = @(
         '--qzbe-v04-peer-smoke',
+        '--test-easy-pow',
         '--network-id', $network,
         '--owner-id', $owner,
         '--miner-id', $miner,
@@ -139,7 +141,7 @@ try {
         '--tx-nonce', '1',
         '--tx-amount-atoms', '2500',
         '--tx-fee-atoms', '7',
-        '--tx-expires-at', '100000',
+        '--tx-expires-at', '4102444800',
         '--tx-signature-hex', $txSignature,
         '--probe-invalid-signature-first',
         '--mine-blocks', '2',

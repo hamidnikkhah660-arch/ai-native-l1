@@ -35,7 +35,7 @@ pub const MAX_V04_EXECUTION_FORK_ARCHIVE_BLOCKS: usize = 4_096;
 pub const MAX_V04_EXECUTION_FORK_ARCHIVE_HEIGHT: u64 = 1_024;
 /// Hard cap on work performed by one candidate-mining call. Callers can use the cancellation
 /// predicate for a stricter wall-clock or operator policy.
-pub const MAX_QZBE_MINING_ATTEMPTS: u32 = 256;
+pub const MAX_QZBE_MINING_ATTEMPTS: u32 = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum V04ExecutionPowError {
@@ -425,6 +425,21 @@ impl V04ExecutionForkChoiceCandidate {
 
     pub fn canonical_height(&self) -> u64 {
         self.canonical_state().ledger().height()
+    }
+
+    /// Timestamp of the currently selected canonical QZBE header. Genesis has timestamp zero.
+    /// Values come only from previously validated envelopes retained in this branch graph.
+    pub fn canonical_timestamp(&self) -> Result<u64, V04ExecutionPowError> {
+        if self.canonical_tip == self.genesis_tip {
+            return Ok(0);
+        }
+        let branch = self
+            .branches
+            .get(&self.canonical_tip)
+            .ok_or(V04ExecutionPowError::UnknownParent)?;
+        let envelope =
+            V04ExecutionPowEnvelope::decode(&branch.envelope, &self.profile, &self.params)?;
+        Ok(envelope.header.timestamp)
     }
 
     pub fn canonical_state(&self) -> &MonetaryLedgerStateV04TransitionCandidate {

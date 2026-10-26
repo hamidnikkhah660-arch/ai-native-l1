@@ -1,8 +1,10 @@
 //! CP-0413: isolated QZBE v2 authenticated two-node loopback runtime candidate.
 //!
-//! This binary is an integration harness only: it binds loopback, requires explicit network,
-//! Genesis-owner, miner and issuance-schedule arguments, accepts exactly one pinned Noise peer,
-//! and uses the deliberately easy local PoW profile. It is not canonical Mainnet or a public node.
+//! This binary is a QZBE v2 runtime candidate: it requires explicit network, Genesis-owner,
+//! miner and issuance-schedule arguments and accepts one pinned Noise peer. Canonical v0.4 Argon2id
+//! parameters are the default; the deliberately easy 8 MiB profile requires an explicit test-only
+//! flag. Listener and peer addresses remain loopback-only until persistent external anti-rollback
+//! anchoring and canonical-runtime activation are complete.
 
 use ai_native_l1_pow_bench::{
     consensus::{ConsensusParameters, Uint256},
@@ -33,7 +35,7 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process, thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const ACK_MAGIC: &[u8; 4] = b"QZA4";
@@ -79,6 +81,7 @@ struct Args {
     run_seconds: u64,
     stop_after_height: Option<u64>,
     exit_after_mining: bool,
+    test_easy_pow: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,7 +100,7 @@ struct PeerAck {
 }
 
 fn usage() -> &'static str {
-    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --tx-public-key-hex HEX64 --observe-account-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 --initial-subsidy-atoms U128 --blocks-per-halving U64 [--tx-recipient-id HEX64 --tx-nonce U64 --tx-amount-atoms U64 --tx-fee-atoms U64 --tx-expires-at U64 --tx-signature-hex HEX128] [--probe-invalid-signature-first] [--peer 127.0.0.1:PORT] [--mine-blocks N] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2 authenticated loopback integration candidate only. Explicit Ed25519 transaction registry; no public bind, no public economics, no mainnet mode."
+    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --tx-public-key-hex HEX64 --observe-account-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 --initial-subsidy-atoms U128 --blocks-per-halving U64 [--tx-recipient-id HEX64 --tx-nonce U64 --tx-amount-atoms U64 --tx-fee-atoms U64 --tx-expires-at U64 --tx-signature-hex HEX128] [--probe-invalid-signature-first] [--test-easy-pow] [--peer 127.0.0.1:PORT] [--mine-blocks N] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2 runtime candidate. Canonical v0.4 Argon2id is the default. --test-easy-pow is for isolated loopback tests only. Explicit Ed25519 registry; no public bind or Mainnet activation."
 }
 
 fn parse_hex32(value: &str, name: &str) -> Result<[u8; 32], String> {
@@ -154,6 +157,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
     let mut values = BTreeMap::<String, String>::new();
     let mut exit_after_mining = false;
     let mut probe_invalid_signature_first = false;
+    let mut test_easy_pow = false;
     let mut i = 0usize;
     while i < tokens.len() {
         let key = tokens[i].as_str();
@@ -170,6 +174,14 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
                 return Err("duplicate option: --probe-invalid-signature-first".into());
             }
             probe_invalid_signature_first = true;
+            i += 1;
+            continue;
+        }
+        if key == "--test-easy-pow" {
+            if test_easy_pow {
+                return Err("duplicate option: --test-easy-pow".into());
+            }
+            test_easy_pow = true;
             i += 1;
             continue;
         }
@@ -379,6 +391,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
         run_seconds,
         stop_after_height,
         exit_after_mining,
+        test_easy_pow,
     }))
 }
 
@@ -406,6 +419,17 @@ fn hex(bytes: &[u8]) -> String {
         output.push(DIGITS[(byte & 0x0f) as usize] as char);
     }
     output
+}
+
+fn next_block_timestamp(previous_timestamp: u64, now: SystemTime) -> Result<u64, String> {
+    let wall_clock = now
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("system clock predates UNIX epoch: {error}"))?
+        .as_secs();
+    let minimum_next = previous_timestamp
+        .checked_add(1)
+        .ok_or_else(|| "QZBE timestamp overflow".to_string())?;
+    Ok(wall_clock.max(minimum_next))
 }
 
 fn consensus_parameters_fingerprint(params: &ConsensusParameters) -> [u8; 32] {
@@ -613,11 +637,14 @@ fn prepare_profile(
         MonetaryLedgerStateV04TransitionCandidate::from_genesis_manifest(&manifest, &profile)
             .map_err(|error| format!("construct QZBE Genesis state: {error:?}"))?;
     let mut params = ConsensusParameters::candidate_testnet()
-        .map_err(|error| format!("construct candidate PoW params: {error}"))?;
-    // This intentionally easy profile is ONLY for a disposable local integration test.
-    params.initial_target = Uint256::from_be_bytes([0xEF; 32]);
-    params.pow_limit = Uint256::MAX;
-    params.pow.memory_kib = 8 * 1024;
+        .map_err(|error| format!("construct canonical v0.4 candidate PoW params: {error}"))?;
+    // Canonical v0.4 Argon2id/difficulty parameters remain the default. The 8 MiB/easy-target
+    // profile may only be chosen explicitly for isolated loopback tests.
+    if args.test_easy_pow {
+        params.initial_target = Uint256::from_be_bytes([0xEF; 32]);
+        params.pow_limit = Uint256::MAX;
+        params.pow.memory_kib = 8 * 1024;
+    }
     params
         .validate()
         .map_err(|error| format!("candidate PoW params rejected: {error}"))?;
@@ -962,10 +989,15 @@ fn run(args: Args) -> Result<(), String> {
     let mut accepted_count = 0u64;
     let mut message_count = 0u64;
     let mut sent_count = 0u64;
-    eprintln!("event=qzbe_v04_peer_smoke_ready network_id={} genesis={} profile={} listen={} peer={} height={} root={} tip={} store=QZBE ack=QZA4 noise=Noise_XX_25519_ChaChaPoly_SHA256 pow_profile=LOCAL_EASY_POW_8MIB tx_policy=Ed25519V1_single_explicit_key local_only=true public_launch_approved=false",
+    let pow_profile = if args.test_easy_pow {
+        "EXPLICIT_LOCAL_TEST_EASY_POW_8MIB"
+    } else {
+        "QZXB_V04_ARGON2ID_64MIB"
+    };
+    eprintln!("event=qzbe_v04_peer_smoke_ready network_id={} genesis={} profile={} listen={} peer={} height={} root={} tip={} store=QZBE ack=QZA4 noise=Noise_XX_25519_ChaChaPoly_SHA256 pow_profile={} tx_policy=Ed25519V1_single_explicit_key local_only=true public_launch_approved=false",
         hex(&args.network_id), hex(&genesis_id), hex(&profile_id), args.listen,
         args.peer.map(|peer| peer.to_string()).unwrap_or_else(|| "inbound_only".into()),
-        initial.height, hex(&initial.state_root), hex(&initial.tip));
+        initial.height, hex(&initial.state_root), hex(&initial.tip), pow_profile);
 
     if args.probe_invalid_signature_first {
         let peer = args
@@ -1021,11 +1053,16 @@ fn run(args: Args) -> Result<(), String> {
             .canonical_height()
             .checked_add(1)
             .ok_or_else(|| "QZBE height overflow".to_string())?;
+        let previous_timestamp = store
+            .fork_choice()
+            .canonical_timestamp()
+            .map_err(|error| format!("read canonical QZBE timestamp: {error}"))?;
+        let timestamp = next_block_timestamp(previous_timestamp, SystemTime::now())?;
         let encoded = store
             .fork_choice()
             .mine_candidate_on(
                 parent_tip,
-                next_height,
+                timestamp,
                 args.miner_id,
                 if block_index == 0 {
                     args.transaction.clone().into_iter().collect()
@@ -1203,7 +1240,24 @@ mod tests {
             run_seconds: 1,
             stop_after_height: None,
             exit_after_mining: true,
+            test_easy_pow: false,
         }
+    }
+
+    #[test]
+    fn block_timestamps_use_wall_clock_and_remain_strictly_monotonic() {
+        let epoch = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert_eq!(next_block_timestamp(0, epoch).unwrap(), 1_800_000_000);
+        // If two blocks are produced in one second, the next timestamp still advances.
+        assert_eq!(
+            next_block_timestamp(1_800_000_000, epoch).unwrap(),
+            1_800_000_001
+        );
+        // A temporarily slow local wall clock cannot move the chain timestamp backwards.
+        assert_eq!(
+            next_block_timestamp(1_800_000_010, epoch).unwrap(),
+            1_800_000_011
+        );
     }
 
     #[test]
@@ -1213,6 +1267,23 @@ mod tests {
             prepare_profile(&canonical).expect("canonical v0.4 candidate profile");
         assert_eq!(profile.schedule().initial_subsidy_atoms(), 35_673_515_981);
         assert_eq!(profile.schedule().blocks_per_halving(), 4_204_800);
+        let default_params = prepare_profile(&canonical).unwrap().3;
+        assert_eq!(default_params.pow.memory_kib, 64 * 1024);
+        assert_eq!(
+            default_params.initial_target,
+            ConsensusParameters::candidate_testnet()
+                .unwrap()
+                .initial_target
+        );
+
+        let mut test_profile_args = test_args(35_673_515_981, 4_204_800);
+        test_profile_args.test_easy_pow = true;
+        let test_params = prepare_profile(&test_profile_args).unwrap().3;
+        assert_eq!(test_params.pow.memory_kib, 8 * 1024);
+        assert_eq!(
+            test_params.initial_target,
+            Uint256::from_be_bytes([0xEF; 32])
+        );
 
         let toy = test_args(1_000_000, 1_000);
         let error =
