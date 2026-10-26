@@ -8,7 +8,9 @@
 mod windows_wallet {
     use ai_native_l1_pow_bench::{
         qzbe_tx_ingress_candidate::{decode_ack, encode_request, TxIngressStatus, ACK_BYTES},
-        state_machine::{encode_transaction, transaction_signing_digest, Transaction},
+        state_machine::{
+            encode_transaction, transaction_id, transaction_signing_digest, Transaction,
+        },
         transaction_auth::Ed25519TransactionSigner,
     };
     use std::{
@@ -16,7 +18,7 @@ mod windows_wallet {
         ffi::c_void,
         fs::{self, File, OpenOptions},
         io::{self, Read, Write},
-        net::{SocketAddr, TcpStream},
+        net::{Shutdown, SocketAddr, TcpStream},
         path::{Path, PathBuf},
         process, ptr,
         sync::atomic::{AtomicU64, Ordering},
@@ -57,6 +59,17 @@ mod windows_wallet {
             self_contained: bool,
             submit_to: Option<SocketAddr>,
         },
+        RpcStatus {
+            rpc: SocketAddr,
+        },
+        Balance {
+            rpc: SocketAddr,
+            account_id: [u8; 32],
+        },
+        TransactionStatus {
+            rpc: SocketAddr,
+            txid: [u8; 32],
+        },
         Help,
     }
 
@@ -82,6 +95,209 @@ mod windows_wallet {
             output.push(DIGITS[(byte & 15) as usize] as char);
         }
         output
+    }
+
+    const MAX_RPC_RESPONSE_BYTES: usize = 16 * 1024;
+
+    fn parse_rpc_address(value: &str) -> Result<SocketAddr, String> {
+        let address = value
+            .parse::<SocketAddr>()
+            .map_err(|_| "--rpc must be a numeric IP:port socket address".to_string())?;
+        if !address.ip().is_loopback() {
+            return Err("wallet RPC queries are restricted to numeric loopback addresses; public RPC is not enabled".into());
+        }
+        Ok(address)
+    }
+
+    fn parse_rpc_http_response(bytes: &[u8]) -> Result<serde_json::Value, String> {
+        if bytes.is_empty() || bytes.len() > MAX_RPC_RESPONSE_BYTES {
+            return Err("read-only RPC response is empty or oversized".into());
+        }
+        let header_end = bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .ok_or_else(|| "read-only RPC response has no complete HTTP headers".to_string())?;
+        let header_text = std::str::from_utf8(&bytes[..header_end])
+            .map_err(|_| "read-only RPC response headers are not UTF-8".to_string())?;
+        if !header_text.is_ascii() {
+            return Err("read-only RPC response headers must be ASCII".into());
+        }
+        let mut lines = header_text.split("\r\n");
+        if lines.next() != Some("HTTP/1.1 200 OK") {
+            return Err("read-only RPC returned a non-200 HTTP status".into());
+        }
+        let mut content_length = None;
+        let mut content_type_ok = false;
+        for line in lines {
+            let Some((name, value)) = line.split_once(':') else {
+                return Err("read-only RPC returned a malformed HTTP header".into());
+            };
+            if name.eq_ignore_ascii_case("content-length") {
+                if content_length.is_some() {
+                    return Err("read-only RPC returned duplicate Content-Length headers".into());
+                }
+                content_length =
+                    Some(value.trim().parse::<usize>().map_err(|_| {
+                        "read-only RPC returned an invalid Content-Length".to_string()
+                    })?);
+            } else if name.eq_ignore_ascii_case("content-type") {
+                content_type_ok = value
+                    .trim()
+                    .to_ascii_lowercase()
+                    .starts_with("application/json");
+            } else if name.eq_ignore_ascii_case("transfer-encoding") {
+                return Err("chunked RPC responses are not accepted".into());
+            }
+        }
+        if !content_type_ok {
+            return Err("read-only RPC response is not JSON".into());
+        }
+        let body_start = header_end + 4;
+        let declared =
+            content_length.ok_or_else(|| "read-only RPC omitted Content-Length".to_string())?;
+        if declared > MAX_RPC_RESPONSE_BYTES || bytes.len().saturating_sub(body_start) != declared {
+            return Err("read-only RPC response length does not match Content-Length".into());
+        }
+        let value: serde_json::Value = serde_json::from_slice(&bytes[body_start..])
+            .map_err(|_| "read-only RPC response contains invalid JSON".to_string())?;
+        if value.get("ok") != Some(&serde_json::Value::Bool(true))
+            || value.get("mainnet") != Some(&serde_json::Value::Bool(false))
+            || value.get("read_only") != Some(&serde_json::Value::Bool(true))
+        {
+            return Err(
+                "RPC response is not explicitly an OK, read-only candidate response".into(),
+            );
+        }
+        Ok(value)
+    }
+
+    fn rpc_get(rpc: SocketAddr, path: &str) -> Result<serde_json::Value, String> {
+        if !rpc.ip().is_loopback() {
+            return Err("wallet RPC queries are restricted to loopback".into());
+        }
+        if !path.starts_with("/v1/")
+            || path.contains(' ')
+            || path.contains('?')
+            || path.contains('#')
+            || path.contains('\r')
+            || path.contains('\n')
+        {
+            return Err("invalid internal candidate RPC path".into());
+        }
+        let mut stream = TcpStream::connect_timeout(&rpc, std::time::Duration::from_secs(3))
+            .map_err(|error| format!("connect to loopback candidate RPC {rpc}: {error}"))?;
+        stream
+            .set_nodelay(true)
+            .map_err(|error| format!("configure wallet RPC TCP_NODELAY: {error}"))?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .map_err(|error| format!("set wallet RPC read timeout: {error}"))?;
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+            .map_err(|error| format!("set wallet RPC write timeout: {error}"))?;
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|error| format!("send wallet RPC query: {error}"))?;
+        stream
+            .shutdown(Shutdown::Write)
+            .map_err(|error| format!("finish wallet RPC request: {error}"))?;
+        let mut response = Vec::with_capacity(1024);
+        let mut chunk = [0u8; 1024];
+        loop {
+            let count = stream
+                .read(&mut chunk)
+                .map_err(|error| format!("read wallet RPC response: {error}"))?;
+            if count == 0 {
+                break;
+            }
+            if response.len().saturating_add(count) > MAX_RPC_RESPONSE_BYTES {
+                return Err("wallet RPC response exceeded the 16 KiB limit".into());
+            }
+            response.extend_from_slice(&chunk[..count]);
+        }
+        parse_rpc_http_response(&response)
+    }
+
+    fn json_string<'a>(value: &'a serde_json::Value, key: &str) -> Result<&'a str, String> {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("candidate RPC omitted string field {key}"))
+    }
+
+    fn json_u64(value: &serde_json::Value, key: &str) -> Result<u64, String> {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("candidate RPC omitted integer field {key}"))
+    }
+
+    fn rpc_status(rpc: SocketAddr) -> Result<(), String> {
+        let value = rpc_get(rpc, "/v1/status")?;
+        println!("wallet_rpc_status=ok");
+        println!("network_id_hex={}", json_string(&value, "network_id")?);
+        println!("genesis_id_hex={}", json_string(&value, "genesis_id")?);
+        println!("profile_id_hex={}", json_string(&value, "profile_id")?);
+        println!("height={}", json_u64(&value, "height")?);
+        println!("tip_hex={}", json_string(&value, "tip")?);
+        println!("state_root_hex={}", json_string(&value, "state_root")?);
+        println!("generation={}", json_u64(&value, "generation")?);
+        println!("network_class=candidate_not_mainnet");
+        Ok(())
+    }
+
+    fn rpc_balance(rpc: SocketAddr, account_id: [u8; 32]) -> Result<(), String> {
+        let value = rpc_get(rpc, &format!("/v1/balance/{}", hex(&account_id)))?;
+        if json_string(&value, "account_id")? != hex(&account_id) {
+            return Err("candidate RPC returned a balance for a different account".into());
+        }
+        println!("wallet_rpc_balance_status=ok");
+        println!("account_id_hex={}", hex(&account_id));
+        println!("balance_atoms={}", json_u64(&value, "balance_atoms")?);
+        println!("height={}", json_u64(&value, "height")?);
+        println!("tip_hex={}", json_string(&value, "tip")?);
+        println!("state_root_hex={}", json_string(&value, "state_root")?);
+        println!("network_class=candidate_not_mainnet");
+        Ok(())
+    }
+
+    fn rpc_transaction_status(rpc: SocketAddr, txid: [u8; 32]) -> Result<(), String> {
+        let value = rpc_get(rpc, &format!("/v1/transaction/{}", hex(&txid)))?;
+        if json_string(&value, "txid")? != hex(&txid) {
+            return Err("candidate RPC returned a receipt for a different TXID".into());
+        }
+        let status = json_string(&value, "status")?;
+        if !matches!(
+            status,
+            "confirmed" | "pending" | "not_found_in_retained_suffix"
+        ) {
+            return Err("candidate RPC returned an unknown transaction status".into());
+        }
+        println!("wallet_tx_status={status}");
+        println!("txid_hex={}", hex(&txid));
+        println!("confirmations={}", json_u64(&value, "confirmations")?);
+        if let Some(height) = value
+            .get("block_height")
+            .and_then(serde_json::Value::as_u64)
+        {
+            println!("block_height={height}");
+        } else {
+            println!("block_height=none");
+        }
+        if let Some(floor) = value
+            .get("search_floor_height")
+            .and_then(serde_json::Value::as_u64)
+        {
+            println!("search_floor_height={floor}");
+        }
+        println!("height={}", json_u64(&value, "height")?);
+        println!("tip_hex={}", json_string(&value, "tip")?);
+        println!("state_root_hex={}", json_string(&value, "state_root")?);
+        println!("finality=probabilistic_candidate_chain_reorg_possible");
+        println!("network_class=candidate_not_mainnet");
+        Ok(())
     }
 
     fn options(
@@ -152,6 +368,23 @@ mod windows_wallet {
                     return Err("--wallet must be an absolute file path".into());
                 }
                 Ok(Command::Address { wallet })
+            }
+            "rpc-status" => {
+                let values = options(&args[1..], &["--rpc"])?;
+                let rpc = parse_rpc_address(required(&values, "--rpc")?)?;
+                Ok(Command::RpcStatus { rpc })
+            }
+            "balance" => {
+                let values = options(&args[1..], &["--rpc", "--account-id-hex"])?;
+                let rpc = parse_rpc_address(required(&values, "--rpc")?)?;
+                let account_id = parse_hex32(required(&values, "--account-id-hex")?, "account ID")?;
+                Ok(Command::Balance { rpc, account_id })
+            }
+            "tx-status" => {
+                let values = options(&args[1..], &["--rpc", "--txid-hex"])?;
+                let rpc = parse_rpc_address(required(&values, "--rpc")?)?;
+                let txid = parse_hex32(required(&values, "--txid-hex")?, "transaction ID")?;
+                Ok(Command::TransactionStatus { rpc, txid })
             }
             "sign-transfer" => {
                 let values = options(
@@ -558,6 +791,8 @@ mod windows_wallet {
         }
         let digest = transaction_signing_digest(&transaction)
             .map_err(|error| format!("transaction signing digest failed: {error:?}"))?;
+        let txid = transaction_id(&transaction)
+            .map_err(|error| format!("transaction ID derivation failed: {error:?}"))?;
         let encoded = encode_transaction(&transaction)
             .map_err(|error| format!("transaction encoding failed: {error:?}"))?;
         println!("tx_network_id_hex={}", hex(&network_id));
@@ -569,6 +804,7 @@ mod windows_wallet {
         println!("tx_fee_atoms={fee}");
         println!("tx_expires_at={expires_at}");
         println!("tx_signing_digest_hex={}", hex(&digest));
+        println!("tx_id_hex={}", hex(&txid));
         println!("tx_signature_hex={}", hex(&transaction.signature));
         println!("tx_wire_hex={}", hex(&encoded));
         println!(
@@ -604,6 +840,11 @@ mod windows_wallet {
                 .map_err(|error| format!("read QZTS/1 admission acknowledgement: {error}"))?;
             let ack = decode_ack(&ack_bytes)
                 .map_err(|error| format!("decode QZTS/1 admission acknowledgement: {error:?}"))?;
+            if ack.transaction_id != txid {
+                return Err(
+                    "QZTS/1 admission ACK TXID does not match the signed transaction".into(),
+                );
+            }
             println!("tx_submit_mempool_count={}", ack.mempool_count);
             println!("tx_submit_transaction_id_hex={}", hex(&ack.transaction_id));
             match ack.status {
@@ -629,10 +870,14 @@ Usage:\n\
   qzxb_wallet address --wallet ABSOLUTE_PATH\n\
   qzxb_wallet sign-transfer --wallet ABSOLUTE_PATH --network-id-hex HEX64 --recipient-id-hex HEX64 --nonce U64 --amount-atoms U64 --fee-atoms U64 --expires-at UNIX_SECONDS [--signature-mode self-contained|registered] [--submit-to IP:PORT]\n\
 Default signature mode embeds the public key with its Ed25519 signature so the sender account can be derived and checked by any validating node. `--signature-mode registered` is for legacy fixtures. `--submit-to` sends signed TXN2 using QZTS/1 and waits for the node's admission ACK; this does not imply Mainnet status or that the transaction was mined.");
+                println!("Read-only candidate RPC: rpc-status --rpc 127.0.0.1:PORT; balance --rpc 127.0.0.1:PORT --account-id-hex HEX64; tx-status --rpc 127.0.0.1:PORT --txid-hex HEX64. These queries are restricted to loopback and refuse responses not marked mainnet=false/read_only=true.");
                 Ok(())
             }
             Ok(Command::Create { output }) => create_wallet(&output),
             Ok(Command::Address { wallet }) => address(&wallet),
+            Ok(Command::RpcStatus { rpc }) => rpc_status(rpc),
+            Ok(Command::Balance { rpc, account_id }) => rpc_balance(rpc, account_id),
+            Ok(Command::TransactionStatus { rpc, txid }) => rpc_transaction_status(rpc, txid),
             Ok(Command::SignTransfer {
                 wallet,
                 network_id,
@@ -665,6 +910,40 @@ Default signature mode embeds the public key with its Ed25519 signature so the s
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn candidate_rpc_client_rejects_non_loopback_addresses() {
+            assert!(parse_rpc_address("127.0.0.1:49339").is_ok());
+            assert!(parse_rpc_address("[::1]:49339").is_ok());
+            assert!(parse_rpc_address("0.0.0.0:49339").is_err());
+            assert!(parse_rpc_address("192.0.2.1:49339").is_err());
+            assert!(parse_rpc_address("localhost:49339").is_err());
+        }
+
+        #[test]
+        fn candidate_rpc_client_requires_bounded_canonical_json_response() {
+            let body = r#"{"ok":true,"mainnet":false,"read_only":true,"height":2}"#;
+            let good = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            let value = parse_rpc_http_response(good.as_bytes()).unwrap();
+            assert_eq!(value["height"].as_u64(), Some(2));
+
+            let mainnet = r#"{"ok":true,"mainnet":true,"read_only":true}"#;
+            let false_mainnet = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                mainnet.len(),
+                mainnet
+            );
+            assert!(parse_rpc_http_response(false_mainnet.as_bytes()).is_err());
+
+            let too_short = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 99\r\n\r\n{}";
+            assert!(parse_rpc_http_response(too_short).is_err());
+            let error_status = b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+            assert!(parse_rpc_http_response(error_status).is_err());
+            assert!(parse_rpc_http_response(&vec![65u8; MAX_RPC_RESPONSE_BYTES + 1]).is_err());
+        }
 
         #[test]
         fn wallet_identity_offsets_are_consistent() {

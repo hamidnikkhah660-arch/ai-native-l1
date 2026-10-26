@@ -46,6 +46,7 @@ dependencies = [
  "getrandom 0.2.16",
  "hmac",
  "libcrux-ml-dsa",
+ "serde_json",
  "sha2",
  "snow",
 ]

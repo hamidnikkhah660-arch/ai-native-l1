@@ -4,12 +4,13 @@ Set-StrictMode -Version Latest
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 $manifest = '.\src\native\pow_bench\Cargo.toml'
-$null = cargo +stable build --release --manifest-path $manifest --bin qzbe_v04_peer_node --bin noise_key_provisioner --bin qzbe_v04_test_tx_signer --quiet
+$null = cargo +stable build --release --manifest-path $manifest --bin qzbe_v04_peer_node --bin noise_key_provisioner --bin qzbe_v04_test_tx_signer --bin qzxb_wallet --quiet
 if ($LASTEXITCODE -ne 0) { throw 'CP-0414 QZBE authenticated transaction runtime release build failed' }
 
 $nodeExe = (Resolve-Path '.\src\native\pow_bench\target\release\qzbe_v04_peer_node.exe').Path
 $keyExe = (Resolve-Path '.\src\native\pow_bench\target\release\noise_key_provisioner.exe').Path
 $txSignerExe = (Resolve-Path '.\src\native\pow_bench\target\release\qzbe_v04_test_tx_signer.exe').Path
+$walletExe = (Resolve-Path '.\src\native\pow_bench\target\release\qzxb_wallet.exe').Path
 $root = Join-Path $env:TEMP ("ain1_cp0413_qzbe_runtime_" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root | Out-Null
 
@@ -195,6 +196,34 @@ try {
     }
     Write-Host ("CP-0414 READ_ONLY_RPC_CANONICAL_TXID_RECEIPT_PASS txid=" + $rpcReceipt.txid +
         " block_height=" + $rpcReceipt.block_height + " confirmations=" + $rpcReceipt.confirmations)
+
+    $walletStatus = @(& $walletExe rpc-status --rpc "127.0.0.1:$rpcPort" 2>&1)
+    $walletStatusExit = $LASTEXITCODE
+    $walletStatusText = $walletStatus -join [Environment]::NewLine
+    if ($walletStatusExit -ne 0 -or $walletStatusText -notmatch 'height=2' -or
+        $walletStatusText -notmatch 'network_class=candidate_not_mainnet' -or
+        $walletStatusText -notmatch 'state_root_hex=' -or $walletStatusText -notmatch 'wallet_rpc_status=ok') {
+        throw ("CP-0414 native wallet rpc-status query failed: " + $walletStatusText)
+    }
+    $walletBalance = @(& $walletExe balance --rpc "127.0.0.1:$rpcPort" --account-id-hex $recipient 2>&1)
+    $walletBalanceExit = $LASTEXITCODE
+    $walletBalanceText = $walletBalance -join [Environment]::NewLine
+    if ($walletBalanceExit -ne 0 -or $walletBalanceText -notmatch 'wallet_rpc_balance_status=ok' -or
+        $walletBalanceText -notmatch 'balance_atoms=2500' -or $walletBalanceText -notmatch 'height=2') {
+        throw ("CP-0414 native wallet balance query failed: " + $walletBalanceText)
+    }
+    $walletTxStatus = @(& $walletExe tx-status --rpc "127.0.0.1:$rpcPort" --txid-hex $tx.TransactionId 2>&1)
+    $walletTxStatusExit = $LASTEXITCODE
+    $walletTxStatusText = $walletTxStatus -join [Environment]::NewLine
+    if ($walletTxStatusExit -ne 0 -or $walletTxStatusText -notmatch 'wallet_tx_status=confirmed' -or
+        $walletTxStatusText -notmatch ('txid_hex=' + $tx.TransactionId) -or
+        $walletTxStatusText -notmatch ('confirmations=' + $rpcReceipt.confirmations) -or
+        $walletTxStatusText -notmatch 'finality=probabilistic_candidate_chain_reorg_possible' -or
+        $walletTxStatusText -notmatch 'network_class=candidate_not_mainnet') {
+        throw ("CP-0414 native wallet TXID query failed: " + $walletTxStatusText)
+    }
+    Write-Host ("CP-0432 NATIVE_WALLET_READ_ONLY_RPC_PASS height=2 balance_atoms=2500 txid=" +
+        $tx.TransactionId + " confirmations=" + $rpcReceipt.confirmations + " mainnet=false")
     if (-not $nodeA.WaitForExit(30000)) { throw 'CP-0414 sending node A did not stop after its bounded mining run' }
     if (-not $nodeB.WaitForExit(10000)) { throw 'CP-0414 receiver node B did not stop after its bounded observer run' }
     $textA = Get-Text $logA
