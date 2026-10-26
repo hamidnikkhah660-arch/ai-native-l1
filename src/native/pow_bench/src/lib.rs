@@ -55,6 +55,8 @@ pub mod monetary_ledger_v04_candidate;
 pub mod monetary_policy_v3_candidate;
 /// CP-0405 candidate QZBE PoW envelope, branch-local QZB4 v2 replay and cumulative-work fork choice; not a persistent branch store or canonical-node integration.
 pub mod monetary_pow_v04_candidate;
+/// CP-0419 candidate QZBE checkpoint codec binding monetary snapshots, chainwork and bounded target history; not yet store-integrated.
+pub mod monetary_pow_v04_checkpoint_candidate;
 /// CP-0406 local persistent QZBE branch archive with replay validation; not externally anchored or node-wired.
 pub mod monetary_pow_v04_store_candidate;
 /// CP-0404 candidate QZB4 v2 profile dispatcher, durable snapshot recovery and external-anchor contract; not canonical-node or PoW/fork-choice wired.

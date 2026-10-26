@@ -16,6 +16,8 @@ CP-0417 adds a local runtime hardening step after CP-0416: the isolated QZBE v0.
 
 CP-0418 extends the isolated QZBE runtime to accept a bounded static set of pinned loopback peers and fan each locally mined block out to all configured peers. A three-node Windows release loopback passed: two blocks reached both independent receiver stores, a bad transaction signature was rejected atomically, and all three stores replayed to an identical height-2 root/tip. The new scenario is added to Windows CI; exact-head validation is pending. It does not implement discovery/gossip, prove multi-operator public reachability or concurrent-miner reorg convergence, and does not close Gate 2 or Gate 8.
 
+CP-0419 adds a versioned QZBE checkpoint-record codec for profile-bound QZP4 state, QZBE tip/chainwork, and the canonical bounded target/timestamp history. A byte-level Genesis vector is checked in Rust and independently parsed/hashed by Python; six focused tests pass, including restoring the actual 2,016-block target history at height 2,016 and reproducing the expected first default retarget for height 2,017. This is not yet integrated with the QZBE durable store or pruning/reorg policy, so the 1,024 logical-height cap remains unchanged and long-term mining is not yet enabled.
+
 Passing tests are necessary engineering evidence, not evidence that the current monetary candidate is active in the canonical node, a production network exists, or the coin has been issued or can be traded.
 
 ## Gate scoreboard
@@ -101,6 +103,7 @@ The Sepolia QX asset is a separate testnet asset, not native QZXB. The proposed 
 - [CP-0416 QZBE store profile lock and downgrade guard](CP-0416_QZBE_STORE_PROFILE_LOCK_DOWNGRADE_GUARD_2026-10-26.md)
 - [CP-0417 QZBE v0.4 default PoW and monotonic timestamp hardening](CP-0417_QZBE_V04_DEFAULT_POW_TIMESTAMP_RUNTIME_CANDIDATE_2026-10-26.md)
 - [CP-0418 QZBE three-node static multi-peer loopback](CP-0418_QZBE_THREE_NODE_STATIC_MULTI_PEER_LOOPBACK_2026-10-26.md)
+- [CP-0419 QZBE bounded checkpoint record candidate](CP-0419_QZBE_BOUNDED_CHECKPOINT_RECORD_CANDIDATE_2026-10-26.md)
 - [G0 public-launch and compliance checklist](CP_0372_G0_PUBLIC_LAUNCH_COMPLIANCE_CHECKLIST_2026-10-22.md)
 - [Owner directive: zero-budget launch and real liquidity](OWNER_DIRECTIVE_ZERO_BUDGET_LAUNCH_AND_LIQUIDITY_GATE_V01_2026-10-21.md)
 

@@ -41,6 +41,8 @@ jobs:
 
       - name: Verify CP-0422 canonical tokenomics and historical-version boundary
         run: python3 ../../../simulations/quantumzxb_tokenomics_checker.py
+      - name: Verify CP-0419 QZBE checkpoint golden vector independently
+        run: python3 ../../../simulations/cp0419_qzbe_checkpoint_oracle.py
 
       - name: Verify CP-0397 v0.4 mining schedule candidate oracle
         run: python3 ../../../simulations/quantumzxb_v04_issuance_schedule_vectors.py --check
