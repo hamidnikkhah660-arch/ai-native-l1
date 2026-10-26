@@ -142,3 +142,8 @@ finally {
     }
     Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+# GitHub Actions appends `exit $LASTEXITCODE` for PowerShell steps. The negative bind
+# probe intentionally invokes a process with exit code 2, so normalize success explicitly
+# only after every positive assertion and cleanup have completed. Exceptions still fail the step.
+exit 0
