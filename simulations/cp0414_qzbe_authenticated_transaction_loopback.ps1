@@ -49,8 +49,9 @@ function Make-Signed-TestTransaction([string]$SeedPath, [string]$Network, [strin
         $pub = [regex]::Match($all, 'tx_public_key_hex=([0-9a-f]{64})')
         $account = [regex]::Match($all, 'tx_sender_account_id_hex=([0-9a-f]{64})')
         $signature = [regex]::Match($all, 'tx_signature_hex=([0-9a-f]{128})')
-        if (-not ($pub.Success -and $account.Success -and $signature.Success)) { throw ("CP-0414 signed transaction material missing: " + $all) }
-        return @{ PublicKey = $pub.Groups[1].Value; Sender = $account.Groups[1].Value; Signature = $signature.Groups[1].Value }
+        $txid = [regex]::Match($all, 'tx_id_hex=([0-9a-f]{64})')
+        if (-not ($pub.Success -and $account.Success -and $signature.Success -and $txid.Success)) { throw ("CP-0414 signed transaction material / TXID missing: " + $all) }
+        return @{ PublicKey = $pub.Groups[1].Value; Sender = $account.Groups[1].Value; Signature = $signature.Groups[1].Value; TransactionId = $txid.Groups[1].Value }
     }
     finally {
         Remove-Item -LiteralPath $SeedPath -Force -ErrorAction SilentlyContinue
@@ -184,6 +185,16 @@ try {
             " balance=" + ($rpcFinalBalance | ConvertTo-Json -Compress))
     }
     Write-Host ("CP-0414 READ_ONLY_RPC_SETTLED_STATE_PASS height=2 balance_atoms=" + $rpcFinalBalance.balance_atoms)
+    $rpcReceipt = Get-QzbeRpc $rpcPort ("/v1/transaction/{0}" -f $tx.TransactionId)
+    if ($rpcReceipt.txid -ne $tx.TransactionId -or $rpcReceipt.status -ne 'confirmed' -or
+        $rpcReceipt.block_height -lt 1 -or $rpcReceipt.block_height -gt $rpcFinalStatus.height -or
+        $rpcReceipt.confirmations -ne ($rpcFinalStatus.height - $rpcReceipt.block_height + 1) -or
+        $rpcReceipt.tip -ne $rpcFinalStatus.tip -or $rpcReceipt.state_root -ne $rpcFinalStatus.state_root -or
+        $rpcReceipt.mainnet -ne $false -or $rpcReceipt.read_only -ne $true) {
+        throw ("CP-0414 read-only transaction receipt mismatch: " + ($rpcReceipt | ConvertTo-Json -Compress))
+    }
+    Write-Host ("CP-0414 READ_ONLY_RPC_CANONICAL_TXID_RECEIPT_PASS txid=" + $rpcReceipt.txid +
+        " block_height=" + $rpcReceipt.block_height + " confirmations=" + $rpcReceipt.confirmations)
     if (-not $nodeA.WaitForExit(30000)) { throw 'CP-0414 sending node A did not stop after its bounded mining run' }
     if (-not $nodeB.WaitForExit(10000)) { throw 'CP-0414 receiver node B did not stop after its bounded observer run' }
     $textA = Get-Text $logA

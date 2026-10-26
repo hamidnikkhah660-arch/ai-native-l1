@@ -1246,6 +1246,21 @@ fn serve_connection(
 enum RpcCommand {
     Status,
     Balance(AccountId),
+    Transaction([u8; 32]),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TransactionLookup {
+    Confirmed {
+        block_height: u64,
+        confirmations: u64,
+    },
+    Pending {
+        mempool_count: usize,
+    },
+    NotFoundInRetainedSuffix {
+        search_floor_height: u64,
+    },
 }
 
 fn parse_rpc_command(request: &[u8]) -> Result<RpcCommand, String> {
@@ -1302,6 +1317,16 @@ fn parse_rpc_command(request: &[u8]) -> Result<RpcCommand, String> {
             }
             Ok(RpcCommand::Balance(parse_hex32(account, "RPC account ID")?))
         }
+        path if path.starts_with("/v1/transaction/") => {
+            let txid = &path["/v1/transaction/".len()..];
+            if txid.len() != 64 || txid.contains('/') || txid.contains('?') || txid.contains('#') {
+                return Err("transaction path must contain exactly one 32-byte hex TXID".into());
+            }
+            Ok(RpcCommand::Transaction(parse_hex32(
+                txid,
+                "RPC transaction ID",
+            )?))
+        }
         _ => Err("unknown read-only RPC path".into()),
     }
 }
@@ -1325,10 +1350,91 @@ fn write_rpc_response(
     Ok(())
 }
 
+fn lookup_transaction(
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    mempool: &BoundedMempool,
+    params: &ConsensusParameters,
+    target_txid: [u8; 32],
+) -> Result<TransactionLookup, String> {
+    let fork = store.fork_choice();
+    let canonical_height = fork.canonical_height();
+    let base_tip = fork.base_tip();
+    let base_height = fork
+        .branch_state(&base_tip)
+        .map(|state| state.ledger().height())
+        .ok_or_else(|| "QZBE RPC cannot resolve the trusted base checkpoint".to_string())?;
+
+    // Build digest-indexed, validated envelopes, then traverse only the canonical ancestry.
+    // Searching every archived branch would falsely describe orphaned-fork transactions as confirmed.
+    let mut envelopes = BTreeMap::new();
+    for bytes in fork.archive_envelopes() {
+        let envelope = V04ExecutionPowEnvelope::decode(&bytes, fork.profile(), params)
+            .map_err(|error| format!("decode retained QZBE envelope for TXID query: {error}"))?;
+        let digest = qzbe_pow_digest(&envelope.header, &envelope.block, params)
+            .map_err(|error| format!("derive retained QZBE digest for TXID query: {error}"))?;
+        if envelopes.insert(digest, envelope).is_some() {
+            return Err(
+                "duplicate QZBE digest encountered while resolving transaction ancestry".into(),
+            );
+        }
+    }
+
+    let mut tip = fork.canonical_tip();
+    let mut height = canonical_height;
+    let mut remaining = envelopes.len().saturating_add(1);
+    while tip != base_tip && remaining > 0 {
+        remaining -= 1;
+        let envelope = envelopes
+            .get(&tip)
+            .ok_or_else(|| "canonical QZBE ancestry is missing a retained envelope".to_string())?;
+        if envelope.header.height != height {
+            return Err("canonical QZBE ancestry height does not match envelope".into());
+        }
+        for transaction in &envelope.block.transactions {
+            let id = transaction_id(transaction).map_err(|error| {
+                format!("derive transaction ID from canonical block: {error:?}")
+            })?;
+            if id == target_txid {
+                return Ok(TransactionLookup::Confirmed {
+                    block_height: height,
+                    confirmations: canonical_height
+                        .checked_sub(height)
+                        .and_then(|depth| depth.checked_add(1))
+                        .ok_or_else(|| {
+                            "QZBE transaction confirmation count overflow".to_string()
+                        })?,
+                });
+            }
+        }
+        tip = envelope.header.previous_consensus_hash;
+        height = height
+            .checked_sub(1)
+            .ok_or_else(|| "QZBE canonical ancestry height underflow".to_string())?;
+    }
+    if tip != base_tip {
+        return Err("canonical QZBE ancestry exceeds its bounded retained suffix".into());
+    }
+
+    for transaction in mempool.ordered_transactions() {
+        let id = transaction_id(&transaction)
+            .map_err(|error| format!("derive pending QZBE transaction ID: {error:?}"))?;
+        if id == target_txid {
+            return Ok(TransactionLookup::Pending {
+                mempool_count: mempool.len(),
+            });
+        }
+    }
+    Ok(TransactionLookup::NotFoundInRetainedSuffix {
+        search_floor_height: base_height,
+    })
+}
+
 fn serve_rpc_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
     store: &V04ExecutionCheckpointForkStoreCandidate,
+    mempool: &BoundedMempool,
+    params: &ConsensusParameters,
     network_id: &[u8; 32],
     genesis_id: &[u8; 32],
     profile_id: &[u8; 32],
@@ -1413,6 +1519,26 @@ fn serve_rpc_connection(
             "{{\"ok\":true,\"network_id\":\"{}\",\"genesis_id\":\"{}\",\"profile_id\":\"{}\",\"account_id\":\"{}\",\"balance_atoms\":{},\"height\":{},\"tip\":\"{}\",\"state_root\":\"{}\",\"generation\":{},\"mainnet\":false,\"read_only\":true}}",
             hex(network_id), hex(genesis_id), hex(profile_id), hex(&account), observed_balance(store, &account), current.height, hex(&current.tip), hex(&current.state_root), current.generation
         ),
+        RpcCommand::Transaction(txid) => {
+            match lookup_transaction(store, mempool, params, txid) {
+                Ok(TransactionLookup::Confirmed { block_height, confirmations }) => format!(
+                    "{{\"ok\":true,\"network_id\":\"{}\",\"genesis_id\":\"{}\",\"profile_id\":\"{}\",\"txid\":\"{}\",\"status\":\"confirmed\",\"block_height\":{},\"confirmations\":{},\"height\":{},\"tip\":\"{}\",\"state_root\":\"{}\",\"generation\":{},\"mainnet\":false,\"read_only\":true}}",
+                    hex(network_id), hex(genesis_id), hex(profile_id), hex(&txid), block_height, confirmations, current.height, hex(&current.tip), hex(&current.state_root), current.generation
+                ),
+                Ok(TransactionLookup::Pending { mempool_count }) => format!(
+                    "{{\"ok\":true,\"network_id\":\"{}\",\"genesis_id\":\"{}\",\"profile_id\":\"{}\",\"txid\":\"{}\",\"status\":\"pending\",\"block_height\":null,\"confirmations\":0,\"mempool_count\":{},\"height\":{},\"tip\":\"{}\",\"state_root\":\"{}\",\"generation\":{},\"mainnet\":false,\"read_only\":true}}",
+                    hex(network_id), hex(genesis_id), hex(profile_id), hex(&txid), mempool_count, current.height, hex(&current.tip), hex(&current.state_root), current.generation
+                ),
+                Ok(TransactionLookup::NotFoundInRetainedSuffix { search_floor_height }) => format!(
+                    "{{\"ok\":true,\"network_id\":\"{}\",\"genesis_id\":\"{}\",\"profile_id\":\"{}\",\"txid\":\"{}\",\"status\":\"not_found_in_retained_suffix\",\"block_height\":null,\"confirmations\":0,\"search_floor_height\":{},\"height\":{},\"tip\":\"{}\",\"state_root\":\"{}\",\"generation\":{},\"mainnet\":false,\"read_only\":true}}",
+                    hex(network_id), hex(genesis_id), hex(profile_id), hex(&txid), search_floor_height, current.height, hex(&current.tip), hex(&current.state_root), current.generation
+                ),
+                Err(_) => return write_rpc_response(
+                    &mut stream, 503, "Service Unavailable",
+                    "{{\"ok\":false,\"error\":\"transaction_state_unavailable\"}}",
+                ),
+            }
+        }
     };
     write_rpc_response(&mut stream, 200, "OK", &body)
 }
@@ -1420,6 +1546,8 @@ fn serve_rpc_connection(
 fn poll_rpc_connections(
     listener: Option<&TcpListener>,
     store: &V04ExecutionCheckpointForkStoreCandidate,
+    mempool: &BoundedMempool,
+    params: &ConsensusParameters,
     network_id: &[u8; 32],
     genesis_id: &[u8; 32],
     profile_id: &[u8; 32],
@@ -1431,7 +1559,7 @@ fn poll_rpc_connections(
         match listener.accept() {
             Ok((stream, peer_addr)) => {
                 if let Err(error) = serve_rpc_connection(
-                    stream, peer_addr, store, network_id, genesis_id, profile_id,
+                    stream, peer_addr, store, mempool, params, network_id, genesis_id, profile_id,
                 ) {
                     eprintln!(
                         "event=qzbe_v04_rpc_request_rejected peer={} reason={}",
@@ -1954,6 +2082,8 @@ fn run(args: Args) -> Result<(), String> {
                 if let Err(error) = poll_rpc_connections(
                     rpc_listener.as_ref(),
                     &store,
+                    &mempool,
+                    &params,
                     &args.network_id,
                     &genesis_id,
                     &profile_id,
@@ -2072,6 +2202,8 @@ fn run(args: Args) -> Result<(), String> {
             poll_rpc_connections(
                 rpc_listener.as_ref(),
                 &store,
+                &mempool,
+                &params,
                 &args.network_id,
                 &genesis_id,
                 &profile_id,
@@ -2577,6 +2709,22 @@ mod tests {
             parse_rpc_command(balance.as_bytes()),
             Ok(RpcCommand::Balance([0x11; 32]))
         );
+        let txid = format!(
+            "GET /v1/transaction/{} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "22".repeat(32)
+        );
+        assert_eq!(
+            parse_rpc_command(txid.as_bytes()),
+            Ok(RpcCommand::Transaction([0x22; 32]))
+        );
+        assert!(parse_rpc_command(
+            format!(
+                "GET /v1/transaction/{} HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n",
+                "xy".repeat(32)
+            )
+            .as_bytes()
+        )
+        .is_err());
         assert!(parse_rpc_command(
             b"POST /v1/status HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
         )

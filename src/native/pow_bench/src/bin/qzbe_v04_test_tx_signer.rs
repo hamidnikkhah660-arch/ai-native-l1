@@ -3,7 +3,7 @@
 //! The 32-byte seed file is temporary test material, never a production wallet format.
 //! The caller owns key custody and must delete the file after use.
 use ai_native_l1_pow_bench::{
-    state_machine::{transaction_signing_digest, Transaction},
+    state_machine::{transaction_id, transaction_signing_digest, Transaction},
     transaction_auth::Ed25519TransactionSigner,
 };
 use std::{collections::BTreeMap, env, fs, path::PathBuf, process};
@@ -151,6 +151,8 @@ fn run(values: BTreeMap<String, String>) -> Result<(), String> {
         .map_err(|error| format!("sign test transaction: {error:?}"))?;
     let digest = transaction_signing_digest(&tx)
         .map_err(|error| format!("derive test transaction digest: {error:?}"))?;
+    let txid =
+        transaction_id(&tx).map_err(|error| format!("derive test transaction ID: {error:?}"))?;
     println!("tx_network_id_hex={}", hex(&tx.network_id));
     println!("tx_public_key_hex={}", hex(&signer.public_key()));
     println!("tx_sender_account_id_hex={}", hex(&signer.account_id()));
@@ -160,6 +162,7 @@ fn run(values: BTreeMap<String, String>) -> Result<(), String> {
     println!("tx_fee_atoms={}", tx.fee);
     println!("tx_expires_at={}", tx.expires_at);
     println!("tx_signing_digest_hex={}", hex(&digest));
+    println!("tx_id_hex={}", hex(&txid));
     println!("tx_signature_hex={}", hex(&tx.signature));
     Ok(())
 }
