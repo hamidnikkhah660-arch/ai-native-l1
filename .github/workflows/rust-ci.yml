@@ -1,4 +1,4 @@
-name: Rust validation
+﻿name: Rust validation
 
 on:
   push:
@@ -97,3 +97,6 @@ jobs:
       - name: Run QZBE continuous mining with height-bounded stop and two-node replay convergence
         shell: pwsh
         run: ./simulations/cp0424_qzbe_continuous_mining_loopback.ps1
+      - name: Run QZXB DPAPI wallet, canonical PoW founder allocation and local transfer
+        shell: pwsh
+        run: ./simulations/cp0425_qzxb_founder_wallet_local_transfer.ps1

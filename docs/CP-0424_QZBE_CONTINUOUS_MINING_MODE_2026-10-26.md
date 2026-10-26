@@ -1,4 +1,4 @@
-# CP-0424 — QZBE continuous mining mode
+﻿# CP-0424 â€” QZBE continuous mining mode
 
 Date: 2026-10-26
 
@@ -29,4 +29,4 @@ Both nodes reopened their stores, replayed the persisted suffix, and agreed on t
 
 This closes the process-lifetime/block-count limitation for the existing diagnostic candidate only. It does **not** make the node publicly reachable or permissionless. QZBE still requires statically pinned peers, retains the loopback-only address guard, and does not yet provide the public transaction-ingress/mempool, automatic peer discovery, or late-join block synchronization needed for a Bitcoin-like public network. The test explicitly uses easy PoW on loopback and is not evidence of mainnet activation, public mining, owner-key custody, or market liquidity.
 
-The exact-head CI run must pass before this change is treated as integrated. Gate 2, Gate 8, public-network operation, and production-release qualification remain open.
+The exact-head GitHub Actions run 40390573762 (https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/40390573762) completed successfully for commit 2ef7d151722b8a357e02a82e3650dfb2739eb075. Gate 2, Gate 8, public-network operation, and production-release qualification remain open.
