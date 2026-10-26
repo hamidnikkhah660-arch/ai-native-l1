@@ -9,7 +9,8 @@ use ai_native_l1_pow_bench::{
     monetary_genesis_v04_candidate::GenesisManifestV04,
     monetary_issuance_v04_candidate::V04MiningIssuanceScheduleCandidate,
     monetary_pow_v04_candidate::{
-        MAX_V04_EXECUTION_FORK_ARCHIVE_BLOCKS, MAX_V04_EXECUTION_FORK_ARCHIVE_HEIGHT,
+        MAX_QZBE_MINING_ATTEMPTS, MAX_V04_EXECUTION_FORK_ARCHIVE_BLOCKS,
+        MAX_V04_EXECUTION_FORK_ARCHIVE_HEIGHT,
     },
     monetary_pow_v04_store_candidate::V04ExecutionForkStoreCandidate,
     monetary_transition_v04_candidate::{
@@ -230,9 +231,10 @@ fn require_dedicated_store_directory(path: &Path) -> Result<(), String> {
 fn prepare_consensus_parameters() -> Result<ConsensusParameters, String> {
     let mut params = ConsensusParameters::candidate_testnet()
         .map_err(|error| format!("candidate PoW parameter construction failed: {error:?}"))?;
-    // Deliberately easy local proof-of-work so this diagnostic cannot be mistaken for a production
-    // difficulty profile. The exact parameters are still fingerprinted in each envelope/manifest.
-    params.initial_target = Uint256::MAX;
+    // Deliberately easy but NON-MAX local proof-of-work: the smoke must exercise the body-bound
+    // mining loop rather than passing every nonce trivially. This is not a production difficulty
+    // profile; the exact parameters are fingerprinted in each envelope/manifest.
+    params.initial_target = Uint256::from_be_bytes([0xEF; 32]);
     params.pow_limit = Uint256::MAX;
     // Match the deliberately small local research profile used by existing offline smoke paths.
     params.pow.memory_kib = 8 * 1024;
@@ -312,15 +314,17 @@ fn run_smoke(args: &Args) -> Result<SmokeResult, String> {
         let parent_tip = store.canonical_tip();
         let encoded = store
             .fork_choice()
-            .build_candidate_on(
+            .mine_candidate_on(
                 parent_tip,
                 next_height,
                 args.miner_id,
                 Vec::new(),
                 next_height,
+                MAX_QZBE_MINING_ATTEMPTS,
                 &RejectAllTransactions,
+                || false,
             )
-            .map_err(|error| format!("build QZBE candidate block: {error}"))?;
+            .map_err(|error| format!("mine bounded body-bound QZBE candidate block: {error}"))?;
         let result = store
             .submit(&encoded, &RejectAllTransactions)
             .map_err(|error| format!("submit QZBE candidate block: {error}"))?;

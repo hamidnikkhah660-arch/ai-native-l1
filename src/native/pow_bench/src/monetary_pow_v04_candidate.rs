@@ -33,6 +33,9 @@ pub const MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES: usize =
     ENVELOPE_HEADER_BYTES + MAX_ENCODED_V04_EXECUTION_BLOCK_BYTES;
 pub const MAX_V04_EXECUTION_FORK_ARCHIVE_BLOCKS: usize = 4_096;
 pub const MAX_V04_EXECUTION_FORK_ARCHIVE_HEIGHT: u64 = 1_024;
+/// Hard cap on work performed by one candidate-mining call. Callers can use the cancellation
+/// predicate for a stricter wall-clock or operator policy.
+pub const MAX_QZBE_MINING_ATTEMPTS: u32 = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum V04ExecutionPowError {
@@ -49,6 +52,10 @@ pub enum V04ExecutionPowError {
     DuplicateDigestConflict,
     ArchiveCapacityExceeded,
     BranchHeightExceeded,
+    MiningAttemptsInvalid,
+    MiningCancelled,
+    MiningExhausted,
+    MiningNonceOverflow,
 }
 
 impl std::fmt::Display for V04ExecutionPowError {
@@ -506,6 +513,75 @@ impl V04ExecutionForkChoiceCandidate {
         Ok(envelope.encode(&self.profile, &self.params)?)
     }
 
+    /// Mine a body-bound QZBE v2 candidate using a hard-bounded nonce loop.
+    ///
+    /// This helper does not mutate the fork graph: callers must still submit the returned bytes
+    /// through the normal validation path. The target is derived from the selected parent's
+    /// target history, and each attempt hashes the exact block body ID together with its header.
+    /// `max_attempts` must be in 1..=MAX_QZBE_MINING_ATTEMPTS; `cancelled` is checked before
+    /// every memory-hard hash so the caller can enforce a wall-clock/resource policy.
+    pub fn mine_candidate_on<A, F>(
+        &self,
+        parent_tip: [u8; 32],
+        timestamp: u64,
+        miner: [u8; 32],
+        transactions: Vec<Transaction>,
+        first_nonce: u64,
+        max_attempts: u32,
+        authenticator: &A,
+        mut cancelled: F,
+    ) -> Result<Vec<u8>, V04ExecutionPowError>
+    where
+        A: TransactionAuthenticator,
+        F: FnMut() -> bool,
+    {
+        if max_attempts == 0 || max_attempts > MAX_QZBE_MINING_ATTEMPTS {
+            return Err(V04ExecutionPowError::MiningAttemptsInvalid);
+        }
+        let encoded = self.build_candidate_on(
+            parent_tip,
+            timestamp,
+            miner,
+            transactions,
+            first_nonce,
+            authenticator,
+        )?;
+        let mut envelope = V04ExecutionPowEnvelope::decode(&encoded, &self.profile, &self.params)?;
+        if envelope.header.target.is_zero() || envelope.header.target > self.params.pow_limit {
+            return Err(V04ExecutionPowError::Consensus(
+                if envelope.header.target.is_zero() {
+                    ConsensusError::InvalidTarget
+                } else {
+                    ConsensusError::TargetAbovePowLimit
+                },
+            ));
+        }
+        for attempt in 0..max_attempts {
+            if cancelled() {
+                return Err(V04ExecutionPowError::MiningCancelled);
+            }
+            let digest = qzbe_pow_digest(&envelope.header, &envelope.block, &self.params)?;
+            if Uint256::from_be_bytes(digest) <= envelope.header.target {
+                let mined = envelope.encode(&self.profile, &self.params)?;
+                // Round-trip the successful candidate through the same consensus verifier so
+                // changes to the mining loop cannot silently diverge from import validation.
+                verify_qzbe_pow(
+                    &V04ExecutionPowEnvelope::decode(&mined, &self.profile, &self.params)?,
+                    &self.params,
+                )?;
+                return Ok(mined);
+            }
+            if attempt + 1 < max_attempts {
+                envelope.header.nonce = envelope
+                    .header
+                    .nonce
+                    .checked_add(1)
+                    .ok_or(V04ExecutionPowError::MiningNonceOverflow)?;
+            }
+        }
+        Err(V04ExecutionPowError::MiningExhausted)
+    }
+
     /// Validate and execute an envelope on its referenced parent, retain it as a branch, then
     /// choose the best tip by exact cumulative work with the repository's deterministic tie-break.
     /// Any invalid header, PoW proof, body, authorization, reward or root leaves the graph unchanged.
@@ -918,6 +994,111 @@ mod tests {
             replayed.branch_work(&replayed.canonical_tip()),
             graph.branch_work(&graph.canonical_tip())
         );
+    }
+
+    #[test]
+    fn bounded_miner_finds_body_bound_pow_under_a_non_max_target() {
+        let (_, profile) = profile(10_000);
+        let genesis = genesis(&profile);
+        let mut parameters = params();
+        parameters.initial_target = Uint256::from_be_bytes([0xEF; 32]);
+        parameters.pow_limit = Uint256::MAX;
+        let mut graph = V04ExecutionForkChoiceCandidate::new(genesis, parameters.clone()).unwrap();
+
+        let encoded = graph
+            .mine_candidate_on(
+                graph.genesis_tip(),
+                1,
+                MINER_A,
+                vec![transfer()],
+                0,
+                64,
+                &TestAuthenticator,
+                || false,
+            )
+            .unwrap();
+        let envelope = V04ExecutionPowEnvelope::decode(&encoded, &profile, &parameters).unwrap();
+        assert_ne!(envelope.header.target, Uint256::MAX);
+        let digest = qzbe_pow_digest(&envelope.header, &envelope.block, &parameters).unwrap();
+        assert!(Uint256::from_be_bytes(digest) <= envelope.header.target);
+        assert_eq!(
+            graph.archive_len(),
+            0,
+            "mining must not mutate the branch graph"
+        );
+
+        let outcome = graph.insert_encoded(&encoded, &TestAuthenticator).unwrap();
+        assert_eq!(outcome.block_digest, digest);
+        assert_eq!(outcome.canonical_height, 1);
+    }
+
+    #[test]
+    fn bounded_miner_honors_cancellation_attempt_limits_and_exhaustion() {
+        let (_, profile) = profile(10_000);
+        let genesis = genesis(&profile);
+
+        let parameters = params();
+        let graph =
+            V04ExecutionForkChoiceCandidate::new(genesis.clone(), parameters.clone()).unwrap();
+        assert_eq!(
+            graph.mine_candidate_on(
+                graph.genesis_tip(),
+                1,
+                MINER_A,
+                vec![transfer()],
+                0,
+                0,
+                &TestAuthenticator,
+                || false,
+            ),
+            Err(V04ExecutionPowError::MiningAttemptsInvalid)
+        );
+        assert_eq!(
+            graph.mine_candidate_on(
+                graph.genesis_tip(),
+                1,
+                MINER_A,
+                vec![transfer()],
+                0,
+                MAX_QZBE_MINING_ATTEMPTS + 1,
+                &TestAuthenticator,
+                || false,
+            ),
+            Err(V04ExecutionPowError::MiningAttemptsInvalid)
+        );
+        assert_eq!(
+            graph.mine_candidate_on(
+                graph.genesis_tip(),
+                1,
+                MINER_A,
+                vec![transfer()],
+                0,
+                4,
+                &TestAuthenticator,
+                || true,
+            ),
+            Err(V04ExecutionPowError::MiningCancelled)
+        );
+        assert_eq!(graph.archive_len(), 0);
+
+        let mut impossible_target = params();
+        impossible_target.initial_target = Uint256::ONE;
+        impossible_target.pow_limit = Uint256::MAX;
+        let graph = V04ExecutionForkChoiceCandidate::new(genesis, impossible_target).unwrap();
+        assert_eq!(
+            graph.mine_candidate_on(
+                graph.genesis_tip(),
+                1,
+                MINER_A,
+                vec![transfer()],
+                0,
+                1,
+                &TestAuthenticator,
+                || false,
+            ),
+            Err(V04ExecutionPowError::MiningExhausted)
+        );
+        assert_eq!(graph.archive_len(), 0);
     }
 
     #[test]
