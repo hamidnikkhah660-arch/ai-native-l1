@@ -22,6 +22,6 @@ This is a localhost test harness, not a node listener or a public/private Devnet
 
 ## Next gates
 
-1. Publish this checkpoint on a separate reviewable Draft PR and run exact-head GitHub CI.
+1. Exact-head GitHub Actions run 40272133241 passed both Rust validation and Windows PMT4/TXN4 two-node loopback for commit 8f15d4b82f0e5d0fe606f2735528326d5b45a709. Draft PR #65 remains open for review; do not merge or promote this test-only candidate as runtime.
 2. Keep this test-only scope separate from canonical node integration. The next runtime change must be independently reviewable and zero-value, and must dispatch QZBE symmetrically across production, import, fork choice, persistence/replay, authenticated peer lifecycle, and transaction admission.
 3. Independently operated anti-rollback CAS and external security review remain mandatory before any value-bearing launch.
