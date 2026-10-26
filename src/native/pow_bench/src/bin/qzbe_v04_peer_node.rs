@@ -1183,6 +1183,44 @@ mod tests {
         params
     }
 
+    fn test_args(initial_subsidy_atoms: u128, blocks_per_halving: u64) -> Args {
+        Args {
+            data_dir: temp_profile_root(),
+            listen: "127.0.0.1:49331".parse().unwrap(),
+            peer: None,
+            network_id: [0x31; 32],
+            owner_id: [0xA7; 32],
+            miner_id: [0xC4; 32],
+            tx_public_key: [0xD1; 32],
+            observe_account_id: [0xB2; 32],
+            transaction: None,
+            probe_invalid_signature_first: false,
+            trusted_peer_key: [0xE6; 32],
+            noise_key_path: env::temp_dir().join("unused-qzbe-test-noise-key"),
+            initial_subsidy_atoms,
+            blocks_per_halving,
+            mine_blocks: 0,
+            run_seconds: 1,
+            stop_after_height: None,
+            exit_after_mining: true,
+        }
+    }
+
+    #[test]
+    fn node_profile_accepts_canonical_schedule_and_rejects_toy_economics() {
+        let canonical = test_args(35_673_515_981, 4_204_800);
+        let (_, profile, _, _) =
+            prepare_profile(&canonical).expect("canonical v0.4 candidate profile");
+        assert_eq!(profile.schedule().initial_subsidy_atoms(), 35_673_515_981);
+        assert_eq!(profile.schedule().blocks_per_halving(), 4_204_800);
+
+        let toy = test_args(1_000_000, 1_000);
+        let error =
+            prepare_profile(&toy).expect_err("node launch must reject noncanonical toy economics");
+        assert!(error.contains("NonCanonicalLaunchParameters"), "{error}");
+        assert!(error.contains("canonical v0.4 tokenomics"), "{error}");
+    }
+
     #[test]
     fn profile_lock_is_create_once_and_binds_network_genesis_profile_and_consensus() {
         let root = temp_profile_root();

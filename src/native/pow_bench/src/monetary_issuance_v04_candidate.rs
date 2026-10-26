@@ -11,8 +11,10 @@
 //! - a reward is capped to the remaining mining allocation;
 //! - no special terminal mint tops up the final rounding remainder.
 //!
-//! The schedule fingerprint is not currently included in QZGM Genesis or QZL4 snapshots. A future
-//! runtime integration must introduce a reviewed, versioned profile that binds this fingerprint.
+//! QZGM Genesis bytes remain unchanged; the versioned QZCP consensus-profile extension binds this
+//! schedule fingerprint alongside the Genesis manifest, network, allocation policy and parameters.
+//! QZB4 v2 execution snapshots bind the resulting profile fingerprint. The separate profile still
+//! must be integrated into the default node runtime before a public Mainnet launch.
 
 use sha2::{Digest, Sha256};
 
