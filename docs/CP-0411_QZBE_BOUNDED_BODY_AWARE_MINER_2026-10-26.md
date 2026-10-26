@@ -40,6 +40,6 @@ Validation passed on this working tree: cargo fmt --all -- --check; cargo check 
 
 The candidate miner has no connection to the canonical node producer or peer network. It does not by itself provide mempool selection, authenticated peer transport, signed transaction submission, production resource governance, externally operated CAS, independently protected anti-rollback state, or a validated economic profile. The non-MAX smoke target and reduced memory are diagnostic values only.
 
-Next work: complete exact-tree all-target validation, publish a separate reviewable follow-up, then design and test the dedicated zero-value development-node runtime with QZB4/QZBE wired across block production, import, fork choice, persistence/replay, peer authentication and transaction admission. Independent operator/provider/security review and explicit legal/economic launch gates remain mandatory before any public or value-bearing launch.
+Next work: publish a separate reviewable follow-up, then design and test the dedicated zero-value development-node runtime with QZB4/QZBE wired across block production, import, fork choice, persistence/replay, peer authentication and transaction admission. Independent operator/provider/security review and explicit legal/economic launch gates remain mandatory before any public or value-bearing launch.
 
 No external team or auditor has been contacted or engaged through this work; no email has been sent, no merge occurred, and no public network or value-bearing issuance has been launched.
