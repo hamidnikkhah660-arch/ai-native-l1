@@ -46,7 +46,7 @@
 - **CP-0408 QZBE offline candidate smoke runner:** [Explicit Genesis/schedule inputs, transaction-free local block production, persistent-store reopen/replay, and strict no-listener boundary](docs/CP-0408_QZBE_OFFLINE_CANDIDATE_SMOKE_RUNNER_2026-10-24.md) - candidate-only; six focused tests, full local all-target suite/check, and a local 0→3→5-height smoke pass; exact-commit CI pending.
 - **CP-0409 independent security audit scope:** [Audit-ready scope, threat model, acceptance criteria and vendor questions](docs/CP-0409_INDEPENDENT_SECURITY_AUDIT_SCOPE_2026-10-25.md) - proposal brief only; no auditor engaged, no audit delivered, Gate 2/Gate 8 remain open.
 - **CP-0410 QZBE v2 body-bound consensus identity:** [Consensus digest correction, adversarial regression and remaining integration gates](docs/CP-0410_QZBE_BODY_BOUND_CONSENSUS_V2_2026-10-26.md) - local candidate fix; focused validation and offline restart smoke pass; exact-commit CI run 40262754020 passed, while independent security review remains pending.
-- **CP-0411 bounded QZBE v2 body-aware miner:** [Nonce mining with explicit attempt cap/cancellation and non-MAX offline smoke](docs/CP-0411_QZBE_BOUNDED_BODY_AWARE_MINER_2026-10-26.md) - all-target local tests passed (830 library tests, both node suites 36/36, smoke 6/6, all other targets green); manual offline persistence/restart smoke passed; exact-commit CI is pending.
+- **CP-0411 bounded QZBE v2 body-aware miner:** [Nonce mining with explicit attempt cap/cancellation and non-MAX offline smoke](docs/CP-0411_QZBE_BOUNDED_BODY_AWARE_MINER_2026-10-26.md) - all-target local tests passed (830 library tests, both node suites 36/36, smoke 6/6, all other targets green); manual persistence/restart smoke passed. GitHub Actions run 40270201401 passed on exact SHA d35a43298aea9584892e81fd1217ef30e045998a; both Rust all-target validation and the Windows PMT4/TXN4 loopback job are green.
 - **Owner's zero-budget launch and liquidity directive:** [Persistent launch gate and fresh-session handoff](docs/OWNER_DIRECTIVE_ZERO_BUDGET_LAUNCH_AND_LIQUIDITY_GATE_V01_2026-10-21.md) - [live execution issue #12](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/12)
 - **Sponsorship and contributor discussion:** [Public issue #1](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/1)
 - **Previous public documentation release:** [v0.2.0-docs](https://github.com/hamidnikkhah660-arch/ai-native-l1/releases/tag/v0.2.0-docs)
@@ -89,6 +89,8 @@ These are planned allocations, not active Genesis issuance, circulating supply, 
 - **Production gate status:** Gate 2 and Gate 8 remain open; native QZXB mainnet and a liquid native-coin market are not launched.
 
 The former 4B founder / 3B mining / 3B public-goods proposal is preserved in versioned historical documents and superseded for current allocation planning by policy v0.4. The separate QX ERC-20 deployment on Ethereum Sepolia is a test asset, not the native QZXB coin or a production market.
+
+- **CP-0412 real Ed25519 through QZBE v2:** [Signed transaction, body-aware PoW, TCP loopback, atomic bad-signature rejection and restart/replay](docs/CP-0412_QZBE_REAL_ED25519_LOOPBACK_2026-10-26.md) - local full suite passed (831 library tests, both node suites 36/36, smoke 6/6, all other targets green); docs preflight passed with 53 README-relative links and 383 Git-index checksum entries; exact-commit CI is pending.
 
 ## Current engineering validation
 

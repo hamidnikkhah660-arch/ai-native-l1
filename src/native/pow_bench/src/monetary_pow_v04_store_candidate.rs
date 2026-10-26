@@ -1322,6 +1322,10 @@ mod tests {
         monetary_issuance_v04_candidate::V04MiningIssuanceScheduleCandidate,
         monetary_transition_v04_candidate::V04ConsensusProfileCandidate,
         state_machine::{AccountId, Transaction},
+        transaction_auth::{
+            AccountPublicKey, Ed25519TransactionAuthenticator, Ed25519TransactionSigner,
+            TransactionAuthenticatorKind,
+        },
         v4_fat1_mldsa65_candidate::LibcruxMlDsa65VerifierCandidate,
     };
     use libcrux_ml_dsa::ml_dsa_65::portable;
@@ -1774,6 +1778,212 @@ mod tests {
         drop(reopened_b);
         fs::remove_dir_all(node_a_path).unwrap();
         fs::remove_dir_all(node_b_path).unwrap();
+    }
+
+    /// CP-0412: validate actual Ed25519 signing/authentication through body-bound QZBE mining,
+    /// TCP byte transfer, persistent commit, and deterministic restart on two independent stores.
+    #[test]
+    fn qzbe_v2_real_ed25519_transaction_mines_transfers_rejects_bad_signature_and_replays() {
+        let signer = Ed25519TransactionSigner::from_seed([0x91; 32]);
+        let owner = signer.account_id();
+        let manifest = GenesisManifestV04::new(NETWORK, owner).unwrap();
+        let schedule = V04MiningIssuanceScheduleCandidate::new(10_000, 2).unwrap();
+        let profile =
+            V04ConsensusProfileCandidate::from_manifest_and_schedule(&manifest, schedule).unwrap();
+        let genesis_state =
+            MonetaryLedgerStateV04TransitionCandidate::from_genesis_manifest(&manifest, &profile)
+                .unwrap();
+        let authenticator = Ed25519TransactionAuthenticator::select(
+            TransactionAuthenticatorKind::Ed25519V1,
+            [AccountPublicKey {
+                account_id: owner,
+                public_key: signer.public_key(),
+            }],
+        )
+        .unwrap();
+
+        let mut parameters = params();
+        parameters.initial_target = Uint256::from_be_bytes([0xEF; 32]);
+        parameters.pow_limit = Uint256::MAX;
+        let path_a = temporary_directory();
+        let path_b = temporary_directory();
+        let mut node_a = V04ExecutionForkStoreCandidate::open(
+            &path_a,
+            genesis_state.clone(),
+            parameters.clone(),
+            &authenticator,
+        )
+        .unwrap();
+        let mut node_b = V04ExecutionForkStoreCandidate::open(
+            &path_b,
+            genesis_state.clone(),
+            parameters.clone(),
+            &authenticator,
+        )
+        .unwrap();
+
+        // A real signed transaction must survive the full body-bound PoW and codec pipeline.
+        let mut first_tx = Transaction {
+            network_id: NETWORK,
+            sender: owner,
+            recipient: RECIPIENT,
+            nonce: 1,
+            amount: 2_500,
+            fee: 7,
+            expires_at: 100,
+            signature: Vec::new(),
+        };
+        signer.sign_transaction(&mut first_tx).unwrap();
+        let first_parent = node_a.canonical_tip();
+        let first = node_a
+            .fork_choice()
+            .mine_candidate_on(
+                first_parent,
+                1,
+                MINER_A,
+                vec![first_tx],
+                0,
+                64,
+                &authenticator,
+                || false,
+            )
+            .unwrap();
+        let first_envelope =
+            V04ExecutionPowEnvelope::decode(&first, &profile, &parameters).unwrap();
+        assert_ne!(first_envelope.header.target, Uint256::MAX);
+        let first_digest =
+            qzbe_pow_digest(&first_envelope.header, &first_envelope.block, &parameters).unwrap();
+        assert!(Uint256::from_be_bytes(first_digest) <= first_envelope.header.target);
+        assert_eq!(
+            node_a.archive_len(),
+            0,
+            "mining must not mutate the durable store"
+        );
+        node_a.submit(&first, &authenticator).unwrap();
+        let received_first = loopback_exchange(&first);
+        assert_eq!(received_first, first);
+        node_b.submit(&received_first, &authenticator).unwrap();
+        assert_eq!(node_a.canonical_tip(), node_b.canonical_tip());
+        assert_eq!(
+            node_a.canonical_state_root().unwrap(),
+            node_b.canonical_state_root().unwrap()
+        );
+        assert_eq!(node_a.canonical_height(), 1);
+        assert_eq!(node_b.canonical_height(), 1);
+
+        // A malformed signature is placed into a structurally valid mined body by an explicitly
+        // permissive test-only producer. The real receiver verifier must reject it atomically.
+        let mut invalid_tx = Transaction {
+            network_id: NETWORK,
+            sender: owner,
+            recipient: RECIPIENT,
+            nonce: 2,
+            amount: 500,
+            fee: 7,
+            expires_at: 100,
+            signature: vec![0x00],
+        };
+        invalid_tx.signature[0] ^= 1;
+        let invalid_parent = node_a.canonical_tip();
+        let invalid = node_a
+            .fork_choice()
+            .mine_candidate_on(
+                invalid_parent,
+                2,
+                MINER_A,
+                vec![invalid_tx],
+                100,
+                64,
+                &AcceptAnyNonemptyAuthenticator,
+                || false,
+            )
+            .unwrap();
+        let received_invalid = loopback_exchange(&invalid);
+        let before_rejection = (
+            node_b.canonical_tip(),
+            node_b.canonical_height(),
+            node_b.canonical_state_root().unwrap(),
+            node_b.generation(),
+            node_b.archive_len(),
+        );
+        assert!(node_b.submit(&received_invalid, &authenticator).is_err());
+        assert_eq!(
+            before_rejection,
+            (
+                node_b.canonical_tip(),
+                node_b.canonical_height(),
+                node_b.canonical_state_root().unwrap(),
+                node_b.generation(),
+                node_b.archive_len(),
+            ),
+            "invalid real-signature verification must not publish any durable transition"
+        );
+
+        // A correctly signed nonce-2 successor still propagates after the invalid candidate.
+        let mut second_tx = Transaction {
+            network_id: NETWORK,
+            sender: owner,
+            recipient: RECIPIENT,
+            nonce: 2,
+            amount: 500,
+            fee: 7,
+            expires_at: 100,
+            signature: Vec::new(),
+        };
+        signer.sign_transaction(&mut second_tx).unwrap();
+        let second_parent = node_a.canonical_tip();
+        let second = node_a
+            .fork_choice()
+            .mine_candidate_on(
+                second_parent,
+                2,
+                MINER_A,
+                vec![second_tx],
+                101,
+                64,
+                &authenticator,
+                || false,
+            )
+            .unwrap();
+        node_a.submit(&second, &authenticator).unwrap();
+        node_b
+            .submit(&loopback_exchange(&second), &authenticator)
+            .unwrap();
+
+        let expected_tip = node_a.canonical_tip();
+        let expected_root = node_a.canonical_state_root().unwrap();
+        assert_eq!(node_b.canonical_tip(), expected_tip);
+        assert_eq!(node_b.canonical_height(), 2);
+        assert_eq!(node_b.canonical_state_root().unwrap(), expected_root);
+        assert_eq!(node_a.generation(), 2);
+        assert_eq!(node_b.generation(), 2);
+        drop(node_a);
+        drop(node_b);
+
+        let reopened_a = V04ExecutionForkStoreCandidate::open(
+            &path_a,
+            genesis_state.clone(),
+            parameters.clone(),
+            &authenticator,
+        )
+        .unwrap();
+        let reopened_b = V04ExecutionForkStoreCandidate::open(
+            &path_b,
+            genesis_state,
+            parameters,
+            &authenticator,
+        )
+        .unwrap();
+        assert_eq!(reopened_a.canonical_tip(), expected_tip);
+        assert_eq!(reopened_b.canonical_tip(), expected_tip);
+        assert_eq!(reopened_a.canonical_state_root().unwrap(), expected_root);
+        assert_eq!(reopened_b.canonical_state_root().unwrap(), expected_root);
+        assert_eq!(reopened_a.canonical_height(), 2);
+        assert_eq!(reopened_b.canonical_height(), 2);
+        drop(reopened_a);
+        drop(reopened_b);
+        fs::remove_dir_all(path_a).unwrap();
+        fs::remove_dir_all(path_b).unwrap();
     }
 
     #[test]

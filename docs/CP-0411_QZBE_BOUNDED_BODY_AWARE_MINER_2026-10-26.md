@@ -34,7 +34,7 @@ The smoke remains explicitly offline: P2P, RPC, wallet and market listeners are 
 - All six qzbe_v04_candidate_smoke binary tests pass after the smoke was switched to the body-aware miner.
 - Manual offline persistence/restart smoke passed against one unique temporary data directory: height 0 to 3, then after close/reopen height 3 to 5. Both runs reported PASS and replayed state roots; all network/service listeners remained disabled, and the temporary directory was removed.
 
-Validation passed on this working tree: cargo fmt --all -- --check; cargo check --all-targets --locked --offline; cargo test --all-targets --locked --offline with 830 library tests, both node harnesses 36/36, the QZBE smoke binary 6/6, and all other targets passing with zero failures. The manual offline 0-to-3 then reopen-and-resume 3-to-5 smoke also passed. Fresh GitHub CI has not yet run for CP-0411.
+Validation passed on this working tree: cargo fmt --all -- --check; cargo check --all-targets --locked --offline; cargo test --all-targets --locked --offline with 830 library tests, both node harnesses 36/36, the QZBE smoke binary 6/6, and all other targets passing with zero failures. The manual offline 0-to-3 then reopen-and-resume 3-to-5 smoke also passed. GitHub Actions run 40270201401 passed on exact CP-0411 tree SHA d35a43298aea9584892e81fd1217ef30e045998a. Both Format/check/test and Windows PMT4/TXN4 two-node loopback jobs succeeded.
 
 ## Remaining blockers
 
