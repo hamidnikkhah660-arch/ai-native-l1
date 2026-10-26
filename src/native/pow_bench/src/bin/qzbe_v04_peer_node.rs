@@ -66,6 +66,8 @@ const MAX_MINE_BLOCKS: u64 = 32;
 const MAX_PEER_MESSAGES: u64 = 512;
 const MAX_TX_SUBMISSIONS_PER_POLL: usize = 8;
 const MAX_TX_SUBMISSIONS: u64 = 65_536;
+const MAX_RPC_REQUEST_BYTES: usize = 2_048;
+const MAX_RPC_CONNECTIONS_PER_POLL: usize = 8;
 const DEFAULT_RUN_SECONDS: u64 = 30;
 
 struct SecretKey([u8; 32]);
@@ -80,6 +82,7 @@ struct Args {
     data_dir: PathBuf,
     listen: SocketAddr,
     tx_listen: Option<SocketAddr>,
+    rpc_listen: Option<SocketAddr>,
     peers: Vec<SocketAddr>,
     network_id: [u8; 32],
     owner_id: [u8; 32],
@@ -116,7 +119,7 @@ struct PeerAck {
 }
 
 fn usage() -> &'static str {
-    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --tx-public-key-hex HEX64 --observe-account-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT [--tx-listen 127.0.0.1:PORT] --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 [--trusted-peer-key-hex HEX64 ...] --initial-subsidy-atoms U128 --blocks-per-halving U64 [--tx-recipient-id HEX64 --tx-nonce U64 --tx-amount-atoms U64 --tx-fee-atoms U64 --tx-expires-at U64 --tx-signature-hex HEX128] [--probe-invalid-signature-first] [--test-easy-pow] [--peer 127.0.0.1:PORT ...] [--mine-blocks N | --mine-forever] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2 runtime candidate with statically pinned multi-peer loopback connections and an optional bounded QZTS/1 transaction-ingress listener. Each --peer is paired by order with the corresponding --trusted-peer-key-hex; additional trusted keys may authorize inbound peers. Canonical v0.4 Argon2id is the default. --mine-forever continuously mines and broadcasts until interrupted or --stop-after-height is reached; it requires at least one pinned peer and cannot be combined with --mine-blocks or --exit-after-mining. --test-easy-pow is for isolated loopback tests only. No public bind or Mainnet activation."
+    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --tx-public-key-hex HEX64 --observe-account-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT [--tx-listen 127.0.0.1:PORT] [--rpc-listen 127.0.0.1:PORT] --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 [--trusted-peer-key-hex HEX64 ...] --initial-subsidy-atoms U128 --blocks-per-halving U64 [--tx-recipient-id HEX64 --tx-nonce U64 --tx-amount-atoms U64 --tx-fee-atoms U64 --tx-expires-at U64 --tx-signature-hex HEX128] [--probe-invalid-signature-first] [--test-easy-pow] [--peer 127.0.0.1:PORT ...] [--mine-blocks N | --mine-forever] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2 runtime candidate with statically pinned multi-peer loopback connections and an optional bounded QZTS/1 transaction-ingress listener. Each --peer is paired by order with the corresponding --trusted-peer-key-hex; additional trusted keys may authorize inbound peers. Canonical v0.4 Argon2id is the default. --mine-forever continuously mines and broadcasts until interrupted or --stop-after-height is reached; it requires at least one pinned peer and cannot be combined with --mine-blocks or --exit-after-mining. --test-easy-pow is for isolated loopback tests only. No public bind or Mainnet activation."
 }
 
 fn parse_hex32(value: &str, name: &str) -> Result<[u8; 32], String> {
@@ -243,6 +246,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
                 | "--data-dir"
                 | "--listen"
                 | "--tx-listen"
+                | "--rpc-listen"
                 | "--noise-static-private-key-dpapi-file"
                 | "--initial-subsidy-atoms"
                 | "--blocks-per-halving"
@@ -292,6 +296,23 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
             return Err("--tx-listen must use a different socket from --listen".into());
         }
     }
+    let rpc_listen = values
+        .get("--rpc-listen")
+        .map(|value| {
+            value
+                .parse::<SocketAddr>()
+                .map_err(|_| "--rpc-listen is not a valid socket address".to_string())
+        })
+        .transpose()?;
+    if let Some(address) = rpc_listen {
+        ensure_loopback_address(address, "read-only RPC listen addresses")?;
+        if address == listen || Some(address) == tx_listen {
+            return Err(
+                "--rpc-listen must use a distinct socket from peer and transaction listeners"
+                    .into(),
+            );
+        }
+    }
 
     let peers = peer_values
         .iter()
@@ -308,6 +329,9 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
         }
         if Some(*address) == tx_listen {
             return Err("--peer cannot refer to this node's transaction-ingress listener".into());
+        }
+        if Some(*address) == rpc_listen {
+            return Err("--peer cannot refer to this node's read-only RPC listener".into());
         }
         if peers[..index].contains(address) {
             return Err("duplicate --peer address".into());
@@ -475,6 +499,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
         data_dir,
         listen,
         tx_listen,
+        rpc_listen,
         peers,
         network_id,
         owner_id,
@@ -1217,6 +1242,210 @@ fn serve_connection(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RpcCommand {
+    Status,
+    Balance(AccountId),
+}
+
+fn parse_rpc_command(request: &[u8]) -> Result<RpcCommand, String> {
+    if request.is_empty() || request.len() > MAX_RPC_REQUEST_BYTES {
+        return Err("RPC request is empty or too large".into());
+    }
+    let header_end = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| "RPC request has no complete HTTP header".to_string())?;
+    if header_end + 4 != request.len() {
+        return Err("RPC request body or pipelined bytes are not allowed".into());
+    }
+    let text = std::str::from_utf8(&request[..header_end])
+        .map_err(|_| "RPC request is not ASCII/UTF-8".to_string())?;
+    if !text.is_ascii() {
+        return Err("RPC request must be ASCII".into());
+    }
+    let mut lines = text.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or_else(|| "RPC request line missing".to_string())?;
+    let fields = request_line.split_ascii_whitespace().collect::<Vec<_>>();
+    if fields.len() != 3 || fields[0] != "GET" || !matches!(fields[2], "HTTP/1.0" | "HTTP/1.1") {
+        return Err("RPC permits only GET HTTP/1.0 or HTTP/1.1".into());
+    }
+    let headers = lines.collect::<Vec<_>>();
+    if fields[2] == "HTTP/1.1"
+        && !headers
+            .iter()
+            .any(|line| line.to_ascii_lowercase().starts_with("host:"))
+    {
+        return Err("HTTP/1.1 RPC request requires Host".into());
+    }
+    for line in headers {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("content-length:") && lower.trim() != "content-length: 0" {
+            return Err("RPC request body is not allowed".into());
+        }
+        if lower.starts_with("transfer-encoding:") {
+            return Err("RPC transfer encoding is not allowed".into());
+        }
+    }
+    match fields[1] {
+        "/v1/status" => Ok(RpcCommand::Status),
+        path if path.starts_with("/v1/balance/") => {
+            let account = &path["/v1/balance/".len()..];
+            if account.len() != 64
+                || account.contains('/')
+                || account.contains('?')
+                || account.contains('#')
+            {
+                return Err("balance path must contain exactly one 32-byte hex account ID".into());
+            }
+            Ok(RpcCommand::Balance(parse_hex32(account, "RPC account ID")?))
+        }
+        _ => Err("unknown read-only RPC path".into()),
+    }
+}
+
+fn write_rpc_response(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    body: &str,
+) -> Result<(), String> {
+    let header = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(header.as_bytes())
+        .map_err(|error| format!("write QZBE RPC headers: {error}"))?;
+    stream
+        .write_all(body.as_bytes())
+        .map_err(|error| format!("write QZBE RPC JSON body: {error}"))?;
+    Ok(())
+}
+
+fn serve_rpc_connection(
+    mut stream: TcpStream,
+    peer_addr: SocketAddr,
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    network_id: &[u8; 32],
+    genesis_id: &[u8; 32],
+    profile_id: &[u8; 32],
+) -> Result<(), String> {
+    if !peer_addr.ip().is_loopback() {
+        return Err("read-only RPC accepts loopback clients only".into());
+    }
+    stream
+        .set_nodelay(true)
+        .map_err(|error| format!("set QZBE RPC TCP_NODELAY: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .map_err(|error| format!("set QZBE RPC read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(1)))
+        .map_err(|error| format!("set QZBE RPC write timeout: {error}"))?;
+    let mut request = Vec::with_capacity(512);
+    let mut chunk = [0u8; 512];
+    loop {
+        let count = match stream.read(&mut chunk) {
+            Ok(count) => count,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+                return Err("QZBE RPC request read timed out before complete headers".into());
+            }
+            Err(error) => return Err(format!("read bounded QZBE RPC request: {error}")),
+        };
+        if count == 0 {
+            break;
+        }
+        if request.len().saturating_add(count) > MAX_RPC_REQUEST_BYTES {
+            let _ = write_rpc_response(
+                &mut stream,
+                413,
+                "Payload Too Large",
+                "{\"ok\":false,\"error\":\"request_too_large\"}",
+            );
+            return Ok(());
+        }
+        request.extend_from_slice(&chunk[..count]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let command = match parse_rpc_command(&request) {
+        Ok(command) => command,
+        Err(_) => {
+            write_rpc_response(
+                &mut stream,
+                400,
+                "Bad Request",
+                "{\"ok\":false,\"error\":\"bad_request\"}",
+            )?;
+            return Ok(());
+        }
+    };
+    let current = match snapshot(store) {
+        Ok(value) => value,
+        Err(_) => {
+            write_rpc_response(
+                &mut stream,
+                503,
+                "Service Unavailable",
+                "{\"ok\":false,\"error\":\"state_unavailable\"}",
+            )?;
+            return Ok(());
+        }
+    };
+    let body = match command {
+        RpcCommand::Status => format!(
+            "{{\"ok\":true,\"network_id\":\"{}\",\"genesis_id\":\"{}\",\"profile_id\":\"{}\",\"height\":{},\"tip\":\"{}\",\"state_root\":\"{}\",\"generation\":{},\"mainnet\":false,\"read_only\":true}}",
+            hex(network_id), hex(genesis_id), hex(profile_id), current.height, hex(&current.tip), hex(&current.state_root), current.generation
+        ),
+        RpcCommand::Balance(account) => format!(
+            "{{\"ok\":true,\"network_id\":\"{}\",\"genesis_id\":\"{}\",\"profile_id\":\"{}\",\"account_id\":\"{}\",\"balance_atoms\":{},\"height\":{},\"tip\":\"{}\",\"state_root\":\"{}\",\"generation\":{},\"mainnet\":false,\"read_only\":true}}",
+            hex(network_id), hex(genesis_id), hex(profile_id), hex(&account), observed_balance(store, &account), current.height, hex(&current.tip), hex(&current.state_root), current.generation
+        ),
+    };
+    write_rpc_response(&mut stream, 200, "OK", &body)
+}
+
+fn poll_rpc_connections(
+    listener: Option<&TcpListener>,
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    network_id: &[u8; 32],
+    genesis_id: &[u8; 32],
+    profile_id: &[u8; 32],
+) -> Result<(), String> {
+    let Some(listener) = listener else {
+        return Ok(());
+    };
+    for _ in 0..MAX_RPC_CONNECTIONS_PER_POLL {
+        match listener.accept() {
+            Ok((stream, peer_addr)) => {
+                if let Err(error) = serve_rpc_connection(
+                    stream, peer_addr, store, network_id, genesis_id, profile_id,
+                ) {
+                    eprintln!(
+                        "event=qzbe_v04_rpc_request_rejected peer={} reason={}",
+                        peer_addr, error
+                    );
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(format!("accept loopback QZBE RPC connection: {error}")),
+        }
+    }
+    Ok(())
+}
+
 fn poll_connections(
     listener: &TcpListener,
     local_key: &SecretKey,
@@ -1575,11 +1804,25 @@ fn run(args: Args) -> Result<(), String> {
     } else {
         None
     };
+    let rpc_listener = if let Some(address) = args.rpc_listen {
+        let rpc = TcpListener::bind(address)
+            .map_err(|error| format!("bind loopback read-only QZBE RPC {address}: {error}"))?;
+        rpc.set_nonblocking(true)
+            .map_err(|error| format!("set QZBE RPC listener nonblocking: {error}"))?;
+        Some(rpc)
+    } else {
+        None
+    };
     let tx_listener_address = tx_listener
         .as_ref()
         .map(|value| value.local_addr())
         .transpose()
         .map_err(|error| format!("read transaction-ingress listen address: {error}"))?;
+    let rpc_listener_address = rpc_listener
+        .as_ref()
+        .map(|value| value.local_addr())
+        .transpose()
+        .map_err(|error| format!("read QZBE RPC listen address: {error}"))?;
     let mut accepted_count = 0u64;
     let mut message_count = 0u64;
     let mut tx_submission_count = 0u64;
@@ -1590,9 +1833,10 @@ fn run(args: Args) -> Result<(), String> {
     } else {
         "QZXB_V04_ARGON2ID_64MIB"
     };
-    eprintln!("event=qzbe_v04_peer_smoke_ready network_id={} genesis={} profile={} listen={} tx_listen={} peer={} height={} root={} tip={} store=QZBE ack=QZA4 tx_ingress=QZTS/1 mempool_max_count={} mempool_max_bytes={} noise=Noise_XX_25519_ChaChaPoly_SHA256 pow_profile={} mining_mode={} tx_policy=registered_or_self_contained_ed25519 local_only=true public_launch_approved=false",
+    eprintln!("event=qzbe_v04_peer_smoke_ready network_id={} genesis={} profile={} listen={} tx_listen={} rpc_listen={} rpc_read_only=true peer={} height={} root={} tip={} store=QZBE ack=QZA4 tx_ingress=QZTS/1 mempool_max_count={} mempool_max_bytes={} noise=Noise_XX_25519_ChaChaPoly_SHA256 pow_profile={} mining_mode={} tx_policy=registered_or_self_contained_ed25519 local_only=true public_launch_approved=false",
         hex(&args.network_id), hex(&genesis_id), hex(&profile_id), args.listen,
         tx_listener_address.map(|address| address.to_string()).unwrap_or_else(|| "disabled".to_string()),
+        rpc_listener_address.map(|address| address.to_string()).unwrap_or_else(|| "disabled".to_string()),
         if args.peers.is_empty() {
             "inbound_only".to_string()
         } else {
@@ -1697,6 +1941,7 @@ fn run(args: Args) -> Result<(), String> {
         let timestamp = next_block_timestamp(previous_timestamp, SystemTime::now())?;
         let block_transactions = mempool.ordered_transactions();
         let mut mining_ingress_error = None;
+        let mut mining_rpc_error = None;
         let mining_result = store.fork_choice().mine_candidate_on(
             parent_tip,
             timestamp,
@@ -1705,17 +1950,32 @@ fn run(args: Args) -> Result<(), String> {
             next_height,
             MAX_QZBE_MINING_ATTEMPTS,
             &authenticator,
-            || match accept_one_tx_connection_for_mining_interrupt(
-                tx_listener.as_ref(),
-                &mut pending_tx_connections,
-            ) {
-                Ok(accepted) => accepted,
-                Err(error) => {
-                    mining_ingress_error = Some(error);
-                    true
+            || {
+                if let Err(error) = poll_rpc_connections(
+                    rpc_listener.as_ref(),
+                    &store,
+                    &args.network_id,
+                    &genesis_id,
+                    &profile_id,
+                ) {
+                    mining_rpc_error = Some(error);
+                    return true;
+                }
+                match accept_one_tx_connection_for_mining_interrupt(
+                    tx_listener.as_ref(),
+                    &mut pending_tx_connections,
+                ) {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        mining_ingress_error = Some(error);
+                        true
+                    }
                 }
             },
         );
+        if let Some(error) = mining_rpc_error {
+            return Err(error);
+        }
         if let Some(error) = mining_ingress_error {
             return Err(error);
         }
@@ -1808,6 +2068,13 @@ fn run(args: Args) -> Result<(), String> {
                 &args.peers,
                 &args.trusted_peer_keys,
                 &mut relayed_tx_count,
+            )?;
+            poll_rpc_connections(
+                rpc_listener.as_ref(),
+                &store,
+                &args.network_id,
+                &genesis_id,
+                &profile_id,
             )?;
             reconcile_pending_mempool(&store, &authenticator, &mut mempool)?;
             if args
@@ -1923,6 +2190,7 @@ mod tests {
             data_dir: temp_profile_root(),
             listen: "127.0.0.1:49331".parse().unwrap(),
             tx_listen: None,
+            rpc_listen: None,
             peers: Vec::new(),
             network_id: [0x31; 32],
             owner_id: [0xA7; 32],
@@ -2295,6 +2563,78 @@ mod tests {
         assert!(decode_ack(&bytes, &[0x32; 32], &[0x41; 32]).is_err());
         assert!(decode_ack(&bytes, &[0x31; 32], &[0x42; 32]).is_err());
         assert!(decode_ack(&bytes[..bytes.len() - 1], &[0x31; 32], &[0x41; 32]).is_err());
+    }
+
+    #[test]
+    fn read_only_rpc_accepts_bounded_status_and_balance_queries_only() {
+        let status = b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        assert_eq!(parse_rpc_command(status), Ok(RpcCommand::Status));
+        let balance = format!(
+            "GET /v1/balance/{} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "11".repeat(32)
+        );
+        assert_eq!(
+            parse_rpc_command(balance.as_bytes()),
+            Ok(RpcCommand::Balance([0x11; 32]))
+        );
+        assert!(parse_rpc_command(
+            b"POST /v1/status HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+        )
+        .is_err());
+        assert!(
+            parse_rpc_command(b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\n\r\nbody").is_err()
+        );
+        assert!(parse_rpc_command(
+            format!(
+                "GET /v1/balance/{} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "zz".repeat(32)
+            )
+            .as_bytes()
+        )
+        .is_err());
+        assert!(parse_rpc_command(&vec![65u8; MAX_RPC_REQUEST_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn rpc_listener_is_optional_loopback_only_and_distinct() {
+        let mut valid = parser_fixture_tokens(&[]);
+        valid.extend([
+            "--trusted-peer-key-hex".into(),
+            "e6".repeat(32),
+            "--rpc-listen".into(),
+            "127.0.0.1:49339".into(),
+        ]);
+        let parsed = parse_args_from(valid).unwrap().unwrap();
+        assert_eq!(parsed.rpc_listen, Some("127.0.0.1:49339".parse().unwrap()));
+
+        let mut non_loopback = parser_fixture_tokens(&[]);
+        non_loopback.extend([
+            "--trusted-peer-key-hex".into(),
+            "e6".repeat(32),
+            "--rpc-listen".into(),
+            "0.0.0.0:49339".into(),
+        ]);
+        assert!(parse_args_from(non_loopback)
+            .unwrap_err()
+            .contains("refuses all non-loopback read-only RPC listen addresses"));
+
+        let mut same_socket = parser_fixture_tokens(&[]);
+        same_socket.extend([
+            "--trusted-peer-key-hex".into(),
+            "e6".repeat(32),
+            "--rpc-listen".into(),
+            "127.0.0.1:49331".into(),
+        ]);
+        assert!(parse_args_from(same_socket)
+            .unwrap_err()
+            .contains("distinct socket"));
+
+        let collides_with_peer = parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        let mut collides_with_peer = collides_with_peer;
+        collides_with_peer.extend(["--rpc-listen".into(), "127.0.0.1:49332".into()]);
+        assert!(parse_args_from(collides_with_peer)
+            .unwrap_err()
+            .contains("read-only RPC listener"));
     }
 
     #[test]

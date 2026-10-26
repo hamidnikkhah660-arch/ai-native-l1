@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $repo = Split-Path -Parent $PSScriptRoot
@@ -31,6 +31,9 @@ function Wait-Pattern([string]$Path, [string]$Pattern, [int]$Millis = 15000) {
         Start-Sleep -Milliseconds 50
     }
     return $false
+}
+function Get-QzbeRpc([int]$Port, [string]$Path) {
+    return Invoke-RestMethod -Uri ("http://127.0.0.1:{0}{1}" -f $Port, $Path) -Method Get -TimeoutSec 5
 }
 function Make-Signed-TestTransaction([string]$SeedPath, [string]$Network, [string]$Recipient) {
     $seed = New-Object byte[] 32
@@ -84,7 +87,9 @@ $logB = Join-Path $root 'node-b.err.log'
 $stdB = Join-Path $root 'node-b.out.log'
 $portA = Get-FreePort
 $portB = Get-FreePort
+$rpcPort = Get-FreePort
 while ($portA -eq $portB) { $portB = Get-FreePort }
+while ($rpcPort -eq $portA -or $rpcPort -eq $portB) { $rpcPort = Get-FreePort }
 $nodeA = $null
 $nodeB = $null
 try {
@@ -110,16 +115,24 @@ try {
         '--blocks-per-halving', $halving,
         '--data-dir', $dataB,
         '--listen', "127.0.0.1:$portB",
+        '--rpc-listen', "127.0.0.1:$rpcPort",
         '--noise-static-private-key-dpapi-file', $keyB,
         '--trusted-peer-key-hex', $pubA,
         '--mine-blocks', '0',
-        '--run-seconds', '30',
-        '--stop-after-height', '2'
+        '--run-seconds', '5'
     )
     $nodeB = Start-Process -FilePath $nodeExe -ArgumentList $argsB -RedirectStandardOutput $stdB -RedirectStandardError $logB -PassThru
     if (-not (Wait-Pattern $logB 'event=qzbe_v04_peer_smoke_ready .*height=0 .*local_only=true public_launch_approved=false' 20000)) {
         throw ("CP-0414 receiver node B did not become ready: " + (Get-Text $stdB) + (Get-Text $logB))
     }
+    $rpcGenesisStatus = Get-QzbeRpc $rpcPort '/v1/status'
+    $rpcGenesisBalance = Get-QzbeRpc $rpcPort ("/v1/balance/{0}" -f $recipient)
+    if ($rpcGenesisStatus.height -ne 0 -or $rpcGenesisStatus.mainnet -ne $false -or
+        $rpcGenesisStatus.read_only -ne $true -or $rpcGenesisBalance.balance_atoms -ne 0) {
+        throw ("CP-0414 read-only RPC Genesis response mismatch: status=" + ($rpcGenesisStatus | ConvertTo-Json -Compress) +
+            " balance=" + ($rpcGenesisBalance | ConvertTo-Json -Compress))
+    }
+    Write-Host 'CP-0414 READ_ONLY_RPC_GENESIS_PASS'
 
     $argsA = @(
         '--test-easy-pow',
@@ -160,8 +173,19 @@ try {
     if (-not (Wait-Pattern $logB 'event=qzbe_v04_peer_block_accepted .*height=2 .*accepted_count=2' 15000)) {
         throw ("CP-0414 receiver B did not accept both QZBE blocks: " + (Get-Text $logB))
     }
+    $rpcFinalStatus = Get-QzbeRpc $rpcPort '/v1/status'
+    $rpcFinalBalance = Get-QzbeRpc $rpcPort ("/v1/balance/{0}" -f $recipient)
+    if ($rpcFinalStatus.height -ne 2 -or $rpcFinalBalance.height -ne 2 -or
+        $rpcFinalStatus.tip -ne $rpcFinalBalance.tip -or
+        $rpcFinalStatus.state_root -ne $rpcFinalBalance.state_root -or
+        $rpcFinalStatus.mainnet -ne $false -or $rpcFinalBalance.read_only -ne $true -or
+        $rpcFinalBalance.balance_atoms -ne 2500) {
+        throw ("CP-0414 read-only RPC settled-state mismatch: status=" + ($rpcFinalStatus | ConvertTo-Json -Compress) +
+            " balance=" + ($rpcFinalBalance | ConvertTo-Json -Compress))
+    }
+    Write-Host ("CP-0414 READ_ONLY_RPC_SETTLED_STATE_PASS height=2 balance_atoms=" + $rpcFinalBalance.balance_atoms)
     if (-not $nodeA.WaitForExit(30000)) { throw 'CP-0414 sending node A did not stop after its bounded mining run' }
-    if (-not $nodeB.WaitForExit(35000)) { throw 'CP-0414 receiver node B did not stop after reaching height 2' }
+    if (-not $nodeB.WaitForExit(10000)) { throw 'CP-0414 receiver node B did not stop after its bounded observer run' }
     $textA = Get-Text $logA
     $textB = Get-Text $logB
     if ($textA -match 'event=qzbe_v04_peer_smoke_failed') { throw ("CP-0414 node A reported runtime failure: " + $textA) }
