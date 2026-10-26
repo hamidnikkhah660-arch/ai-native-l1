@@ -106,3 +106,6 @@ jobs:
       - name: Run QZXB three-node authenticated transaction gossip and replay convergence
         shell: pwsh
         run: ./simulations/cp0427_qzxb_three_node_transaction_gossip.ps1
+      - name: Run explicit public zero-value Devnet transport and state convergence
+        shell: pwsh
+        run: ./simulations/cp0429_public_zero_value_devnet_transport.ps1
