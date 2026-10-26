@@ -129,7 +129,10 @@ fn ensure_loopback_address(address: SocketAddr, role: &str) -> Result<(), String
     }
 }
 fn parse_args() -> Result<Option<Args>, String> {
-    let tokens = env::args().skip(1).collect::<Vec<_>>();
+    parse_args_from(env::args().skip(1).collect())
+}
+
+fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
     if tokens
         .iter()
         .any(|value| value == "--help" || value == "-h")
@@ -962,6 +965,19 @@ fn run(args: Args) -> Result<(), String> {
     }
     Ok(())
 }
+/// Run only after `devnet_node` has explicitly consumed `--qzbe-v04-peer-smoke`.
+/// The token list excludes that dispatch token and is parsed with the same strict parser as the
+/// standalone diagnostic binary. This does not select QZBE for the default PTB2/PFS2 runtime.
+pub fn run_from_devnet_dispatch(tokens: Vec<String>) -> Result<(), String> {
+    match parse_args_from(tokens)? {
+        None => {
+            println!("{}", usage());
+            Ok(())
+        }
+        Some(args) => run(args),
+    }
+}
+
 fn main() {
     match parse_args() {
         Ok(None) => println!("{}", usage()),
