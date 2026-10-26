@@ -1317,6 +1317,7 @@ mod tests {
     use super::*;
     use crate::{
         consensus::{ConsensusParameters, Uint256},
+        devnet_noise_transport_candidate::DevnetNoiseSession,
         external_cas_anchor_candidate::{ExternalCasReadRequest, ExternalCasReceiptKind},
         monetary_genesis_v04_candidate::GenesisManifestV04,
         monetary_issuance_v04_candidate::V04MiningIssuanceScheduleCandidate,
@@ -1327,11 +1328,10 @@ mod tests {
     use libcrux_ml_dsa::ml_dsa_65::portable;
     use std::{
         fs,
-        io::{Read, Write},
         net::{TcpListener, TcpStream},
         path::PathBuf,
         thread,
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     const NETWORK: [u8; 32] = [0x31; 32];
@@ -1588,49 +1588,66 @@ mod tests {
         ))
     }
 
-    /// Exercise an actual loopback TCP byte transfer with explicit framing and bounded reads.
-    /// This is a test helper only; it is not the production P2P transport or peer-authentication
-    /// protocol.
-    fn loopback_exchange(payload: &[u8]) -> Vec<u8> {
-        let length = u32::try_from(payload.len()).expect("test envelope length fits u32");
-        assert!(payload.len() <= MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES);
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral loopback listener");
-        let address = listener
-            .local_addr()
-            .expect("read ephemeral loopback address");
-        let receiver = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept loopback connection");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .expect("set bounded read timeout");
-            let mut length_bytes = [0u8; 4];
-            stream
-                .read_exact(&mut length_bytes)
-                .expect("read framed envelope length");
-            let received_length = u32::from_be_bytes(length_bytes) as usize;
-            assert!(received_length <= MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES);
-            let mut bytes = vec![0u8; received_length];
-            stream
-                .read_exact(&mut bytes)
-                .expect("read complete framed envelope");
-            bytes
-        });
-
-        let mut stream = TcpStream::connect(address).expect("connect to loopback receiver");
-        stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .expect("set bounded write timeout");
-        stream
-            .write_all(&length.to_be_bytes())
-            .expect("write framed envelope length");
-        stream
-            .write_all(payload)
-            .expect("write complete framed envelope");
-        drop(stream);
-        receiver.join().expect("loopback receiver completes")
+    fn test_noise_keypair() -> ([u8; 32], [u8; 32]) {
+        let parameters: snow::params::NoiseParams = "Noise_XX_25519_ChaChaPoly_SHA256"
+            .parse()
+            .expect("valid Noise XX test parameters");
+        let mut keypair = snow::Builder::new(parameters)
+            .generate_keypair()
+            .expect("generate local Noise keypair");
+        let private = <[u8; 32]>::try_from(keypair.private.as_slice())
+            .expect("Noise private key is 32 bytes");
+        let public =
+            <[u8; 32]>::try_from(keypair.public.as_slice()).expect("Noise public key is 32 bytes");
+        keypair.private.fill(0);
+        keypair.public.fill(0);
+        (private, public)
     }
 
-    /// CP-0410: two independent persistent QZBE stores exchange blocks through real loopback TCP.
+    /// Exchange one QZBE envelope through loopback TCP using the bounded, network-bound Noise XX
+    /// transport used by the controlled Devnet candidate. Each side pins the other side's generated
+    /// static public key. This tests transport/store composition only, not persistent peer identity,
+    /// a production listener, or public peer discovery.
+    fn loopback_exchange(payload: &[u8], network_id: &[u8; 32]) -> Vec<u8> {
+        assert!(payload.len() <= MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES);
+        let (server_private, server_public) = test_noise_keypair();
+        let (client_private, client_public) = test_noise_keypair();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral Noise listener");
+        let address = listener
+            .local_addr()
+            .expect("read ephemeral Noise listener address");
+        let network = *network_id;
+        let receiver = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept Noise loopback connection");
+            let mut session = DevnetNoiseSession::accept(
+                &mut stream,
+                &server_private,
+                &[client_public],
+                &network,
+            )
+            .expect("accept only the explicitly pinned Noise peer");
+            assert_eq!(session.remote_static_public_key(), &client_public);
+            session
+                .read_record(&mut stream)
+                .expect("read authenticated QZBE record")
+        });
+
+        let mut stream = TcpStream::connect(address).expect("connect to Noise loopback receiver");
+        let mut session =
+            DevnetNoiseSession::connect(&mut stream, &client_private, &server_public, network_id)
+                .expect("connect only to the explicitly pinned Noise peer");
+        assert_eq!(session.remote_static_public_key(), &server_public);
+        session
+            .write_record(&mut stream, payload)
+            .expect("write encrypted QZBE record");
+        drop(session);
+        drop(stream);
+        receiver
+            .join()
+            .expect("authenticated Noise receiver completes")
+    }
+
+    /// CP-0412: two independent persistent QZBE stores exchange blocks over pinned Noise TCP.
     /// The test explicitly verifies receiver-side signature rejection, continued convergence, and
     /// deterministic replay. It does not claim production P2P, external CAS, or network hardening.
     #[test]
@@ -1670,8 +1687,8 @@ mod tests {
             .unwrap();
         node_a.submit(&first, &TestAuthenticator).unwrap();
 
-        // Move only the encoded bytes over TCP; Node B independently decodes, verifies and commits.
-        let received_first = loopback_exchange(&first);
+        // Move only the encoded bytes in an authenticated Noise record; Node B independently decodes, verifies and commits.
+        let received_first = loopback_exchange(&first, &NETWORK);
         assert_eq!(received_first, first);
         node_b.submit(&received_first, &TestAuthenticator).unwrap();
         assert_eq!(node_a.canonical_height(), 1);
@@ -1699,7 +1716,7 @@ mod tests {
                 &AcceptAnyNonemptyAuthenticator,
             )
             .unwrap();
-        let received_invalid = loopback_exchange(&invalid);
+        let received_invalid = loopback_exchange(&invalid, &NETWORK);
         let before_invalid = (
             node_b.canonical_tip(),
             node_b.canonical_height(),
@@ -1734,7 +1751,7 @@ mod tests {
             )
             .unwrap();
         node_a.submit(&second, &TestAuthenticator).unwrap();
-        let received_second = loopback_exchange(&second);
+        let received_second = loopback_exchange(&second, &NETWORK);
         node_b.submit(&received_second, &TestAuthenticator).unwrap();
 
         let expected_tip = node_a.canonical_tip();
