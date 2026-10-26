@@ -89,11 +89,12 @@ The planned maximum native QZXB supply is **10,000,000,000 coins**: **30% mining
 These are planned allocations, not active Genesis issuance, circulating supply, cash raised, signed awards, a completed airdrop or an actual burn. Exchange listing is not guaranteed; the exchange reserve is conditional on documented services/milestones, not a promise to buy a listing. Sponsor, marketing and contributor awards must be documented. The burn reserve is not burned until a verifiable burn occurs and carries no price-support promise. The owner allocation is explicitly 1B / 10%; control does not authorize hidden issuance or bypassing published consensus rules.
 
 - **Current allocation policy:** [Tokenomics and Distribution Policy v0.4](docs/FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V04_2026-10-24.md)
+- **Canonical founder allocation decision:** [CP-0422 — 10B cap / 1B founder / historical-version boundary](docs/CP-0422_CANONICAL_TOKENOMICS_DECISION_2026-10-26.md)
 - **Current white paper:** [QuantumZXB Native Coin White Paper v0.3](docs/QUANTUMZXB_NATIVE_COIN_WHITEPAPER_V03.md)
 - **Current engineering roadmap:** [QuantumZXB Engineering & Ecosystem Roadmap v0.3](docs/QUANTUMZXB_MASTER_ROADMAP_V03.md)
 - **Production gate status:** Gate 2 and Gate 8 remain open; native QZXB mainnet and a liquid native-coin market are not launched.
 
-The former 4B founder / 3B mining / 3B public-goods proposal is preserved in versioned historical documents and superseded for current allocation planning by policy v0.4. The separate QX ERC-20 deployment on Ethereum Sepolia is a test asset, not the native QZXB coin or a production market.
+The former 4B founder / 3B mining / 3B public-goods proposal is preserved only as versioned historical protocol/test material and is superseded for current allocation planning by policy v0.4. The CP-0422 canonical decision records the 1B / 10% founder ceiling and explains the version boundary. `simulations/sponsor_allocation_checker.py` preserves CP-0343 v0.3 historical arithmetic only; it must not be used as the current v0.4 allocator. `simulations/quantumzxb_tokenomics_checker.py` is the current v0.4 allocation/documentation preflight. The separate QX ERC-20 deployment on Ethereum Sepolia is a test asset, not the native QZXB coin or a production market.
 
 ## Current engineering validation
 

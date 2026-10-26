@@ -39,6 +39,9 @@ jobs:
       - name: Verify independent candidate issuance schedule oracle
         run: python3 ../../../simulations/cp0366_monetary_issuance_oracle_candidate.py --check
 
+      - name: Verify CP-0422 canonical tokenomics and historical-version boundary
+        run: python3 ../../../simulations/quantumzxb_tokenomics_checker.py
+
       - name: Verify CP-0397 v0.4 mining schedule candidate oracle
         run: python3 ../../../simulations/quantumzxb_v04_issuance_schedule_vectors.py --check
 

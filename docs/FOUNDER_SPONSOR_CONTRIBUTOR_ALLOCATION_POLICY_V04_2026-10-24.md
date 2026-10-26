@@ -1,7 +1,7 @@
 # QuantumZXB Tokenomics and Distribution Policy v0.4
 
 **Date:** 2026-10-24
-**Status:** Owner-directed allocation proposal; not encoded in production Genesis, not an on-chain balance statement, and not a market or investment promise. This policy supersedes the former 40% / 30% / 30% allocation framework for current planning. The v0.3 policy is retained as historical context.
+**Status:** Owner-directed allocation policy; not yet encoded in canonical production Genesis/runtime, not an on-chain balance statement, and not a market or investment promise. This policy supersedes the former 40% / 30% / 30% framework for current planning. The v0.3 policy and CP-0343 sponsor calculator are historical only. The binding owner decision and migration requirements are recorded in [CP-0422](CP-0422_CANONICAL_TOKENOMICS_DECISION_2026-10-26.md).
 
 ## 1. Total cap and planned allocation
 
@@ -26,8 +26,8 @@ The proposed maximum native QZXB supply is **10,000,000,000 coins**. These eight
 3. The exchange reserve is not a listing guarantee or a default fee. Any award requires a documented counterparty, permitted arrangement, defined services, milestones, disclosures and legal review. Unused tokens remain unawarded.
 4. Marketing awards require written scopes, transparent paid-promotion disclosure and performance-based release; do not promise returns or encourage artificial trading volume.
 5. Sponsor and contributor awards require recorded terms, recipient/wallet verification, deliverable evidence, amount, timing and approval. A proposal or expression of interest is not a secured sponsor.
-6. Burn rules must objectively define eligible tokens, control, trigger and transaction evidence. Do not trigger or advertise burns as an automatic rescue for price declines or stagnation. An actual burn is irreversible and does not guarantee price appreciation or a floor.
-7. The owner allocation is explicitly 1B / 10%. Public documentation need not expose private keys, recovery phrases or personal security information. Owner control remains subject to ordinary transaction authentication and published consensus rules; it does not create a hidden mint or consensus override.
+6. Only already-issued tokens may be burned; a verified burn is irreversible, reduces live supply, does not reduce cumulative gross issuance and never restores mint headroom. Define eligible source balances, authorization, trigger and transaction evidence. The 1B protocol burn reserve is a category cap, not a claim that 1B is already burned or a source of additive supply. Do not advertise burns as price support.
+7. The founder allocation is fixed at 1B / 10% of the 10B cap, with no protocol lock or time vesting under the latest owner direction. Public documentation must not expose private keys or recovery material. Founder control remains subject to ordinary transaction authentication and published consensus rules; it does not create a hidden mint or consensus override.
 8. Any later percentage change requires a versioned policy, checked arithmetic, updated public docs and review before production deployment.
 
 ## 3. Zero-personal-budget financing

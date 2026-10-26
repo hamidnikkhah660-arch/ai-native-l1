@@ -2,6 +2,10 @@
 Date: 2026-10-24
 Status: evidence-based planning checkpoint. No Mainnet launch date, exchange listing, token price, or liquidity outcome is promised.
 
+## Canonical monetary decision
+
+The latest founder-directed allocation is recorded in [CP-0422 — Canonical Tokenomics Decision](CP-0422_CANONICAL_TOKENOMICS_DECISION_2026-10-26.md): 10B QZXB maximum cap, 1B / 10% founder envelope and seven other v0.4 category ceilings. This resolves intent only. Gate 2 remains open until the policy is integrated and proven through the actual canonical producer/importer, fork choice, durable store, replay, reorg and state-root paths; the older v0.3 policy remains historical and must not be silently reinterpreted.
+
 ## Executive status
 
 The public repository and a curated source release exist. Commit `80935c27a4c7da22492cf6fa8b8ad39148d5a395` (CP-0406) passed GitHub Actions run `40112877967` on 2026-10-24, including Rust validation and Windows PMT4/TXN4 two-node loopback. Commit `e3ad9a535bb021d3c810434622ff5207244ac840` adds the injected external-CAS adapter and pending-manifest recovery for QZBE. Local focused tests pass **10/10**; full `cargo test --all-targets --locked --offline` exited 0 with **826 library tests passed**, both node suites at **36/36**, all-target `cargo check` and format check passed, and checksum/docs preflight passed at **377 entries / 48 README-relative links**. GitHub Actions run `40122352670` passed on that exact implementation SHA with both Rust validation and Windows PMT4/TXN4 loopback successful. CP-0408 adds an offline-only QZB4 v2/QZBE smoke executable that explicitly takes the schedule and Genesis scope, writes to a dedicated store, builds transaction-free candidate blocks, and closes/reopens to replay. Its six unit tests pass, and a manual run has advanced height 0→3 then resumed 3→5 with identical post-replay state. It opens no P2P/RPC/wallet/market listener and rejects all transactions. All-target validation and fresh CI for CP-0408 remain required. These changes remain candidates, not production-node integration.
