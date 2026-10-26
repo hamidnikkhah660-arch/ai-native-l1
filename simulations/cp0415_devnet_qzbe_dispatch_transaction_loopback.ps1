@@ -161,6 +161,20 @@ try {
     }
     if (-not $nodeA.WaitForExit(30000)) { throw 'CP-0415 sending node A did not stop after its bounded mining run' }
     if (-not $nodeB.WaitForExit(35000)) { throw 'CP-0415 receiver node B did not stop after reaching height 2' }
+
+    # The ordinary/default devnet entrypoint must refuse to interpret the same locked directory
+    # as PTB2/PFS2 or PMT3/PMT4. QZBE selection is exact and opt-in; no silent downgrade/fallback.
+    $savedErrorPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $legacyProbe = @(& $nodeExe --network-id $network --data-dir $dataA 2>&1)
+    $legacyExitCode = $LASTEXITCODE
+    $ErrorActionPreference = $savedErrorPreference
+    $legacyText = $legacyProbe -join [Environment]::NewLine
+    if ($legacyExitCode -eq 0 -or $legacyText -notmatch 'data_directory_is_locked_to_the_isolated_QZBE_v2_candidate_profile_by_') {
+        throw ("CP-0416 default devnet dispatch did not fail closed on a QZBE-locked data directory (exit=$legacyExitCode): " + $legacyText)
+    }
+    Write-Host 'CP-0416 QZBE_PROFILE_LOCK_DOWNGRADE_GUARD_PASS'
+
     $textA = Get-Text $logA
     $textB = Get-Text $logB
     if ($textA -match 'event=qzbe_v04_peer_smoke_failed') { throw ("CP-0415 node A reported runtime failure: " + $textA) }

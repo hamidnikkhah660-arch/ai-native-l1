@@ -80,6 +80,6 @@ jobs:
       - name: Run QZBE signed transaction, invalid-signature atomic rejection, replay and public-bind guard
         shell: pwsh
         run: ./simulations/cp0414_qzbe_authenticated_transaction_loopback.ps1
-      - name: Run QZBE signed transaction through explicit devnet_node subcommand dispatch
+      - name: Run QZBE store-profile lock, signed transaction and legacy downgrade guard through devnet_node
         shell: pwsh
         run: ./simulations/cp0415_devnet_qzbe_dispatch_transaction_loopback.ps1
