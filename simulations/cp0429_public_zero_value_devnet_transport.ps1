@@ -61,7 +61,7 @@ try {
         '--public-devnet', '--network-id', $network, '--data-dir', $dataA,
         '--listen', "0.0.0.0:$portA", '--peer', "127.0.0.1:$portB",
         '--noise-static-private-key-dpapi-file', $keyA, '--trusted-peer-key-hex', $pubB,
-        '--run-seconds', '60', '--stop-after-height', '1'
+        '--test-easy-pow', '--run-seconds', '60', '--stop-after-height', '1'
     )
     $nodeA = Start-Process -FilePath $nodeExe -ArgumentList $argsA -RedirectStandardOutput $stdA -RedirectStandardError $logA -PassThru
     if (-not (Wait-Pattern $logA 'event=devnet_node_ready .*network_surface=external_bind_allowed_with_authenticated_peers public_devnet_mode=true .*mainnet=false public_launch_approved=false' 30000)) {
@@ -72,13 +72,13 @@ try {
     # B uses the same zero-balance Genesis, dials A through a pinned Noise identity, and mines one
     # empty candidate block. A exits only after accepting that block; no monetary mode is enabled.
     $argsB = @(
-        '--network-id', $network, '--data-dir', $dataB, '--listen', "127.0.0.1:$portB",
+        '--public-devnet', '--test-easy-pow', '--network-id', $network, '--data-dir', $dataB, '--listen', "127.0.0.1:$portB",
         '--peer', "127.0.0.1:$portA",
         '--noise-static-private-key-dpapi-file', $keyB, '--trusted-peer-key-hex', $pubA,
-        '--mine-blocks', '1', '--run-seconds', '12'
+        '--mine-blocks', '1', '--exit-after-mining', 'true', '--run-seconds', '60'
     )
     $nodeB = Start-Process -FilePath $nodeExe -ArgumentList $argsB -RedirectStandardOutput $stdB -RedirectStandardError $logB -PassThru
-    if (-not (Wait-Pattern $logB 'event=devnet_node_ready .*network_surface=loopback_only public_devnet_mode=false' 30000)) {
+    if (-not (Wait-Pattern $logB 'event=devnet_node_ready .*network_surface=external_bind_allowed_with_authenticated_peers public_devnet_mode=true .*initial_target=max pow_memory_kib=8192 .*mainnet=false public_launch_approved=false' 30000)) {
         throw ("CP-0429 loopback peer did not become ready: " + (Get-Text $stdB) + (Get-Text $logB))
     }
     if (-not (Wait-Pattern $logB 'event=private_testnet_broadcast height=1 peers=1 accepted=1' 60000)) {

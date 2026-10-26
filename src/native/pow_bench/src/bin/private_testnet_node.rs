@@ -128,6 +128,7 @@ const TXN4_HTTP_DEADLINE: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone)]
 struct Config {
     public_devnet: bool,
+    test_easy_pow: bool,
     listen: SocketAddr,
     status_listen: Option<SocketAddr>,
     transaction_listen: Option<SocketAddr>,
@@ -186,6 +187,7 @@ fn parse_hex32(value: &str, field: &str) -> Result<[u8; 32], String> {
 fn parse_args() -> Result<Config, String> {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut public_devnet = false;
+    let mut test_easy_pow = false;
     let mut listen = "127.0.0.1:49301"
         .parse::<SocketAddr>()
         .expect("static default socket address");
@@ -234,13 +236,21 @@ fn parse_args() -> Result<Config, String> {
         let flag = args[i].as_str();
         match flag {
             "--help" | "-h" => {
-                return Err("usage: devnet_node [--public-devnet] --network-id HEX64 --data-dir PATH [--listen IP:PORT] [--status-listen 127.0.0.1:PORT] [--transaction-listen 127.0.0.1:PORT --v4-founder-ed25519-public-key-hex HEX64 --v4-founder-mldsa65-public-key-file PATH] [--peer 127.0.0.1:PORT ... --noise-static-private-key-dpapi-file PATH (--trusted-peer-key-hex HEX64 ... | --trusted-peer-identity-file PATH ... --deployment-config-file PATH --deployment-authority-key-hex HEX64 --deployment-config-min-sequence N --issuer-registry-file PATH --peer-identity-issuer-id N)] [--archive-range-max-page-items 1..16] [--archive-range-post-commit-delay-ms 0..5000] [--mine-blocks N] [--run-seconds N] [--monetary-candidate-local-smoke | --monetary-v4-hybrid-local-smoke | --monetary-v4-hybrid-peer-smoke [--monetary-v4-hybrid-archive-range-sync] [--test-crash-after-monetary-v4-import] [--test-reorg-after-first-archive-range-page] [--test-reorg-after-second-archive-range-page] | --monetary-candidate-peer-smoke [--monetary-candidate-archive-range-sync]]".into());
+                return Err("usage: devnet_node [--public-devnet] [--test-easy-pow] --network-id HEX64 --data-dir PATH [--listen IP:PORT] [--status-listen 127.0.0.1:PORT] [--transaction-listen 127.0.0.1:PORT --v4-founder-ed25519-public-key-hex HEX64 --v4-founder-mldsa65-public-key-file PATH] [--peer 127.0.0.1:PORT ... --noise-static-private-key-dpapi-file PATH (--trusted-peer-key-hex HEX64 ... | --trusted-peer-identity-file PATH ... --deployment-config-file PATH --deployment-authority-key-hex HEX64 --deployment-config-min-sequence N --issuer-registry-file PATH --peer-identity-issuer-id N)] [--archive-range-max-page-items 1..16] [--archive-range-post-commit-delay-ms 0..5000] [--mine-blocks N] [--run-seconds N] [--monetary-candidate-local-smoke | --monetary-v4-hybrid-local-smoke | --monetary-v4-hybrid-peer-smoke [--monetary-v4-hybrid-archive-range-sync] [--test-crash-after-monetary-v4-import] [--test-reorg-after-first-archive-range-page] [--test-reorg-after-second-archive-range-page] | --monetary-candidate-peer-smoke [--monetary-candidate-archive-range-sync]]".into());
             }
             "--public-devnet" => {
                 if public_devnet {
                     return Err("--public-devnet may be specified only once".into());
                 }
                 public_devnet = true;
+                i += 1;
+                continue;
+            }
+            "--test-easy-pow" => {
+                if test_easy_pow {
+                    return Err("--test-easy-pow may be specified only once".into());
+                }
+                test_easy_pow = true;
                 i += 1;
                 continue;
             }
@@ -695,6 +705,7 @@ fn parse_args() -> Result<Config, String> {
 
     Ok(Config {
         public_devnet,
+        test_easy_pow,
         listen,
         status_listen,
         transaction_listen,
@@ -6647,6 +6658,11 @@ fn validate_network_surface(
     if config.status_listen == Some(config.listen) {
         return Err("--status-listen must differ from --listen".into());
     }
+    if config.test_easy_pow && !config.public_devnet {
+        return Err(
+            "--test-easy-pow requires the explicit --public-devnet zero-value-only mode".into(),
+        );
+    }
     if !config.public_devnet {
         return Ok(());
     }
@@ -6810,8 +6826,12 @@ fn run_with_runtime_profile(runtime_profile: NodeRuntimeProfile) -> Result<(), S
     });
     let devnet_profile = if runtime_profile == NodeRuntimeProfile::ZeroValueDevnet {
         Some(
-            DevnetProfileCandidate::new(config.network_id)
-                .map_err(|error| format!("devnet profile rejected: {error}"))?,
+            (if config.test_easy_pow {
+                DevnetProfileCandidate::new_test_pow(config.network_id)
+            } else {
+                DevnetProfileCandidate::new(config.network_id)
+            })
+            .map_err(|error| format!("devnet profile rejected: {error}"))?,
         )
     } else {
         None
@@ -7799,6 +7819,7 @@ mod signed_identity_runtime_tests {
         write_trust_bootstrap(root, network, authority, &issuer, 1, 1);
         Config {
             public_devnet: false,
+            test_easy_pow: false,
             listen: "127.0.0.1:0".parse().unwrap(),
             status_listen: None,
             transaction_listen: None,
@@ -7863,6 +7884,26 @@ mod signed_identity_runtime_tests {
                 .contains("--public-devnet")
         );
 
+        let mut test_pow_without_public_mode = config.clone();
+        test_pow_without_public_mode.public_devnet = false;
+        test_pow_without_public_mode.test_easy_pow = true;
+        test_pow_without_public_mode.listen = "127.0.0.1:49301".parse().unwrap();
+        test_pow_without_public_mode.peers = vec!["127.0.0.1:49302".parse().unwrap()];
+        assert!(validate_network_surface(
+            &test_pow_without_public_mode,
+            NodeRuntimeProfile::ZeroValueDevnet
+        )
+        .unwrap_err()
+        .contains("requires the explicit --public-devnet"));
+
+        let mut test_pow_with_public_mode = config.clone();
+        test_pow_with_public_mode.test_easy_pow = true;
+        assert!(validate_network_surface(
+            &test_pow_with_public_mode,
+            NodeRuntimeProfile::ZeroValueDevnet
+        )
+        .is_ok());
+
         let mut missing_noise = config.clone();
         missing_noise.noise_static_private_key_dpapi_file = None;
         assert!(
@@ -7923,6 +7964,7 @@ mod signed_identity_runtime_tests {
     fn local_monetary_config(root: &Path, network: [u8; 32]) -> Config {
         Config {
             public_devnet: false,
+            test_easy_pow: false,
             listen: "127.0.0.1:49301".parse().unwrap(),
             status_listen: None,
             transaction_listen: None,
