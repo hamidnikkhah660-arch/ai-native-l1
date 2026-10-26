@@ -183,7 +183,7 @@ try {
     if ($textA -match 'event=qzbe_v04_peer_smoke_failed') { throw ("CP-0415 node A reported runtime failure: " + $textA) }
     if ($textB -match 'event=qzbe_v04_peer_smoke_failed') { throw ("CP-0415 node B reported runtime failure: " + $textB) }
 
-    $pattern = 'event=qzbe_v04_peer_smoke_stopped .*height=2 state_root=([0-9a-f]{64}) tip=([0-9a-f]{64}) generation=2 total_mined_atoms=' + $expectedMinedAtoms + ' observed_account=' + $recipient + ' observed_balance_atoms=2500 accepted_peer_blocks=\d+ sent_peer_blocks=\d+ replay=matched local_only=true public_launch_approved=false'
+    $pattern = 'event=qzbe_v04_peer_smoke_stopped .*height=2 state_root=([0-9a-f]{64}) tip=([0-9a-f]{64}) generation=2 total_mined_atoms=' + $expectedMinedAtoms + ' observed_account=' + $recipient + ' observed_balance_atoms=2500 accepted_peer_blocks=\d+ sent_peer_blocks=\d+(?: tx_submissions=\d+ mempool_count=\d+)? replay=matched local_only=true public_launch_approved=false'
     $finalA = [regex]::Match((Get-Text $logA), $pattern)
     $finalB = [regex]::Match((Get-Text $logB), $pattern)
     if (-not ($finalA.Success -and $finalB.Success)) {
