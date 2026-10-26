@@ -65,7 +65,7 @@ impl Drop for SecretKey {
 struct Args {
     data_dir: PathBuf,
     listen: SocketAddr,
-    peer: Option<SocketAddr>,
+    peers: Vec<SocketAddr>,
     network_id: [u8; 32],
     owner_id: [u8; 32],
     miner_id: [u8; 32],
@@ -73,7 +73,7 @@ struct Args {
     observe_account_id: [u8; 32],
     transaction: Option<Transaction>,
     probe_invalid_signature_first: bool,
-    trusted_peer_key: [u8; 32],
+    trusted_peer_keys: Vec<[u8; 32]>,
     noise_key_path: PathBuf,
     initial_subsidy_atoms: u128,
     blocks_per_halving: u64,
@@ -100,7 +100,7 @@ struct PeerAck {
 }
 
 fn usage() -> &'static str {
-    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --tx-public-key-hex HEX64 --observe-account-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 --initial-subsidy-atoms U128 --blocks-per-halving U64 [--tx-recipient-id HEX64 --tx-nonce U64 --tx-amount-atoms U64 --tx-fee-atoms U64 --tx-expires-at U64 --tx-signature-hex HEX128] [--probe-invalid-signature-first] [--test-easy-pow] [--peer 127.0.0.1:PORT] [--mine-blocks N] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2 runtime candidate. Canonical v0.4 Argon2id is the default. --test-easy-pow is for isolated loopback tests only. Explicit Ed25519 registry; no public bind or Mainnet activation."
+    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --tx-public-key-hex HEX64 --observe-account-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 [--trusted-peer-key-hex HEX64 ...] --initial-subsidy-atoms U128 --blocks-per-halving U64 [--tx-recipient-id HEX64 --tx-nonce U64 --tx-amount-atoms U64 --tx-fee-atoms U64 --tx-expires-at U64 --tx-signature-hex HEX128] [--probe-invalid-signature-first] [--test-easy-pow] [--peer 127.0.0.1:PORT ...] [--mine-blocks N] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2 runtime candidate with statically pinned multi-peer loopback connections. Each --peer is paired by order with the corresponding --trusted-peer-key-hex; additional trusted keys may authorize inbound peers. Canonical v0.4 Argon2id is the default. --test-easy-pow is for isolated loopback tests only. No public bind or Mainnet activation."
 }
 
 fn parse_hex32(value: &str, name: &str) -> Result<[u8; 32], String> {
@@ -155,6 +155,8 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
         return Ok(None);
     }
     let mut values = BTreeMap::<String, String>::new();
+    let mut peer_values = Vec::<String>::new();
+    let mut trusted_peer_values = Vec::<String>::new();
     let mut exit_after_mining = false;
     let mut probe_invalid_signature_first = false;
     let mut test_easy_pow = false;
@@ -185,6 +187,21 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
             i += 1;
             continue;
         }
+        if key == "--peer" || key == "--trusted-peer-key-hex" {
+            let value = tokens
+                .get(i + 1)
+                .ok_or_else(|| format!("missing value for {key}"))?;
+            if value.starts_with("--") {
+                return Err(format!("missing value for {key}"));
+            }
+            if key == "--peer" {
+                peer_values.push(value.clone());
+            } else {
+                trusted_peer_values.push(value.clone());
+            }
+            i += 2;
+            continue;
+        }
         if !matches!(
             key,
             "--network-id"
@@ -200,9 +217,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
                 | "--tx-signature-hex"
                 | "--data-dir"
                 | "--listen"
-                | "--peer"
                 | "--noise-static-private-key-dpapi-file"
-                | "--trusted-peer-key-hex"
                 | "--initial-subsidy-atoms"
                 | "--blocks-per-halving"
                 | "--mine-blocks"
@@ -238,35 +253,65 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
 
     ensure_loopback_address(listen, "listen addresses")?;
 
-    let peer = values
-        .get("--peer")
+    let peers = peer_values
+        .iter()
         .map(|value| {
             value
                 .parse::<SocketAddr>()
-                .map_err(|_| "--peer is not a valid socket address".to_string())
+                .map_err(|_| "--peer contains an invalid socket address".to_string())
         })
-        .transpose()?;
-    if let Some(address) = peer {
-        ensure_loopback_address(address, "peers")?;
-
-        if address == listen {
+        .collect::<Result<Vec<_>, _>>()?;
+    for (index, address) in peers.iter().enumerate() {
+        ensure_loopback_address(*address, "peers")?;
+        if *address == listen {
             return Err("--peer cannot refer to this node's own listener".into());
         }
+        if peers[..index].contains(address) {
+            return Err("duplicate --peer address".into());
+        }
+    }
+    if peers.len() > 16 {
+        return Err("at most 16 statically pinned outbound --peer entries are allowed".into());
     }
     let network_id = parse_hex32(&take("--network-id")?, "--network-id")?;
     let owner_id = parse_hex32(&take("--owner-id")?, "--owner-id")?;
     let miner_id = parse_hex32(&take("--miner-id")?, "--miner-id")?;
     let tx_public_key = parse_hex32(&take("--tx-public-key-hex")?, "--tx-public-key-hex")?;
     let observe_account_id = parse_hex32(&take("--observe-account-id")?, "--observe-account-id")?;
-    let trusted_peer_key = parse_hex32(&take("--trusted-peer-key-hex")?, "--trusted-peer-key-hex")?;
+    let trusted_peer_keys = trusted_peer_values
+        .iter()
+        .map(|value| parse_hex32(value, "--trusted-peer-key-hex"))
+        .collect::<Result<Vec<_>, _>>()?;
+    if trusted_peer_keys.is_empty() {
+        return Err(
+            "at least one --trusted-peer-key-hex is required for inbound Noise authentication"
+                .into(),
+        );
+    }
+    if trusted_peer_keys.len() > 32 {
+        return Err("at most 32 --trusted-peer-key-hex entries are allowed".into());
+    }
+    if peers.len() > trusted_peer_keys.len() {
+        return Err("each outbound --peer requires a corresponding --trusted-peer-key-hex in the same order".into());
+    }
+    for (index, key) in trusted_peer_keys.iter().enumerate() {
+        if key.iter().all(|byte| *byte == 0) {
+            return Err("--trusted-peer-key-hex values must be nonzero".into());
+        }
+        if trusted_peer_keys[..index].contains(key) {
+            return Err("duplicate --trusted-peer-key-hex value".into());
+        }
+    }
     if network_id.iter().all(|byte| *byte == 0)
         || owner_id.iter().all(|byte| *byte == 0)
         || miner_id.iter().all(|byte| *byte == 0)
         || tx_public_key.iter().all(|byte| *byte == 0)
         || observe_account_id.iter().all(|byte| *byte == 0)
-        || trusted_peer_key.iter().all(|byte| *byte == 0)
     {
-        return Err("network, owner, miner, transaction public key, observe account and trusted peer key must be nonzero".into());
+        return Err(
+            "network, owner, miner, transaction public key and observe account must be nonzero"
+                .into(),
+        );
     }
     if account_id_from_public_key(&tx_public_key) != owner_id {
         return Err("--owner-id must equal the domain-separated account ID derived from --tx-public-key-hex".into());
@@ -355,11 +400,13 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
     if stop_after_height == Some(0) {
         return Err("--stop-after-height must be greater than zero".into());
     }
-    if mine_blocks > 0 && peer.is_none() {
-        return Err("mining requires --peer so each candidate is peer-acknowledged".into());
+    if mine_blocks > 0 && peers.is_empty() {
+        return Err(
+            "mining requires at least one --peer so each candidate is peer-acknowledged".into(),
+        );
     }
     if probe_invalid_signature_first
-        && (transaction.is_none() || mine_blocks == 0 || peer.is_none())
+        && (transaction.is_none() || mine_blocks == 0 || peers.is_empty())
     {
         return Err("--probe-invalid-signature-first requires a signed --transaction, --peer and --mine-blocks > 0".into());
     }
@@ -375,7 +422,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
     Ok(Some(Args {
         data_dir,
         listen,
-        peer,
+        peers,
         network_id,
         owner_id,
         miner_id,
@@ -383,7 +430,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
         observe_account_id,
         transaction,
         probe_invalid_signature_first,
-        trusted_peer_key,
+        trusted_peer_keys,
         noise_key_path,
         initial_subsidy_atoms,
         blocks_per_halving,
@@ -873,7 +920,7 @@ fn serve_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
     local_key: &SecretKey,
-    peer_key: &[u8; 32],
+    trusted_peer_keys: &[[u8; 32]],
     network_id: &[u8; 32],
     profile: &[u8; 32],
     store: &mut V04ExecutionForkStoreCandidate,
@@ -884,10 +931,12 @@ fn serve_connection(
         .set_nodelay(true)
         .map_err(|error| format!("set inbound TCP_NODELAY: {error}"))?;
     let mut session =
-        DevnetNoiseSession::accept(&mut stream, &local_key.0, &[*peer_key], network_id)
+        DevnetNoiseSession::accept(&mut stream, &local_key.0, trusted_peer_keys, network_id)
             .map_err(|error| format!("authenticate inbound peer {peer_addr}: {error}"))?;
-    if session.remote_static_public_key() != peer_key {
-        return Err("authenticated peer static key differs from configured pin".into());
+    if !trusted_peer_keys.contains(session.remote_static_public_key()) {
+        return Err(
+            "authenticated peer static key is not present in the configured trust set".into(),
+        );
     }
     let candidate = session
         .read_record(&mut stream)
@@ -918,7 +967,7 @@ fn serve_connection(
 fn poll_connections(
     listener: &TcpListener,
     local_key: &SecretKey,
-    peer_key: &[u8; 32],
+    trusted_peer_keys: &[[u8; 32]],
     network_id: &[u8; 32],
     profile: &[u8; 32],
     store: &mut V04ExecutionForkStoreCandidate,
@@ -937,7 +986,7 @@ fn poll_connections(
                     stream,
                     peer_addr,
                     local_key,
-                    peer_key,
+                    trusted_peer_keys,
                     network_id,
                     profile,
                     store,
@@ -996,13 +1045,19 @@ fn run(args: Args) -> Result<(), String> {
     };
     eprintln!("event=qzbe_v04_peer_smoke_ready network_id={} genesis={} profile={} listen={} peer={} height={} root={} tip={} store=QZBE ack=QZA4 noise=Noise_XX_25519_ChaChaPoly_SHA256 pow_profile={} tx_policy=Ed25519V1_single_explicit_key local_only=true public_launch_approved=false",
         hex(&args.network_id), hex(&genesis_id), hex(&profile_id), args.listen,
-        args.peer.map(|peer| peer.to_string()).unwrap_or_else(|| "inbound_only".into()),
+        if args.peers.is_empty() {
+            "inbound_only".to_string()
+        } else {
+            args.peers.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
+        },
         initial.height, hex(&initial.state_root), hex(&initial.tip), pow_profile);
 
     if args.probe_invalid_signature_first {
-        let peer = args
-            .peer
-            .ok_or("invalid-signature probe requires a pinned peer")?;
+        let peer = *args
+            .peers
+            .first()
+            .ok_or("invalid-signature probe requires a pinned outbound peer")?;
+        let peer_key = args.trusted_peer_keys[0];
         let candidate = store
             .fork_choice()
             .mine_candidate_on(
@@ -1028,7 +1083,7 @@ fn run(args: Args) -> Result<(), String> {
         send_rejection_probe(
             peer,
             &secret.0,
-            &args.trusted_peer_key,
+            &peer_key,
             &args.network_id,
             &profile_id,
             &tampered,
@@ -1040,7 +1095,7 @@ fn run(args: Args) -> Result<(), String> {
         poll_connections(
             &listener,
             &secret,
-            &args.trusted_peer_key,
+            &args.trusted_peer_keys,
             &args.network_id,
             &profile_id,
             &mut store,
@@ -1085,22 +1140,21 @@ fn run(args: Args) -> Result<(), String> {
             ));
         }
         let current = snapshot(&store)?;
-        let peer = args
-            .peer
-            .ok_or("missing peer address for a mined QZBE block")?;
-        send_candidate(
-            peer,
-            &secret.0,
-            &args.trusted_peer_key,
-            &args.network_id,
-            &profile_id,
-            &encoded,
-            outcome.block_digest,
-            &current,
-        )?;
-        sent_count = sent_count.saturating_add(1);
-        eprintln!("event=qzbe_v04_peer_broadcast_ack height={} digest={} root={} tip={} generation={} peer={} status=accepted_or_duplicate sent_count={}",
-            current.height, hex(&outcome.block_digest), hex(&current.state_root), hex(&current.tip), current.generation, peer, sent_count);
+        for (index, peer) in args.peers.iter().enumerate() {
+            send_candidate(
+                *peer,
+                &secret.0,
+                &args.trusted_peer_keys[index],
+                &args.network_id,
+                &profile_id,
+                &encoded,
+                outcome.block_digest,
+                &current,
+            )?;
+            sent_count = sent_count.saturating_add(1);
+            eprintln!("event=qzbe_v04_peer_broadcast_ack height={} digest={} root={} tip={} generation={} peer={} status=accepted_or_duplicate sent_count={}",
+                current.height, hex(&outcome.block_digest), hex(&current.state_root), hex(&current.tip), current.generation, peer, sent_count);
+        }
     }
 
     if !args.exit_after_mining {
@@ -1109,7 +1163,7 @@ fn run(args: Args) -> Result<(), String> {
             poll_connections(
                 &listener,
                 &secret,
-                &args.trusted_peer_key,
+                &args.trusted_peer_keys,
                 &args.network_id,
                 &profile_id,
                 &mut store,
@@ -1224,7 +1278,7 @@ mod tests {
         Args {
             data_dir: temp_profile_root(),
             listen: "127.0.0.1:49331".parse().unwrap(),
-            peer: None,
+            peers: Vec::new(),
             network_id: [0x31; 32],
             owner_id: [0xA7; 32],
             miner_id: [0xC4; 32],
@@ -1232,7 +1286,7 @@ mod tests {
             observe_account_id: [0xB2; 32],
             transaction: None,
             probe_invalid_signature_first: false,
-            trusted_peer_key: [0xE6; 32],
+            trusted_peer_keys: vec![[0xE6; 32]],
             noise_key_path: env::temp_dir().join("unused-qzbe-test-noise-key"),
             initial_subsidy_atoms,
             blocks_per_halving,
@@ -1242,6 +1296,109 @@ mod tests {
             exit_after_mining: true,
             test_easy_pow: false,
         }
+    }
+
+    fn parser_fixture_tokens(peers: &[(&str, &str)]) -> Vec<String> {
+        let network = [0x31; 32];
+        let tx_public_key = [0xD1; 32];
+        let owner = account_id_from_public_key(&tx_public_key);
+        let mut tokens = vec![
+            "--network-id".into(),
+            hex(&network),
+            "--owner-id".into(),
+            hex(&owner),
+            "--miner-id".into(),
+            "c4".repeat(32),
+            "--tx-public-key-hex".into(),
+            hex(&tx_public_key),
+            "--observe-account-id".into(),
+            "b2".repeat(32),
+            "--data-dir".into(),
+            env::temp_dir()
+                .join("qzbe-multi-peer-parser-test")
+                .to_string_lossy()
+                .to_string(),
+            "--listen".into(),
+            "127.0.0.1:49331".into(),
+            "--noise-static-private-key-dpapi-file".into(),
+            env::temp_dir()
+                .join("unused-qzbe-parser-test-key")
+                .to_string_lossy()
+                .to_string(),
+            "--initial-subsidy-atoms".into(),
+            "35673515981".into(),
+            "--blocks-per-halving".into(),
+            "4204800".into(),
+        ];
+        for (peer, key) in peers {
+            tokens.extend(["--peer".into(), (*peer).into()]);
+            tokens.extend(["--trusted-peer-key-hex".into(), (*key).into()]);
+        }
+        tokens
+    }
+
+    #[test]
+    fn parser_accepts_ordered_static_multi_peer_pins_and_rejects_bad_peer_sets() {
+        let input = parser_fixture_tokens(&[
+            ("127.0.0.1:49332", &"e6".repeat(32)),
+            ("127.0.0.1:49333", &"f7".repeat(32)),
+        ]);
+        let parsed = parse_args_from(input).expect("parse two-peer configuration");
+        let args = parsed.expect("not help");
+        assert_eq!(
+            args.peers,
+            vec![
+                "127.0.0.1:49332".parse::<SocketAddr>().unwrap(),
+                "127.0.0.1:49333".parse::<SocketAddr>().unwrap()
+            ]
+        );
+        assert_eq!(args.trusted_peer_keys, vec![[0xE6; 32], [0xF7; 32]]);
+
+        let duplicate_peer = parser_fixture_tokens(&[
+            ("127.0.0.1:49332", &"e6".repeat(32)),
+            ("127.0.0.1:49332", &"f7".repeat(32)),
+        ]);
+        assert!(parse_args_from(duplicate_peer)
+            .unwrap_err()
+            .contains("duplicate --peer"));
+
+        let missing_pin = vec![
+            "--network-id".into(),
+            "31".repeat(32),
+            "--owner-id".into(),
+            hex(&account_id_from_public_key(&[0xD1; 32])),
+            "--miner-id".into(),
+            "c4".repeat(32),
+            "--tx-public-key-hex".into(),
+            "d1".repeat(32),
+            "--observe-account-id".into(),
+            "b2".repeat(32),
+            "--data-dir".into(),
+            env::temp_dir()
+                .join("qzbe-multi-peer-parser-test")
+                .to_string_lossy()
+                .to_string(),
+            "--listen".into(),
+            "127.0.0.1:49331".into(),
+            "--noise-static-private-key-dpapi-file".into(),
+            env::temp_dir()
+                .join("unused-qzbe-parser-test-key")
+                .to_string_lossy()
+                .to_string(),
+            "--peer".into(),
+            "127.0.0.1:49332".into(),
+            "--peer".into(),
+            "127.0.0.1:49333".into(),
+            "--trusted-peer-key-hex".into(),
+            "e6".repeat(32),
+            "--initial-subsidy-atoms".into(),
+            "35673515981".into(),
+            "--blocks-per-halving".into(),
+            "4204800".into(),
+        ];
+        assert!(parse_args_from(missing_pin)
+            .unwrap_err()
+            .contains("corresponding --trusted-peer-key-hex"));
     }
 
     #[test]

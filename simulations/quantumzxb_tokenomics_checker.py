@@ -39,6 +39,8 @@ pow_source = load("src/native/pow_bench/src/monetary_pow_v04_candidate.rs")
 qzbe_node_source = load("src/native/pow_bench/src/bin/qzbe_v04_peer_node.rs")
 loopback_0414 = load("simulations/cp0414_qzbe_authenticated_transaction_loopback.ps1")
 loopback_0415 = load("simulations/cp0415_devnet_qzbe_dispatch_transaction_loopback.ps1")
+loopback_0418 = load("simulations/cp0418_qzbe_three_node_multi_peer_loopback.ps1")
+workflow = load(".github/workflows/rust-ci.yml")
 assert "pub const QZXB_V04_INITIAL_SUBSIDY_ATOMS: u128 = 35_673_515_981;" in issuance_source
 assert "pub const QZXB_V04_BLOCKS_PER_HALVING: u64 = 4_204_800;" in issuance_source
 assert "validate_canonical_v04_launch_parameters()" in qzbe_node_source
@@ -47,6 +49,11 @@ assert "if args.test_easy_pow" in qzbe_node_source
 assert "QZXB_V04_ARGON2ID_64MIB" in qzbe_node_source
 assert "next_block_timestamp(previous_timestamp, SystemTime::now())" in qzbe_node_source
 assert "--test-easy-pow" in loopback_0414 and "--test-easy-pow" in loopback_0415
+assert "peer_values = Vec::<String>::new()" in qzbe_node_source
+assert "trusted_peer_values = Vec::<String>::new()" in qzbe_node_source
+assert "for (index, peer) in args.peers.iter().enumerate()" in qzbe_node_source
+assert "CP-0418 QZBE_THREE_NODE_MULTI_PEER_PASS" in loopback_0418
+assert "cp0418_qzbe_three_node_multi_peer_loopback.ps1" in workflow
 
 for label, (percent, amount) in BUCKETS.items():
     assert label in policy and f"{amount:,}" in policy, f"policy missing {label}/{amount}"
@@ -84,4 +91,4 @@ print("QZXB_TOKENOMICS_V04_CHECK=PASS")
 print(f"cap={CAP}; buckets={len(BUCKETS)}; percentages={sum(p for p, _ in BUCKETS.values())}; amounts={sum(n for _, n in BUCKETS.values())}")
 print("founder=1000000000 (10%); old_4B_policy=historical_only; gross_issuance_and_burn=distinct")
 print(f"mining_emission_atoms={cumulative_mining_atoms}; unissued_mining_residual_atoms={mining_residual_atoms}")
-print("readme_site_whitepaper_roadmap_policy=checked; rust_schedule_is_pinned; qzbe_default_pow_and_time=checked; gate_2_and_gate_8_remain_open")
+print("readme_site_whitepaper_roadmap_policy=checked; rust_schedule_is_pinned; qzbe_default_pow_time_multi_peer=checked; gate_2_and_gate_8_remain_open")

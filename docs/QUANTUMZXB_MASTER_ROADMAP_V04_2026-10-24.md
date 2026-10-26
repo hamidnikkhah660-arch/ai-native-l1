@@ -14,6 +14,8 @@ Latest local checkpoint - 2026-10-26: CP-0410 corrected QZBE branch identity by 
 
 CP-0417 adds a local runtime hardening step after CP-0416: the isolated QZBE v0.4 node now uses the candidate's 64 MiB Argon2id / 2,016-block retarget parameters by default; the 8 MiB easy target is selected only with an explicit test-only flag. Its bounded candidate mining allowance is now 4,096 attempts, and mining uses real Unix timestamps with strict monotonicity over the canonical parent. Local format, all-target check, the 47-test devnet-node harness, the seven-test standalone QZBE harness, and both Windows release loopbacks passed. The tokenomics preflight now checks these runtime defaults against the recorded v0.4 economics. These are still candidate-only changes: external CAS is not deployed, the listener remains loopback-only, and the default legacy node lifecycle is not unified with QZBE. Fresh exact-head CI is tracked separately against the pushed commit; public-launch gates remain open.
 
+CP-0418 extends the isolated QZBE runtime to accept a bounded static set of pinned loopback peers and fan each locally mined block out to all configured peers. A three-node Windows release loopback passed: two blocks reached both independent receiver stores, a bad transaction signature was rejected atomically, and all three stores replayed to an identical height-2 root/tip. The new scenario is added to Windows CI; exact-head validation is pending. It does not implement discovery/gossip, prove multi-operator public reachability or concurrent-miner reorg convergence, and does not close Gate 2 or Gate 8.
+
 Passing tests are necessary engineering evidence, not evidence that the current monetary candidate is active in the canonical node, a production network exists, or the coin has been issued or can be traded.
 
 ## Gate scoreboard
@@ -98,6 +100,7 @@ The Sepolia QX asset is a separate testnet asset, not native QZXB. The proposed 
 - [CP-0415 Devnet QZBE explicit dispatch](CP-0415_DEVNET_QZBE_EXPLICIT_DISPATCH_2026-10-26.md)
 - [CP-0416 QZBE store profile lock and downgrade guard](CP-0416_QZBE_STORE_PROFILE_LOCK_DOWNGRADE_GUARD_2026-10-26.md)
 - [CP-0417 QZBE v0.4 default PoW and monotonic timestamp hardening](CP-0417_QZBE_V04_DEFAULT_POW_TIMESTAMP_RUNTIME_CANDIDATE_2026-10-26.md)
+- [CP-0418 QZBE three-node static multi-peer loopback](CP-0418_QZBE_THREE_NODE_STATIC_MULTI_PEER_LOOPBACK_2026-10-26.md)
 - [G0 public-launch and compliance checklist](CP_0372_G0_PUBLIC_LAUNCH_COMPLIANCE_CHECKLIST_2026-10-22.md)
 - [Owner directive: zero-budget launch and real liquidity](OWNER_DIRECTIVE_ZERO_BUDGET_LAUNCH_AND_LIQUIDITY_GATE_V01_2026-10-21.md)
 

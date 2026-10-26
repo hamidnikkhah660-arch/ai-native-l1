@@ -86,3 +86,6 @@ jobs:
       - name: Run QZBE store-profile lock, signed transaction and legacy downgrade guard through devnet_node
         shell: pwsh
         run: ./simulations/cp0415_devnet_qzbe_dispatch_transaction_loopback.ps1
+      - name: Run QZBE three-node static multi-peer propagation and replay
+        shell: pwsh
+        run: ./simulations/cp0418_qzbe_three_node_multi_peer_loopback.ps1

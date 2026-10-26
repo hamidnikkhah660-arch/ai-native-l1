@@ -20,7 +20,7 @@ Status: **local candidate change; exact-head CI pending; not canonical Mainnet i
 - simulations/cp0414_qzbe_authenticated_transaction_loopback.ps1: passed on Windows release binaries with the same signed-transfer, invalid-signature rejection, replay and public-bind assertions.
 - simulations/quantumzxb_tokenomics_checker.py: passed after being extended to check the Rust runtime defaults and the explicit test-only profile.
 - simulations/public_docs_refresh_checker.py and release checksum preflight are to be run on the staged change.
-- Exact-head GitHub Actions must be recorded after the commit is pushed; the parent checkpoint's success is not substituted for new-CI evidence.
+- Exact-head GitHub Actions run 40371654299 passed for commit 05f71e596c881b5ac2d9a1c312679b0a483ff93d: both Linux all-target validation/tests and the Windows TXN4/PFM4/QZBE loopback job completed successfully. That green result covers CP-0417; it does not cover the subsequent CP-0418 multi-peer patch, whose exact-head CI is pending.
 
 ## Still not closed
 
