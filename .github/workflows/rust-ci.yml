@@ -77,6 +77,6 @@ jobs:
         shell: pwsh
         run: ./simulations/cp0362_pfm4_page2_cursor_reorg.ps1
 
-      - name: Run QZBE v2 authenticated two-node runtime candidate, replay and public-bind guard
+      - name: Run QZBE signed transaction, invalid-signature atomic rejection, replay and public-bind guard
         shell: pwsh
-        run: ./simulations/cp0413_qzbe_authenticated_two_node_loopback.ps1
+        run: ./simulations/cp0414_qzbe_authenticated_transaction_loopback.ps1
