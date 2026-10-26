@@ -76,3 +76,7 @@ jobs:
       - name: Run PFM4 paged archive sync with inter-page reorg and stale-cursor rejection
         shell: pwsh
         run: ./simulations/cp0362_pfm4_page2_cursor_reorg.ps1
+
+      - name: Run QZBE v2 authenticated two-node runtime candidate, replay and public-bind guard
+        shell: pwsh
+        run: ./simulations/cp0413_qzbe_authenticated_two_node_loopback.ps1
