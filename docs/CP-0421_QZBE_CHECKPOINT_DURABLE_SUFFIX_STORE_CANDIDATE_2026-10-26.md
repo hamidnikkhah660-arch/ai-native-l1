@@ -12,11 +12,13 @@ Submitting a new block writes immutable branch bytes first, then commits an incr
 
 ## Local evidence
 
-- The focused checkpoint-store tests passed 3/3. They verify checkpoint-base open, one QZBE block's durable suffix commit and restart/replay equality; reject a changed supplied checkpoint; reject a manifest with a broken checksum; and reject branch bytes that no longer match the committed branch hash.
+- The focused checkpoint-store tests passed **4/4** after the height-2,017 extension was added. They verify checkpoint-base open, durable suffix commit/restart replay at Genesis, durable suffix commit/restart replay from a supplied height-2,016 checkpoint to height 2,017, rejection of a changed supplied checkpoint, rejection of a manifest with a broken checksum, and rejection of branch bytes that no longer match the committed branch hash.
 - The focused checkpoint-record/fork-choice tests passed 7/7, including restoring the configured 2,016-block target history, producing a checkpoint-based QZBE block at logical height 2,017, replaying the suffix, and constructing the next checkpoint from the live canonical branch.
 - Rust formatting and cargo check --all-targets --locked passed locally; existing unrelated warnings remain.
 - The independent CP-0419 checkpoint-byte oracle passed, and the tokenomics/runtime preflight passed.
 - Parent commit 9c78832123e37b5ccb646ee7cb0756c542ead155 passed exact-head CI run 40377595429. CP-0421 requires its own fresh exact-head CI; parent CI is not a substitute.
+
+The height-2,017 storage test uses a synthetic, explicitly supplied trusted checkpoint whose state and target history are transition-built; it does not mine or prove that the prior 2,016 QZBE PoW blocks existed. It verifies that the store persists and replays the successor block *from that supplied trust base*. The exact-head CI run started before this additional test was added; a follow-up commit must carry this test and obtain fresh CI.
 
 ## Security boundary
 

@@ -72,6 +72,7 @@ assert "MAX_V04_CHECKPOINT_SUFFIX_ARCHIVE_BYTES" in checkpoint_fork_choice
 assert "pub fn open_from_trusted_checkpoint" in checkpoint_store
 assert "pub fn submit" in checkpoint_store
 assert "checkpoint_store_commits_suffix_and_reopens_only_with_exact_trusted_checkpoint" in checkpoint_store
+assert "checkpoint_store_persists_and_replays_block_2017_from_trusted_checkpoint_2016" in checkpoint_store
 assert "monetary_pow_v04_checkpoint_store_candidate" in workflow
 
 for label, (percent, amount) in BUCKETS.items():

@@ -750,6 +750,96 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_store_persists_and_replays_block_2017_from_trusted_checkpoint_2016() {
+        let manifest = GenesisManifestV04::new(NETWORK, OWNER).unwrap();
+        let schedule = V04MiningIssuanceScheduleCandidate::new(35_673_515_981, 4_204_800).unwrap();
+        let profile =
+            V04ConsensusProfileCandidate::from_manifest_and_schedule(&manifest, schedule).unwrap();
+        let mut params = ConsensusParameters::candidate_testnet().unwrap();
+        params.initial_target = crate::consensus::Uint256::from_be_bytes([0xEF; 32]);
+        params.pow_limit = crate::consensus::Uint256::MAX;
+        params.pow.memory_kib = 8 * 1024;
+        let mut state =
+            MonetaryLedgerStateV04TransitionCandidate::from_genesis_manifest(&manifest, &profile)
+                .unwrap();
+        let mut history = TargetHistory::new(params.clone()).unwrap();
+        for height in 1..=2_016u64 {
+            let timestamp = height * params.target_block_time_secs;
+            let block = state.build_next_block(timestamp, [0x23; 32]).unwrap();
+            state.apply_block(&block).unwrap();
+            let target = history.expected_target(height, None).unwrap();
+            history.record_next(height, target, timestamp).unwrap();
+        }
+        let context = QzbeCheckpointValidationContext {
+            manifest: &manifest,
+            profile: &profile,
+            params: &params,
+        };
+        let checkpoint = QzbeCheckpointRecord::from_state(
+            &context,
+            &state,
+            [0x91; 32],
+            Uint256::ONE,
+            [0x42; 32],
+            history.checkpoint_snapshot().unwrap(),
+        )
+        .unwrap();
+
+        let dir = temp_root();
+        let mut store = V04ExecutionCheckpointForkStoreCandidate::open_from_trusted_checkpoint(
+            &dir,
+            checkpoint.clone(),
+            &context,
+            params.clone(),
+            &NoTransactionAuth,
+        )
+        .unwrap();
+        assert_eq!(store.canonical_height(), 2_016);
+        let encoded = store
+            .fork_choice()
+            .mine_candidate_on(
+                checkpoint.consensus_tip_digest,
+                2_017 * params.target_block_time_secs,
+                [0x24; 32],
+                Vec::new(),
+                1,
+                crate::monetary_pow_v04_candidate::MAX_QZBE_MINING_ATTEMPTS,
+                &NoTransactionAuth,
+                || false,
+            )
+            .unwrap();
+        let outcome = store
+            .submit(&encoded, &context, &NoTransactionAuth)
+            .unwrap();
+        assert!(outcome.canonical_changed);
+        assert_eq!(store.canonical_height(), 2_017);
+        let expected_tip = store.canonical_tip();
+        let expected_root = store.fork_choice().canonical_state().state_root().unwrap();
+        drop(store);
+
+        let reopened = V04ExecutionCheckpointForkStoreCandidate::open_from_trusted_checkpoint(
+            &dir,
+            checkpoint,
+            &context,
+            params.clone(),
+            &NoTransactionAuth,
+        )
+        .unwrap();
+        assert_eq!(reopened.canonical_height(), 2_017);
+        assert_eq!(reopened.canonical_tip(), expected_tip);
+        assert_eq!(
+            reopened
+                .fork_choice()
+                .canonical_state()
+                .state_root()
+                .unwrap(),
+            expected_root
+        );
+        drop(reopened);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn checkpoint_store_rejects_manifest_checksum_tampering() {
         let (manifest, profile, params, checkpoint) = fixture();
         let context = QzbeCheckpointValidationContext {
