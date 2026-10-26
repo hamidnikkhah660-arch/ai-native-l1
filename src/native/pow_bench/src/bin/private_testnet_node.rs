@@ -6618,8 +6618,40 @@ impl NodeRuntimeProfile {
     }
 }
 
+const QZBE_RUNTIME_PROFILE_FILE: &str = "qzbe-runtime.profile";
+const QZBE_STORE_LOCK_FILE: &str = "qzbe-store.lock";
+const QZBE_PENDING_MANIFEST_FILE: &str = ".qzbe-manifest.pending-cas";
+const QZBE_EXTERNAL_CAS_REQUIRED_FILE: &str = ".qzbe-external-cas-required";
+
+fn reject_qzbe_locked_data_directory(data_dir: &Path) -> Result<(), String> {
+    // The profile marker is primary. Keep the persistent unique QZBE writer-lock pathname and
+    // CAS-recovery markers as secondary evidence so deleting/corrupting just the profile marker
+    // cannot accidentally make the ordinary legacy entrypoint eligible for this data directory.
+    let evidence = [
+        QZBE_RUNTIME_PROFILE_FILE,
+        QZBE_STORE_LOCK_FILE,
+        QZBE_PENDING_MANIFEST_FILE,
+        QZBE_EXTERNAL_CAS_REQUIRED_FILE,
+    ];
+    let mut found = Vec::new();
+    for name in evidence {
+        let path = data_dir.join(name);
+        if path_entry_exists(&path)? {
+            found.push(path.display().to_string());
+        }
+    }
+    if !found.is_empty() {
+        return Err(format!(
+            "data directory is locked to the isolated QZBE v2 candidate profile by {}; refusing implicit PTB2/PFS2 or PMT3/PMT4 dispatch/downgrade; use the exact devnet_node --qzbe-v04-peer-smoke subcommand for this disposable store, or provision a separate data directory",
+            found.join(",")
+        ));
+    }
+    Ok(())
+}
+
 fn run_with_runtime_profile(runtime_profile: NodeRuntimeProfile) -> Result<(), String> {
     let config = parse_args()?;
+    reject_qzbe_locked_data_directory(&config.data_dir)?;
     if config.transaction_listen.is_some() && !config.monetary_v4_hybrid_peer_smoke {
         return Err("--transaction-listen requires --monetary-v4-hybrid-peer-smoke".into());
     }
@@ -7502,6 +7534,54 @@ mod signed_identity_runtime_tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn legacy_runtime_refuses_qzbe_locked_data_dir_without_rewriting_profile() {
+        let root = root();
+        let marker = root.join(QZBE_RUNTIME_PROFILE_FILE);
+        let marker_bytes = b"QZRP\0\x01candidate-profile-lock";
+        fs::write(&marker, marker_bytes).unwrap();
+        let error = reject_qzbe_locked_data_directory(&root)
+            .expect_err("legacy/default dispatch must refuse a QZBE-locked directory");
+        assert!(error.contains("refusing implicit PTB2/PFS2 or PMT3/PMT4 dispatch/downgrade"));
+        assert_eq!(
+            fs::read(&marker).unwrap(),
+            marker_bytes,
+            "legacy path must not mutate or clear QZBE lock"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_runtime_still_refuses_qzbe_store_when_profile_marker_is_missing_but_writer_lock_remains(
+    ) {
+        let root = root();
+        fs::write(root.join(QZBE_STORE_LOCK_FILE), b"pid=123\n").unwrap();
+        let error = reject_qzbe_locked_data_directory(&root)
+            .expect_err("persistent QZBE lock must keep legacy/default entrypoint out");
+        assert!(error.contains("qzbe-store.lock"));
+        assert!(error.contains("refusing implicit PTB2/PFS2 or PMT3/PMT4 dispatch/downgrade"));
+        assert!(!root.join(QZBE_RUNTIME_PROFILE_FILE).exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_runtime_refuses_even_a_dangling_qzbe_profile_lock_symlink_when_supported() {
+        let root = root();
+        let marker = root.join(QZBE_RUNTIME_PROFILE_FILE);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("missing-target"), &marker).unwrap();
+            assert!(reject_qzbe_locked_data_directory(&root).is_err());
+        }
+        #[cfg(windows)]
+        {
+            // Creating symlinks can require an elevated Windows policy; skip only that OS setup
+            // limitation while still testing regular marker detection in the cross-platform test.
+            let _ = &marker;
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn record(public_key: [u8; 32]) -> KeyRecord {

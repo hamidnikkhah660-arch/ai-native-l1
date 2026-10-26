@@ -24,9 +24,12 @@ use ai_native_l1_pow_bench::{
         TransactionAuthenticatorKind,
     },
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    env, fs, io,
+    env,
+    fs::{self, OpenOptions},
+    io::{self, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process, thread,
@@ -36,6 +39,15 @@ use std::{
 const ACK_MAGIC: &[u8; 4] = b"QZA4";
 const ACK_VERSION: u16 = 1;
 const ACK_BYTES: usize = 183;
+/// Root-level immutable profile lock for every QZBE candidate data directory.
+/// Legacy PTB2/PFS2 and PMT3/PMT4 entrypoints detect its presence and fail closed.
+const QZBE_RUNTIME_PROFILE_FILE: &str = "qzbe-runtime.profile";
+const QZBE_RUNTIME_PROFILE_MAGIC: &[u8; 4] = b"QZRP";
+const QZBE_RUNTIME_PROFILE_VERSION: u16 = 1;
+const QZBE_RUNTIME_PROFILE_CHECKSUM_DOMAIN: &[u8] = b"AIN1-QZBE-RUNTIME-PROFILE-CHECKSUM-V1\0";
+const QZBE_RUNTIME_PARAMS_DOMAIN: &[u8] = b"AIN1-QZBE-CONSENSUS-PARAMS-V1\0";
+const QZBE_RUNTIME_PROFILE_PREFIX_BYTES: usize = 4 + 2 + 32 * 4;
+const QZBE_RUNTIME_PROFILE_MARKER_BYTES: usize = QZBE_RUNTIME_PROFILE_PREFIX_BYTES + 32;
 const MAX_MINE_BLOCKS: u64 = 32;
 const MAX_PEER_MESSAGES: u64 = 512;
 const DEFAULT_RUN_SECONDS: u64 = 30;
@@ -396,13 +408,107 @@ fn hex(bytes: &[u8]) -> String {
     output
 }
 
-fn require_dedicated_store_directory(path: &Path) -> Result<(), String> {
+fn consensus_parameters_fingerprint(params: &ConsensusParameters) -> [u8; 32] {
+    let mut preimage = Vec::with_capacity(256);
+    preimage.extend_from_slice(QZBE_RUNTIME_PARAMS_DOMAIN);
+    preimage.extend_from_slice(&params.protocol_version.to_be_bytes());
+    preimage.extend_from_slice(&params.target_block_time_secs.to_be_bytes());
+    preimage.extend_from_slice(&params.difficulty_window_blocks.to_be_bytes());
+    preimage.extend_from_slice(&params.difficulty_min_ratio_divisor.to_be_bytes());
+    preimage.extend_from_slice(&params.difficulty_max_ratio.to_be_bytes());
+    preimage.extend_from_slice(&params.pow_limit.to_be_bytes());
+    preimage.extend_from_slice(&params.initial_target.to_be_bytes());
+    preimage.push(match params.pow.algorithm {
+        ai_native_l1_pow_bench::consensus::PowAlgorithm::Argon2id => 1,
+    });
+    preimage.extend_from_slice(&params.pow.memory_kib.to_be_bytes());
+    preimage.extend_from_slice(&params.pow.iterations.to_be_bytes());
+    preimage.extend_from_slice(&params.pow.lanes.to_be_bytes());
+    preimage.push(params.pow.output_bytes);
+    preimage.extend_from_slice(&params.issuance.maximum_supply().to_be_bytes());
+    preimage.extend_from_slice(&params.issuance.initial_subsidy().to_be_bytes());
+    preimage.extend_from_slice(&params.issuance.blocks_per_halving().to_be_bytes());
+    Sha256::digest(&preimage).into()
+}
+
+fn qzbe_runtime_profile_marker(
+    network_id: &[u8; 32],
+    genesis_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    params: &ConsensusParameters,
+) -> Vec<u8> {
+    let params_id = consensus_parameters_fingerprint(params);
+    let mut marker = Vec::with_capacity(QZBE_RUNTIME_PROFILE_MARKER_BYTES);
+    marker.extend_from_slice(QZBE_RUNTIME_PROFILE_MAGIC);
+    marker.extend_from_slice(&QZBE_RUNTIME_PROFILE_VERSION.to_be_bytes());
+    marker.extend_from_slice(network_id);
+    marker.extend_from_slice(genesis_id);
+    marker.extend_from_slice(profile_id);
+    marker.extend_from_slice(&params_id);
+    debug_assert_eq!(marker.len(), QZBE_RUNTIME_PROFILE_PREFIX_BYTES);
+    let mut hash = Sha256::new();
+    hash.update(QZBE_RUNTIME_PROFILE_CHECKSUM_DOMAIN);
+    hash.update(&marker);
+    marker.extend_from_slice(&hash.finalize());
+    debug_assert_eq!(marker.len(), QZBE_RUNTIME_PROFILE_MARKER_BYTES);
+    marker
+}
+
+fn read_exact_profile_marker(path: &Path, expected: &[u8]) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect QZBE profile lock {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("QZBE profile lock must be a regular non-symlink file".into());
+    }
+    if metadata.len() != expected.len() as u64 {
+        return Err(format!(
+            "QZBE profile lock has noncanonical length {}; expected {}; refusing profile reset/downgrade",
+            metadata.len(), expected.len()
+        ));
+    }
+    // Bound the read even if a concurrent writer replaces/grows the file after metadata check.
+    let mut file = fs::File::open(path)
+        .map_err(|error| format!("open QZBE profile lock {}: {error}", path.display()))?;
+    let mut bytes = Vec::with_capacity(expected.len());
+    Read::by_ref(&mut file)
+        .take(expected.len() as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read QZBE profile lock {}: {error}", path.display()))?;
+    if bytes.as_slice() != expected {
+        return Err("QZBE profile lock checksum or chain/profile/consensus binding mismatch; refusing profile reset/downgrade".into());
+    }
+    Ok(())
+}
+
+fn sync_profile_directory(path: &Path) -> Result<(), String> {
+    // Unix supports fsync on an open directory using the standard library. On Windows the file
+    // itself is flushed with sync_all above; std does not expose a portable directory fsync.
+    #[cfg(unix)]
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync QZBE profile directory {}: {error}", path.display()))?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn require_dedicated_store_directory(
+    path: &Path,
+    network_id: &[u8; 32],
+    genesis_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    params: &ConsensusParameters,
+) -> Result<(), String> {
     fs::create_dir_all(path).map_err(|error| format!("create QZBE store directory: {error}"))?;
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("inspect QZBE store directory: {error}"))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err("QZBE data directory must be a real directory, not a symlink or file".into());
     }
+    let marker_path = path.join(QZBE_RUNTIME_PROFILE_FILE);
+    let expected_marker = qzbe_runtime_profile_marker(network_id, genesis_id, profile_id, params);
+    let mut marker_present = false;
+    let mut store_artifacts_present = false;
     for entry in
         fs::read_dir(path).map_err(|error| format!("list QZBE store directory: {error}"))?
     {
@@ -416,10 +522,18 @@ fn require_dedicated_store_directory(path: &Path) -> Result<(), String> {
                 if kind.is_symlink() || !kind.is_dir() {
                     return Err(format!("QZBE path {name} must be a real directory"));
                 }
+                store_artifacts_present = true;
             }
             "qzbe-store.lock" => {
                 if kind.is_symlink() || !kind.is_file() {
                     return Err("QZBE store lock must be a regular non-symlink file".into());
+                }
+                store_artifacts_present = true;
+            }
+            QZBE_RUNTIME_PROFILE_FILE => {
+                marker_present = true;
+                if kind.is_symlink() || !kind.is_file() {
+                    return Err("QZBE profile lock must be a regular non-symlink file".into());
                 }
             }
             ".qzbe-manifest.pending-cas" | ".qzbe-external-cas-required" => {
@@ -431,7 +545,43 @@ fn require_dedicated_store_directory(path: &Path) -> Result<(), String> {
             _ => return Err(format!("refusing non-QZBE data in dedicated store: {name}")),
         }
     }
-    Ok(())
+
+    if marker_present {
+        // Existing QZBE stores must never be adopted under changed Genesis/schedule/PoW/profile.
+        return read_exact_profile_marker(&marker_path, &expected_marker);
+    }
+    if store_artifacts_present {
+        // Older or partially restored QZBE stores without the profile lock are ambiguous. Do not
+        // infer their intended profile from their current blocks and never silently bless them.
+        return Err("existing QZBE store artifacts have no immutable qzbe-runtime.profile lock; refusing implicit adoption, restore, or profile downgrade; preserve this directory and provision a separate fresh store".into());
+    }
+
+    // Fresh directories are locked exactly once. A crash that leaves a truncated marker makes the
+    // next startup fail closed; no automatic delete/rewrite path exists. Concurrent first boots
+    // must either create this exact lock or validate the winner's identical bytes.
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker_path)
+    {
+        Ok(mut file) => {
+            file.write_all(&expected_marker).map_err(|error| {
+                format!("write QZBE profile lock {}: {error}", marker_path.display())
+            })?;
+            file.sync_all().map_err(|error| {
+                format!("flush QZBE profile lock {}: {error}", marker_path.display())
+            })?;
+            sync_profile_directory(path)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            read_exact_profile_marker(&marker_path, &expected_marker)
+        }
+        Err(error) => Err(format!(
+            "create QZBE profile lock {}: {error}",
+            marker_path.display()
+        )),
+    }
 }
 
 fn prepare_profile(
@@ -776,11 +926,17 @@ fn poll_connections(
 fn run(args: Args) -> Result<(), String> {
     let authenticator = configured_authenticator(&args)?;
     let (manifest, profile, genesis, params) = prepare_profile(&args)?;
-    require_dedicated_store_directory(&args.data_dir)?;
     let profile_id = *profile.profile_fingerprint();
     let genesis_id = manifest
         .manifest_hash()
         .map_err(|error| format!("hash QZBE Genesis manifest: {error:?}"))?;
+    require_dedicated_store_directory(
+        &args.data_dir,
+        &args.network_id,
+        &genesis_id,
+        &profile_id,
+        &params,
+    )?;
     let mut raw_key = load_protected_noise_private_key(&args.noise_key_path, &args.network_id)
         .map_err(|error| format!("load protected QZBE Noise private key: {error}"))?;
     let secret = SecretKey(raw_key);
@@ -997,6 +1153,136 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_profile_root() -> PathBuf {
+        let tick = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        let path = env::temp_dir().join(format!(
+            "ain1_qzbe_profile_lock_{}_{}",
+            std::process::id(),
+            tick
+        ));
+        fs::create_dir_all(&path).expect("create temporary QZBE profile test root");
+        path
+    }
+
+    fn test_candidate_params() -> ConsensusParameters {
+        let mut params = ConsensusParameters::candidate_testnet().expect("candidate params");
+        params.initial_target = Uint256::from_be_bytes([0xEF; 32]);
+        params.pow_limit = Uint256::MAX;
+        params.pow.memory_kib = 8 * 1024;
+        params.validate().expect("valid candidate test params");
+        params
+    }
+
+    #[test]
+    fn profile_lock_is_create_once_and_binds_network_genesis_profile_and_consensus() {
+        let root = temp_profile_root();
+        let network = [0x31; 32];
+        let genesis = [0x42; 32];
+        let profile = [0x53; 32];
+        let params = test_candidate_params();
+        require_dedicated_store_directory(&root, &network, &genesis, &profile, &params)
+            .expect("fresh QZBE store gets its profile lock");
+        let marker_path = root.join(QZBE_RUNTIME_PROFILE_FILE);
+        let persisted = fs::read(&marker_path).expect("read persisted profile lock");
+        assert_eq!(persisted.len(), QZBE_RUNTIME_PROFILE_MARKER_BYTES);
+        assert_eq!(&persisted[..4], QZBE_RUNTIME_PROFILE_MAGIC);
+        assert_eq!(
+            u16::from_be_bytes([persisted[4], persisted[5]]),
+            QZBE_RUNTIME_PROFILE_VERSION
+        );
+        require_dedicated_store_directory(&root, &network, &genesis, &profile, &params)
+            .expect("same immutable profile can reopen");
+        assert_eq!(
+            fs::read(&marker_path).unwrap(),
+            persisted,
+            "reopen must not rewrite the marker"
+        );
+        assert!(
+            require_dedicated_store_directory(&root, &[0x32; 32], &genesis, &profile, &params)
+                .is_err()
+        );
+        assert!(
+            require_dedicated_store_directory(&root, &network, &[0x43; 32], &profile, &params)
+                .is_err()
+        );
+        assert!(
+            require_dedicated_store_directory(&root, &network, &genesis, &[0x54; 32], &params)
+                .is_err()
+        );
+        let mut changed_params = params.clone();
+        changed_params.pow.memory_kib += 8;
+        assert!(require_dedicated_store_directory(
+            &root,
+            &network,
+            &genesis,
+            &profile,
+            &changed_params
+        )
+        .is_err());
+        assert_eq!(
+            fs::read(&marker_path).unwrap(),
+            persisted,
+            "profile mismatch must not rewrite lock"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn existing_qzbe_store_without_profile_lock_is_never_silently_adopted() {
+        let root = temp_profile_root();
+        fs::create_dir(root.join("branches")).unwrap();
+        let network = [0x31; 32];
+        let genesis = [0x42; 32];
+        let profile = [0x53; 32];
+        let params = test_candidate_params();
+        let error = require_dedicated_store_directory(&root, &network, &genesis, &profile, &params)
+            .expect_err("legacy/unlocked store artifacts must fail closed");
+        assert!(error.contains("no immutable qzbe-runtime.profile lock"));
+        assert!(
+            !root.join(QZBE_RUNTIME_PROFILE_FILE).exists(),
+            "must not bless the old store by writing a marker"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_or_wrong_width_profile_lock_fails_closed_and_is_never_replaced() {
+        let root = temp_profile_root();
+        let network = [0x31; 32];
+        let genesis = [0x42; 32];
+        let profile = [0x53; 32];
+        let params = test_candidate_params();
+        require_dedicated_store_directory(&root, &network, &genesis, &profile, &params).unwrap();
+        let marker_path = root.join(QZBE_RUNTIME_PROFILE_FILE);
+        let original = fs::read(&marker_path).unwrap();
+        let mut corrupted = original.clone();
+        corrupted[13] ^= 1;
+        fs::write(&marker_path, &corrupted).unwrap();
+        assert!(
+            require_dedicated_store_directory(&root, &network, &genesis, &profile, &params)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(&marker_path).unwrap(),
+            corrupted,
+            "corrupt lock is preserved for recovery, never reset"
+        );
+        fs::write(&marker_path, [0x5a; 7]).unwrap();
+        assert!(
+            require_dedicated_store_directory(&root, &network, &genesis, &profile, &params)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(&marker_path).unwrap(),
+            [0x5a; 7],
+            "wrong-width lock is preserved, never reset"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn qzbe_ack_has_a_fixed_canonical_width_and_binds_profile() {
