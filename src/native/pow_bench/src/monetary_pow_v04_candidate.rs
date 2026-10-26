@@ -7,8 +7,8 @@
 
 use crate::{
     consensus::{
-        block_work, compare_chain_tips, pow_digest, verify_pow, ChainTip, ConsensusError,
-        ConsensusParameters, PowHeader, Uint256,
+        block_work, compare_chain_tips, pow_digest, ChainTip, ConsensusError, ConsensusParameters,
+        PowHeader, Uint256,
     },
     monetary_transition_v04_candidate::{
         MonetaryLedgerStateV04TransitionCandidate, V04ConsensusProfileCandidate,
@@ -22,10 +22,13 @@ use sha2::{Digest, Sha256};
 use std::{cmp::Ordering, collections::BTreeMap};
 
 pub const V04_EXECUTION_POW_ENVELOPE_MAGIC: [u8; 4] = *b"QZBE";
-pub const V04_EXECUTION_POW_ENVELOPE_VERSION: u16 = 1;
+/// Version 2 binds the canonical QZB4 v2 body into the digest used for PoW and fork choice.
+/// Version 1 was a local-only candidate and is intentionally not accepted by this candidate.
+pub const V04_EXECUTION_POW_ENVELOPE_VERSION: u16 = 2;
 const ENVELOPE_HEADER_BYTES: usize = 228;
 const POW_PROFILE_FINGERPRINT_DOMAIN: &[u8] =
-    b"QUANTUMZXB-V04-POW-CONSENSUS-PROFILE-CANDIDATE-V1\0";
+    b"QUANTUMZXB-V04-POW-CONSENSUS-PROFILE-CANDIDATE-V2\0";
+const QZBE_BODY_BOUND_POW_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-BODY-BOUND-POW-V2\0";
 pub const MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES: usize =
     ENVELOPE_HEADER_BYTES + MAX_ENCODED_V04_EXECUTION_BLOCK_BYTES;
 pub const MAX_V04_EXECUTION_FORK_ARCHIVE_BLOCKS: usize = 4_096;
@@ -70,7 +73,7 @@ impl From<PrivateConsensusError> for V04ExecutionPowError {
     }
 }
 
-/// Canonical QZBE v1 envelope containing exactly one canonical QZB4 v2 execution body.
+/// Canonical QZBE v2 envelope containing exactly one canonical QZB4 v2 execution body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V04ExecutionPowEnvelope {
     /// Fingerprints every configured PoW/difficulty parameter used to validate this header.
@@ -208,6 +211,54 @@ pub fn pow_consensus_profile_fingerprint(
     hash.update(params.pow.lanes.to_be_bytes());
     hash.update([params.pow.output_bytes]);
     Ok(hash.finalize().into())
+}
+
+/// QZBE v2 digest. The memory-hard header digest is additionally committed to the canonical
+/// transaction-bearing QZB4 v2 block ID. This binds all transactions/body bytes into PoW identity,
+/// fork choice, branch filenames and parent links without changing the legacy PMT3/PMT4 digest.
+pub fn qzbe_pow_digest(
+    header: &PowHeader,
+    block: &V04ExecutionBlockCandidate,
+    params: &ConsensusParameters,
+) -> Result<[u8; 32], V04ExecutionPowError> {
+    let header_digest = pow_digest(header, params.pow)?;
+    let block_id = block.block_id()?;
+    let mut hash = Sha256::new();
+    hash.update(QZBE_BODY_BOUND_POW_DOMAIN);
+    hash.update(header_digest);
+    hash.update(block_id);
+    Ok(hash.finalize().into())
+}
+
+/// Verify QZBE v2 using the body-bound digest rather than the legacy header-only digest.
+fn verify_qzbe_pow(
+    envelope: &V04ExecutionPowEnvelope,
+    params: &ConsensusParameters,
+) -> Result<[u8; 32], V04ExecutionPowError> {
+    params.validate()?;
+    if envelope.header.target.is_zero() {
+        return Err(V04ExecutionPowError::Consensus(
+            ConsensusError::InvalidTarget,
+        ));
+    }
+    if envelope.header.target > params.pow_limit {
+        return Err(V04ExecutionPowError::Consensus(
+            ConsensusError::TargetAbovePowLimit,
+        ));
+    }
+    if envelope.header.protocol_version != params.protocol_version {
+        return Err(V04ExecutionPowError::Consensus(
+            ConsensusError::InvalidProtocolVersion,
+        ));
+    }
+    let digest = qzbe_pow_digest(&envelope.header, &envelope.block, params)?;
+    if Uint256::from_be_bytes(digest) <= envelope.header.target {
+        Ok(digest)
+    } else {
+        Err(V04ExecutionPowError::Consensus(
+            ConsensusError::PowHashFailed,
+        ))
+    }
 }
 
 fn validate_header_body_binding(
@@ -467,7 +518,7 @@ impl V04ExecutionForkChoiceCandidate {
         if envelope.header.height > MAX_V04_EXECUTION_FORK_ARCHIVE_HEIGHT {
             return Err(V04ExecutionPowError::BranchHeightExceeded);
         }
-        let digest = verify_pow(&envelope.header, &self.params)?;
+        let digest = verify_qzbe_pow(&envelope, &self.params)?;
         if let Some(existing) = self.branches.get(&digest) {
             if existing.envelope.as_slice() != bytes {
                 return Err(V04ExecutionPowError::DuplicateDigestConflict);
@@ -637,7 +688,7 @@ impl V04ExecutionForkChoiceCandidate {
             .into_iter()
             .map(|bytes| {
                 let envelope = V04ExecutionPowEnvelope::decode(&bytes, &profile, &params)?;
-                let digest = pow_digest(&envelope.header, params.pow)?;
+                let digest = qzbe_pow_digest(&envelope.header, &envelope.block, &params)?;
                 Ok::<_, V04ExecutionPowError>((envelope.header.height, digest, bytes))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -705,8 +756,10 @@ mod tests {
 
     fn params() -> ConsensusParameters {
         let mut parameters = ConsensusParameters::candidate_testnet().unwrap();
+        // Unit tests need only exercise hashing/binding/target logic, not a production cost profile.
         parameters.initial_target = Uint256::MAX;
         parameters.pow_limit = Uint256::MAX;
+        parameters.pow.memory_kib = 8 * 1024;
         parameters
     }
 
@@ -768,11 +821,11 @@ mod tests {
             Err(V04ExecutionPowError::MalformedEnvelope)
         ));
 
-        let mut wrong_version = encoded.clone();
-        wrong_version[4..6].copy_from_slice(&2u16.to_be_bytes());
+        let mut legacy_version = encoded.clone();
+        legacy_version[4..6].copy_from_slice(&1u16.to_be_bytes());
         assert!(matches!(
-            V04ExecutionPowEnvelope::decode(&wrong_version, &profile, &params()),
-            Err(V04ExecutionPowError::UnsupportedEnvelopeVersion(2))
+            V04ExecutionPowEnvelope::decode(&legacy_version, &profile, &params()),
+            Err(V04ExecutionPowError::UnsupportedEnvelopeVersion(1))
         ));
         assert!(matches!(
             V04ExecutionPowEnvelope::decode(&decoded.block.encode().unwrap(), &profile, &params()),
@@ -818,25 +871,16 @@ mod tests {
         assert_eq!(outcome_b.canonical_height, 1);
         assert_eq!(graph.archive_len(), 2);
 
-        let digest_a = pow_digest(
-            &V04ExecutionPowEnvelope::decode(&branch_a, &profile, &params())
-                .unwrap()
-                .header,
-            params().pow,
-        )
-        .unwrap();
-        let digest_b = pow_digest(
-            &V04ExecutionPowEnvelope::decode(&branch_b, &profile, &params())
-                .unwrap()
-                .header,
-            params().pow,
-        )
-        .unwrap();
+        let envelope_a = V04ExecutionPowEnvelope::decode(&branch_a, &profile, &params()).unwrap();
+        let digest_a = qzbe_pow_digest(&envelope_a.header, &envelope_a.block, &params()).unwrap();
+        let envelope_b = V04ExecutionPowEnvelope::decode(&branch_b, &profile, &params()).unwrap();
+        let digest_b = qzbe_pow_digest(&envelope_b.header, &envelope_b.block, &params()).unwrap();
         let losing_tip = if graph.canonical_tip() == digest_a {
             digest_b
         } else {
             digest_a
         };
+        let reorgs_before_extension = graph.reorg_count();
         let extension = graph
             .build_candidate_on(losing_tip, 3, MINER_B, vec![], 3, &TestAuthenticator)
             .unwrap();
@@ -845,7 +889,7 @@ mod tests {
             .unwrap();
         assert_eq!(extension_result.canonical_height, 2);
         assert!(extension_result.canonical_changed);
-        assert_eq!(graph.reorg_count(), 1);
+        assert_eq!(graph.reorg_count(), reorgs_before_extension + 1);
         assert_eq!(graph.canonical_state().ledger().height(), 2);
         assert_eq!(
             graph.canonical_state().state_root().unwrap(),
@@ -873,6 +917,115 @@ mod tests {
         assert_eq!(
             replayed.branch_work(&replayed.canonical_tip()),
             graph.branch_work(&graph.canonical_tip())
+        );
+    }
+
+    #[test]
+    fn body_permutations_with_same_state_root_have_distinct_pow_identity_and_replay() {
+        let (_, profile) = profile(10_000);
+        let genesis = genesis(&profile);
+        let parameters = params();
+        let mut graph =
+            V04ExecutionForkChoiceCandidate::new(genesis.clone(), parameters.clone()).unwrap();
+
+        // Give two independent senders funds and establish each sender's nonce.
+        let mut fund_a = transfer();
+        fund_a.amount = 1_000;
+        let mut fund_b = transfer();
+        fund_b.recipient = [0xB3; 32];
+        fund_b.nonce = 2;
+        fund_b.amount = 1_000;
+        let funding = graph
+            .build_candidate_on(
+                graph.genesis_tip(),
+                1,
+                MINER_A,
+                vec![fund_a, fund_b],
+                1,
+                &TestAuthenticator,
+            )
+            .unwrap();
+        graph.insert_encoded(&funding, &TestAuthenticator).unwrap();
+        let parent = graph.canonical_tip();
+
+        // These transactions are independent. Reordering them changes canonical body bytes and
+        // block ID, while balances, per-account nonces, and therefore pre-tip state root agree.
+        let mut spend_a = transfer();
+        spend_a.sender = RECIPIENT;
+        spend_a.recipient = OWNER;
+        spend_a.amount = 400;
+        let mut spend_b = transfer();
+        spend_b.sender = [0xB3; 32];
+        spend_b.recipient = OWNER;
+        spend_b.amount = 400;
+
+        let candidate_a = graph
+            .build_candidate_on(
+                parent,
+                2,
+                MINER_A,
+                vec![spend_a.clone(), spend_b.clone()],
+                2,
+                &TestAuthenticator,
+            )
+            .unwrap();
+        let candidate_b = graph
+            .build_candidate_on(
+                parent,
+                2,
+                MINER_A,
+                vec![spend_b, spend_a],
+                2,
+                &TestAuthenticator,
+            )
+            .unwrap();
+        let envelope_a =
+            V04ExecutionPowEnvelope::decode(&candidate_a, &profile, &parameters).unwrap();
+        let envelope_b =
+            V04ExecutionPowEnvelope::decode(&candidate_b, &profile, &parameters).unwrap();
+        assert_eq!(envelope_a.header, envelope_b.header);
+        assert_eq!(envelope_a.block.state_root, envelope_b.block.state_root);
+        assert_ne!(
+            envelope_a.block.block_id().unwrap(),
+            envelope_b.block.block_id().unwrap()
+        );
+
+        // Reproduce the old failure explicitly: identical headers had identical old-style digests.
+        let legacy_digest_a = pow_digest(&envelope_a.header, parameters.pow).unwrap();
+        let legacy_digest_b = pow_digest(&envelope_b.header, parameters.pow).unwrap();
+        assert_eq!(legacy_digest_a, legacy_digest_b);
+
+        let digest_a = qzbe_pow_digest(&envelope_a.header, &envelope_a.block, &parameters).unwrap();
+        let digest_b = qzbe_pow_digest(&envelope_b.header, &envelope_b.block, &parameters).unwrap();
+        assert_ne!(
+            digest_a, digest_b,
+            "PoW/fork-choice identity must bind the full body"
+        );
+
+        graph
+            .insert_encoded(&candidate_a, &TestAuthenticator)
+            .unwrap();
+        graph
+            .insert_encoded(&candidate_b, &TestAuthenticator)
+            .unwrap();
+        assert_eq!(graph.archive_len(), 3);
+        let state_a = graph.branch_state(&digest_a).unwrap();
+        let state_b = graph.branch_state(&digest_b).unwrap();
+        assert_eq!(state_a.state_root().unwrap(), state_b.state_root().unwrap());
+        assert_ne!(state_a.ledger().tip_hash(), state_b.ledger().tip_hash());
+
+        let replayed = V04ExecutionForkChoiceCandidate::rebuild_from_envelopes(
+            genesis,
+            parameters,
+            graph.archive_envelopes(),
+            &TestAuthenticator,
+        )
+        .unwrap();
+        assert_eq!(replayed.archive_len(), graph.archive_len());
+        assert_eq!(replayed.canonical_tip(), graph.canonical_tip());
+        assert_eq!(
+            replayed.canonical_state().state_root().unwrap(),
+            graph.canonical_state().state_root().unwrap()
         );
     }
 

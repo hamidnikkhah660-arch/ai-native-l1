@@ -7,14 +7,14 @@
 //! The provider remains an injected interface/test fixture: there is no deployed provider,
 //! independent key custody, canonical-node wiring, or Mainnet launch in this module.
 use crate::{
-    consensus::{pow_digest, ConsensusError, ConsensusParameters},
+    consensus::{ConsensusError, ConsensusParameters},
     external_cas_anchor_candidate::{
         ExternalCasClientError, ExternalCasError, ExternalCasPin, ExternalCasProviderTransport,
         ExternalCasReceipt, ExternalCasReceiptOutcome, ExternalCasRecord, ExternalCasWriteRequest,
         VerifiedExternalCasClient,
     },
     monetary_pow_v04_candidate::{
-        pow_consensus_profile_fingerprint, V04ExecutionForkChoiceCandidate,
+        pow_consensus_profile_fingerprint, qzbe_pow_digest, V04ExecutionForkChoiceCandidate,
         V04ExecutionForkChoiceOutcome, V04ExecutionPowEnvelope, V04ExecutionPowError,
         MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES, MAX_V04_EXECUTION_FORK_ARCHIVE_BLOCKS,
     },
@@ -35,8 +35,8 @@ use std::{
 };
 
 const MANIFEST_MAGIC: &[u8; 4] = b"QZMF";
-const MANIFEST_VERSION: u16 = 1;
-const MANIFEST_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-STORE-MANIFEST-CANDIDATE-V1\0";
+const MANIFEST_VERSION: u16 = 2;
+const MANIFEST_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-STORE-MANIFEST-CANDIDATE-V2\0";
 const MANIFEST_PREFIX_BYTES: usize = 4 + 2 + 8 + 32 * 6 + 8 + 4;
 const MANIFEST_ENTRY_BYTES: usize = 64;
 const MANIFEST_CHECKSUM_BYTES: usize = 32;
@@ -53,14 +53,14 @@ const LOCK_NAME: &str = "qzbe-store.lock";
 const PENDING_MANIFEST_NAME: &str = ".qzbe-manifest.pending-cas";
 const ANCHOR_MODE_MARKER_NAME: &str = ".qzbe-external-cas-required";
 const ANCHOR_MODE_MARKER_MAGIC: &[u8; 4] = b"QZCA";
-const ANCHOR_MODE_MARKER_VERSION: u16 = 1;
-const ANCHOR_MODE_MARKER_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-EXTERNAL-CAS-MODE-MARKER-V1\0";
+const ANCHOR_MODE_MARKER_VERSION: u16 = 2;
+const ANCHOR_MODE_MARKER_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-EXTERNAL-CAS-MODE-MARKER-V2\0";
 const ANCHOR_MODE_MARKER_BYTES: usize = 4 + 2 + 7 * 32 + 32;
-const MANIFEST_ANCHOR_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-MANIFEST-ANCHOR-CANDIDATE-V1\0";
-const CAS_READ_OPERATION_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-CAS-READ-CANDIDATE-V1\0";
-const CAS_WRITE_OPERATION_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-CAS-WRITE-CANDIDATE-V1\0";
-const CAS_WRITE_NONCE_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-CAS-WRITE-NONCE-CANDIDATE-V1\0";
-const CAS_GENESIS_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-CAS-GENESIS-CANDIDATE-V1\0";
+const MANIFEST_ANCHOR_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-MANIFEST-ANCHOR-CANDIDATE-V2\0";
+const CAS_READ_OPERATION_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-CAS-READ-CANDIDATE-V2\0";
+const CAS_WRITE_OPERATION_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-CAS-WRITE-CANDIDATE-V2\0";
+const CAS_WRITE_NONCE_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-CAS-WRITE-NONCE-CANDIDATE-V2\0";
+const CAS_GENESIS_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-CAS-GENESIS-CANDIDATE-V2\0";
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
@@ -505,7 +505,7 @@ impl V04ExecutionForkStoreCandidate {
                     }
                     let envelope =
                         V04ExecutionPowEnvelope::decode(&envelope_bytes, graph.profile(), &params)?;
-                    if pow_digest(&envelope.header, params.pow)? != *digest {
+                    if qzbe_pow_digest(&envelope.header, &envelope.block, &params)? != *digest {
                         return Err(V04ExecutionForkStoreError::BranchDigestMismatch);
                     }
                     envelopes.push(envelope_bytes);
@@ -795,7 +795,7 @@ impl V04ExecutionForkStoreCandidate {
             self.fork_choice.profile(),
             &self.params,
         )?;
-        let digest = pow_digest(&decoded.header, self.params.pow)?;
+        let digest = qzbe_pow_digest(&decoded.header, &decoded.block, &self.params)?;
         let mut staged = self.fork_choice.clone();
         let outcome = staged.insert_encoded(envelope_bytes, authenticator)?;
         if staged.archive_len() == self.fork_choice.archive_len() {
@@ -960,7 +960,7 @@ impl V04ExecutionForkStoreCandidate {
             self.fork_choice.profile(),
             &self.params,
         )?;
-        let digest = pow_digest(&decoded.header, self.params.pow)?;
+        let digest = qzbe_pow_digest(&decoded.header, &decoded.block, &self.params)?;
         let mut staged = self.fork_choice.clone();
         let outcome = staged.insert_encoded(envelope_bytes, authenticator)?;
         if staged.archive_len() == self.fork_choice.archive_len() {
@@ -1021,7 +1021,7 @@ fn encode_manifest(
             return Err(V04ExecutionForkStoreError::ArchiveCapacityExceeded);
         }
         let envelope = V04ExecutionPowEnvelope::decode(&bytes, graph.profile(), params)?;
-        let digest = pow_digest(&envelope.header, params.pow)?;
+        let digest = qzbe_pow_digest(&envelope.header, &envelope.block, params)?;
         if entries.insert(digest, sha256(&bytes)).is_some() {
             return Err(V04ExecutionForkStoreError::BranchDigestMismatch);
         }
@@ -1327,8 +1327,11 @@ mod tests {
     use libcrux_ml_dsa::ml_dsa_65::portable;
     use std::{
         fs,
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
         path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     const NETWORK: [u8; 32] = [0x31; 32];
@@ -1344,6 +1347,19 @@ mod tests {
                 Ok(())
             } else {
                 Err(())
+            }
+        }
+    }
+
+    /// Test-only producer fixture for constructing a block whose transaction signature is
+    /// intentionally rejected by the receiving store's stricter verifier.
+    struct AcceptAnyNonemptyAuthenticator;
+    impl TransactionAuthenticator for AcceptAnyNonemptyAuthenticator {
+        fn verify(&self, _: &AccountId, _: &[u8; 32], signature: &[u8]) -> Result<(), ()> {
+            if signature.is_empty() {
+                Err(())
+            } else {
+                Ok(())
             }
         }
     }
@@ -1532,8 +1548,10 @@ mod tests {
 
     fn params() -> ConsensusParameters {
         let mut parameters = ConsensusParameters::candidate_testnet().unwrap();
+        // Unit tests need only exercise hashing/binding/target logic, not a production cost profile.
         parameters.initial_target = Uint256::MAX;
         parameters.pow_limit = Uint256::MAX;
+        parameters.pow.memory_kib = 8 * 1024;
         parameters
     }
 
@@ -1570,6 +1588,194 @@ mod tests {
         ))
     }
 
+    /// Exercise an actual loopback TCP byte transfer with explicit framing and bounded reads.
+    /// This is a test helper only; it is not the production P2P transport or peer-authentication
+    /// protocol.
+    fn loopback_exchange(payload: &[u8]) -> Vec<u8> {
+        let length = u32::try_from(payload.len()).expect("test envelope length fits u32");
+        assert!(payload.len() <= MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral loopback listener");
+        let address = listener
+            .local_addr()
+            .expect("read ephemeral loopback address");
+        let receiver = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept loopback connection");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set bounded read timeout");
+            let mut length_bytes = [0u8; 4];
+            stream
+                .read_exact(&mut length_bytes)
+                .expect("read framed envelope length");
+            let received_length = u32::from_be_bytes(length_bytes) as usize;
+            assert!(received_length <= MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES);
+            let mut bytes = vec![0u8; received_length];
+            stream
+                .read_exact(&mut bytes)
+                .expect("read complete framed envelope");
+            bytes
+        });
+
+        let mut stream = TcpStream::connect(address).expect("connect to loopback receiver");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("set bounded write timeout");
+        stream
+            .write_all(&length.to_be_bytes())
+            .expect("write framed envelope length");
+        stream
+            .write_all(payload)
+            .expect("write complete framed envelope");
+        drop(stream);
+        receiver.join().expect("loopback receiver completes")
+    }
+
+    /// CP-0410: two independent persistent QZBE stores exchange blocks through real loopback TCP.
+    /// The test explicitly verifies receiver-side signature rejection, continued convergence, and
+    /// deterministic replay. It does not claim production P2P, external CAS, or network hardening.
+    #[test]
+    fn independent_qzbe_stores_exchange_loopback_blocks_and_replay_identically() {
+        let (_manifest, profile) = profile();
+        let genesis_state = genesis(&profile);
+        let parameters = params();
+        let node_a_path = temporary_directory();
+        let node_b_path = temporary_directory();
+
+        let mut node_a = V04ExecutionForkStoreCandidate::open(
+            &node_a_path,
+            genesis_state.clone(),
+            parameters.clone(),
+            &TestAuthenticator,
+        )
+        .unwrap();
+        let mut node_b = V04ExecutionForkStoreCandidate::open(
+            &node_b_path,
+            genesis_state.clone(),
+            parameters.clone(),
+            &TestAuthenticator,
+        )
+        .unwrap();
+
+        // Node A produces a transaction-bearing QZB4 v2 body and wraps it in QZBE.
+        let first = node_a
+            .fork_choice()
+            .build_candidate_on(
+                node_a.canonical_tip(),
+                1,
+                MINER_A,
+                vec![transaction()],
+                1,
+                &TestAuthenticator,
+            )
+            .unwrap();
+        node_a.submit(&first, &TestAuthenticator).unwrap();
+
+        // Move only the encoded bytes over TCP; Node B independently decodes, verifies and commits.
+        let received_first = loopback_exchange(&first);
+        assert_eq!(received_first, first);
+        node_b.submit(&received_first, &TestAuthenticator).unwrap();
+        assert_eq!(node_a.canonical_height(), 1);
+        assert_eq!(node_b.canonical_height(), 1);
+        assert_eq!(node_a.canonical_tip(), node_b.canonical_tip());
+        assert_eq!(
+            node_a.canonical_state_root().unwrap(),
+            node_b.canonical_state_root().unwrap()
+        );
+
+        // Build a structurally valid candidate with a deliberately bad signature using a
+        // test-only permissive producer fixture. The receiver's configured verifier must reject
+        // it without changing its manifest generation, canonical tip, or state root.
+        let mut bad_transaction = transaction();
+        bad_transaction.nonce = 2;
+        bad_transaction.signature = vec![0x00];
+        let invalid = node_a
+            .fork_choice()
+            .build_candidate_on(
+                node_a.canonical_tip(),
+                2,
+                MINER_A,
+                vec![bad_transaction],
+                2,
+                &AcceptAnyNonemptyAuthenticator,
+            )
+            .unwrap();
+        let received_invalid = loopback_exchange(&invalid);
+        let before_invalid = (
+            node_b.canonical_tip(),
+            node_b.canonical_height(),
+            node_b.canonical_state_root().unwrap(),
+            node_b.generation(),
+        );
+        assert!(node_b
+            .submit(&received_invalid, &TestAuthenticator)
+            .is_err());
+        assert_eq!(
+            before_invalid,
+            (
+                node_b.canonical_tip(),
+                node_b.canonical_height(),
+                node_b.canonical_state_root().unwrap(),
+                node_b.generation(),
+            )
+        );
+
+        // A valid successor remains acceptable after the rejected payload; both nodes converge.
+        let mut second_transaction = transaction();
+        second_transaction.nonce = 2;
+        let second = node_a
+            .fork_choice()
+            .build_candidate_on(
+                node_a.canonical_tip(),
+                2,
+                MINER_A,
+                vec![second_transaction],
+                2,
+                &TestAuthenticator,
+            )
+            .unwrap();
+        node_a.submit(&second, &TestAuthenticator).unwrap();
+        let received_second = loopback_exchange(&second);
+        node_b.submit(&received_second, &TestAuthenticator).unwrap();
+
+        let expected_tip = node_a.canonical_tip();
+        let expected_root = node_a.canonical_state_root().unwrap();
+        assert_eq!(node_b.canonical_tip(), expected_tip);
+        assert_eq!(node_b.canonical_height(), 2);
+        assert_eq!(node_b.canonical_state_root().unwrap(), expected_root);
+        assert_eq!(node_a.generation(), 2);
+        assert_eq!(node_b.generation(), 2);
+        assert_eq!(node_a.archive_len(), 2);
+        assert_eq!(node_b.archive_len(), 2);
+        drop(node_a);
+        drop(node_b);
+
+        // Independent process-style reopens replay their own durable archives from Genesis.
+        let reopened_a = V04ExecutionForkStoreCandidate::open(
+            &node_a_path,
+            genesis_state.clone(),
+            parameters.clone(),
+            &TestAuthenticator,
+        )
+        .unwrap();
+        let reopened_b = V04ExecutionForkStoreCandidate::open(
+            &node_b_path,
+            genesis_state,
+            parameters,
+            &TestAuthenticator,
+        )
+        .unwrap();
+        assert_eq!(reopened_a.canonical_tip(), expected_tip);
+        assert_eq!(reopened_b.canonical_tip(), expected_tip);
+        assert_eq!(reopened_a.canonical_height(), 2);
+        assert_eq!(reopened_b.canonical_height(), 2);
+        assert_eq!(reopened_a.canonical_state_root().unwrap(), expected_root);
+        assert_eq!(reopened_b.canonical_state_root().unwrap(), expected_root);
+        drop(reopened_a);
+        drop(reopened_b);
+        fs::remove_dir_all(node_a_path).unwrap();
+        fs::remove_dir_all(node_b_path).unwrap();
+    }
+
     #[test]
     fn store_reopens_by_replaying_every_branch_and_preserves_canonical_state() {
         let (_manifest, profile) = profile();
@@ -1604,20 +1810,10 @@ mod tests {
                 .unwrap();
             store.submit(&b, &TestAuthenticator).unwrap();
             assert_eq!(store.archive_len(), 2);
-            let da = pow_digest(
-                &V04ExecutionPowEnvelope::decode(&a, &profile, &params())
-                    .unwrap()
-                    .header,
-                params().pow,
-            )
-            .unwrap();
-            let db = pow_digest(
-                &V04ExecutionPowEnvelope::decode(&b, &profile, &params())
-                    .unwrap()
-                    .header,
-                params().pow,
-            )
-            .unwrap();
+            let envelope_a = V04ExecutionPowEnvelope::decode(&a, &profile, &params()).unwrap();
+            let da = qzbe_pow_digest(&envelope_a.header, &envelope_a.block, &params()).unwrap();
+            let envelope_b = V04ExecutionPowEnvelope::decode(&b, &profile, &params()).unwrap();
+            let db = qzbe_pow_digest(&envelope_b.header, &envelope_b.block, &params()).unwrap();
             let losing_tip = if store.canonical_tip() == da { db } else { da };
             let extension = store
                 .fork_choice()
@@ -1736,13 +1932,8 @@ mod tests {
                     &TestAuthenticator,
                 )
                 .unwrap();
-            digest = pow_digest(
-                &V04ExecutionPowEnvelope::decode(&encoded, &profile, &params())
-                    .unwrap()
-                    .header,
-                params().pow,
-            )
-            .unwrap();
+            let envelope = V04ExecutionPowEnvelope::decode(&encoded, &profile, &params()).unwrap();
+            digest = qzbe_pow_digest(&envelope.header, &envelope.block, &params()).unwrap();
             store.submit(&encoded, &TestAuthenticator).unwrap();
         }
         fs::remove_file(
@@ -1814,13 +2005,8 @@ mod tests {
                     &TestAuthenticator,
                 )
                 .unwrap();
-            digest = pow_digest(
-                &V04ExecutionPowEnvelope::decode(&encoded, &profile, &params())
-                    .unwrap()
-                    .header,
-                params().pow,
-            )
-            .unwrap();
+            let envelope = V04ExecutionPowEnvelope::decode(&encoded, &profile, &params()).unwrap();
+            digest = qzbe_pow_digest(&envelope.header, &envelope.block, &params()).unwrap();
             store.submit(&encoded, &TestAuthenticator).unwrap();
         }
         let branch_path = path
