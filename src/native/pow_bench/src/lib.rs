@@ -14,6 +14,8 @@ pub mod auth_transport;
 /// Research-only bounded program-pool claim accounting; not wired into canonical consensus.
 pub mod bounded_reward_pools_candidate;
 pub mod canonical_provider;
+/// CP-0417 explicit height/profile-bound family selection; candidate contract only, not node-wired.
+pub mod canonical_version_dispatch_candidate;
 pub mod chain_admission;
 pub mod chain_import;
 pub mod chain_view;
