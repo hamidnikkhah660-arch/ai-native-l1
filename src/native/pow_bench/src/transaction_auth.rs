@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 
 pub const ED25519_SIGNATURE_LEN: usize = 64;
 pub const ED25519_PUBLIC_KEY_LEN: usize = 32;
+pub const ED25519_SELF_CONTAINED_SIGNATURE_LEN: usize =
+    ED25519_PUBLIC_KEY_LEN + ED25519_SIGNATURE_LEN;
 pub const ACCOUNT_ID_DOMAIN: &[u8] = b"AIN1-ACCOUNT-ID-ED25519-V1\0";
 
 /// Explicit algorithm selector. Unknown values must be rejected; never auto-fallback.
@@ -87,7 +89,7 @@ impl Ed25519TransactionSigner {
         account_id_from_public_key(&self.public_key())
     }
 
-    /// Sign a TXN2 transaction only when its sender is this signer's derived account.
+    /// Sign a TXN2 transaction using the legacy 64-byte registry-bound signature form.
     pub fn sign_transaction(&self, tx: &mut Transaction) -> Result<(), AuthenticatorError> {
         if tx.sender != self.account_id() {
             return Err(AuthenticatorError::WrongSignerAccount);
@@ -95,6 +97,27 @@ impl Ed25519TransactionSigner {
         let digest =
             transaction_signing_digest(tx).map_err(|_| AuthenticatorError::InvalidTransaction)?;
         tx.signature = self.sign_digest(&digest);
+        Ok(())
+    }
+
+    /// Sign a TXN2 transaction with a self-contained `[public_key || signature]` envelope.
+    /// This lets any validating node derive the sender account from the transaction itself,
+    /// rather than requiring every account's key to be provisioned out-of-band.
+    pub fn sign_transaction_self_contained(
+        &self,
+        tx: &mut Transaction,
+    ) -> Result<(), AuthenticatorError> {
+        if tx.sender != self.account_id() {
+            return Err(AuthenticatorError::WrongSignerAccount);
+        }
+        let digest =
+            transaction_signing_digest(tx).map_err(|_| AuthenticatorError::InvalidTransaction)?;
+        let public_key = self.public_key();
+        let signature = self.sign_digest(&digest);
+        let mut envelope = Vec::with_capacity(ED25519_SELF_CONTAINED_SIGNATURE_LEN);
+        envelope.extend_from_slice(&public_key);
+        envelope.extend_from_slice(&signature);
+        tx.signature = envelope;
         Ok(())
     }
 
@@ -187,11 +210,28 @@ impl Ed25519TransactionAuthenticator {
         signing_digest: &[u8; 32],
         signature: &[u8],
     ) -> Result<(), ()> {
-        if signature.len() != ED25519_SIGNATURE_LEN {
+        if signature.len() == ED25519_SIGNATURE_LEN {
+            let key = self.keys.get(sender).ok_or(())?;
+            let signature = Signature::from_slice(signature).map_err(|_| ())?;
+            return key
+                .verify_strict(signing_digest, &signature)
+                .map_err(|_| ());
+        }
+        if signature.len() != ED25519_SELF_CONTAINED_SIGNATURE_LEN {
             return Err(());
         }
-        let key = self.keys.get(sender).ok_or(())?;
-        let signature = Signature::from_slice(signature).map_err(|_| ())?;
+        let public_key_bytes: [u8; ED25519_PUBLIC_KEY_LEN] = signature[..ED25519_PUBLIC_KEY_LEN]
+            .try_into()
+            .map_err(|_| ())?;
+        if account_id_from_public_key(&public_key_bytes) != *sender {
+            return Err(());
+        }
+        let key = VerifyingKey::from_bytes(&public_key_bytes).map_err(|_| ())?;
+        if key.is_weak() {
+            return Err(());
+        }
+        let signature =
+            Signature::from_slice(&signature[ED25519_PUBLIC_KEY_LEN..]).map_err(|_| ())?;
         key.verify_strict(signing_digest, &signature)
             .map_err(|_| ())
     }
@@ -266,6 +306,40 @@ mod tests {
             Ok(())
         );
         assert_eq!(tx.signature.len(), ED25519_SIGNATURE_LEN);
+    }
+
+    #[test]
+    fn self_contained_ed25519_signature_derives_sender_without_registry_provisioning() {
+        let sender_signer = Ed25519TransactionSigner::from_seed(TEST_SEED);
+        let unrelated_signer = Ed25519TransactionSigner::from_seed([0x42; 32]);
+        let authenticator = selected(&unrelated_signer);
+        let mut tx = unsigned_transaction(sender_signer.account_id());
+        sender_signer
+            .sign_transaction_self_contained(&mut tx)
+            .unwrap();
+        assert_eq!(tx.signature.len(), ED25519_SELF_CONTAINED_SIGNATURE_LEN);
+        let digest = transaction_signing_digest(&tx).unwrap();
+        assert_eq!(
+            authenticator.verify(&tx.sender, &digest, &tx.signature),
+            Ok(())
+        );
+
+        let mut bad_signature = tx.signature.clone();
+        *bad_signature.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            authenticator.verify(&tx.sender, &digest, &bad_signature),
+            Err(())
+        );
+        let mut wrong_embedded_key = tx.signature.clone();
+        wrong_embedded_key[0] ^= 1;
+        assert_eq!(
+            authenticator.verify(&tx.sender, &digest, &wrong_embedded_key),
+            Err(())
+        );
+        assert_eq!(
+            authenticator.verify(&[0x77; 32], &digest, &tx.signature),
+            Err(())
+        );
     }
 
     #[test]

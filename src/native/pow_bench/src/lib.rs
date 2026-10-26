@@ -109,6 +109,7 @@ pub mod private_testnet_v4_hybrid_fork_store_candidate;
 /// Candidate-only PTB2 envelope for linked PoW headers + canonical block-body transport.
 pub mod private_testnet_wire;
 pub mod protocol_profile;
+pub mod qzbe_tx_ingress_candidate;
 pub mod recovery;
 pub mod reference_time;
 pub mod reference_time_store;

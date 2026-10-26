@@ -24,7 +24,14 @@ use ai_native_l1_pow_bench::{
     },
     noise_key_provisioning::load_protected_noise_private_key,
     private_testnet_driver::TargetHistory,
-    state_machine::{AccountId, Transaction},
+    private_testnet_mempool_candidate::{BoundedMempool, MempoolError, MempoolLimits},
+    qzbe_tx_ingress_candidate::{
+        decode_request_header, encode_ack as encode_tx_ingress_ack, TxIngressAck, TxIngressStatus,
+        REQUEST_HEADER_BYTES,
+    },
+    state_machine::{
+        decode_transaction, transaction_id, AccountId, Transaction, MAX_TRANSACTION_BYTES,
+    },
     transaction_auth::{
         account_id_from_public_key, AccountPublicKey, Ed25519TransactionAuthenticator,
         TransactionAuthenticatorKind,
@@ -56,6 +63,8 @@ const QZBE_RUNTIME_PROFILE_PREFIX_BYTES: usize = 4 + 2 + 32 * 4;
 const QZBE_RUNTIME_PROFILE_MARKER_BYTES: usize = QZBE_RUNTIME_PROFILE_PREFIX_BYTES + 32;
 const MAX_MINE_BLOCKS: u64 = 32;
 const MAX_PEER_MESSAGES: u64 = 512;
+const MAX_TX_SUBMISSIONS_PER_POLL: usize = 8;
+const MAX_TX_SUBMISSIONS: u64 = 65_536;
 const DEFAULT_RUN_SECONDS: u64 = 30;
 
 struct SecretKey([u8; 32]);
@@ -69,6 +78,7 @@ impl Drop for SecretKey {
 struct Args {
     data_dir: PathBuf,
     listen: SocketAddr,
+    tx_listen: Option<SocketAddr>,
     peers: Vec<SocketAddr>,
     network_id: [u8; 32],
     owner_id: [u8; 32],
@@ -105,7 +115,7 @@ struct PeerAck {
 }
 
 fn usage() -> &'static str {
-    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --tx-public-key-hex HEX64 --observe-account-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 [--trusted-peer-key-hex HEX64 ...] --initial-subsidy-atoms U128 --blocks-per-halving U64 [--tx-recipient-id HEX64 --tx-nonce U64 --tx-amount-atoms U64 --tx-fee-atoms U64 --tx-expires-at U64 --tx-signature-hex HEX128] [--probe-invalid-signature-first] [--test-easy-pow] [--peer 127.0.0.1:PORT ...] [--mine-blocks N | --mine-forever] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2 runtime candidate with statically pinned multi-peer loopback connections. Each --peer is paired by order with the corresponding --trusted-peer-key-hex; additional trusted keys may authorize inbound peers. Canonical v0.4 Argon2id is the default. --mine-forever continuously mines and broadcasts until interrupted or --stop-after-height is reached; it requires at least one pinned peer and cannot be combined with --mine-blocks or --exit-after-mining. --test-easy-pow is for isolated loopback tests only. No public bind or Mainnet activation."
+    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --tx-public-key-hex HEX64 --observe-account-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT [--tx-listen 127.0.0.1:PORT] --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 [--trusted-peer-key-hex HEX64 ...] --initial-subsidy-atoms U128 --blocks-per-halving U64 [--tx-recipient-id HEX64 --tx-nonce U64 --tx-amount-atoms U64 --tx-fee-atoms U64 --tx-expires-at U64 --tx-signature-hex HEX128] [--probe-invalid-signature-first] [--test-easy-pow] [--peer 127.0.0.1:PORT ...] [--mine-blocks N | --mine-forever] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2 runtime candidate with statically pinned multi-peer loopback connections and an optional bounded QZTS/1 transaction-ingress listener. Each --peer is paired by order with the corresponding --trusted-peer-key-hex; additional trusted keys may authorize inbound peers. Canonical v0.4 Argon2id is the default. --mine-forever continuously mines and broadcasts until interrupted or --stop-after-height is reached; it requires at least one pinned peer and cannot be combined with --mine-blocks or --exit-after-mining. --test-easy-pow is for isolated loopback tests only. No public bind or Mainnet activation."
 }
 
 fn parse_hex32(value: &str, name: &str) -> Result<[u8; 32], String> {
@@ -231,6 +241,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
                 | "--tx-signature-hex"
                 | "--data-dir"
                 | "--listen"
+                | "--tx-listen"
                 | "--noise-static-private-key-dpapi-file"
                 | "--initial-subsidy-atoms"
                 | "--blocks-per-halving"
@@ -266,6 +277,20 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
         .map_err(|_| "--listen is not a valid socket address".to_string())?;
 
     ensure_loopback_address(listen, "listen addresses")?;
+    let tx_listen = values
+        .get("--tx-listen")
+        .map(|value| {
+            value
+                .parse::<SocketAddr>()
+                .map_err(|_| "--tx-listen is not a valid socket address".to_string())
+        })
+        .transpose()?;
+    if let Some(address) = tx_listen {
+        ensure_loopback_address(address, "transaction-ingress listen addresses")?;
+        if address == listen {
+            return Err("--tx-listen must use a different socket from --listen".into());
+        }
+    }
 
     let peers = peer_values
         .iter()
@@ -279,6 +304,9 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
         ensure_loopback_address(*address, "peers")?;
         if *address == listen {
             return Err("--peer cannot refer to this node's own listener".into());
+        }
+        if Some(*address) == tx_listen {
+            return Err("--peer cannot refer to this node's transaction-ingress listener".into());
         }
         if peers[..index].contains(address) {
             return Err("duplicate --peer address".into());
@@ -445,6 +473,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
     Ok(Some(Args {
         data_dir,
         listen,
+        tx_listen,
         peers,
         network_id,
         owner_id,
@@ -1031,6 +1060,158 @@ fn poll_connections(
         }
     }
 }
+fn tx_ingress_ack(
+    stream: &mut TcpStream,
+    status: TxIngressStatus,
+    mempool: &BoundedMempool,
+    transaction_id: [u8; 32],
+) -> Result<(), String> {
+    let count = u32::try_from(mempool.len()).unwrap_or(u32::MAX);
+    let bytes = encode_tx_ingress_ack(TxIngressAck {
+        status,
+        mempool_count: count,
+        transaction_id,
+    });
+    stream
+        .write_all(&bytes)
+        .map_err(|error| format!("write QZTS/1 transaction acknowledgement: {error}"))
+}
+
+fn serve_tx_connection(
+    mut stream: TcpStream,
+    peer_addr: SocketAddr,
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    authenticator: &Ed25519TransactionAuthenticator,
+    mempool: &mut BoundedMempool,
+) -> Result<(), String> {
+    if !peer_addr.ip().is_loopback() {
+        return Err(
+            "QZBE transaction ingress only accepts loopback clients in candidate mode".into(),
+        );
+    }
+    stream
+        .set_nodelay(true)
+        .map_err(|error| format!("set TXN2 ingress TCP_NODELAY: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("set TXN2 ingress read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("set TXN2 ingress write timeout: {error}"))?;
+
+    let mut header = [0u8; REQUEST_HEADER_BYTES];
+    stream
+        .read_exact(&mut header)
+        .map_err(|error| format!("read QZTS/1 request header: {error}"))?;
+    let transaction_len = match decode_request_header(&header) {
+        Ok(length) => length,
+        Err(error) => {
+            tx_ingress_ack(&mut stream, TxIngressStatus::Rejected, mempool, [0; 32])?;
+            return Err(format!("invalid QZTS/1 request header: {error:?}"));
+        }
+    };
+    if transaction_len > MAX_TRANSACTION_BYTES {
+        tx_ingress_ack(&mut stream, TxIngressStatus::Rejected, mempool, [0; 32])?;
+        return Err("QZTS/1 transaction exceeds the canonical TXN2 byte cap".into());
+    }
+    let mut transaction_wire = vec![0u8; transaction_len];
+    stream
+        .read_exact(&mut transaction_wire)
+        .map_err(|error| format!("read bounded QZTS/1 TXN2 payload: {error}"))?;
+    let transaction = match decode_transaction(&transaction_wire) {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            tx_ingress_ack(&mut stream, TxIngressStatus::Rejected, mempool, [0; 32])?;
+            eprintln!("event=qzbe_v04_tx_rejected peer={} reason=malformed_txn2 error={:?} mempool_count={}", peer_addr, error, mempool.len());
+            return Ok(());
+        }
+    };
+    let txid = match transaction_id(&transaction) {
+        Ok(id) => id,
+        Err(error) => {
+            tx_ingress_ack(&mut stream, TxIngressStatus::Rejected, mempool, [0; 32])?;
+            eprintln!("event=qzbe_v04_tx_rejected peer={} reason=transaction_id error={:?} mempool_count={}", peer_addr, error, mempool.len());
+            return Ok(());
+        }
+    };
+    let admission = {
+        let ledger = store.fork_choice().canonical_state().ledger();
+        let candidate_timestamp = next_block_timestamp(ledger.last_timestamp(), SystemTime::now())?;
+        mempool.submit(transaction, ledger, authenticator, candidate_timestamp)
+    };
+    match admission {
+        Ok(admitted_id) => {
+            tx_ingress_ack(&mut stream, TxIngressStatus::Accepted, mempool, admitted_id)?;
+            eprintln!("event=qzbe_v04_tx_admitted peer={} txid={} mempool_count={} bounded=true signature_policy=self_contained_or_registered_ed25519", peer_addr, hex(&admitted_id), mempool.len());
+        }
+        Err(MempoolError::Duplicate) => {
+            tx_ingress_ack(&mut stream, TxIngressStatus::Duplicate, mempool, txid)?;
+            eprintln!(
+                "event=qzbe_v04_tx_duplicate peer={} txid={} mempool_count={}",
+                peer_addr,
+                hex(&txid),
+                mempool.len()
+            );
+        }
+        Err(error) => {
+            tx_ingress_ack(&mut stream, TxIngressStatus::Rejected, mempool, [0; 32])?;
+            eprintln!("event=qzbe_v04_tx_rejected peer={} txid={} reason={:?} mempool_count={} rejected_atomically=true", peer_addr, hex(&txid), error, mempool.len());
+        }
+    }
+    Ok(())
+}
+
+fn poll_tx_connections(
+    listener: Option<&TcpListener>,
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    authenticator: &Ed25519TransactionAuthenticator,
+    mempool: &mut BoundedMempool,
+    submission_count: &mut u64,
+) -> Result<(), String> {
+    let Some(listener) = listener else {
+        return Ok(());
+    };
+    for _ in 0..MAX_TX_SUBMISSIONS_PER_POLL {
+        match listener.accept() {
+            Ok((mut stream, peer_addr)) => {
+                *submission_count = submission_count.saturating_add(1);
+                if *submission_count > MAX_TX_SUBMISSIONS {
+                    let _ =
+                        tx_ingress_ack(&mut stream, TxIngressStatus::Rejected, mempool, [0; 32]);
+                    eprintln!("event=qzbe_v04_tx_rejected peer={} reason=bounded_submission_budget_exhausted", peer_addr);
+                    continue;
+                }
+                if let Err(error) =
+                    serve_tx_connection(stream, peer_addr, store, authenticator, mempool)
+                {
+                    eprintln!(
+                        "event=qzbe_v04_tx_connection_rejected peer={} reason={}",
+                        peer_addr, error
+                    );
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(format!("accept QZBE transaction ingress: {error}")),
+        }
+    }
+    Ok(())
+}
+
+fn reconcile_pending_mempool(
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    authenticator: &Ed25519TransactionAuthenticator,
+    mempool: &mut BoundedMempool,
+) -> Result<(), String> {
+    let ledger = store.fork_choice().canonical_state().ledger();
+    let candidate_timestamp = next_block_timestamp(ledger.last_timestamp(), SystemTime::now())?;
+    let summary =
+        mempool.reconcile_after_reorg(ledger, authenticator, candidate_timestamp, &[], &[]);
+    if summary.dropped_expired > 0 || summary.dropped_invalid > 0 {
+        eprintln!("event=qzbe_v04_mempool_reconciled kept={} dropped_expired={} dropped_invalid={} mempool_count={}", summary.kept, summary.dropped_expired, summary.dropped_invalid, mempool.len());
+    }
+    Ok(())
+}
+
 fn run(args: Args) -> Result<(), String> {
     let authenticator = configured_authenticator(&args)?;
     let (manifest, profile, genesis, params) = prepare_profile(&args)?;
@@ -1076,27 +1257,57 @@ fn run(args: Args) -> Result<(), String> {
     )
     .map_err(|error| format!("open checkpoint-rooted local QZBE store: {error}"))?;
     let initial = snapshot(&store)?;
+    let mut mempool = BoundedMempool::new(MempoolLimits::default())
+        .map_err(|error| format!("configure bounded QZBE transaction mempool: {error:?}"))?;
+    if let Some(transaction) = args.transaction.clone() {
+        let ledger = store.fork_choice().canonical_state().ledger();
+        let candidate_timestamp = next_block_timestamp(ledger.last_timestamp(), SystemTime::now())?;
+        mempool
+            .submit(transaction, ledger, &authenticator, candidate_timestamp)
+            .map_err(|error| {
+                format!("admit configured legacy-fixture TXN2 to bounded mempool: {error:?}")
+            })?;
+    }
     let listener = TcpListener::bind(args.listen)
         .map_err(|error| format!("bind loopback QZBE listener {}: {error}", args.listen))?;
     listener
         .set_nonblocking(true)
         .map_err(|error| format!("set QZBE listener nonblocking: {error}"))?;
+    let tx_listener = if let Some(address) = args.tx_listen {
+        let tx_listener = TcpListener::bind(address).map_err(|error| {
+            format!("bind loopback QZBE transaction ingress {address}: {error}")
+        })?;
+        tx_listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("set QZBE transaction ingress nonblocking: {error}"))?;
+        Some(tx_listener)
+    } else {
+        None
+    };
+    let tx_listener_address = tx_listener
+        .as_ref()
+        .map(|value| value.local_addr())
+        .transpose()
+        .map_err(|error| format!("read transaction-ingress listen address: {error}"))?;
     let mut accepted_count = 0u64;
     let mut message_count = 0u64;
+    let mut tx_submission_count = 0u64;
     let mut sent_count = 0u64;
     let pow_profile = if args.test_easy_pow {
         "EXPLICIT_LOCAL_TEST_EASY_POW_8MIB"
     } else {
         "QZXB_V04_ARGON2ID_64MIB"
     };
-    eprintln!("event=qzbe_v04_peer_smoke_ready network_id={} genesis={} profile={} listen={} peer={} height={} root={} tip={} store=QZBE ack=QZA4 noise=Noise_XX_25519_ChaChaPoly_SHA256 pow_profile={} mining_mode={} tx_policy=Ed25519V1_single_explicit_key local_only=true public_launch_approved=false",
+    eprintln!("event=qzbe_v04_peer_smoke_ready network_id={} genesis={} profile={} listen={} tx_listen={} peer={} height={} root={} tip={} store=QZBE ack=QZA4 tx_ingress=QZTS/1 mempool_max_count={} mempool_max_bytes={} noise=Noise_XX_25519_ChaChaPoly_SHA256 pow_profile={} mining_mode={} tx_policy=registered_or_self_contained_ed25519 local_only=true public_launch_approved=false",
         hex(&args.network_id), hex(&genesis_id), hex(&profile_id), args.listen,
+        tx_listener_address.map(|address| address.to_string()).unwrap_or_else(|| "disabled".to_string()),
         if args.peers.is_empty() {
             "inbound_only".to_string()
         } else {
             args.peers.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
         },
-        initial.height, hex(&initial.state_root), hex(&initial.tip), pow_profile,
+        initial.height, hex(&initial.state_root), hex(&initial.tip), mempool.limits().max_transactions,
+        mempool.limits().max_bytes, pow_profile,
         if args.mine_forever { "continuous" } else { "bounded" });
 
     if args.probe_invalid_signature_first {
@@ -1143,7 +1354,7 @@ fn run(args: Args) -> Result<(), String> {
     } else {
         args.mine_blocks
     };
-    for block_index in 0..mine_limit {
+    for _ in 0..mine_limit {
         if args
             .stop_after_height
             .is_some_and(|height| store.canonical_height() >= height)
@@ -1162,6 +1373,14 @@ fn run(args: Args) -> Result<(), String> {
             &mut accepted_count,
             &mut message_count,
         )?;
+        poll_tx_connections(
+            tx_listener.as_ref(),
+            &store,
+            &authenticator,
+            &mut mempool,
+            &mut tx_submission_count,
+        )?;
+        reconcile_pending_mempool(&store, &authenticator, &mut mempool)?;
         let parent_tip = store.canonical_tip();
         let next_height = store
             .canonical_height()
@@ -1172,17 +1391,14 @@ fn run(args: Args) -> Result<(), String> {
             .canonical_timestamp()
             .map_err(|error| format!("read canonical QZBE timestamp: {error}"))?;
         let timestamp = next_block_timestamp(previous_timestamp, SystemTime::now())?;
+        let block_transactions = mempool.ordered_transactions();
         let encoded = store
             .fork_choice()
             .mine_candidate_on(
                 parent_tip,
                 timestamp,
                 args.miner_id,
-                if block_index == 0 {
-                    args.transaction.clone().into_iter().collect()
-                } else {
-                    Vec::new()
-                },
+                block_transactions.clone(),
                 next_height,
                 MAX_QZBE_MINING_ATTEMPTS,
                 &authenticator,
@@ -1197,6 +1413,10 @@ fn run(args: Args) -> Result<(), String> {
                 "QZBE local fork choice did not advance to height {next_height} from {}",
                 hex(&parent_tip)
             ));
+        }
+        let removed_transactions = mempool.remove_included(&block_transactions);
+        if removed_transactions != block_transactions.len() {
+            return Err(format!("QZBE mempool inclusion accounting mismatch: selected={} removed={removed_transactions}", block_transactions.len()));
         }
         let current = snapshot(&store)?;
         for (index, peer) in args.peers.iter().enumerate() {
@@ -1231,6 +1451,14 @@ fn run(args: Args) -> Result<(), String> {
                 &mut accepted_count,
                 &mut message_count,
             )?;
+            poll_tx_connections(
+                tx_listener.as_ref(),
+                &store,
+                &authenticator,
+                &mut mempool,
+                &mut tx_submission_count,
+            )?;
+            reconcile_pending_mempool(&store, &authenticator, &mut mempool)?;
             if args
                 .stop_after_height
                 .is_some_and(|height| store.canonical_height() >= height)
@@ -1265,9 +1493,9 @@ fn run(args: Args) -> Result<(), String> {
     }
     let recipient_balance = observed_balance(&replayed, &args.observe_account_id);
     let total_mined_atoms = replayed.fork_choice().canonical_state().total_mined_atoms();
-    eprintln!("event=qzbe_v04_peer_smoke_stopped network_id={} profile={} height={} state_root={} tip={} generation={} total_mined_atoms={} observed_account={} observed_balance_atoms={} accepted_peer_blocks={} sent_peer_blocks={} replay=matched local_only=true public_launch_approved=false",
+    eprintln!("event=qzbe_v04_peer_smoke_stopped network_id={} profile={} height={} state_root={} tip={} generation={} total_mined_atoms={} observed_account={} observed_balance_atoms={} accepted_peer_blocks={} sent_peer_blocks={} tx_submissions={} mempool_count={} replay=matched local_only=true public_launch_approved=false",
         hex(&args.network_id), hex(&profile_id), final_snapshot.height, hex(&final_snapshot.state_root),
-        hex(&final_snapshot.tip), final_snapshot.generation, total_mined_atoms, hex(&args.observe_account_id), recipient_balance, accepted_count, sent_count);
+        hex(&final_snapshot.tip), final_snapshot.generation, total_mined_atoms, hex(&args.observe_account_id), recipient_balance, accepted_count, sent_count, tx_submission_count, mempool.len());
     if final_snapshot.height < initial.height || final_snapshot.tip.iter().all(|byte| *byte == 0) {
         return Err("QZBE replay returned an invalid canonical snapshot".into());
     }
@@ -1343,6 +1571,7 @@ mod tests {
         Args {
             data_dir: temp_profile_root(),
             listen: "127.0.0.1:49331".parse().unwrap(),
+            tx_listen: None,
             peers: Vec::new(),
             network_id: [0x31; 32],
             owner_id: [0xA7; 32],
@@ -1465,6 +1694,48 @@ mod tests {
         assert!(parse_args_from(missing_pin)
             .unwrap_err()
             .contains("corresponding --trusted-peer-key-hex"));
+    }
+
+    #[test]
+    fn transaction_ingress_listener_is_optional_loopback_only_and_distinct() {
+        let mut valid = parser_fixture_tokens(&[]);
+        valid.extend([
+            "--trusted-peer-key-hex".into(),
+            "e6".repeat(32),
+            "--tx-listen".into(),
+            "127.0.0.1:49334".into(),
+        ]);
+        let parsed = parse_args_from(valid).unwrap().unwrap();
+        assert_eq!(parsed.tx_listen, Some("127.0.0.1:49334".parse().unwrap()));
+
+        let mut non_loopback = parser_fixture_tokens(&[]);
+        non_loopback.extend([
+            "--trusted-peer-key-hex".into(),
+            "e6".repeat(32),
+            "--tx-listen".into(),
+            "0.0.0.0:49334".into(),
+        ]);
+        assert!(parse_args_from(non_loopback)
+            .unwrap_err()
+            .contains("refuses all non-loopback transaction-ingress listen addresses"));
+
+        let mut same_socket = parser_fixture_tokens(&[]);
+        same_socket.extend([
+            "--trusted-peer-key-hex".into(),
+            "e6".repeat(32),
+            "--tx-listen".into(),
+            "127.0.0.1:49331".into(),
+        ]);
+        assert!(parse_args_from(same_socket)
+            .unwrap_err()
+            .contains("must use a different socket"));
+
+        let mut collides_with_peer =
+            parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        collides_with_peer.extend(["--tx-listen".into(), "127.0.0.1:49332".into()]);
+        assert!(parse_args_from(collides_with_peer)
+            .unwrap_err()
+            .contains("cannot refer to this node's transaction-ingress listener"));
     }
 
     #[test]

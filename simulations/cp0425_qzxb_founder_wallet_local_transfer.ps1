@@ -59,7 +59,7 @@ $owner = $ownerMatch.Groups[1].Value
 $txAmountAtoms = '10000000000000000'
 $txFeeAtoms = '1'
 $txExpiresAt = '4102444800'
-$txOutput = @(& $walletExe sign-transfer --wallet $walletPath --network-id-hex $network --recipient-id-hex $recipient --nonce 1 --amount-atoms $txAmountAtoms --fee-atoms $txFeeAtoms --expires-at $txExpiresAt 2>&1)
+$txOutput = @(& $walletExe sign-transfer --wallet $walletPath --network-id-hex $network --recipient-id-hex $recipient --nonce 1 --amount-atoms $txAmountAtoms --fee-atoms $txFeeAtoms --expires-at $txExpiresAt --signature-mode registered 2>&1)
 if ($LASTEXITCODE -ne 0) { throw ("CP-0425 founder transfer signing failed: " + ($txOutput -join [Environment]::NewLine)) }
 $txText = $txOutput -join [Environment]::NewLine
 $sigMatch = [regex]::Match($txText, 'tx_signature_hex=([0-9a-f]{128})')

@@ -2,10 +2,12 @@
 //!
 //! The QZKW1 file contains a CurrentUser-DPAPI protected 32-byte seed and public identifiers.
 //! It never accepts secret material on the command line or emits the seed. DPAPI is local desktop
-//! custody, not an HSM or a portable backup format; this binary does not submit transactions.
+//! custody, not an HSM or a portable backup format. `--submit-to` uses the versioned QZTS/1
+//! transaction-ingress protocol; the destination's admission acknowledgement is printed.
 #[cfg(windows)]
 mod windows_wallet {
     use ai_native_l1_pow_bench::{
+        qzbe_tx_ingress_candidate::{decode_ack, encode_request, TxIngressStatus, ACK_BYTES},
         state_machine::{encode_transaction, transaction_signing_digest, Transaction},
         transaction_auth::Ed25519TransactionSigner,
     };
@@ -14,6 +16,7 @@ mod windows_wallet {
         ffi::c_void,
         fs::{self, File, OpenOptions},
         io::{self, Read, Write},
+        net::{SocketAddr, TcpStream},
         path::{Path, PathBuf},
         process, ptr,
         sync::atomic::{AtomicU64, Ordering},
@@ -51,6 +54,8 @@ mod windows_wallet {
             amount: u64,
             fee: u64,
             expires_at: u64,
+            self_contained: bool,
+            submit_to: Option<SocketAddr>,
         },
         Help,
     }
@@ -159,6 +164,8 @@ mod windows_wallet {
                         "--amount-atoms",
                         "--fee-atoms",
                         "--expires-at",
+                        "--signature-mode",
+                        "--submit-to",
                     ],
                 )?;
                 let wallet = PathBuf::from(required(&values, "--wallet")?);
@@ -181,6 +188,21 @@ mod windows_wallet {
                 let expires_at = required(&values, "--expires-at")?
                     .parse::<u64>()
                     .map_err(|_| "expiry must be an unsigned 64-bit timestamp".to_string())?;
+                let self_contained = match values.get("--signature-mode").map(String::as_str) {
+                    None | Some("self-contained") => true,
+                    Some("registered") => false,
+                    Some(_) => {
+                        return Err("--signature-mode must be self-contained or registered".into())
+                    }
+                };
+                let submit_to = values
+                    .get("--submit-to")
+                    .map(|value| {
+                        value.parse::<SocketAddr>().map_err(|_| {
+                            "--submit-to must be a numeric IP:port socket address".to_string()
+                        })
+                    })
+                    .transpose()?;
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_err(|_| "system clock is before the Unix epoch".to_string())?
@@ -201,6 +223,8 @@ mod windows_wallet {
                     amount,
                     fee,
                     expires_at,
+                    self_contained,
+                    submit_to,
                 })
             }
             _ => Err(format!("unknown subcommand: {subcommand}")),
@@ -505,6 +529,8 @@ mod windows_wallet {
         amount: u64,
         fee: u64,
         expires_at: u64,
+        self_contained: bool,
+        submit_to: Option<SocketAddr>,
     ) -> Result<(), String> {
         let (seed, public_key, account_id) = load_wallet(path)?;
         if account_id == recipient {
@@ -521,9 +547,15 @@ mod windows_wallet {
             expires_at,
             signature: Vec::new(),
         };
-        signer
-            .sign_transaction(&mut transaction)
-            .map_err(|error| format!("transaction signing failed: {error:?}"))?;
+        if self_contained {
+            signer
+                .sign_transaction_self_contained(&mut transaction)
+                .map_err(|error| format!("self-contained transaction signing failed: {error:?}"))?;
+        } else {
+            signer
+                .sign_transaction(&mut transaction)
+                .map_err(|error| format!("registered transaction signing failed: {error:?}"))?;
+        }
         let digest = transaction_signing_digest(&transaction)
             .map_err(|error| format!("transaction signing digest failed: {error:?}"))?;
         let encoded = encode_transaction(&transaction)
@@ -539,7 +571,52 @@ mod windows_wallet {
         println!("tx_signing_digest_hex={}", hex(&digest));
         println!("tx_signature_hex={}", hex(&transaction.signature));
         println!("tx_wire_hex={}", hex(&encoded));
-        println!("broadcast=not_attempted_no_public_rpc");
+        println!(
+            "tx_signature_mode={}",
+            if self_contained {
+                "self-contained-ed25519-v1"
+            } else {
+                "registered-ed25519-v1"
+            }
+        );
+        if let Some(address) = submit_to {
+            let request = encode_request(&encoded)
+                .map_err(|error| format!("encode bounded QZTS/1 transaction request: {error:?}"))?;
+            let mut stream =
+                TcpStream::connect_timeout(&address, std::time::Duration::from_secs(5)).map_err(
+                    |error| format!("connect to transaction-ingress endpoint {address}: {error}"),
+                )?;
+            stream
+                .set_nodelay(true)
+                .map_err(|error| format!("configure TXN2 submission TCP_NODELAY: {error}"))?;
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(180)))
+                .map_err(|error| format!("set TXN2 submission ACK timeout: {error}"))?;
+            stream
+                .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+                .map_err(|error| format!("set TXN2 submission write timeout: {error}"))?;
+            stream
+                .write_all(&request)
+                .map_err(|error| format!("send signed TXN2 request: {error}"))?;
+            let mut ack_bytes = [0u8; ACK_BYTES];
+            stream
+                .read_exact(&mut ack_bytes)
+                .map_err(|error| format!("read QZTS/1 admission acknowledgement: {error}"))?;
+            let ack = decode_ack(&ack_bytes)
+                .map_err(|error| format!("decode QZTS/1 admission acknowledgement: {error:?}"))?;
+            println!("tx_submit_mempool_count={}", ack.mempool_count);
+            println!("tx_submit_transaction_id_hex={}", hex(&ack.transaction_id));
+            match ack.status {
+                TxIngressStatus::Accepted => println!("tx_submit_status=accepted"),
+                TxIngressStatus::Duplicate => println!("tx_submit_status=duplicate"),
+                TxIngressStatus::Rejected => {
+                    println!("tx_submit_status=rejected");
+                    return Err("node transaction ingress rejected the signed transaction".into());
+                }
+            }
+        } else {
+            println!("tx_submit_status=not_attempted_submit_to_not_set");
+        }
         Ok(())
     }
 
@@ -550,8 +627,8 @@ mod windows_wallet {
 Usage:\n\
   qzxb_wallet create --output ABSOLUTE_PATH\n\
   qzxb_wallet address --wallet ABSOLUTE_PATH\n\
-  qzxb_wallet sign-transfer --wallet ABSOLUTE_PATH --network-id-hex HEX64 --recipient-id-hex HEX64 --nonce U64 --amount-atoms U64 --fee-atoms U64 --expires-at UNIX_SECONDS\n\
-Notes: this local wallet does not submit transactions; mainnet balance is not implied.");
+  qzxb_wallet sign-transfer --wallet ABSOLUTE_PATH --network-id-hex HEX64 --recipient-id-hex HEX64 --nonce U64 --amount-atoms U64 --fee-atoms U64 --expires-at UNIX_SECONDS [--signature-mode self-contained|registered] [--submit-to IP:PORT]\n\
+Default signature mode embeds the public key with its Ed25519 signature so the sender account can be derived and checked by any validating node. `--signature-mode registered` is for legacy fixtures. `--submit-to` sends signed TXN2 using QZTS/1 and waits for the node's admission ACK; this does not imply Mainnet status or that the transaction was mined.");
                 Ok(())
             }
             Ok(Command::Create { output }) => create_wallet(&output),
@@ -564,8 +641,18 @@ Notes: this local wallet does not submit transactions; mainnet balance is not im
                 amount,
                 fee,
                 expires_at,
+                self_contained,
+                submit_to,
             }) => sign_transfer(
-                &wallet, network_id, recipient, nonce, amount, fee, expires_at,
+                &wallet,
+                network_id,
+                recipient,
+                nonce,
+                amount,
+                fee,
+                expires_at,
+                self_contained,
+                submit_to,
             ),
             Err(error) => Err(error),
         };

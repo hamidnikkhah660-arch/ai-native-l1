@@ -100,3 +100,6 @@ jobs:
       - name: Run QZXB DPAPI wallet, canonical PoW founder allocation and local transfer
         shell: pwsh
         run: ./simulations/cp0425_qzxb_founder_wallet_local_transfer.ps1
+      - name: Run QZXB live signed TXN2 ingress, bounded mempool, mining and replay
+        shell: pwsh
+        run: ./simulations/cp0426_qzxb_live_tx_ingress_mempool.ps1
