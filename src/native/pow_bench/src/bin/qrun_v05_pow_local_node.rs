@@ -1051,3 +1051,133 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tx_ingress_tests {
+    use super::*;
+    use ai_native_l1_pow_bench::qzbe_tx_ingress_candidate::{decode_ack, encode_request};
+    use ai_native_l1_pow_bench::state_machine::{encode_transaction, Transaction};
+    use ai_native_l1_pow_bench::transaction_auth::Ed25519TransactionSigner;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TX_TEST: AtomicU64 = AtomicU64::new(1);
+    struct TestDir(PathBuf);
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "qrun_v05_qzts_ingress_{}_{}",
+                std::process::id(),
+                NEXT_TX_TEST.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_params() -> ConsensusParameters {
+        let mut params = ConsensusParameters::candidate_testnet().unwrap();
+        params.initial_target = Uint256::MAX;
+        params.pow_limit = Uint256::MAX;
+        params.pow.memory_kib = 8 * 1024;
+        params.pow.iterations = 1;
+        params.pow.lanes = 1;
+        params
+    }
+
+    fn test_node_state(
+        directory: &Path,
+        network: NetworkId,
+        signer: &Ed25519TransactionSigner,
+    ) -> NodeState {
+        let account = signer.account_id();
+        let authenticator = Ed25519TransactionAuthenticator::select(
+            TransactionAuthenticatorKind::Ed25519V1,
+            [AccountPublicKey {
+                account_id: account,
+                public_key: signer.public_key(),
+            }],
+        )
+        .unwrap();
+        let clock = SystemClockReferenceTime;
+        let runtime = QRunV05PowForkRuntime::open(
+            directory,
+            network,
+            account,
+            test_params(),
+            &authenticator,
+            &clock,
+        )
+        .unwrap();
+        let mut state = NodeState {
+            runtime,
+            authenticator,
+            clock,
+            receipts: BTreeMap::new(),
+            profile_id: profile_id(&network),
+            block_peers: Vec::new(),
+        };
+        state.refresh_receipts().unwrap();
+        state
+    }
+
+    #[test]
+    fn qzts_signed_wallet_request_executes_and_persists_canonical_receipt() {
+        let dir = TestDir::new();
+        let network = [0x51; 32];
+        let signer = Ed25519TransactionSigner::from_seed([0x46; 32]);
+        let owner = signer.account_id();
+        let recipient = [0x78; 32];
+        let state = Arc::new(Mutex::new(test_node_state(&dir.0, network, &signer)));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+
+        let timestamp = now_unix().unwrap();
+        let mut tx = Transaction {
+            network_id: network,
+            sender: owner,
+            recipient,
+            nonce: 1,
+            amount: 7_500,
+            fee: 7,
+            expires_at: timestamp + 3_600,
+            signature: Vec::new(),
+        };
+        signer.sign_transaction(&mut tx).unwrap();
+        let wire = encode_transaction(&tx).unwrap();
+        client.write_all(&encode_request(&wire).unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        handle_transaction(&mut server, &state).unwrap();
+
+        let mut ack_wire = [0u8; ACK_BYTES];
+        client.read_exact(&mut ack_wire).unwrap();
+        let ack = decode_ack(&ack_wire).unwrap();
+        let txid = transaction_id(&tx).unwrap();
+        assert_eq!(ack.status, TxIngressStatus::Accepted);
+        assert_eq!(ack.transaction_id, txid);
+
+        let node = state.lock().unwrap();
+        assert_eq!(node.runtime.canonical_height(), 1);
+        assert_eq!(
+            node.runtime
+                .canonical_state()
+                .account(&recipient)
+                .unwrap()
+                .balance,
+            7_500
+        );
+        assert_eq!(
+            node.runtime.canonical_state().total_value().unwrap(),
+            ai_native_l1_pow_bench::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+        );
+        assert_eq!(
+            node.receipts.get(&txid).map(|receipt| receipt.height),
+            Some(1)
+        );
+    }
+}
