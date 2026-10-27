@@ -114,6 +114,8 @@ pub mod protocol_profile;
 /// CP-0441 candidate: Genesis-rooted QZBE canonical replay across bounded in-memory segments; durable archive integration remains open.
 pub mod qzbe_history_replay_candidate;
 pub mod qzbe_tx_ingress_candidate;
+/// Candidate native AMM accounting and checked constant-product transitions; not yet consensus-wired.
+pub mod qzxb_amm_candidate;
 pub mod recovery;
 pub mod reference_time;
 pub mod reference_time_store;
