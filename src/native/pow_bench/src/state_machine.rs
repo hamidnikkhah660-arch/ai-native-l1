@@ -633,6 +633,72 @@ impl LedgerState {
         self.accounts.get(id).copied()
     }
 
+    pub(crate) fn apply_amm_account_updates(
+        &mut self,
+        sender: AccountId,
+        sender_nonce: u64,
+        balances: &[(AccountId, u64)],
+    ) -> Result<(), StateError> {
+        if is_zero_account(&sender) {
+            return Err(StateError::InvalidAccountId);
+        }
+        let current_nonce = self.account(&sender).map_or(0, |account| account.nonce);
+        let expected_nonce = current_nonce
+            .checked_add(1)
+            .ok_or(StateError::InvalidNonce(current_nonce))?;
+        if sender_nonce != expected_nonce {
+            return Err(StateError::NonceMismatch {
+                expected: expected_nonce,
+                actual: sender_nonce,
+            });
+        }
+        let before = self.total_value()?;
+        let mut next = self.clone();
+        let mut seen = BTreeSet::new();
+        let mut sender_balance_was_supplied = false;
+        for (account_id, balance) in balances {
+            if is_zero_account(account_id) || !seen.insert(*account_id) {
+                return Err(StateError::InvariantViolation);
+            }
+            let old = next
+                .accounts
+                .get(account_id)
+                .copied()
+                .unwrap_or(AccountState {
+                    balance: 0,
+                    nonce: 0,
+                });
+            let nonce = if *account_id == sender {
+                sender_balance_was_supplied = true;
+                sender_nonce
+            } else {
+                old.nonce
+            };
+            if !next.accounts.contains_key(account_id) && *balance == 0 && nonce == 0 {
+                continue;
+            }
+            if !next.accounts.contains_key(account_id) && next.accounts.len() >= MAX_ACCOUNTS {
+                return Err(StateError::TooManyAccounts);
+            }
+            next.accounts.insert(
+                *account_id,
+                AccountState {
+                    balance: *balance,
+                    nonce,
+                },
+            );
+        }
+        if !sender_balance_was_supplied {
+            return Err(StateError::InvariantViolation);
+        }
+        let after = next.total_value()?;
+        if after != before {
+            return Err(StateError::InvariantViolation);
+        }
+        *self = next;
+        Ok(())
+    }
+
     pub fn account_count(&self) -> usize {
         self.accounts.len()
     }

@@ -111,10 +111,12 @@ pub mod private_testnet_v4_hybrid_fork_store_candidate;
 /// Candidate-only PTB2 envelope for linked PoW headers + canonical block-body transport.
 pub mod private_testnet_wire;
 pub mod protocol_profile;
+/// Bounded QZAS/1 framing for canonical signed QAX1 operations; candidate-node ingress only.
+pub mod qzbe_amm_ingress_candidate;
 /// CP-0441 candidate: Genesis-rooted QZBE canonical replay across bounded in-memory segments; durable archive integration remains open.
 pub mod qzbe_history_replay_candidate;
 pub mod qzbe_tx_ingress_candidate;
-/// Candidate native AMM accounting and checked constant-product transitions; not yet consensus-wired.
+/// Candidate native AMM with QZB4 v3 transition and QZP4/QAMS snapshot integration; not Mainnet-approved.
 pub mod qzxb_amm_candidate;
 pub mod recovery;
 pub mod reference_time;

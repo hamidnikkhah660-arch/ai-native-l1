@@ -1,13 +1,14 @@
-//! CP-0405 candidate QZB4 v2 + PoW envelope and branch-local fork choice.
+//! Candidate QZB4 v2/v3 + PoW envelope and branch-local fork choice.
 //!
 //! This is deliberately separate from PMT3/PMT4 and the canonical node runtime. The QZBE
-//! envelope binds the transaction-bearing QZB4 v2 body to the existing PoW header, target-history,
+//! envelope binds the transaction-bearing QZB4 v2/v3 body to the existing PoW header, target-history,
 //! chainwork and replay rules. A caller must supply the exact monetary profile and consensus
 //! parameters; this module has no Mainnet defaults and is not a persistent branch store.
 
 use crate::monetary_pow_v04_checkpoint_candidate::{
     QzbeCheckpointError, QzbeCheckpointRecord, QzbeCheckpointValidationContext,
 };
+use crate::qzxb_amm_candidate::AmmSignedOperation;
 use crate::{
     consensus::{
         block_work, compare_chain_tips, pow_digest, ChainTip, ConsensusError, ConsensusParameters,
@@ -616,14 +617,36 @@ impl V04ExecutionForkChoiceCandidate {
         Ok(self.archive_envelopes())
     }
 
-    /// Build the next body/header candidate on a specific known branch. The nonce is supplied by
-    /// the caller's mining loop; this method does not claim the resulting nonce satisfies PoW.
+    /// Build a candidate with legacy TXN2 transfers only.
     pub fn build_candidate_on<A: TransactionAuthenticator>(
         &self,
         parent_tip: [u8; 32],
         timestamp: u64,
         miner: [u8; 32],
         transactions: Vec<Transaction>,
+        nonce: u64,
+        authenticator: &A,
+    ) -> Result<Vec<u8>, V04ExecutionPowError> {
+        self.build_candidate_on_with_amm(
+            parent_tip,
+            timestamp,
+            miner,
+            transactions,
+            Vec::new(),
+            nonce,
+            authenticator,
+        )
+    }
+
+    /// Build a candidate containing legacy transfers plus canonical signed AMM operations.
+    /// The transition layer validates signatures, nonces, balances, pair identity and the resulting state root.
+    pub fn build_candidate_on_with_amm<A: TransactionAuthenticator>(
+        &self,
+        parent_tip: [u8; 32],
+        timestamp: u64,
+        miner: [u8; 32],
+        transactions: Vec<Transaction>,
+        amm_operations: Vec<AmmSignedOperation>,
         nonce: u64,
         authenticator: &A,
     ) -> Result<Vec<u8>, V04ExecutionPowError> {
@@ -636,10 +659,11 @@ impl V04ExecutionForkChoiceCandidate {
                 .ok_or(V04ExecutionPowError::UnknownParent)?;
             (&branch.state, branch.target_history.clone())
         };
-        let block = parent_state.build_next_execution_block(
+        let block = parent_state.build_next_execution_block_with_amm(
             timestamp,
             miner,
             transactions,
+            amm_operations,
             authenticator,
         )?;
         let next_height = block.height;
@@ -678,6 +702,35 @@ impl V04ExecutionForkChoiceCandidate {
         first_nonce: u64,
         max_attempts: u32,
         authenticator: &A,
+        cancelled: F,
+    ) -> Result<Vec<u8>, V04ExecutionPowError>
+    where
+        A: TransactionAuthenticator,
+        F: FnMut() -> bool,
+    {
+        self.mine_candidate_on_with_amm(
+            parent_tip,
+            timestamp,
+            miner,
+            transactions,
+            Vec::new(),
+            first_nonce,
+            max_attempts,
+            authenticator,
+            cancelled,
+        )
+    }
+
+    pub fn mine_candidate_on_with_amm<A, F>(
+        &self,
+        parent_tip: [u8; 32],
+        timestamp: u64,
+        miner: [u8; 32],
+        transactions: Vec<Transaction>,
+        amm_operations: Vec<AmmSignedOperation>,
+        first_nonce: u64,
+        max_attempts: u32,
+        authenticator: &A,
         mut cancelled: F,
     ) -> Result<Vec<u8>, V04ExecutionPowError>
     where
@@ -687,11 +740,12 @@ impl V04ExecutionForkChoiceCandidate {
         if max_attempts == 0 || max_attempts > MAX_QZBE_MINING_ATTEMPTS {
             return Err(V04ExecutionPowError::MiningAttemptsInvalid);
         }
-        let encoded = self.build_candidate_on(
+        let encoded = self.build_candidate_on_with_amm(
             parent_tip,
             timestamp,
             miner,
             transactions,
+            amm_operations,
             first_nonce,
             authenticator,
         )?;
@@ -997,6 +1051,7 @@ mod tests {
     use crate::{
         monetary_genesis_v04_candidate::GenesisManifestV04,
         monetary_issuance_v04_candidate::V04MiningIssuanceScheduleCandidate,
+        qzxb_amm_candidate::{AmmOperation, AmmSignedOperation},
         state_machine::{AccountId, Transaction},
     };
 
@@ -1188,6 +1243,65 @@ mod tests {
         assert_eq!(
             replayed.branch_work(&replayed.canonical_tip()),
             graph.branch_work(&graph.canonical_tip())
+        );
+    }
+
+    #[test]
+    fn qzbe_v3_amm_block_passes_pow_fork_choice_and_genesis_archive_replay() {
+        let (_, profile) = profile(10_000);
+        let genesis = genesis(&profile);
+        let mut graph = V04ExecutionForkChoiceCandidate::new(genesis.clone(), params()).unwrap();
+        let quote_asset = [0x55; 32];
+        let operation = AmmSignedOperation {
+            network_id: NETWORK,
+            sender: OWNER,
+            nonce: 1,
+            expires_at: 100,
+            operation: AmmOperation::RegisterAsset {
+                asset_id: quote_asset,
+            },
+            // This verifier is explicitly test-only; production candidate tests cover real Ed25519.
+            signature: vec![0x5A],
+        };
+
+        let encoded = graph
+            .mine_candidate_on_with_amm(
+                graph.genesis_tip(),
+                1,
+                MINER_A,
+                Vec::new(),
+                vec![operation],
+                0,
+                64,
+                &TestAuthenticator,
+                || false,
+            )
+            .unwrap();
+        let envelope = V04ExecutionPowEnvelope::decode(&encoded, &profile, &params()).unwrap();
+        assert_eq!(envelope.block.wire_version, 3);
+        assert_eq!(envelope.block.amm_operations.len(), 1);
+        let outcome = graph.insert_encoded(&encoded, &TestAuthenticator).unwrap();
+        assert_eq!(outcome.canonical_height, 1);
+        assert!(graph
+            .canonical_state()
+            .amm_state()
+            .is_asset_registered(&quote_asset));
+        assert!(graph.canonical_state().amm_state().is_asset_registered(
+            &crate::qzxb_amm_candidate::qzxb_native_asset_id(NETWORK).unwrap()
+        ));
+
+        let replayed = V04ExecutionForkChoiceCandidate::rebuild_from_envelopes(
+            genesis,
+            params(),
+            graph.archive_envelopes(),
+            &TestAuthenticator,
+        )
+        .unwrap();
+        assert_eq!(replayed.canonical_tip(), graph.canonical_tip());
+        assert_eq!(replayed.canonical_state(), graph.canonical_state());
+        assert_eq!(
+            replayed.canonical_state().state_root().unwrap(),
+            graph.canonical_state().state_root().unwrap()
         );
     }
 

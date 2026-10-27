@@ -1,10 +1,10 @@
 //! CP-0413: isolated QZBE v2 authenticated two-node loopback runtime candidate.
 //!
-//! This binary is a QZBE v2 runtime candidate: it requires explicit network, Genesis-owner,
+//! This binary is a QZBE v2/v3 runtime candidate: it requires explicit network, Genesis-owner,
 //! miner and issuance-schedule arguments and accepts one pinned Noise peer. Canonical v0.4 Argon2id
 //! parameters are the default; the deliberately easy 8 MiB profile requires an explicit test-only
-//! flag. Listener and peer addresses remain loopback-only until persistent external anti-rollback
-//! anchoring and canonical-runtime activation are complete.
+//! flag. Transaction and AMM ingress default to loopback; public test ingress remains explicitly
+//! zero-value/easy-PoW gated. This candidate is not a Mainnet activation.
 
 use ai_native_l1_pow_bench::{
     consensus::{ConsensusParameters, Uint256},
@@ -25,16 +25,23 @@ use ai_native_l1_pow_bench::{
     monetary_pow_v04_checkpoint_store_candidate::V04ExecutionCheckpointForkStoreCandidate,
     monetary_transition_v04_candidate::{
         MonetaryLedgerStateV04TransitionCandidate, V04ConsensusProfileCandidate,
+        MAX_AMM_OPERATIONS_PER_BLOCK,
     },
     noise_key_provisioning::load_protected_noise_private_key,
     private_testnet_driver::TargetHistory,
     private_testnet_mempool_candidate::{BoundedMempool, MempoolError, MempoolLimits},
+    qzbe_amm_ingress_candidate::{
+        decode_request_header as decode_amm_request_header, encode_ack as encode_amm_ingress_ack,
+        operation_id as amm_operation_id, AmmIngressAck, AmmIngressStatus,
+        AMM_INGRESS_REQUEST_HEADER_BYTES,
+    },
     qzbe_history_replay_candidate::replay_canonical_history_from_genesis,
     qzbe_tx_ingress_candidate::{
         decode_ack as decode_tx_ingress_ack, decode_gossip_frame, decode_request_header,
         encode_ack as encode_tx_ingress_ack, encode_gossip_frame, TxIngressAck, TxIngressStatus,
         GOSSIP_MAGIC, REQUEST_HEADER_BYTES,
     },
+    qzxb_amm_candidate::{AmmSignedOperation, MAX_AMM_SIGNED_OPERATION_BYTES},
     state_machine::{
         decode_transaction, transaction_id, AccountId, Transaction, MAX_TRANSACTION_BYTES,
     },
@@ -45,7 +52,7 @@ use ai_native_l1_pow_bench::{
 };
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     env,
     fs::{self, OpenOptions},
     io::{self, Read, Write},
@@ -95,6 +102,7 @@ struct Args {
     data_dir: PathBuf,
     listen: SocketAddr,
     tx_listen: Option<SocketAddr>,
+    amm_listen: Option<SocketAddr>,
     rpc_listen: Option<SocketAddr>,
     peers: Vec<SocketAddr>,
     network_id: [u8; 32],
@@ -118,6 +126,7 @@ struct Args {
     test_easy_pow: bool,
     public_testnet_p2p: bool,
     public_testnet_tx_ingress: bool,
+    public_testnet_amm_ingress: bool,
     sync_from_peers: bool,
 }
 
@@ -127,6 +136,82 @@ struct Snapshot {
     tip: [u8; 32],
     state_root: [u8; 32],
     generation: u64,
+}
+
+const MAX_AMM_MEMPOOL_BYTES: usize = 1 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+struct PendingAmmOperation {
+    id: [u8; 32],
+    wire: Vec<u8>,
+    operation: AmmSignedOperation,
+}
+
+#[derive(Debug, Default)]
+struct BoundedAmmMempool {
+    operations: Vec<PendingAmmOperation>,
+    total_bytes: usize,
+}
+
+impl BoundedAmmMempool {
+    fn len(&self) -> usize {
+        self.operations.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.operations.is_empty()
+    }
+
+    fn ordered_operations(&self) -> Vec<AmmSignedOperation> {
+        self.operations
+            .iter()
+            .map(|entry| entry.operation.clone())
+            .collect()
+    }
+
+    fn contains_id(&self, id: &[u8; 32]) -> bool {
+        self.operations.iter().any(|entry| &entry.id == id)
+    }
+
+    fn insert(
+        &mut self,
+        id: [u8; 32],
+        wire: Vec<u8>,
+        operation: AmmSignedOperation,
+    ) -> AmmIngressStatus {
+        if self.contains_id(&id) {
+            return AmmIngressStatus::Duplicate;
+        }
+        if self.operations.len() >= MAX_AMM_OPERATIONS_PER_BLOCK
+            || self.total_bytes.saturating_add(wire.len()) > MAX_AMM_MEMPOOL_BYTES
+        {
+            return AmmIngressStatus::PoolFull;
+        }
+        self.total_bytes = self.total_bytes.saturating_add(wire.len());
+        self.operations.push(PendingAmmOperation {
+            id,
+            wire,
+            operation,
+        });
+        AmmIngressStatus::Accepted
+    }
+
+    fn remove_included(&mut self, included: &[AmmSignedOperation]) -> usize {
+        let included_ids: BTreeSet<[u8; 32]> = included
+            .iter()
+            .filter_map(|operation| operation.encode().ok().map(|wire| amm_operation_id(&wire)))
+            .collect();
+        let before = self.operations.len();
+        self.operations
+            .retain(|entry| !included_ids.contains(&entry.id));
+        self.total_bytes = self.operations.iter().map(|entry| entry.wire.len()).sum();
+        before - self.operations.len()
+    }
+
+    fn retain_ids(&mut self, keep: &BTreeSet<[u8; 32]>) {
+        self.operations.retain(|entry| keep.contains(&entry.id));
+        self.total_bytes = self.operations.iter().map(|entry| entry.wire.len()).sum();
+    }
 }
 
 #[derive(Debug)]
@@ -340,7 +425,7 @@ fn archive_sync_digest(envelopes: &[Vec<u8>]) -> Result<[u8; 32], String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --tx-public-key-hex HEX64 --observe-account-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT [--tx-listen 127.0.0.1:PORT] [--rpc-listen 127.0.0.1:PORT] --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 [--trusted-peer-key-hex HEX64 ...] --initial-subsidy-atoms U128 --blocks-per-halving U64 [--tx-recipient-id HEX64 --tx-nonce U64 --tx-amount-atoms U64 --tx-fee-atoms U64 --tx-expires-at U64 --tx-signature-hex HEX128_OR_HEX192] [--probe-invalid-signature-first] [--test-easy-pow --public-testnet-p2p [--public-testnet-tx-ingress]] [--sync-from-peers] [--peer IP:PORT ...] [--mine-blocks N | --mine-forever] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2 runtime candidate with statically pinned Noise peers. Transaction ingress and read-only RPC default to loopback; public transaction ingress is available only for an explicit zero-value testnet using --test-easy-pow --public-testnet-p2p --public-testnet-tx-ingress, while read-only RPC remains loopback-only. Each --peer is paired by order with --trusted-peer-key-hex; additional trusted keys authorize inbound peers. Canonical v0.4 Argon2id is the default. --mine-forever continuously mines and broadcasts until interrupted or --stop-after-height is reached; it requires a pinned peer and cannot be combined with --mine-blocks or --exit-after-mining. External P2P bind is available only with BOTH --test-easy-pow and --public-testnet-p2p; all inbound peers still require a configured Noise static-key pin. Public transaction ingress is unaudited, easy-PoW testnet only and carries no real-value guarantee; it is not Mainnet activation. Read-only RPC remains loopback-only."
+    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --tx-public-key-hex HEX64 --observe-account-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT [--tx-listen 127.0.0.1:PORT] [--amm-listen 127.0.0.1:PORT] [--rpc-listen 127.0.0.1:PORT] --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 [--trusted-peer-key-hex HEX64 ...] --initial-subsidy-atoms U128 --blocks-per-halving U64 [--tx-recipient-id HEX64 --tx-nonce U64 --tx-amount-atoms U64 --tx-fee-atoms U64 --tx-expires-at U64 --tx-signature-hex HEX128_OR_HEX192] [--probe-invalid-signature-first] [--test-easy-pow --public-testnet-p2p [--public-testnet-tx-ingress] [--public-testnet-amm-ingress]] [--sync-from-peers] [--peer IP:PORT ...] [--mine-blocks N | --mine-forever] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2/v3 runtime candidate with statically pinned Noise peers. QZB4 v3 carries signed canonical AMM operations; QZAS/1 AMM ingress and legacy transaction ingress default to loopback. Public AMM ingress is available only for an explicit zero-value testnet using --test-easy-pow --public-testnet-p2p --public-testnet-amm-ingress. Each --peer is paired by order with --trusted-peer-key-hex; additional trusted keys authorize inbound peers. Canonical v0.4 Argon2id is the default. --mine-forever continuously mines and broadcasts until interrupted or --stop-after-height is reached; it requires a pinned peer and cannot be combined with --mine-blocks or --exit-after-mining. External P2P bind is available only with BOTH --test-easy-pow and --public-testnet-p2p; all inbound peers still require a configured Noise static-key pin. Public transaction and AMM ingress are unaudited, easy-PoW zero-value testnet only and carry no real-value guarantee; they are not Mainnet activation. Read-only RPC remains loopback-only."
 }
 
 fn parse_hex32(value: &str, name: &str) -> Result<[u8; 32], String> {
@@ -419,6 +504,31 @@ fn ensure_tx_listen_address(
     Ok(())
 }
 
+fn ensure_amm_listen_address(
+    address: SocketAddr,
+    public_testnet_amm_ingress: bool,
+    public_testnet_p2p: bool,
+    test_easy_pow: bool,
+) -> Result<(), String> {
+    if address.ip().is_loopback() {
+        return Ok(());
+    }
+    if !public_testnet_amm_ingress {
+        return Err(
+            "non-loopback AMM ingress requires explicit --public-testnet-amm-ingress".into(),
+        );
+    }
+    if !public_testnet_p2p || !test_easy_pow {
+        return Err("--public-testnet-amm-ingress requires both --test-easy-pow and --public-testnet-p2p; it is zero-value testnet only".into());
+    }
+    if address.port() == 0 || address.ip().is_multicast() {
+        return Err(
+            "public testnet AMM ingress requires a nonzero port and non-multicast bind".into(),
+        );
+    }
+    Ok(())
+}
+
 fn ensure_peer_listen_address(
     address: SocketAddr,
     public_testnet_p2p: bool,
@@ -481,6 +591,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
     let mut test_easy_pow = false;
     let mut public_testnet_p2p = false;
     let mut public_testnet_tx_ingress = false;
+    let mut public_testnet_amm_ingress = false;
     let mut sync_from_peers = false;
     let mut i = 0usize;
     while i < tokens.len() {
@@ -541,6 +652,14 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
             i += 1;
             continue;
         }
+        if key == "--public-testnet-amm-ingress" {
+            if public_testnet_amm_ingress {
+                return Err("duplicate option: --public-testnet-amm-ingress".into());
+            }
+            public_testnet_amm_ingress = true;
+            i += 1;
+            continue;
+        }
         if key == "--sync-from-peers" {
             if sync_from_peers {
                 return Err("duplicate option: --sync-from-peers".into());
@@ -580,6 +699,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
                 | "--data-dir"
                 | "--listen"
                 | "--tx-listen"
+                | "--amm-listen"
                 | "--rpc-listen"
                 | "--wait-for-transaction-ms"
                 | "--noise-static-private-key-dpapi-file"
@@ -636,6 +756,28 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
             return Err("--tx-listen must use a different socket from --listen".into());
         }
     }
+    let amm_listen = values
+        .get("--amm-listen")
+        .map(|value| {
+            value
+                .parse::<SocketAddr>()
+                .map_err(|_| "--amm-listen is not a valid socket address".to_string())
+        })
+        .transpose()?;
+    if let Some(address) = amm_listen {
+        ensure_amm_listen_address(
+            address,
+            public_testnet_amm_ingress,
+            public_testnet_p2p,
+            test_easy_pow,
+        )?;
+        if address == listen || Some(address) == tx_listen {
+            return Err(
+                "--amm-listen must use a distinct socket from peer and transaction listeners"
+                    .into(),
+            );
+        }
+    }
     let rpc_listen = values
         .get("--rpc-listen")
         .map(|value| {
@@ -646,9 +788,9 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
         .transpose()?;
     if let Some(address) = rpc_listen {
         ensure_loopback_address(address, "read-only RPC listen addresses")?;
-        if address == listen || Some(address) == tx_listen {
+        if address == listen || Some(address) == tx_listen || Some(address) == amm_listen {
             return Err(
-                "--rpc-listen must use a distinct socket from peer and transaction listeners"
+                "--rpc-listen must use a distinct socket from peer, transaction and AMM listeners"
                     .into(),
             );
         }
@@ -691,6 +833,10 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
     }
     if public_testnet_tx_ingress && tx_listen.is_none() {
         return Err("--public-testnet-tx-ingress requires --tx-listen".into());
+    }
+    if public_testnet_amm_ingress && !(test_easy_pow && public_testnet_p2p && amm_listen.is_some())
+    {
+        return Err("--public-testnet-amm-ingress requires --amm-listen, --test-easy-pow and --public-testnet-p2p; it is zero-value testnet only".into());
     }
     if sync_from_peers && !(public_testnet_p2p && test_easy_pow) {
         return Err("--sync-from-peers is restricted to the explicit zero-value test profile (--test-easy-pow --public-testnet-p2p)".into());
@@ -881,6 +1027,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
         data_dir,
         listen,
         tx_listen,
+        amm_listen,
         rpc_listen,
         peers,
         network_id,
@@ -904,6 +1051,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
         test_easy_pow,
         public_testnet_p2p,
         public_testnet_tx_ingress,
+        public_testnet_amm_ingress,
         sync_from_peers,
     }))
 }
@@ -2589,6 +2737,308 @@ fn poll_tx_connections(
     Ok(())
 }
 
+fn amm_ingress_ack(
+    stream: &mut TcpStream,
+    status: AmmIngressStatus,
+    mempool: &BoundedAmmMempool,
+    operation_id: [u8; 32],
+) -> Result<(), String> {
+    let ack = encode_amm_ingress_ack(&AmmIngressAck {
+        status,
+        mempool_count: u32::try_from(mempool.len()).unwrap_or(u32::MAX),
+        operation_id,
+    });
+    stream
+        .write_all(&ack)
+        .map_err(|error| format!("write QZAS/1 AMM acknowledgement: {error}"))
+}
+
+fn preview_amm_operation_batch(
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    authenticator: &Ed25519TransactionAuthenticator,
+    mempool: &BoundedMempool,
+    operations: &[AmmSignedOperation],
+    miner_id: [u8; 32],
+) -> Result<(), String> {
+    if operations.len() > MAX_AMM_OPERATIONS_PER_BLOCK {
+        return Err("AMM operation batch exceeds the per-block count cap".into());
+    }
+    if operations.is_empty() {
+        return Ok(());
+    }
+    let fork_choice = store.fork_choice();
+    let ledger = fork_choice.canonical_state().ledger();
+    let timestamp = next_block_timestamp(ledger.last_timestamp(), SystemTime::now())?;
+    let next_height = fork_choice
+        .canonical_height()
+        .checked_add(1)
+        .ok_or_else(|| "QZBE height overflow while validating AMM ingress".to_string())?;
+    // This constructs and validates the full candidate transition (signature, account nonce,
+    // expiry, balances, pair state, state root and snapshot invariants) without claiming PoW.
+    fork_choice
+        .build_candidate_on_with_amm(
+            fork_choice.canonical_tip(),
+            timestamp,
+            miner_id,
+            mempool.ordered_transactions(),
+            operations.to_vec(),
+            next_height,
+            authenticator,
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            format!("AMM operation batch failed canonical transition preview: {error}")
+        })
+}
+
+fn serve_amm_connection(
+    mut stream: TcpStream,
+    peer_addr: SocketAddr,
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    authenticator: &Ed25519TransactionAuthenticator,
+    mempool: &BoundedMempool,
+    amm_mempool: &mut BoundedAmmMempool,
+    miner_id: [u8; 32],
+    allow_public_testnet_amm_ingress: bool,
+) -> Result<(), String> {
+    if !peer_addr.ip().is_loopback() && !allow_public_testnet_amm_ingress {
+        return Err(
+            "QZBE AMM ingress only accepts loopback clients unless explicit zero-value public testnet AMM ingress is enabled".into(),
+        );
+    }
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("set AMM ingress blocking mode: {error}"))?;
+    stream
+        .set_nodelay(true)
+        .map_err(|error| format!("configure AMM ingress TCP_NODELAY: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("set AMM ingress read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("set AMM ingress write timeout: {error}"))?;
+
+    let mut header = [0u8; AMM_INGRESS_REQUEST_HEADER_BYTES];
+    stream
+        .read_exact(&mut header)
+        .map_err(|error| format!("read QZAS/1 request header: {error}"))?;
+    let payload_len = match decode_amm_request_header(&header) {
+        Ok(length) => length,
+        Err(error) => {
+            amm_ingress_ack(
+                &mut stream,
+                AmmIngressStatus::Rejected,
+                amm_mempool,
+                [0; 32],
+            )?;
+            return Err(format!("invalid QZAS/1 request header: {error}"));
+        }
+    };
+    if payload_len > MAX_AMM_SIGNED_OPERATION_BYTES {
+        amm_ingress_ack(
+            &mut stream,
+            AmmIngressStatus::Rejected,
+            amm_mempool,
+            [0; 32],
+        )?;
+        return Err("QZAS/1 AMM operation exceeds canonical QAX1 byte cap".into());
+    }
+    let mut wire = vec![0u8; payload_len];
+    stream
+        .read_exact(&mut wire)
+        .map_err(|error| format!("read bounded QAX1 operation: {error}"))?;
+    let operation = match AmmSignedOperation::decode(&wire) {
+        Ok(operation) => operation,
+        Err(error) => {
+            amm_ingress_ack(
+                &mut stream,
+                AmmIngressStatus::Rejected,
+                amm_mempool,
+                [0; 32],
+            )?;
+            eprintln!(
+                "event=qzbe_v04_amm_rejected peer={} reason=malformed_qax1 error={:?}",
+                peer_addr, error
+            );
+            return Ok(());
+        }
+    };
+    let canonical_wire = match operation.encode() {
+        Ok(bytes) if bytes == wire => bytes,
+        _ => {
+            amm_ingress_ack(
+                &mut stream,
+                AmmIngressStatus::Rejected,
+                amm_mempool,
+                [0; 32],
+            )?;
+            return Ok(());
+        }
+    };
+    let id = amm_operation_id(&canonical_wire);
+    if amm_mempool.contains_id(&id) {
+        amm_ingress_ack(&mut stream, AmmIngressStatus::Duplicate, amm_mempool, id)?;
+        return Ok(());
+    }
+    let mut candidate_operations = amm_mempool.ordered_operations();
+    candidate_operations.push(operation.clone());
+    if let Err(error) = preview_amm_operation_batch(
+        store,
+        authenticator,
+        mempool,
+        &candidate_operations,
+        miner_id,
+    ) {
+        amm_ingress_ack(&mut stream, AmmIngressStatus::Rejected, amm_mempool, id)?;
+        eprintln!(
+            "event=qzbe_v04_amm_rejected peer={} operation_id={} reason={}",
+            peer_addr,
+            hex(&id),
+            error
+        );
+        return Ok(());
+    }
+    let status = amm_mempool.insert(id, canonical_wire, operation);
+    amm_ingress_ack(&mut stream, status, amm_mempool, id)?;
+    eprintln!(
+        "event=qzbe_v04_amm_admission peer={} operation_id={} status={:?} amm_mempool_count={} bounded=true mainnet=false public_launch_approved=false",
+        peer_addr, hex(&id), status, amm_mempool.len()
+    );
+    Ok(())
+}
+
+fn accept_one_amm_connection_for_mining_interrupt(
+    listener: Option<&TcpListener>,
+    pending: &mut VecDeque<(TcpStream, SocketAddr)>,
+) -> Result<bool, String> {
+    let Some(listener) = listener else {
+        return Ok(false);
+    };
+    match listener.accept() {
+        Ok((stream, peer_addr)) => {
+            pending.push_back((stream, peer_addr));
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(format!("accept QZBE AMM ingress during PoW: {error}")),
+    }
+}
+
+fn poll_amm_connections(
+    listener: Option<&TcpListener>,
+    pending: &mut VecDeque<(TcpStream, SocketAddr)>,
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    authenticator: &Ed25519TransactionAuthenticator,
+    mempool: &BoundedMempool,
+    amm_mempool: &mut BoundedAmmMempool,
+    miner_id: [u8; 32],
+    submission_count: &mut u64,
+    allow_public_testnet_amm_ingress: bool,
+) -> Result<(), String> {
+    while let Some((stream, peer_addr)) = pending.pop_front() {
+        *submission_count = submission_count.saturating_add(1);
+        if *submission_count > MAX_TX_SUBMISSIONS {
+            let mut stream = stream;
+            let _ = amm_ingress_ack(
+                &mut stream,
+                AmmIngressStatus::Rejected,
+                amm_mempool,
+                [0; 32],
+            );
+            eprintln!(
+                "event=qzbe_v04_amm_rejected peer={} reason=bounded_submission_budget_exhausted",
+                peer_addr
+            );
+            continue;
+        }
+        if let Err(error) = serve_amm_connection(
+            stream,
+            peer_addr,
+            store,
+            authenticator,
+            mempool,
+            amm_mempool,
+            miner_id,
+            allow_public_testnet_amm_ingress,
+        ) {
+            eprintln!(
+                "event=qzbe_v04_amm_connection_rejected peer={} reason={}",
+                peer_addr, error
+            );
+        }
+    }
+
+    let Some(listener) = listener else {
+        return Ok(());
+    };
+    for _ in 0..MAX_TX_SUBMISSIONS_PER_POLL {
+        match listener.accept() {
+            Ok((stream, peer_addr)) => {
+                *submission_count = submission_count.saturating_add(1);
+                if *submission_count > MAX_TX_SUBMISSIONS {
+                    let mut stream = stream;
+                    let _ = amm_ingress_ack(
+                        &mut stream,
+                        AmmIngressStatus::Rejected,
+                        amm_mempool,
+                        [0; 32],
+                    );
+                    continue;
+                }
+                if let Err(error) = serve_amm_connection(
+                    stream,
+                    peer_addr,
+                    store,
+                    authenticator,
+                    mempool,
+                    amm_mempool,
+                    miner_id,
+                    allow_public_testnet_amm_ingress,
+                ) {
+                    eprintln!(
+                        "event=qzbe_v04_amm_connection_rejected peer={} reason={}",
+                        peer_addr, error
+                    );
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(format!("accept QZBE AMM ingress connection: {error}")),
+        }
+    }
+    Ok(())
+}
+
+fn reconcile_pending_amm_mempool(
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    authenticator: &Ed25519TransactionAuthenticator,
+    mempool: &BoundedMempool,
+    amm_mempool: &mut BoundedAmmMempool,
+    miner_id: [u8; 32],
+) -> Result<(), String> {
+    if amm_mempool.is_empty() {
+        return Ok(());
+    }
+    let mut retained = Vec::new();
+    let existing = amm_mempool.operations.clone();
+    let mut retained_ids = BTreeSet::new();
+    for entry in existing {
+        let mut trial = retained.clone();
+        trial.push(entry.operation.clone());
+        if preview_amm_operation_batch(store, authenticator, mempool, &trial, miner_id).is_ok() {
+            retained.push(entry.operation);
+            retained_ids.insert(entry.id);
+        } else {
+            eprintln!(
+                "event=qzbe_v04_amm_dropped operation_id={} reason=canonical_state_changed",
+                hex(&entry.id)
+            );
+        }
+    }
+    amm_mempool.retain_ids(&retained_ids);
+    Ok(())
+}
+
 fn reconcile_pending_mempool(
     store: &V04ExecutionCheckpointForkStoreCandidate,
     authenticator: &Ed25519TransactionAuthenticator,
@@ -2731,7 +3181,9 @@ fn run(args: Args) -> Result<(), String> {
     let initial = snapshot(&store)?;
     let mut mempool = BoundedMempool::new(MempoolLimits::default())
         .map_err(|error| format!("configure bounded QZBE transaction mempool: {error:?}"))?;
+    let mut amm_mempool = BoundedAmmMempool::default();
     let mut pending_tx_connections: VecDeque<(TcpStream, SocketAddr)> = VecDeque::new();
+    let mut pending_amm_connections: VecDeque<(TcpStream, SocketAddr)> = VecDeque::new();
     if let Some(transaction) = args.transaction.clone() {
         if !args.defer_configured_transaction {
             let ledger = store.fork_choice().canonical_state().ledger();
@@ -2759,6 +3211,16 @@ fn run(args: Args) -> Result<(), String> {
     } else {
         None
     };
+    let amm_listener = if let Some(address) = args.amm_listen {
+        let listener = TcpListener::bind(address)
+            .map_err(|error| format!("bind QZBE AMM ingress {address}: {error}"))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("set QZBE AMM ingress nonblocking: {error}"))?;
+        Some(listener)
+    } else {
+        None
+    };
     let rpc_listener = if let Some(address) = args.rpc_listen {
         let rpc = TcpListener::bind(address)
             .map_err(|error| format!("bind loopback read-only QZBE RPC {address}: {error}"))?;
@@ -2773,6 +3235,11 @@ fn run(args: Args) -> Result<(), String> {
         .map(|value| value.local_addr())
         .transpose()
         .map_err(|error| format!("read transaction-ingress listen address: {error}"))?;
+    let amm_listener_address = amm_listener
+        .as_ref()
+        .map(|value| value.local_addr())
+        .transpose()
+        .map_err(|error| format!("read AMM-ingress listen address: {error}"))?;
     let rpc_listener_address = rpc_listener
         .as_ref()
         .map(|value| value.local_addr())
@@ -2781,6 +3248,7 @@ fn run(args: Args) -> Result<(), String> {
     let mut accepted_count = 0u64;
     let mut message_count = 0u64;
     let mut tx_submission_count = 0u64;
+    let mut amm_submission_count = 0u64;
     let mut relayed_tx_count = 0u64;
     let mut sent_count = 0u64;
     let pow_profile = if args.test_easy_pow {
@@ -2799,9 +3267,10 @@ fn run(args: Args) -> Result<(), String> {
         args.public_testnet_p2p,
         args.public_testnet_tx_ingress,
     );
-    eprintln!("event=qzbe_v04_peer_smoke_ready network_id={} genesis={} profile={} listen={} tx_listen={} rpc_listen={} rpc_read_only=true peer={} height={} root={} tip={} store=QZBE ack=QZA4 tx_ingress=QZTS/1 tx_ingress_surface={} rpc_loopback_only=true mempool_max_count={} mempool_max_bytes={} noise=Noise_XX_25519_ChaChaPoly_SHA256 pow_profile={} mining_mode={} tx_policy=registered_or_self_contained_ed25519 mainnet=false network_surface={} local_only={} public_launch_approved=false",
+    eprintln!("event=qzbe_v04_peer_smoke_ready network_id={} genesis={} profile={} listen={} tx_listen={} amm_listen={} rpc_listen={} rpc_read_only=true peer={} height={} root={} tip={} store=QZBE ack=QZA4 tx_ingress=QZTS/1 amm_ingress=QZAS/1 amm_ingress_surface={} tx_ingress_surface={} rpc_loopback_only=true mempool_max_count={} mempool_max_bytes={} amm_mempool_max_count={} amm_mempool_max_bytes={} noise=Noise_XX_25519_ChaChaPoly_SHA256 pow_profile={} mining_mode={} tx_policy=registered_or_self_contained_ed25519 mainnet=false network_surface={} local_only={} public_launch_approved=false",
         hex(&args.network_id), hex(&genesis_id), hex(&profile_id), args.listen,
         tx_listener_address.map(|address| address.to_string()).unwrap_or_else(|| "disabled".to_string()),
+        amm_listener_address.map(|address| address.to_string()).unwrap_or_else(|| "disabled".to_string()),
         rpc_listener_address.map(|address| address.to_string()).unwrap_or_else(|| "disabled".to_string()),
         if args.peers.is_empty() {
             "inbound_only".to_string()
@@ -2809,9 +3278,13 @@ fn run(args: Args) -> Result<(), String> {
             args.peers.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
         },
         initial.height, hex(&initial.state_root), hex(&initial.tip),
+        if args.public_testnet_amm_ingress { "public_zero_value_testnet_only" } else if amm_listener_address.is_some() { "loopback_only" } else { "disabled" },
         if args.public_testnet_tx_ingress { "public_zero_value_testnet_only" } else { "loopback_only" },
         mempool.limits().max_transactions,
-        mempool.limits().max_bytes, pow_profile,
+        mempool.limits().max_bytes,
+        MAX_AMM_OPERATIONS_PER_BLOCK,
+        MAX_AMM_MEMPOOL_BYTES,
+        pow_profile,
         if args.mine_forever { "continuous" } else { "bounded" },
         network_surface, local_only);
 
@@ -2889,6 +3362,24 @@ fn run(args: Args) -> Result<(), String> {
                 &mut relayed_tx_count,
                 args.public_testnet_tx_ingress,
             )?;
+            poll_amm_connections(
+                amm_listener.as_ref(),
+                &mut pending_amm_connections,
+                &store,
+                &authenticator,
+                &mempool,
+                &mut amm_mempool,
+                args.miner_id,
+                &mut amm_submission_count,
+                args.public_testnet_amm_ingress,
+            )?;
+            reconcile_pending_amm_mempool(
+                &store,
+                &authenticator,
+                &mempool,
+                &mut amm_mempool,
+                args.miner_id,
+            )?;
             poll_rpc_connections(
                 rpc_listener.as_ref(),
                 &store,
@@ -2961,7 +3452,25 @@ fn run(args: Args) -> Result<(), String> {
             &mut relayed_tx_count,
             args.public_testnet_tx_ingress,
         )?;
+        poll_amm_connections(
+            amm_listener.as_ref(),
+            &mut pending_amm_connections,
+            &store,
+            &authenticator,
+            &mempool,
+            &mut amm_mempool,
+            args.miner_id,
+            &mut amm_submission_count,
+            args.public_testnet_amm_ingress,
+        )?;
         reconcile_pending_mempool(&store, &authenticator, &mut mempool)?;
+        reconcile_pending_amm_mempool(
+            &store,
+            &authenticator,
+            &mempool,
+            &mut amm_mempool,
+            args.miner_id,
+        )?;
         let parent_tip = store.canonical_tip();
         let next_height = store
             .canonical_height()
@@ -2973,13 +3482,16 @@ fn run(args: Args) -> Result<(), String> {
             .map_err(|error| format!("read canonical QZBE timestamp: {error}"))?;
         let timestamp = next_block_timestamp(previous_timestamp, SystemTime::now())?;
         let block_transactions = mempool.ordered_transactions();
+        let block_amm_operations = amm_mempool.ordered_operations();
         let mut mining_ingress_error = None;
+        let mut mining_amm_ingress_error = None;
         let mut mining_rpc_error = None;
-        let mining_result = store.fork_choice().mine_candidate_on(
+        let mining_result = store.fork_choice().mine_candidate_on_with_amm(
             parent_tip,
             timestamp,
             args.miner_id,
             block_transactions.clone(),
+            block_amm_operations.clone(),
             next_height,
             MAX_QZBE_MINING_ATTEMPTS,
             &authenticator,
@@ -3001,9 +3513,20 @@ fn run(args: Args) -> Result<(), String> {
                     tx_listener.as_ref(),
                     &mut pending_tx_connections,
                 ) {
-                    Ok(accepted) => accepted,
+                    Ok(true) => return true,
+                    Ok(false) => {}
                     Err(error) => {
                         mining_ingress_error = Some(error);
+                        return true;
+                    }
+                }
+                match accept_one_amm_connection_for_mining_interrupt(
+                    amm_listener.as_ref(),
+                    &mut pending_amm_connections,
+                ) {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        mining_amm_ingress_error = Some(error);
                         true
                     }
                 }
@@ -3015,10 +3538,13 @@ fn run(args: Args) -> Result<(), String> {
         if let Some(error) = mining_ingress_error {
             return Err(error);
         }
+        if let Some(error) = mining_amm_ingress_error {
+            return Err(error);
+        }
         let encoded = match mining_result {
             Ok(encoded) => encoded,
             Err(ai_native_l1_pow_bench::monetary_pow_v04_candidate::V04ExecutionPowError::MiningCancelled)
-                if !pending_tx_connections.is_empty() =>
+                if !pending_tx_connections.is_empty() || !pending_amm_connections.is_empty() =>
             {
                 eprintln!("event=qzbe_v04_mining_yielded_to_transaction_ingress height={} pending_connections={}", next_height, pending_tx_connections.len());
                 poll_tx_connections(
@@ -3036,7 +3562,19 @@ fn run(args: Args) -> Result<(), String> {
                     &mut relayed_tx_count,
                 args.public_testnet_tx_ingress,
                 )?;
+                poll_amm_connections(
+                    amm_listener.as_ref(),
+                    &mut pending_amm_connections,
+                    &store,
+                    &authenticator,
+                    &mempool,
+                    &mut amm_mempool,
+                    args.miner_id,
+                    &mut amm_submission_count,
+                    args.public_testnet_amm_ingress,
+                )?;
                 reconcile_pending_mempool(&store, &authenticator, &mut mempool)?;
+                reconcile_pending_amm_mempool(&store, &authenticator, &mempool, &mut amm_mempool, args.miner_id)?;
                 continue;
             }
             Err(error) => return Err(format!("mine bounded QZBE block at height {next_height}: {error}")),
@@ -3053,6 +3591,10 @@ fn run(args: Args) -> Result<(), String> {
         let removed_transactions = mempool.remove_included(&block_transactions);
         if removed_transactions != block_transactions.len() {
             return Err(format!("QZBE mempool inclusion accounting mismatch: selected={} removed={removed_transactions}", block_transactions.len()));
+        }
+        let removed_amm_operations = amm_mempool.remove_included(&block_amm_operations);
+        if removed_amm_operations != block_amm_operations.len() {
+            return Err(format!("QZBE AMM mempool inclusion accounting mismatch: selected={} removed={removed_amm_operations}", block_amm_operations.len()));
         }
         mined_blocks = mined_blocks.saturating_add(1);
         let current = snapshot(&store)?;
@@ -3108,6 +3650,17 @@ fn run(args: Args) -> Result<(), String> {
                 &mut relayed_tx_count,
                 args.public_testnet_tx_ingress,
             )?;
+            poll_amm_connections(
+                amm_listener.as_ref(),
+                &mut pending_amm_connections,
+                &store,
+                &authenticator,
+                &mempool,
+                &mut amm_mempool,
+                args.miner_id,
+                &mut amm_submission_count,
+                args.public_testnet_amm_ingress,
+            )?;
             poll_rpc_connections(
                 rpc_listener.as_ref(),
                 &store,
@@ -3119,6 +3672,13 @@ fn run(args: Args) -> Result<(), String> {
                 recovery_readiness,
             )?;
             reconcile_pending_mempool(&store, &authenticator, &mut mempool)?;
+            reconcile_pending_amm_mempool(
+                &store,
+                &authenticator,
+                &mempool,
+                &mut amm_mempool,
+                args.miner_id,
+            )?;
             if args
                 .stop_after_height
                 .is_some_and(|height| store.canonical_height() >= height)
@@ -3153,9 +3713,9 @@ fn run(args: Args) -> Result<(), String> {
     }
     let recipient_balance = observed_balance(&replayed, &args.observe_account_id);
     let total_mined_atoms = replayed.fork_choice().canonical_state().total_mined_atoms();
-    eprintln!("event=qzbe_v04_peer_smoke_stopped network_id={} profile={} height={} state_root={} tip={} generation={} total_mined_atoms={} observed_account={} observed_balance_atoms={} accepted_peer_blocks={} sent_peer_blocks={} tx_submissions={} mempool_count={} replay=matched tx_rpc_loopback_only=true mainnet=false network_surface={} local_only={} public_launch_approved=false",
+    eprintln!("event=qzbe_v04_peer_smoke_stopped network_id={} profile={} height={} state_root={} tip={} generation={} total_mined_atoms={} observed_account={} observed_balance_atoms={} accepted_peer_blocks={} sent_peer_blocks={} tx_submissions={} mempool_count={} amm_submissions={} amm_mempool_count={} replay=matched tx_rpc_loopback_only=true mainnet=false network_surface={} local_only={} public_launch_approved=false",
         hex(&args.network_id), hex(&profile_id), final_snapshot.height, hex(&final_snapshot.state_root),
-        hex(&final_snapshot.tip), final_snapshot.generation, total_mined_atoms, hex(&args.observe_account_id), recipient_balance, accepted_count, sent_count, tx_submission_count, mempool.len(),
+        hex(&final_snapshot.tip), final_snapshot.generation, total_mined_atoms, hex(&args.observe_account_id), recipient_balance, accepted_count, sent_count, tx_submission_count, mempool.len(), amm_submission_count, amm_mempool.len(),
         if args.public_testnet_p2p { "explicit_testnet_public_p2p_noise_pinned" } else { "loopback_only" },
         !args.public_testnet_p2p);
     if final_snapshot.height < initial.height || final_snapshot.tip.iter().all(|byte| *byte == 0) {
@@ -3236,6 +3796,7 @@ mod tests {
             data_dir: temp_profile_root(),
             listen: "127.0.0.1:49331".parse().unwrap(),
             tx_listen: None,
+            amm_listen: None,
             rpc_listen: None,
             peers: Vec::new(),
             network_id: [0x31; 32],
@@ -3259,6 +3820,7 @@ mod tests {
             test_easy_pow: false,
             public_testnet_p2p: false,
             public_testnet_tx_ingress: false,
+            public_testnet_amm_ingress: false,
             sync_from_peers: false,
         }
     }
@@ -3461,6 +4023,120 @@ mod tests {
         assert!(parse_args_from(collides_with_peer)
             .unwrap_err()
             .contains("cannot refer to this node's transaction-ingress listener"));
+    }
+
+    #[test]
+    fn amm_mempool_deduplicates_and_enforces_per_block_capacity() {
+        let mut pool = BoundedAmmMempool::default();
+        let mut operations = Vec::new();
+        for nonce in 1..=MAX_AMM_OPERATIONS_PER_BLOCK as u64 {
+            let operation = AmmSignedOperation {
+                network_id: [0x31; 32],
+                sender: [0x41; 32],
+                nonce,
+                expires_at: 1_000,
+                operation:
+                    ai_native_l1_pow_bench::qzxb_amm_candidate::AmmOperation::RegisterAsset {
+                        asset_id: [nonce as u8; 32],
+                    },
+                signature: vec![0xA5; 64],
+            };
+            let wire = operation.encode().unwrap();
+            let id = amm_operation_id(&wire);
+            assert_eq!(
+                pool.insert(id, wire, operation.clone()),
+                AmmIngressStatus::Accepted
+            );
+            operations.push(operation);
+        }
+        assert_eq!(pool.len(), MAX_AMM_OPERATIONS_PER_BLOCK);
+        let duplicate = operations[0].clone();
+        let duplicate_wire = duplicate.encode().unwrap();
+        assert_eq!(
+            pool.insert(amm_operation_id(&duplicate_wire), duplicate_wire, duplicate),
+            AmmIngressStatus::Duplicate
+        );
+        let overflow = AmmSignedOperation {
+            network_id: [0x31; 32],
+            sender: [0x41; 32],
+            nonce: MAX_AMM_OPERATIONS_PER_BLOCK as u64 + 1,
+            expires_at: 1_000,
+            operation: ai_native_l1_pow_bench::qzxb_amm_candidate::AmmOperation::RegisterAsset {
+                asset_id: [0xFE; 32],
+            },
+            signature: vec![0xA5; 64],
+        };
+        let overflow_wire = overflow.encode().unwrap();
+        assert_eq!(
+            pool.insert(amm_operation_id(&overflow_wire), overflow_wire, overflow),
+            AmmIngressStatus::PoolFull
+        );
+        assert_eq!(
+            pool.remove_included(&operations),
+            MAX_AMM_OPERATIONS_PER_BLOCK
+        );
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn parser_bounds_amm_ingress_to_distinct_loopback_or_explicit_zero_value_testnet() {
+        let mut valid = parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        valid.extend(["--amm-listen".into(), "127.0.0.1:49335".into()]);
+        let args = parse_args_from(valid).unwrap().unwrap();
+        assert_eq!(args.amm_listen, Some("127.0.0.1:49335".parse().unwrap()));
+        assert!(!args.public_testnet_amm_ingress);
+
+        let mut external_without_gate =
+            parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        external_without_gate.extend(["--amm-listen".into(), "0.0.0.0:49335".into()]);
+        assert!(parse_args_from(external_without_gate)
+            .unwrap_err()
+            .contains("explicit --public-testnet-amm-ingress"));
+
+        let mut public_without_test_mode =
+            parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        public_without_test_mode.extend([
+            "--amm-listen".into(),
+            "0.0.0.0:49335".into(),
+            "--public-testnet-amm-ingress".into(),
+        ]);
+        assert!(parse_args_from(public_without_test_mode)
+            .unwrap_err()
+            .contains("--test-easy-pow and --public-testnet-p2p"));
+
+        let mut public_missing_listener =
+            parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        public_missing_listener.extend([
+            "--test-easy-pow".into(),
+            "--public-testnet-p2p".into(),
+            "--public-testnet-amm-ingress".into(),
+        ]);
+        assert!(parse_args_from(public_missing_listener)
+            .unwrap_err()
+            .contains("requires --amm-listen"));
+
+        let mut colliding = parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        colliding.extend([
+            "--tx-listen".into(),
+            "127.0.0.1:49334".into(),
+            "--amm-listen".into(),
+            "127.0.0.1:49334".into(),
+        ]);
+        assert!(parse_args_from(colliding)
+            .unwrap_err()
+            .contains("distinct socket"));
+
+        let mut missing_public_flag =
+            parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        missing_public_flag.extend([
+            "--test-easy-pow".into(),
+            "--public-testnet-p2p".into(),
+            "--amm-listen".into(),
+            "0.0.0.0:49335".into(),
+        ]);
+        assert!(parse_args_from(missing_public_flag)
+            .unwrap_err()
+            .contains("explicit --public-testnet-amm-ingress"));
     }
 
     #[test]

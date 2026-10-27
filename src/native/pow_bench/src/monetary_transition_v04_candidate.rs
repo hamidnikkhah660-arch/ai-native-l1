@@ -21,6 +21,10 @@ use crate::{
         MonetaryLedgerStateV04Candidate, V04LedgerGenesisError, V04LedgerSnapshotError,
         MAX_ENCODED_V04_LEDGER_SNAPSHOT_BYTES,
     },
+    qzxb_amm_candidate::{
+        qzxb_native_asset_id, AmmAssetId, AmmError, AmmOperation, AmmSignedOperation,
+        QzxbAmmStateCandidate, SwapReceipt, MAX_AMM_SIGNED_OPERATION_BYTES, MAX_AMM_SNAPSHOT_BYTES,
+    },
     state_machine::{
         decode_transaction, encode_transaction, LedgerState, StateError, Transaction,
         TransactionAuthenticator, MAX_ENCODED_BLOCK_BYTES, MAX_TRANSACTIONS_PER_BLOCK,
@@ -34,23 +38,31 @@ pub const V04_MINING_BLOCK_MAGIC: [u8; 4] = *b"QZB4";
 pub const V04_MINING_BLOCK_VERSION: u16 = 1;
 pub const V04_CONSENSUS_PROFILE_BYTES: usize = 254;
 pub const V04_MINING_BLOCK_BYTES: usize = 166;
-/// QZB4 v2 is the transaction-bearing extension; QZB4 v1 remains mining-only and unchanged.
+/// QZB4 v2 carries native transfers; QZB4 v3 adds signed AMM operations.
 pub const V04_EXECUTION_BLOCK_VERSION: u16 = 2;
+pub const V04_EXECUTION_BLOCK_AMM_VERSION: u16 = 3;
+pub const MAX_AMM_OPERATIONS_PER_BLOCK: usize = 128;
+const MAX_ENCODED_AMM_SIGNED_OPERATION_BYTES: usize = MAX_AMM_SIGNED_OPERATION_BYTES;
 const V04_EXECUTION_BLOCK_FIXED_BYTES: usize = 4 + 2 + 32 + 8 + 8 + 32 + 32 + 16 + 4 + 32;
+const V04_EXECUTION_BLOCK_AMM_FIXED_BYTES: usize = V04_EXECUTION_BLOCK_FIXED_BYTES + 4;
 // BLK2 transactions are bounded at MAX_ENCODED_BLOCK_BYTES with an 88-byte header.
-// QZB4 v2 uses the same transaction batch and a 170-byte fixed header.
-pub const MAX_ENCODED_V04_EXECUTION_BLOCK_BYTES: usize =
-    MAX_ENCODED_BLOCK_BYTES + (V04_EXECUTION_BLOCK_FIXED_BYTES - 88);
+// QZB4 v2 retains its 170-byte fixed header; v3 adds a bounded AMM-operation count/batch.
+pub const MAX_ENCODED_V04_EXECUTION_BLOCK_BYTES: usize = MAX_ENCODED_BLOCK_BYTES
+    + (V04_EXECUTION_BLOCK_FIXED_BYTES - 88)
+    + MAX_AMM_OPERATIONS_PER_BLOCK * (4 + MAX_ENCODED_AMM_SIGNED_OPERATION_BYTES);
 const EXECUTION_BLOCK_ID_DOMAIN: &[u8] = b"QUANTUMZXB-V04-EXECUTION-BLOCK-ID-CANDIDATE-V1\0";
 /// Profile-bound restart envelope; separate from the unprofiled QZL4 format.
 pub const V04_PROFILE_BOUND_SNAPSHOT_MAGIC: [u8; 4] = *b"QZP4";
-pub const V04_PROFILE_BOUND_SNAPSHOT_VERSION: u16 = 1;
+pub const V04_PROFILE_BOUND_SNAPSHOT_VERSION: u16 = 2;
 const PROFILE_BOUND_SNAPSHOT_CHECKSUM_DOMAIN: &[u8] =
     b"QUANTUMZXB-V04-PROFILE-BOUND-SNAPSHOT-CHECK-CANDIDATE-V1\0";
 const PROFILE_BOUND_SNAPSHOT_HEADER_BYTES: usize = 4 + 2 + 32 + V04_CONSENSUS_PROFILE_BYTES + 4;
 const PROFILE_BOUND_SNAPSHOT_FIXED_OVERHEAD: usize = PROFILE_BOUND_SNAPSHOT_HEADER_BYTES + 32 + 32;
 pub const MAX_ENCODED_V04_PROFILE_BOUND_SNAPSHOT_BYTES: usize =
-    MAX_ENCODED_V04_LEDGER_SNAPSHOT_BYTES + PROFILE_BOUND_SNAPSHOT_FIXED_OVERHEAD;
+    MAX_ENCODED_V04_LEDGER_SNAPSHOT_BYTES
+        + MAX_AMM_SNAPSHOT_BYTES
+        + PROFILE_BOUND_SNAPSHOT_FIXED_OVERHEAD
+        + 4;
 
 const PROFILE_FINGERPRINT_DOMAIN: &[u8] =
     b"QUANTUMZXB-V04-CONSENSUS-PROFILE-FINGERPRINT-CANDIDATE-V1\0";
@@ -98,6 +110,11 @@ pub enum V04TransitionError {
     ProfileBoundSnapshotStateRootMismatch,
     NonCanonicalProfileBoundSnapshot,
     LedgerSnapshot(V04LedgerSnapshotError),
+    Amm(AmmError),
+    AmmLedgerBalanceMismatch,
+    AmmNativeBalanceOverflow,
+    AmmPoolAccountCollision,
+    UnsupportedAmmBlockVersion(u16),
 }
 
 impl From<GenesisManifestError> for V04TransitionError {
@@ -133,6 +150,12 @@ impl From<V04MiningScheduleError> for V04TransitionError {
 impl From<V04LedgerSnapshotError> for V04TransitionError {
     fn from(value: V04LedgerSnapshotError) -> Self {
         Self::LedgerSnapshot(value)
+    }
+}
+
+impl From<AmmError> for V04TransitionError {
+    fn from(value: AmmError) -> Self {
+        Self::Amm(value)
     }
 }
 
@@ -404,6 +427,8 @@ impl V04MiningBlockCandidate {
 /// delegated to the injected authenticator; the final production signature/key scheme is not chosen here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V04ExecutionBlockCandidate {
+    /// Exact wire/consensus version, retained when decoding historical blocks.
+    pub wire_version: u16,
     pub profile_fingerprint: [u8; 32],
     pub height: u64,
     pub timestamp: u64,
@@ -411,6 +436,7 @@ pub struct V04ExecutionBlockCandidate {
     pub miner: [u8; 32],
     pub claimed_subsidy_atoms: u128,
     pub transactions: Vec<Transaction>,
+    pub amm_operations: Vec<AmmSignedOperation>,
     pub state_root: [u8; 32],
 }
 
@@ -421,12 +447,18 @@ impl V04ExecutionBlockCandidate {
             || self.profile_fingerprint.iter().all(|byte| *byte == 0)
             || self.miner.iter().all(|byte| *byte == 0)
             || self.transactions.len() > MAX_TRANSACTIONS_PER_BLOCK
+            || self.amm_operations.len() > MAX_AMM_OPERATIONS_PER_BLOCK
+            || !matches!(
+                self.wire_version,
+                V04_EXECUTION_BLOCK_VERSION | V04_EXECUTION_BLOCK_AMM_VERSION
+            )
+            || (self.wire_version == V04_EXECUTION_BLOCK_VERSION && !self.amm_operations.is_empty())
         {
             return Err(V04TransitionError::MalformedExecutionBlock);
         }
         let mut bytes = Vec::with_capacity(V04_EXECUTION_BLOCK_FIXED_BYTES);
         bytes.extend_from_slice(&V04_MINING_BLOCK_MAGIC);
-        bytes.extend_from_slice(&V04_EXECUTION_BLOCK_VERSION.to_be_bytes());
+        bytes.extend_from_slice(&self.wire_version.to_be_bytes());
         bytes.extend_from_slice(&self.profile_fingerprint);
         bytes.extend_from_slice(&self.height.to_be_bytes());
         bytes.extend_from_slice(&self.timestamp.to_be_bytes());
@@ -449,8 +481,30 @@ impl V04ExecutionBlockCandidate {
                     .to_be_bytes(),
             );
             bytes.extend_from_slice(&encoded);
-            if bytes.len() + 32 > MAX_ENCODED_V04_EXECUTION_BLOCK_BYTES {
+            if bytes.len().saturating_add(32) > MAX_ENCODED_V04_EXECUTION_BLOCK_BYTES {
                 return Err(V04TransitionError::MalformedExecutionBlock);
+            }
+        }
+        if self.wire_version == V04_EXECUTION_BLOCK_AMM_VERSION {
+            bytes.extend_from_slice(
+                &u32::try_from(self.amm_operations.len())
+                    .map_err(|_| V04TransitionError::MalformedExecutionBlock)?
+                    .to_be_bytes(),
+            );
+            for operation in &self.amm_operations {
+                let encoded = operation.encode()?;
+                if encoded.len() > MAX_ENCODED_AMM_SIGNED_OPERATION_BYTES {
+                    return Err(V04TransitionError::MalformedExecutionBlock);
+                }
+                bytes.extend_from_slice(
+                    &u32::try_from(encoded.len())
+                        .map_err(|_| V04TransitionError::MalformedExecutionBlock)?
+                        .to_be_bytes(),
+                );
+                bytes.extend_from_slice(&encoded);
+                if bytes.len().saturating_add(32) > MAX_ENCODED_V04_EXECUTION_BLOCK_BYTES {
+                    return Err(V04TransitionError::MalformedExecutionBlock);
+                }
             }
         }
         bytes.extend_from_slice(&self.state_root);
@@ -471,12 +525,20 @@ impl V04ExecutionBlockCandidate {
             return Err(V04TransitionError::WrongMiningBlockMagic);
         }
         let version = u16::from_be_bytes([bytes[4], bytes[5]]);
-        if version != V04_EXECUTION_BLOCK_VERSION {
+        if !matches!(
+            version,
+            V04_EXECUTION_BLOCK_VERSION | V04_EXECUTION_BLOCK_AMM_VERSION
+        ) {
             return Err(V04TransitionError::UnsupportedExecutionBlockVersion(
                 version,
             ));
         }
-        if bytes.len() < V04_EXECUTION_BLOCK_FIXED_BYTES {
+        let minimum_length = if version == V04_EXECUTION_BLOCK_AMM_VERSION {
+            V04_EXECUTION_BLOCK_AMM_FIXED_BYTES
+        } else {
+            V04_EXECUTION_BLOCK_FIXED_BYTES
+        };
+        if bytes.len() < minimum_length {
             return Err(V04TransitionError::MalformedExecutionBlock);
         }
         let mut cursor = 6usize;
@@ -500,11 +562,28 @@ impl V04ExecutionBlockCandidate {
             let transaction_bytes = take_v04_execution_slice(bytes, &mut cursor, length)?;
             transactions.push(decode_transaction(transaction_bytes)?);
         }
+        let mut amm_operations = Vec::new();
+        if version == V04_EXECUTION_BLOCK_AMM_VERSION {
+            let operation_count = take_v04_execution_u32(bytes, &mut cursor)? as usize;
+            if operation_count > MAX_AMM_OPERATIONS_PER_BLOCK {
+                return Err(V04TransitionError::MalformedExecutionBlock);
+            }
+            amm_operations.reserve(operation_count);
+            for _ in 0..operation_count {
+                let length = take_v04_execution_u32(bytes, &mut cursor)? as usize;
+                if length == 0 || length > MAX_ENCODED_AMM_SIGNED_OPERATION_BYTES {
+                    return Err(V04TransitionError::MalformedExecutionBlock);
+                }
+                let operation_bytes = take_v04_execution_slice(bytes, &mut cursor, length)?;
+                amm_operations.push(AmmSignedOperation::decode(operation_bytes)?);
+            }
+        }
         let state_root = take_v04_execution_array::<32>(bytes, &mut cursor)?;
         if cursor != bytes.len() {
             return Err(V04TransitionError::MalformedExecutionBlock);
         }
         let block = Self {
+            wire_version: version,
             profile_fingerprint,
             height,
             timestamp,
@@ -512,6 +591,7 @@ impl V04ExecutionBlockCandidate {
             miner,
             claimed_subsidy_atoms,
             transactions,
+            amm_operations,
             state_root,
         };
         if block.encode()?.as_slice() != bytes {
@@ -571,6 +651,9 @@ pub struct V04ExecutionApplySummary {
     pub total_mined_atoms: u128,
     pub fees_collected: u64,
     pub transactions_applied: usize,
+    pub amm_operations_applied: usize,
+    /// Receipts from native swaps in this block; consumers must wait for canonical finality before indexing candles.
+    pub amm_swaps: Vec<SwapReceipt>,
     pub live_supply_atoms: u128,
 }
 
@@ -590,6 +673,7 @@ pub struct MonetaryLedgerStateV04TransitionCandidate {
     ledger: LedgerState,
     allocation_accounting: AllocationAccounting,
     total_mined_atoms: u128,
+    amm: QzxbAmmStateCandidate,
     profile: V04ConsensusProfileCandidate,
 }
 
@@ -600,10 +684,12 @@ impl MonetaryLedgerStateV04TransitionCandidate {
     ) -> Result<Self, V04TransitionError> {
         profile.validate_for_manifest(manifest)?;
         let genesis = MonetaryLedgerStateV04Candidate::from_genesis_manifest(manifest)?;
+        let amm = QzxbAmmStateCandidate::new(profile.network_id, 4_096, 4_096, 65_536)?;
         let state = Self {
             ledger: genesis.ledger().clone(),
             allocation_accounting: genesis.allocation_accounting().clone(),
             total_mined_atoms: genesis.total_mined_atoms(),
+            amm,
             profile: profile.clone(),
         };
         state.validate()?;
@@ -626,6 +712,10 @@ impl MonetaryLedgerStateV04TransitionCandidate {
         &self.profile
     }
 
+    pub fn amm_state(&self) -> &QzxbAmmStateCandidate {
+        &self.amm
+    }
+
     pub fn total_value_atoms(&self) -> Result<u128, V04TransitionError> {
         Ok(self.ledger.total_value()?)
     }
@@ -638,6 +728,10 @@ impl MonetaryLedgerStateV04TransitionCandidate {
         hash.update(self.ledger.state_root());
         hash.update(allocation_commitment);
         hash.update(self.total_mined_atoms.to_be_bytes());
+        if self.amm.has_state() {
+            hash.update(b"QZXB-AMM-CONSENSUS-STATE-V1\0");
+            hash.update(self.amm.state_root()?);
+        }
         Ok(hash.finalize().into())
     }
 
@@ -648,9 +742,12 @@ impl MonetaryLedgerStateV04TransitionCandidate {
 
     pub fn validate(&self) -> Result<(), V04TransitionError> {
         self.profile.validate_internal()?;
-        if self.ledger.network_id() != self.profile.network_id {
+        if self.ledger.network_id() != self.profile.network_id
+            || self.amm.network_id() != self.profile.network_id
+        {
             return Err(V04TransitionError::ProfileBindingMismatch);
         }
+        self.amm.verify_invariants()?;
         self.allocation_accounting.validate()?;
         if self.total_mined_atoms
             != self
@@ -715,6 +812,7 @@ impl MonetaryLedgerStateV04TransitionCandidate {
             ledger: next_ledger,
             allocation_accounting: next_accounting,
             total_mined_atoms: next_total_mined,
+            amm: self.amm.clone(),
             profile: self.profile.clone(),
         };
         next.validate()?;
@@ -782,6 +880,7 @@ impl MonetaryLedgerStateV04TransitionCandidate {
             ledger: candidate_ledger.clone(),
             allocation_accounting: candidate_accounting,
             total_mined_atoms: candidate_total_mined,
+            amm: self.amm.clone(),
             profile: self.profile.clone(),
         };
         candidate.validate()?;
@@ -818,11 +917,16 @@ impl MonetaryLedgerStateV04TransitionCandidate {
         .encode_snapshot()?;
         let ledger_length = u32::try_from(ledger_snapshot.len())
             .map_err(|_| V04TransitionError::ProfileBoundSnapshotLengthOverflow)?;
+        let amm_snapshot = self.amm.encode_snapshot()?;
+        let amm_length = u32::try_from(amm_snapshot.len())
+            .map_err(|_| V04TransitionError::ProfileBoundSnapshotLengthOverflow)?;
         let committed_root = self.state_root()?;
 
         let mut bytes = Vec::with_capacity(
             PROFILE_BOUND_SNAPSHOT_FIXED_OVERHEAD
                 .checked_add(ledger_snapshot.len())
+                .and_then(|value| value.checked_add(4))
+                .and_then(|value| value.checked_add(amm_snapshot.len()))
                 .ok_or(V04TransitionError::ProfileBoundSnapshotLengthOverflow)?,
         );
         bytes.extend_from_slice(&V04_PROFILE_BOUND_SNAPSHOT_MAGIC);
@@ -831,6 +935,8 @@ impl MonetaryLedgerStateV04TransitionCandidate {
         bytes.extend_from_slice(&profile_bytes);
         bytes.extend_from_slice(&ledger_length.to_be_bytes());
         bytes.extend_from_slice(&ledger_snapshot);
+        bytes.extend_from_slice(&amm_length.to_be_bytes());
+        bytes.extend_from_slice(&amm_snapshot);
         bytes.extend_from_slice(&committed_root);
 
         let total_length = bytes
@@ -869,7 +975,7 @@ impl MonetaryLedgerStateV04TransitionCandidate {
             return Err(V04TransitionError::WrongProfileBoundSnapshotMagic);
         }
         let version = u16::from_be_bytes([payload[4], payload[5]]);
-        if version != V04_PROFILE_BOUND_SNAPSHOT_VERSION {
+        if !matches!(version, 1 | V04_PROFILE_BOUND_SNAPSHOT_VERSION) {
             return Err(V04TransitionError::UnsupportedProfileBoundSnapshotVersion(
                 version,
             ));
@@ -905,33 +1011,73 @@ impl MonetaryLedgerStateV04TransitionCandidate {
         let ledger_end = ledger_start
             .checked_add(ledger_length)
             .ok_or(V04TransitionError::ProfileBoundSnapshotLengthOverflow)?;
-        let expected_payload_length = ledger_end
-            .checked_add(32)
-            .ok_or(V04TransitionError::ProfileBoundSnapshotLengthOverflow)?;
-        if payload.len() != expected_payload_length {
-            return Err(V04TransitionError::ProfileBoundSnapshotWrongLength);
-        }
-
         let ledger_snapshot = &payload[ledger_start..ledger_end];
         let restored_ledger =
             MonetaryLedgerStateV04Candidate::decode_snapshot(ledger_snapshot, &network_id)?;
         if restored_ledger.encode_snapshot()?.as_slice() != ledger_snapshot {
             return Err(V04TransitionError::NonCanonicalProfileBoundSnapshot);
         }
-        let committed_root: [u8; 32] = payload[ledger_end..ledger_end + 32]
+
+        let (restored_amm, root_start) = if version == 1 {
+            // Historical QZP4 v1 snapshots predate the AMM. They are compatible only with
+            // the original empty AMM state; the root check below prevents upgrading an active
+            // AMM state from a v1 snapshot that cannot represent it.
+            (
+                QzxbAmmStateCandidate::new(network_id, 4_096, 4_096, 65_536)?,
+                ledger_end,
+            )
+        } else {
+            let amm_length_end = ledger_end
+                .checked_add(4)
+                .ok_or(V04TransitionError::ProfileBoundSnapshotLengthOverflow)?;
+            if amm_length_end > payload.len() {
+                return Err(V04TransitionError::ProfileBoundSnapshotWrongLength);
+            }
+            let amm_length = u32::from_be_bytes(
+                payload[ledger_end..amm_length_end]
+                    .try_into()
+                    .map_err(|_| V04TransitionError::ProfileBoundSnapshotWrongLength)?,
+            ) as usize;
+            let amm_end = amm_length_end
+                .checked_add(amm_length)
+                .ok_or(V04TransitionError::ProfileBoundSnapshotLengthOverflow)?;
+            let expected_payload_length = amm_end
+                .checked_add(32)
+                .ok_or(V04TransitionError::ProfileBoundSnapshotLengthOverflow)?;
+            if payload.len() != expected_payload_length || amm_length == 0 {
+                return Err(V04TransitionError::ProfileBoundSnapshotWrongLength);
+            }
+            let amm_bytes = &payload[amm_length_end..amm_end];
+            let amm = QzxbAmmStateCandidate::decode_snapshot(amm_bytes)?;
+            if amm.network_id() != network_id || amm.encode_snapshot()?.as_slice() != amm_bytes {
+                return Err(V04TransitionError::NonCanonicalProfileBoundSnapshot);
+            }
+            (amm, amm_end)
+        };
+        if root_start
+            .checked_add(32)
+            .ok_or(V04TransitionError::ProfileBoundSnapshotLengthOverflow)?
+            != payload.len()
+        {
+            return Err(V04TransitionError::ProfileBoundSnapshotWrongLength);
+        }
+        let committed_root: [u8; 32] = payload[root_start..root_start + 32]
             .try_into()
             .map_err(|_| V04TransitionError::ProfileBoundSnapshotWrongLength)?;
         let restored = Self {
             ledger: restored_ledger.ledger().clone(),
             allocation_accounting: restored_ledger.allocation_accounting().clone(),
             total_mined_atoms: restored_ledger.total_mined_atoms(),
+            amm: restored_amm,
             profile: restored_profile,
         };
         restored.validate()?;
         if restored.state_root()? != committed_root {
             return Err(V04TransitionError::ProfileBoundSnapshotStateRootMismatch);
         }
-        if restored.encode_snapshot()?.as_slice() != bytes {
+        if version == V04_PROFILE_BOUND_SNAPSHOT_VERSION
+            && restored.encode_snapshot()?.as_slice() != bytes
+        {
             return Err(V04TransitionError::NonCanonicalProfileBoundSnapshot);
         }
         Ok(restored)
@@ -939,6 +1085,39 @@ impl MonetaryLedgerStateV04TransitionCandidate {
 }
 
 impl MonetaryLedgerStateV04TransitionCandidate {
+    fn reconcile_amm_user_balance(
+        amm: &mut QzxbAmmStateCandidate,
+        ledger: &LedgerState,
+        native_asset: AmmAssetId,
+        account: [u8; 32],
+    ) -> Result<(), V04TransitionError> {
+        if amm.is_pool_account_id(&account) {
+            return Err(V04TransitionError::AmmPoolAccountCollision);
+        }
+        let balance = ledger
+            .account(&account)
+            .map_or(0, |state| state.balance as u128);
+        amm.reconcile_external_balance(native_asset, account, balance)?;
+        Ok(())
+    }
+
+    fn native_balance_updates(
+        amm: &QzxbAmmStateCandidate,
+        native_asset: AmmAssetId,
+        accounts: &[[u8; 32]],
+    ) -> Result<Vec<([u8; 32], u64)>, V04TransitionError> {
+        let mut updates = Vec::with_capacity(accounts.len());
+        for account in accounts {
+            if updates.iter().any(|(existing, _)| existing == account) {
+                continue;
+            }
+            let amount = u64::try_from(amm.balance_of(&native_asset, account))
+                .map_err(|_| V04TransitionError::AmmNativeBalanceOverflow)?;
+            updates.push((*account, amount));
+        }
+        Ok(updates)
+    }
+
     fn stage_execution_candidate<A: TransactionAuthenticator>(
         &self,
         height: u64,
@@ -947,17 +1126,151 @@ impl MonetaryLedgerStateV04TransitionCandidate {
         miner: &[u8; 32],
         reward_atoms: u128,
         transactions: Vec<Transaction>,
+        amm_operations: Vec<AmmSignedOperation>,
         authenticator: &A,
-    ) -> Result<(Self, u64), V04TransitionError> {
-        let (ledger, fees_collected) = self.ledger.stage_v04_execution_transition(
+    ) -> Result<(Self, u64, Vec<SwapReceipt>), V04TransitionError> {
+        let mut amm = self.amm.clone();
+        let amm_active = amm.has_state() || !amm_operations.is_empty();
+        let native_asset = qzxb_native_asset_id(self.profile.network_id)?;
+        if amm_active && !amm.is_asset_registered(&native_asset) {
+            amm.register_asset(native_asset)?;
+        }
+
+        if amm_active {
+            for transaction in &transactions {
+                if amm.is_pool_account_id(&transaction.sender)
+                    || amm.is_pool_account_id(&transaction.recipient)
+                {
+                    return Err(V04TransitionError::AmmPoolAccountCollision);
+                }
+            }
+        }
+
+        let (mut ledger, fees_collected) = self.ledger.stage_v04_execution_transition(
             height,
             timestamp,
             parent_hash,
             miner,
             reward_atoms,
-            transactions,
+            transactions.clone(),
             authenticator,
         )?;
+
+        // QZXB balances in the AMM state are a mirror of the canonical native ledger.
+        // Refresh every touched ordinary account after the block's TXN4 transfers.
+        if amm_active {
+            for transaction in &transactions {
+                Self::reconcile_amm_user_balance(
+                    &mut amm,
+                    &ledger,
+                    native_asset,
+                    transaction.sender,
+                )?;
+                Self::reconcile_amm_user_balance(
+                    &mut amm,
+                    &ledger,
+                    native_asset,
+                    transaction.recipient,
+                )?;
+            }
+        }
+
+        let mut swap_receipts = Vec::new();
+        for signed in &amm_operations {
+            let sender = signed.sender;
+            let current_account = ledger.account(&sender);
+            let expected_nonce = current_account
+                .map_or(0, |account| account.nonce)
+                .checked_add(1)
+                .ok_or(V04TransitionError::State(StateError::InvalidNonce(
+                    current_account.map_or(0, |account| account.nonce),
+                )))?;
+            Self::reconcile_amm_user_balance(&mut amm, &ledger, native_asset, sender)?;
+
+            let mut recipient_to_sync = None;
+            let mut pool_to_sync = None;
+            match &signed.operation {
+                AmmOperation::RegisterAsset { .. } => {}
+                AmmOperation::CreatePair { token_a, token_b } => {
+                    let pair_id = QzxbAmmStateCandidate::pair_id_for_assets(*token_a, *token_b)?;
+                    if ledger
+                        .account(&pair_id)
+                        .is_some_and(|account| account.balance != 0 || account.nonce != 0)
+                    {
+                        return Err(V04TransitionError::AmmPoolAccountCollision);
+                    }
+                    if *token_a == native_asset || *token_b == native_asset {
+                        pool_to_sync = Some(pair_id);
+                    }
+                }
+                AmmOperation::TransferAsset {
+                    asset_id,
+                    recipient,
+                    ..
+                } => {
+                    if *asset_id == native_asset {
+                        Self::reconcile_amm_user_balance(
+                            &mut amm,
+                            &ledger,
+                            native_asset,
+                            *recipient,
+                        )?;
+                        recipient_to_sync = Some(*recipient);
+                    }
+                }
+                AmmOperation::AddLiquidity { pair_id, .. }
+                | AmmOperation::RemoveLiquidity { pair_id, .. } => {
+                    let (token0, token1) = amm.pair_assets(pair_id)?;
+                    if token0 == native_asset || token1 == native_asset {
+                        pool_to_sync = Some(*pair_id);
+                    }
+                }
+                AmmOperation::SwapExactIn {
+                    token_in,
+                    token_out,
+                    ..
+                } => {
+                    let pair_id = QzxbAmmStateCandidate::pair_id_for_assets(*token_in, *token_out)?;
+                    let (token0, token1) = amm.pair_assets(&pair_id)?;
+                    if token0 == native_asset || token1 == native_asset {
+                        pool_to_sync = Some(pair_id);
+                    }
+                }
+            }
+            if let Some(pair_id) = pool_to_sync {
+                if amm.is_pool_account_id(&pair_id) {
+                    let amm_balance = u64::try_from(amm.balance_of(&native_asset, &pair_id))
+                        .map_err(|_| V04TransitionError::AmmNativeBalanceOverflow)?;
+                    let ledger_balance = ledger
+                        .account(&pair_id)
+                        .map_or(0, |account| account.balance);
+                    if amm_balance != ledger_balance {
+                        return Err(V04TransitionError::AmmLedgerBalanceMismatch);
+                    }
+                }
+            }
+
+            let receipt = amm.apply_signed_operation_with_expected_nonce(
+                signed,
+                timestamp,
+                expected_nonce,
+                authenticator,
+            )?;
+            if let Some(receipt) = receipt {
+                swap_receipts.push(receipt);
+            }
+
+            let mut affected = vec![sender];
+            if let Some(recipient) = recipient_to_sync {
+                affected.push(recipient);
+            }
+            if let Some(pair_id) = pool_to_sync {
+                affected.push(pair_id);
+            }
+            let balance_updates = Self::native_balance_updates(&amm, native_asset, &affected)?;
+            ledger.apply_amm_account_updates(sender, signed.nonce, &balance_updates)?;
+        }
+
         let mut allocation_accounting = self.allocation_accounting.clone();
         if reward_atoms != 0 {
             allocation_accounting
@@ -971,14 +1284,15 @@ impl MonetaryLedgerStateV04TransitionCandidate {
             ledger,
             allocation_accounting,
             total_mined_atoms,
+            amm,
             profile: self.profile.clone(),
         };
         candidate.validate()?;
-        Ok((candidate, fees_collected))
+        Ok((candidate, fees_collected, swap_receipts))
     }
 
-    /// Build QZB4 version 2 with canonical transactions and locally-derived issuance.
-    /// The v1 mining-only QZB4 codec is unchanged. No peer-provided subsidy is trusted by builder.
+    /// Build the next candidate with legacy transactions only. Once the AMM is activated,
+    /// the builder emits QZB4 v3 even for blocks that contain no AMM operation.
     pub fn build_next_execution_block<A: TransactionAuthenticator>(
         &self,
         timestamp: u64,
@@ -986,7 +1300,28 @@ impl MonetaryLedgerStateV04TransitionCandidate {
         transactions: Vec<Transaction>,
         authenticator: &A,
     ) -> Result<V04ExecutionBlockCandidate, V04TransitionError> {
+        self.build_next_execution_block_with_amm(
+            timestamp,
+            miner,
+            transactions,
+            Vec::new(),
+            authenticator,
+        )
+    }
+
+    /// Build a deterministic v3 block carrying both legacy transfers and signed native AMM operations.
+    pub fn build_next_execution_block_with_amm<A: TransactionAuthenticator>(
+        &self,
+        timestamp: u64,
+        miner: [u8; 32],
+        transactions: Vec<Transaction>,
+        amm_operations: Vec<AmmSignedOperation>,
+        authenticator: &A,
+    ) -> Result<V04ExecutionBlockCandidate, V04TransitionError> {
         self.validate()?;
+        if amm_operations.len() > MAX_AMM_OPERATIONS_PER_BLOCK {
+            return Err(V04TransitionError::MalformedExecutionBlock);
+        }
         let height = self
             .ledger
             .height()
@@ -997,16 +1332,23 @@ impl MonetaryLedgerStateV04TransitionCandidate {
             .profile
             .schedule
             .reward_for_height(height, self.total_mined_atoms)?;
-        let (candidate, _) = self.stage_execution_candidate(
+        let wire_version = if self.amm.has_state() || !amm_operations.is_empty() {
+            V04_EXECUTION_BLOCK_AMM_VERSION
+        } else {
+            V04_EXECUTION_BLOCK_VERSION
+        };
+        let (candidate, _, _) = self.stage_execution_candidate(
             height,
             timestamp,
             &parent_hash,
             &miner,
             reward_atoms,
             transactions.clone(),
+            amm_operations.clone(),
             authenticator,
         )?;
         Ok(V04ExecutionBlockCandidate {
+            wire_version,
             profile_fingerprint: *self.profile.profile_fingerprint(),
             height,
             timestamp,
@@ -1014,6 +1356,7 @@ impl MonetaryLedgerStateV04TransitionCandidate {
             miner,
             claimed_subsidy_atoms: reward_atoms,
             transactions,
+            amm_operations,
             state_root: candidate.compute_state_root()?,
         })
     }
@@ -1052,17 +1395,31 @@ impl MonetaryLedgerStateV04TransitionCandidate {
                 actual: block.claimed_subsidy_atoms,
             });
         }
-        let mut candidate = self
-            .stage_execution_candidate(
-                block.height,
-                block.timestamp,
-                &block.parent_hash,
-                &block.miner,
-                expected_reward,
-                block.transactions.clone(),
-                authenticator,
-            )?
-            .0;
+        if block.wire_version == V04_EXECUTION_BLOCK_VERSION
+            && (self.amm.has_state() || !block.amm_operations.is_empty())
+        {
+            return Err(V04TransitionError::UnsupportedAmmBlockVersion(
+                block.wire_version,
+            ));
+        }
+        if block.wire_version == V04_EXECUTION_BLOCK_AMM_VERSION
+            && !self.amm.has_state()
+            && block.amm_operations.is_empty()
+        {
+            return Err(V04TransitionError::UnsupportedAmmBlockVersion(
+                block.wire_version,
+            ));
+        }
+        let (mut candidate, _fees_collected, amm_swaps) = self.stage_execution_candidate(
+            block.height,
+            block.timestamp,
+            &block.parent_hash,
+            &block.miner,
+            expected_reward,
+            block.transactions.clone(),
+            block.amm_operations.clone(),
+            authenticator,
+        )?;
         if candidate.compute_state_root()? != block.state_root {
             return Err(V04TransitionError::StateRootMismatch);
         }
@@ -1083,6 +1440,8 @@ impl MonetaryLedgerStateV04TransitionCandidate {
                     .ok_or(V04TransitionError::State(StateError::FeeOverflow))
             })?,
             transactions_applied: block.transactions.len(),
+            amm_operations_applied: block.amm_operations.len(),
+            amm_swaps,
             live_supply_atoms,
         };
         *self = candidate;
@@ -1186,6 +1545,358 @@ mod tests {
             expires_at: 100,
             signature: vec![0x5A],
         }
+    }
+
+    #[test]
+    fn qzb4_v3_authenticated_amm_operations_bind_state_root_and_snapshot() {
+        use crate::transaction_auth::{
+            AccountPublicKey, Ed25519TransactionAuthenticator, Ed25519TransactionSigner,
+            TransactionAuthenticatorKind,
+        };
+
+        let signer = Ed25519TransactionSigner::from_seed([0x4D; 32]);
+        let genesis = GenesisManifestV04::new(NETWORK, signer.account_id()).unwrap();
+        let configured_profile = profile(&genesis, 10_000, 2);
+        let mut producer = MonetaryLedgerStateV04TransitionCandidate::from_genesis_manifest(
+            &genesis,
+            &configured_profile,
+        )
+        .unwrap();
+        let mut importer = producer.clone();
+        let authenticator = Ed25519TransactionAuthenticator::select(
+            TransactionAuthenticatorKind::Ed25519V1,
+            [AccountPublicKey {
+                account_id: signer.account_id(),
+                public_key: signer.public_key(),
+            }],
+        )
+        .unwrap();
+
+        let quote_asset = [0x55; 32];
+        let sign = |nonce: u64, operation: AmmOperation| {
+            let mut signed = AmmSignedOperation {
+                network_id: NETWORK,
+                sender: signer.account_id(),
+                nonce,
+                expires_at: 1_000,
+                operation,
+                signature: Vec::new(),
+            };
+            signed.signature = signer.sign_digest(&signed.signing_digest().unwrap());
+            signed
+        };
+
+        let register_asset = sign(
+            1,
+            AmmOperation::RegisterAsset {
+                asset_id: quote_asset,
+            },
+        );
+        let block1 = producer
+            .build_next_execution_block_with_amm(
+                1,
+                MINER,
+                Vec::new(),
+                vec![register_asset],
+                &authenticator,
+            )
+            .unwrap();
+        assert_eq!(block1.wire_version, V04_EXECUTION_BLOCK_AMM_VERSION);
+        let wire1 = block1.encode().unwrap();
+        assert_eq!(V04ExecutionBlockCandidate::decode(&wire1).unwrap(), block1);
+        let applied1 = importer
+            .apply_execution_block(
+                &V04ExecutionBlockCandidate::decode(&wire1).unwrap(),
+                &authenticator,
+            )
+            .unwrap();
+        producer
+            .apply_execution_block(&block1, &authenticator)
+            .unwrap();
+        assert_eq!(applied1.amm_operations_applied, 1);
+        assert!(importer.amm_state().is_asset_registered(&quote_asset));
+        let native_asset = qzxb_native_asset_id(NETWORK).unwrap();
+        assert!(importer.amm_state().is_asset_registered(&native_asset));
+        assert_eq!(
+            importer
+                .amm_state()
+                .balance_of(&native_asset, &signer.account_id()),
+            importer
+                .ledger()
+                .account(&signer.account_id())
+                .unwrap()
+                .balance as u128
+        );
+
+        let pair_id = QzxbAmmStateCandidate::pair_id_for_assets(native_asset, quote_asset).unwrap();
+        let create_pair = sign(
+            2,
+            AmmOperation::CreatePair {
+                token_a: native_asset,
+                token_b: quote_asset,
+            },
+        );
+        let block2 = producer
+            .build_next_execution_block_with_amm(
+                2,
+                MINER,
+                Vec::new(),
+                vec![create_pair],
+                &authenticator,
+            )
+            .unwrap();
+        let decoded2 = V04ExecutionBlockCandidate::decode(&block2.encode().unwrap()).unwrap();
+        importer
+            .apply_execution_block(&decoded2, &authenticator)
+            .unwrap();
+        producer
+            .apply_execution_block(&block2, &authenticator)
+            .unwrap();
+        assert_eq!(producer.amm_state().pair_count(), 1);
+        assert_eq!(producer.amm_state().pair_assets(&pair_id).unwrap(), {
+            if native_asset < quote_asset {
+                (native_asset, quote_asset)
+            } else {
+                (quote_asset, native_asset)
+            }
+        });
+
+        // A corrupted signature is rejected before any pool, nonce, ledger or block-tip state publishes.
+        let create_other_asset = sign(
+            3,
+            AmmOperation::RegisterAsset {
+                asset_id: [0x66; 32],
+            },
+        );
+        let valid_block3 = producer
+            .build_next_execution_block_with_amm(
+                3,
+                MINER,
+                Vec::new(),
+                vec![create_other_asset],
+                &authenticator,
+            )
+            .unwrap();
+        let mut tampered_block3 = valid_block3.clone();
+        tampered_block3.amm_operations[0].signature[0] ^= 1;
+        let before = importer.encode_snapshot().unwrap();
+        assert_eq!(
+            importer.apply_execution_block(&tampered_block3, &authenticator),
+            Err(V04TransitionError::Amm(AmmError::InvalidSignature))
+        );
+        assert_eq!(importer.encode_snapshot().unwrap(), before);
+
+        let applied3 = importer
+            .apply_execution_block(&valid_block3, &authenticator)
+            .unwrap();
+        producer
+            .apply_execution_block(&valid_block3, &authenticator)
+            .unwrap();
+        assert_eq!(applied3.amm_operations_applied, 1);
+        assert!(applied3.amm_swaps.is_empty());
+        assert_eq!(importer, producer);
+
+        let snapshot = producer.encode_snapshot().unwrap();
+        let restored = MonetaryLedgerStateV04TransitionCandidate::decode_snapshot(
+            &snapshot,
+            &genesis,
+            &configured_profile,
+        )
+        .unwrap();
+        assert_eq!(restored, producer);
+        assert_eq!(
+            restored.state_root().unwrap(),
+            producer.state_root().unwrap()
+        );
+    }
+
+    #[test]
+    fn qzb4_v3_native_swap_updates_canonical_ledger_and_emits_receipt() {
+        use crate::transaction_auth::{
+            AccountPublicKey, Ed25519TransactionAuthenticator, Ed25519TransactionSigner,
+            TransactionAuthenticatorKind,
+        };
+
+        // This is explicitly a test-only second-asset Genesis fixture. It proves execution and
+        // accounting end-to-end, not that a real USDT bridge or external liquidity exists.
+        let signer = Ed25519TransactionSigner::from_seed([0x4E; 32]);
+        let genesis = GenesisManifestV04::new(NETWORK, signer.account_id()).unwrap();
+        let configured_profile = profile(&genesis, 10_000, 2);
+        let mut producer = MonetaryLedgerStateV04TransitionCandidate::from_genesis_manifest(
+            &genesis,
+            &configured_profile,
+        )
+        .unwrap();
+        let native_asset = qzxb_native_asset_id(NETWORK).unwrap();
+        let quote_asset = [0x55; 32];
+        producer.amm.register_asset(native_asset).unwrap();
+        producer.amm.register_asset(quote_asset).unwrap();
+        producer
+            .amm
+            .credit_genesis_balance(quote_asset, signer.account_id(), 100_000_000_000)
+            .unwrap();
+        let mut importer = producer.clone();
+        let authenticator = Ed25519TransactionAuthenticator::select(
+            TransactionAuthenticatorKind::Ed25519V1,
+            [AccountPublicKey {
+                account_id: signer.account_id(),
+                public_key: signer.public_key(),
+            }],
+        )
+        .unwrap();
+
+        let sign = |nonce: u64, operation: AmmOperation| {
+            let mut signed = AmmSignedOperation {
+                network_id: NETWORK,
+                sender: signer.account_id(),
+                nonce,
+                expires_at: 1_000,
+                operation,
+                signature: Vec::new(),
+            };
+            signed.signature = signer.sign_digest(&signed.signing_digest().unwrap());
+            signed
+        };
+
+        let pair_id = QzxbAmmStateCandidate::pair_id_for_assets(native_asset, quote_asset).unwrap();
+        let create_pair = sign(
+            1,
+            AmmOperation::CreatePair {
+                token_a: native_asset,
+                token_b: quote_asset,
+            },
+        );
+        let create_block = producer
+            .build_next_execution_block_with_amm(
+                1,
+                MINER,
+                Vec::new(),
+                vec![create_pair],
+                &authenticator,
+            )
+            .unwrap();
+        importer
+            .apply_execution_block(
+                &V04ExecutionBlockCandidate::decode(&create_block.encode().unwrap()).unwrap(),
+                &authenticator,
+            )
+            .unwrap();
+        producer
+            .apply_execution_block(&create_block, &authenticator)
+            .unwrap();
+
+        let (token0, _) = producer.amm.pair_assets(&pair_id).unwrap();
+        let native_deposit = 10_000_000_000u128;
+        let quote_deposit = 20_000_000_000u128;
+        let (amount0_desired, amount1_desired) = if token0 == native_asset {
+            (native_deposit, quote_deposit)
+        } else {
+            (quote_deposit, native_deposit)
+        };
+        let add_liquidity = sign(
+            2,
+            AmmOperation::AddLiquidity {
+                pair_id,
+                amount0_desired,
+                amount1_desired,
+                min_lp_shares: 1,
+            },
+        );
+        let liquidity_block = producer
+            .build_next_execution_block_with_amm(
+                2,
+                MINER,
+                Vec::new(),
+                vec![add_liquidity],
+                &authenticator,
+            )
+            .unwrap();
+        let liquidity_summary = importer
+            .apply_execution_block(
+                &V04ExecutionBlockCandidate::decode(&liquidity_block.encode().unwrap()).unwrap(),
+                &authenticator,
+            )
+            .unwrap();
+        producer
+            .apply_execution_block(&liquidity_block, &authenticator)
+            .unwrap();
+        assert_eq!(liquidity_summary.amm_operations_applied, 1);
+        assert!(producer.amm.reserves(&pair_id).unwrap().1 > 0);
+        assert!(producer.amm.reserves(&pair_id).unwrap().3 > 0);
+
+        let sender_before = producer
+            .ledger
+            .account(&signer.account_id())
+            .unwrap()
+            .balance;
+        let swap = sign(
+            3,
+            AmmOperation::SwapExactIn {
+                token_in: native_asset,
+                token_out: quote_asset,
+                amount_in: 1_000_000,
+                min_amount_out: 1,
+            },
+        );
+        let swap_block = producer
+            .build_next_execution_block_with_amm(3, MINER, Vec::new(), vec![swap], &authenticator)
+            .unwrap();
+        let swap_summary = importer
+            .apply_execution_block(
+                &V04ExecutionBlockCandidate::decode(&swap_block.encode().unwrap()).unwrap(),
+                &authenticator,
+            )
+            .unwrap();
+        producer
+            .apply_execution_block(&swap_block, &authenticator)
+            .unwrap();
+
+        assert_eq!(swap_summary.amm_operations_applied, 1);
+        assert_eq!(swap_summary.amm_swaps.len(), 1);
+        let receipt = &swap_summary.amm_swaps[0];
+        assert_eq!(receipt.pair_id, pair_id);
+        assert_eq!(receipt.token_in, native_asset);
+        assert_eq!(receipt.token_out, quote_asset);
+        assert_eq!(receipt.amount_in, 1_000_000);
+        assert!(receipt.amount_out > 0);
+        assert!(receipt.fee_atoms > 0);
+        assert!(
+            producer
+                .ledger
+                .account(&signer.account_id())
+                .unwrap()
+                .balance
+                < sender_before
+        );
+        assert_eq!(
+            producer.amm.balance_of(&native_asset, &signer.account_id()),
+            producer
+                .ledger
+                .account(&signer.account_id())
+                .unwrap()
+                .balance as u128
+        );
+        assert_eq!(
+            producer.amm.balance_of(&native_asset, &pair_id),
+            producer
+                .ledger
+                .account(&pair_id)
+                .map_or(0, |account| account.balance) as u128
+        );
+        assert_eq!(producer, importer);
+
+        let snapshot = producer.encode_snapshot().unwrap();
+        let restored = MonetaryLedgerStateV04TransitionCandidate::decode_snapshot(
+            &snapshot,
+            &genesis,
+            &configured_profile,
+        )
+        .unwrap();
+        assert_eq!(restored, producer);
+        assert_eq!(
+            restored.state_root().unwrap(),
+            producer.state_root().unwrap()
+        );
     }
 
     #[test]
@@ -1488,7 +2199,7 @@ mod tests {
         );
 
         let mut wrong_version = bytes.clone();
-        wrong_version[4..6].copy_from_slice(&2u16.to_be_bytes());
+        wrong_version[4..6].copy_from_slice(&3u16.to_be_bytes());
         let checksum_start = wrong_version.len() - 32;
         let checksum = profile_bound_snapshot_checksum(&wrong_version[..checksum_start]);
         wrong_version[checksum_start..].copy_from_slice(&checksum);
@@ -1499,7 +2210,7 @@ mod tests {
                 &profile
             ),
             Err(V04TransitionError::UnsupportedProfileBoundSnapshotVersion(
-                2
+                3
             ))
         );
 

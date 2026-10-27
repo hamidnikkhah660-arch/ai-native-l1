@@ -25,7 +25,10 @@ pub const AMM_SIGNED_OPERATION_MAGIC: [u8; 4] = *b"QAX1";
 pub const AMM_SIGNED_OPERATION_VERSION: u16 = 1;
 pub const MAX_AMM_OPERATION_BYTES: usize = 256;
 pub const MAX_AMM_SIGNATURE_BYTES: usize = 4 * 1024;
+pub const MAX_AMM_SIGNED_OPERATION_BYTES: usize =
+    MAX_AMM_OPERATION_BYTES + MAX_AMM_SIGNATURE_BYTES + 128;
 const AMM_OPERATION_SIGNING_DOMAIN: &[u8] = b"QZXB-AMM-OPERATION-SIGN-V1\0";
+const NATIVE_ASSET_ID_DOMAIN: &[u8] = b"QZXB-NATIVE-ASSET-ID-V1\0";
 const MAX_SNAPSHOT_ENTRIES: usize = 100_000;
 const AMM_SNAPSHOT_CHECKSUM_DOMAIN: &[u8] = b"QZXB-NATIVE-AMM-SNAPSHOT-CHECK-V1\0";
 const PAIR_ID_DOMAIN: &[u8] = b"QZXB-NATIVE-AMM-PAIR-V1\0";
@@ -467,6 +470,17 @@ impl AmmSignedOperation {
     }
 }
 
+/// Network-bound canonical ID for the chain's native QZXB asset.
+pub fn qzxb_native_asset_id(network_id: [u8; 32]) -> Result<AmmAssetId, AmmError> {
+    if is_zero(&network_id) {
+        return Err(AmmError::InvalidNetworkId);
+    }
+    let mut hash = Sha256::new();
+    hash.update(NATIVE_ASSET_ID_DOMAIN);
+    hash.update(network_id);
+    Ok(hash.finalize().into())
+}
+
 impl QzxbAmmStateCandidate {
     pub fn new(
         network_id: [u8; 32],
@@ -550,22 +564,96 @@ impl QzxbAmmStateCandidate {
         self.pools.len()
     }
 
+    /// True after any asset, balance, pool or nonce has been committed.
+    pub fn has_state(&self) -> bool {
+        !self.registered_assets.is_empty()
+            || !self.balances.is_empty()
+            || !self.pools.is_empty()
+            || !self.nonces.is_empty()
+    }
+
+    /// Accounts whose balances for a specific asset are represented in this AMM state.
+    pub fn accounts_with_asset_balance(&self, asset: &AmmAssetId) -> Vec<AmmAccountId> {
+        self.balances
+            .keys()
+            .filter_map(|(key_asset, account)| (key_asset == asset).then_some(*account))
+            .collect()
+    }
+
+    pub fn is_pool_account_id(&self, account: &AmmAccountId) -> bool {
+        self.is_pool_account(account)
+    }
+
+    /// Reconcile a user balance from the canonical native ledger into the mirrored AMM view.
+    /// Pool-custody accounts may only be changed by AMM transitions, never by this sync helper.
+    pub(crate) fn reconcile_external_balance(
+        &mut self,
+        asset: AmmAssetId,
+        account: AmmAccountId,
+        amount: u128,
+    ) -> Result<(), AmmError> {
+        self.ensure_asset(&asset)?;
+        self.ensure_user_account(&account)?;
+        let key = (asset, account);
+        if amount == 0 {
+            self.balances.remove(&key);
+        } else {
+            if !self.balances.contains_key(&key) && self.balances.len() >= self.max_holdings {
+                return Err(AmmError::TooManyHoldings);
+            }
+            self.balances.insert(key, amount);
+        }
+        self.verify_invariants()
+    }
+
     pub fn network_id(&self) -> [u8; 32] {
         self.network_id
+    }
+
+    pub fn is_asset_registered(&self, asset: &AmmAssetId) -> bool {
+        self.registered_assets.contains(asset)
+    }
+
+    pub fn pair_assets(&self, pair_id: &AmmPairId) -> Result<(AmmAssetId, AmmAssetId), AmmError> {
+        let pool = self.pools.get(pair_id).ok_or(AmmError::PairNotFound)?;
+        Ok((pool.token0, pool.token1))
     }
 
     pub fn operation_nonce(&self, account: &AmmAccountId) -> u64 {
         self.nonces.get(account).copied().unwrap_or(0)
     }
 
-    /// Authenticate and atomically execute one AMM operation in the candidate state.
-    /// Inclusion time is supplied by the block-transition caller; this method never reads the wall clock.
+    /// Authenticate and atomically execute one AMM operation using the AMM-local nonce.
+    /// This helper is for isolated candidate tests; a block transition must use the native-ledger nonce.
     pub fn apply_signed_operation<A: TransactionAuthenticator>(
         &mut self,
         signed: &AmmSignedOperation,
         inclusion_timestamp: u64,
         authenticator: &A,
     ) -> Result<(), AmmError> {
+        let expected_nonce = self
+            .operation_nonce(&signed.sender)
+            .checked_add(1)
+            .ok_or(AmmError::InvalidNonce)?;
+        self.apply_signed_operation_with_expected_nonce(
+            signed,
+            inclusion_timestamp,
+            expected_nonce,
+            authenticator,
+        )
+        .map(|_| ())
+    }
+
+    /// Authenticate and atomically execute an operation against the canonical account nonce.
+    /// The caller supplies the next nonce from the native ledger after prior block transactions.
+    /// Returns a canonical swap receipt only for SwapExactIn; failures never mutate state.
+    pub fn apply_signed_operation_with_expected_nonce<A: TransactionAuthenticator>(
+        &mut self,
+        signed: &AmmSignedOperation,
+        inclusion_timestamp: u64,
+        expected_nonce: u64,
+        authenticator: &A,
+    ) -> Result<Option<SwapReceipt>, AmmError> {
         let _ = signed.encode()?;
         if signed.network_id != self.network_id {
             return Err(AmmError::WrongNetwork);
@@ -573,13 +661,10 @@ impl QzxbAmmStateCandidate {
         if inclusion_timestamp == 0 || signed.expires_at <= inclusion_timestamp {
             return Err(AmmError::Expired);
         }
-        let expected_nonce = self
-            .operation_nonce(&signed.sender)
-            .checked_add(1)
-            .ok_or(AmmError::InvalidNonce)?;
-        if signed.nonce != expected_nonce {
+        let previous_amm_nonce = self.operation_nonce(&signed.sender);
+        if signed.nonce != expected_nonce || signed.nonce <= previous_amm_nonce {
             return Err(AmmError::NonceMismatch {
-                expected: expected_nonce,
+                expected: expected_nonce.max(previous_amm_nonce.saturating_add(1)),
                 actual: signed.nonce,
             });
         }
@@ -587,12 +672,17 @@ impl QzxbAmmStateCandidate {
         authenticator
             .verify(&signed.sender, &digest, &signed.signature)
             .map_err(|_| AmmError::InvalidSignature)?;
+        self.ensure_user_account(&signed.sender)?;
 
         let mut next = self.clone();
-        match &signed.operation {
-            AmmOperation::RegisterAsset { asset_id } => next.register_asset(*asset_id)?,
+        let swap_receipt = match &signed.operation {
+            AmmOperation::RegisterAsset { asset_id } => {
+                next.register_asset(*asset_id)?;
+                None
+            }
             AmmOperation::CreatePair { token_a, token_b } => {
                 next.create_pair(*token_a, *token_b)?;
+                None
             }
             AmmOperation::TransferAsset {
                 asset_id,
@@ -603,6 +693,7 @@ impl QzxbAmmStateCandidate {
                 next.ensure_user_account(&signed.sender)?;
                 next.ensure_user_account(recipient)?;
                 next.move_balance(*asset_id, signed.sender, *recipient, *amount)?;
+                None
             }
             AmmOperation::AddLiquidity {
                 pair_id,
@@ -617,6 +708,7 @@ impl QzxbAmmStateCandidate {
                     *amount1_desired,
                     *min_lp_shares,
                 )?;
+                None
             }
             AmmOperation::RemoveLiquidity {
                 pair_id,
@@ -631,29 +723,28 @@ impl QzxbAmmStateCandidate {
                     *min_amount0_out,
                     *min_amount1_out,
                 )?;
+                None
             }
             AmmOperation::SwapExactIn {
                 token_in,
                 token_out,
                 amount_in,
                 min_amount_out,
-            } => {
-                next.swap_exact_in(
-                    signed.sender,
-                    *token_in,
-                    *token_out,
-                    *amount_in,
-                    *min_amount_out,
-                )?;
-            }
-        }
+            } => Some(next.swap_exact_in(
+                signed.sender,
+                *token_in,
+                *token_out,
+                *amount_in,
+                *min_amount_out,
+            )?),
+        };
         if !next.nonces.contains_key(&signed.sender) && next.nonces.len() >= next.max_holdings {
             return Err(AmmError::TooManyHoldings);
         }
         next.nonces.insert(signed.sender, signed.nonce);
         next.verify_invariants()?;
         *self = next;
-        Ok(())
+        Ok(swap_receipt)
     }
 
     pub fn pair_id_for_assets(a: AmmAssetId, b: AmmAssetId) -> Result<AmmPairId, AmmError> {
@@ -1102,6 +1193,9 @@ impl QzxbAmmStateCandidate {
         // fee schedule cannot silently report the same empty-state root.
         hash.update(AMM_FEE_BPS.to_be_bytes());
         hash.update(AMM_BPS_DENOMINATOR.to_be_bytes());
+        hash.update((self.max_assets as u64).to_be_bytes());
+        hash.update((self.max_pairs as u64).to_be_bytes());
+        hash.update((self.max_holdings as u64).to_be_bytes());
         hash.update((self.registered_assets.len() as u64).to_be_bytes());
         for asset in &self.registered_assets {
             hash.update(asset);
