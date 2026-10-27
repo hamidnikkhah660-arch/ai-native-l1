@@ -6,6 +6,7 @@
 - **Source and contribution issues:** https://github.com/hamidnikkhah660-arch/ai-native-l1
 - **Engineering white paper:** [QuantumZXB Native Coin White Paper v0.3](docs/QUANTUMZXB_NATIVE_COIN_WHITEPAPER_V03.md)
 - **Master roadmap:** [QuantumZXB Engineering & Public-Launch Roadmap v0.4](docs/QUANTUMZXB_MASTER_ROADMAP_V04_2026-10-24.md) - evidence-based gates; not a launch approval.
+- **Standing launch policy (CP-0443):** [Bitcoin-inspired permissionless-first gate](docs/CP-0443_BITCOIN_INSPIRED_PERMISSIONLESS_LAUNCH_GATE_2026-10-28.md) - do not wait for exchange listings, platform indexing, sponsors, or external sign-off to publish a permissionless protocol; retain concrete consensus, wallet, network, supply and asset-backing blockers for the features claimed.
 - **Technical review and test evidence:** [CP-0343 report](docs/CP_0343_TECHNICAL_REVIEW_AND_TEST_RESULTS.md)
 - **Latest halving visualization and emission-data checkpoint:** [CP-0349](docs/CP_0349_REPRODUCIBLE_CANDIDATE_HALVING_VISUALIZATION_2026-10-21.md)
 - **Latest full curated source validation:** [CP-0347](docs/CP_0347_PUBLIC_CURATED_CHECKOUT_VALIDATION_2026-10-21.md) - **Latest founder/market-readiness docs:** [CP-0348](docs/CP_0348_FOUNDER_CREDENTIAL_MARKET_READINESS_2026-10-21.md)
