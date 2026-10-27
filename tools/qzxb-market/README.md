@@ -4,7 +4,9 @@ This repository module computes hourly (`1h`), daily (`1d`), Monday-UTC weekly (
 
 ## Components
 
-- `candles.mjs` is the deterministic candle builder. It filters noncanonical/unconfirmed swap events, handles reversed token order, deduplicates overlapping log pages, and rejects conflicting event identities.
+- `candles.mjs` is the deterministic EVM candle builder. It filters noncanonical/unconfirmed swap events, handles reversed token order, deduplicates overlapping log pages, and rejects conflicting event identities.
+- `native-candles.mjs` builds hourly, daily, Monday-UTC weekly, and calendar-month candles from the candidate native node's `/v1/amm/swaps` response. It consumes 32-byte native pair/asset IDs and operation-indexed swap receipts, rejects conflicting canonical hashes at the same height, and uses integer arithmetic for token-decimal-aware price calculation.
+- `native-indexer.mjs` fetches bounded pages from the node's loopback-only candidate RPC, checks that tip/reorg metadata stays unchanged across the read, and fails closed on incomplete history rather than serving a partial candle series as complete.
 - `indexer.mjs` is a JSON-RPC adapter for Uniswap-V2-compatible pools. It requires two HTTP(S) RPC endpoints with different origins, verifies their chain IDs, deployed pair/factory bytecode, exact token0/token1 addresses, factory `getPair` mapping, token decimals, bounded log scans and confirmation depth. Both endpoints must return the same swap logs and canonical block hashes/timestamps before a candle is accepted.
 
 The endpoints should be operated by independent providers; different URL origins alone do not prove operational independence. For high-value use, reconcile with a third source and monitor provider freshness. The configured quote-token address must be the official stablecoin contract on that exact chain. A symbol such as `USDT` is not token identity. The configured factory must be the reviewed DEX factory for that chain.
@@ -20,5 +22,5 @@ This package is data ingestion, not a token bridge, AMM deployment, liquidity po
 Run with Node.js:
 
 ```powershell
-node --test tools/qzxb-market/candles.test.mjs tools/qzxb-market/indexer.test.mjs
+node --test tools/qzxb-market/candles.test.mjs tools/qzxb-market/indexer.test.mjs tools/qzxb-market/native-candles.test.mjs tools/qzxb-market/native-indexer.test.mjs
 ```

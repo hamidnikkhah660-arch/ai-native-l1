@@ -48,7 +48,7 @@ const V04_EXECUTION_BLOCK_AMM_FIXED_BYTES: usize = V04_EXECUTION_BLOCK_FIXED_BYT
 // BLK2 transactions are bounded at MAX_ENCODED_BLOCK_BYTES with an 88-byte header.
 // QZB4 v2 retains its 170-byte fixed header; v3 adds a bounded AMM-operation count/batch.
 pub const MAX_ENCODED_V04_EXECUTION_BLOCK_BYTES: usize = MAX_ENCODED_BLOCK_BYTES
-    + (V04_EXECUTION_BLOCK_FIXED_BYTES - 88)
+    + (V04_EXECUTION_BLOCK_AMM_FIXED_BYTES - 88)
     + MAX_AMM_OPERATIONS_PER_BLOCK * (4 + MAX_ENCODED_AMM_SIGNED_OPERATION_BYTES);
 const EXECUTION_BLOCK_ID_DOMAIN: &[u8] = b"QUANTUMZXB-V04-EXECUTION-BLOCK-ID-CANDIDATE-V1\0";
 /// Profile-bound restart envelope; separate from the unprofiled QZL4 format.
@@ -652,8 +652,10 @@ pub struct V04ExecutionApplySummary {
     pub fees_collected: u64,
     pub transactions_applied: usize,
     pub amm_operations_applied: usize,
-    /// Receipts from native swaps in this block; consumers must wait for canonical finality before indexing candles.
+    /// Receipts from native swaps in this block; consumers must wait for canonical confirmation policy before indexing candles.
     pub amm_swaps: Vec<SwapReceipt>,
+    /// Zero-based AMM-operation positions corresponding one-to-one with amm_swaps.
+    pub amm_swap_operation_indices: Vec<usize>,
     pub live_supply_atoms: u128,
 }
 
@@ -714,6 +716,11 @@ impl MonetaryLedgerStateV04TransitionCandidate {
 
     pub fn amm_state(&self) -> &QzxbAmmStateCandidate {
         &self.amm
+    }
+
+    #[cfg(test)]
+    pub(crate) fn amm_state_mut_for_test(&mut self) -> &mut QzxbAmmStateCandidate {
+        &mut self.amm
     }
 
     pub fn total_value_atoms(&self) -> Result<u128, V04TransitionError> {
@@ -1128,7 +1135,7 @@ impl MonetaryLedgerStateV04TransitionCandidate {
         transactions: Vec<Transaction>,
         amm_operations: Vec<AmmSignedOperation>,
         authenticator: &A,
-    ) -> Result<(Self, u64, Vec<SwapReceipt>), V04TransitionError> {
+    ) -> Result<(Self, u64, Vec<SwapReceipt>, Vec<usize>), V04TransitionError> {
         let mut amm = self.amm.clone();
         let amm_active = amm.has_state() || !amm_operations.is_empty();
         let native_asset = qzxb_native_asset_id(self.profile.network_id)?;
@@ -1176,7 +1183,8 @@ impl MonetaryLedgerStateV04TransitionCandidate {
         }
 
         let mut swap_receipts = Vec::new();
-        for signed in &amm_operations {
+        let mut swap_operation_indices = Vec::new();
+        for (operation_index, signed) in amm_operations.iter().enumerate() {
             let sender = signed.sender;
             let current_account = ledger.account(&sender);
             let expected_nonce = current_account
@@ -1258,6 +1266,7 @@ impl MonetaryLedgerStateV04TransitionCandidate {
             )?;
             if let Some(receipt) = receipt {
                 swap_receipts.push(receipt);
+                swap_operation_indices.push(operation_index);
             }
 
             let mut affected = vec![sender];
@@ -1288,7 +1297,12 @@ impl MonetaryLedgerStateV04TransitionCandidate {
             profile: self.profile.clone(),
         };
         candidate.validate()?;
-        Ok((candidate, fees_collected, swap_receipts))
+        Ok((
+            candidate,
+            fees_collected,
+            swap_receipts,
+            swap_operation_indices,
+        ))
     }
 
     /// Build the next candidate with legacy transactions only. Once the AMM is activated,
@@ -1337,7 +1351,7 @@ impl MonetaryLedgerStateV04TransitionCandidate {
         } else {
             V04_EXECUTION_BLOCK_VERSION
         };
-        let (candidate, _, _) = self.stage_execution_candidate(
+        let (candidate, _, _, _) = self.stage_execution_candidate(
             height,
             timestamp,
             &parent_hash,
@@ -1410,16 +1424,17 @@ impl MonetaryLedgerStateV04TransitionCandidate {
                 block.wire_version,
             ));
         }
-        let (mut candidate, _fees_collected, amm_swaps) = self.stage_execution_candidate(
-            block.height,
-            block.timestamp,
-            &block.parent_hash,
-            &block.miner,
-            expected_reward,
-            block.transactions.clone(),
-            block.amm_operations.clone(),
-            authenticator,
-        )?;
+        let (mut candidate, _fees_collected, amm_swaps, amm_swap_operation_indices) = self
+            .stage_execution_candidate(
+                block.height,
+                block.timestamp,
+                &block.parent_hash,
+                &block.miner,
+                expected_reward,
+                block.transactions.clone(),
+                block.amm_operations.clone(),
+                authenticator,
+            )?;
         if candidate.compute_state_root()? != block.state_root {
             return Err(V04TransitionError::StateRootMismatch);
         }
@@ -1442,6 +1457,7 @@ impl MonetaryLedgerStateV04TransitionCandidate {
             transactions_applied: block.transactions.len(),
             amm_operations_applied: block.amm_operations.len(),
             amm_swaps,
+            amm_swap_operation_indices,
             live_supply_atoms,
         };
         *self = candidate;
@@ -1853,6 +1869,7 @@ mod tests {
 
         assert_eq!(swap_summary.amm_operations_applied, 1);
         assert_eq!(swap_summary.amm_swaps.len(), 1);
+        assert_eq!(swap_summary.amm_swap_operation_indices, vec![0]);
         let receipt = &swap_summary.amm_swaps[0];
         assert_eq!(receipt.pair_id, pair_id);
         assert_eq!(receipt.token_in, native_asset);

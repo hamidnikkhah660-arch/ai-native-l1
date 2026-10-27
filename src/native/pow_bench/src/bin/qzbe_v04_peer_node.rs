@@ -1984,6 +1984,11 @@ enum RpcCommand {
     Status,
     Balance(AccountId),
     Transaction([u8; 32]),
+    AmmSwapBlocks {
+        before_height: Option<u64>,
+        min_confirmations: u64,
+        limit_blocks: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1998,6 +2003,59 @@ enum TransactionLookup {
     NotFoundInRetainedSuffix {
         search_floor_height: u64,
     },
+}
+
+fn parse_amm_swap_rpc_command(raw_path: &str) -> Result<RpcCommand, String> {
+    let (path, query) = raw_path.split_once('?').unwrap_or((raw_path, ""));
+    if path != "/v1/amm/swaps" {
+        return Err("unknown read-only RPC path".into());
+    }
+    let mut before_height = None;
+    let mut min_confirmations = 6u64;
+    let mut limit_blocks = 8usize;
+    let mut seen = BTreeSet::new();
+    if !query.is_empty() {
+        for field in query.split('&') {
+            let (key, value) = field
+                .split_once('=')
+                .ok_or_else(|| "AMM swap query must use key=value".to_string())?;
+            if !seen.insert(key) {
+                return Err("duplicate AMM swap query parameter".into());
+            }
+            match key {
+                "before_height" => {
+                    before_height =
+                        Some(value.parse::<u64>().map_err(|_| {
+                            "before_height must be a non-negative integer".to_string()
+                        })?);
+                }
+                "min_confirmations" => {
+                    min_confirmations = value.parse::<u64>().map_err(|_| {
+                        "min_confirmations must be a non-negative integer".to_string()
+                    })?;
+                }
+                "limit_blocks" => {
+                    limit_blocks = value
+                        .parse::<usize>()
+                        .map_err(|_| "limit_blocks must be a positive integer".to_string())?;
+                }
+                _ => return Err("unknown AMM swap query parameter".into()),
+            }
+        }
+    } else if raw_path.ends_with('?') {
+        return Err("empty AMM swap query is not allowed".into());
+    }
+    if !(1..=1024).contains(&min_confirmations) {
+        return Err("min_confirmations must be between 1 and 1024".into());
+    }
+    if !(1..=8).contains(&limit_blocks) {
+        return Err("limit_blocks must be between 1 and 8".into());
+    }
+    Ok(RpcCommand::AmmSwapBlocks {
+        before_height,
+        min_confirmations,
+        limit_blocks,
+    })
 }
 
 fn parse_rpc_command(request: &[u8]) -> Result<RpcCommand, String> {
@@ -2041,7 +2099,14 @@ fn parse_rpc_command(request: &[u8]) -> Result<RpcCommand, String> {
             return Err("RPC transfer encoding is not allowed".into());
         }
     }
-    match fields[1] {
+    let raw_path = fields[1];
+    if raw_path == "/v1/amm/swaps" || raw_path.starts_with("/v1/amm/swaps?") {
+        return parse_amm_swap_rpc_command(raw_path);
+    }
+    if raw_path.contains('?') {
+        return Err("query parameters are only supported by /v1/amm/swaps".into());
+    }
+    match raw_path {
         "/v1/status" => Ok(RpcCommand::Status),
         path if path.starts_with("/v1/balance/") => {
             let account = &path["/v1/balance/".len()..];
@@ -2410,6 +2475,72 @@ fn serve_rpc_connection(
                     "{{\"ok\":false,\"error\":\"transaction_state_unavailable\"}}",
                 ),
             }
+        }
+        RpcCommand::AmmSwapBlocks {
+            before_height,
+            min_confirmations,
+            limit_blocks,
+        } => {
+            let fork = store.fork_choice();
+            let blocks = match fork.canonical_swap_blocks(
+                before_height,
+                min_confirmations,
+                limit_blocks,
+            ) {
+                Ok(blocks) => blocks,
+                Err(_) => {
+                    return write_rpc_response(
+                        &mut stream,
+                        503,
+                        "Service Unavailable",
+                        "{\"ok\":false,\"error\":\"amm_event_history_unavailable\"}",
+                    )
+                }
+            };
+            let mut body = format!(
+                "{{\"ok\":true,\"network_id\":\"{}\",\"genesis_id\":\"{}\",\"profile_id\":\"{}\",\"height\":{},\"tip\":\"{}\",\"retained_base_height\":{},\"reorg_count\":{},\"min_confirmations\":{},\"finality_model\":\"probabilistic_pow_confirmations\",\"mainnet\":false,\"public_launch_approved\":false,\"read_only\":true,\"blocks\":[",
+                hex(network_id),
+                hex(genesis_id),
+                hex(profile_id),
+                current.height,
+                hex(&current.tip),
+                fork.retained_base_height(),
+                fork.reorg_count(),
+                min_confirmations,
+            );
+            for (block_index, block) in blocks.iter().enumerate() {
+                if block_index != 0 {
+                    body.push(',');
+                }
+                body.push_str(&format!(
+                    "{{\"height\":{},\"block_hash\":\"{}\",\"timestamp\":{},\"confirmations\":{},\"canonical\":true,\"swaps\":[",
+                    block.height,
+                    hex(&block.block_hash),
+                    block.timestamp,
+                    block.confirmations,
+                ));
+                for (swap_index, event) in block.swaps.iter().enumerate() {
+                    if swap_index != 0 {
+                        body.push(',');
+                    }
+                    let receipt = &event.receipt;
+                    body.push_str(&format!(
+                        "{{\"operation_index\":{},\"pair_id\":\"{}\",\"token_in\":\"{}\",\"token_out\":\"{}\",\"amount_in_atoms\":\"{}\",\"amount_out_atoms\":\"{}\",\"fee_atoms\":\"{}\",\"reserve0_after_atoms\":\"{}\",\"reserve1_after_atoms\":\"{}\"}}",
+                        event.operation_index,
+                        hex(&receipt.pair_id),
+                        hex(&receipt.token_in),
+                        hex(&receipt.token_out),
+                        receipt.amount_in,
+                        receipt.amount_out,
+                        receipt.fee_atoms,
+                        receipt.reserve0_after,
+                        receipt.reserve1_after,
+                    ));
+                }
+                body.push_str("]}");
+            }
+            body.push_str("]}");
+            body
         }
     };
     write_rpc_response(&mut stream, 200, "OK", &body)
@@ -4543,6 +4674,33 @@ mod tests {
         )
         .is_err());
         assert!(parse_rpc_command(&vec![65u8; MAX_RPC_REQUEST_BYTES + 1]).is_err());
+
+        let swaps = b"GET /v1/amm/swaps HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        assert_eq!(
+            parse_rpc_command(swaps),
+            Ok(RpcCommand::AmmSwapBlocks {
+                before_height: None,
+                min_confirmations: 6,
+                limit_blocks: 8,
+            })
+        );
+        let paged_swaps = b"GET /v1/amm/swaps?before_height=120&min_confirmations=12&limit_blocks=8 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        assert_eq!(
+            parse_rpc_command(paged_swaps),
+            Ok(RpcCommand::AmmSwapBlocks {
+                before_height: Some(120),
+                min_confirmations: 12,
+                limit_blocks: 8,
+            })
+        );
+        for invalid in [
+            "GET /v1/amm/swaps?min_confirmations=0 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET /v1/amm/swaps?limit_blocks=65 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET /v1/amm/swaps?before_height=3&before_height=4 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET /v1/amm/swaps?unknown=1 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ] {
+            assert!(parse_rpc_command(invalid.as_bytes()).is_err(), "{invalid}");
+        }
     }
 
     #[test]
