@@ -163,7 +163,7 @@ try {
     if (-not (Wait-Pattern $logB 'event=qzbe_v04_peer_smoke_ready .*height=0 .*network_surface=explicit_testnet_public_p2p_noise_pinned local_only=false public_launch_approved=false' 20000)) {
         throw ("CP-0434 receiver node B did not become ready in explicit public candidate P2P mode: " + (Get-Text $stdB) + (Get-Text $logB))
     }
-    if ((Get-Text $logB) -notmatch 'tx_rpc_loopback_only=true') {
+    if ((Get-Text $logB) -notmatch 'tx_ingress_surface=loopback_only rpc_loopback_only=true') {
         throw ("CP-0434 public P2P mode did not explicitly retain loopback-only transaction/RPC listeners: " + (Get-Text $logB))
     }
     Write-Host 'CP-0434 PUBLIC_CANDIDATE_P2P_NOISE_PINNED_BIND_PASS'
