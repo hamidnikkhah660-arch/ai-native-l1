@@ -29,6 +29,7 @@ use ai_native_l1_pow_bench::{
     noise_key_provisioning::load_protected_noise_private_key,
     private_testnet_driver::TargetHistory,
     private_testnet_mempool_candidate::{BoundedMempool, MempoolError, MempoolLimits},
+    qzbe_history_replay_candidate::replay_canonical_history_from_genesis,
     qzbe_tx_ingress_candidate::{
         decode_ack as decode_tx_ingress_ack, decode_gossip_frame, decode_request_header,
         encode_ack as encode_tx_ingress_ack, encode_gossip_frame, TxIngressAck, TxIngressStatus,
@@ -2071,13 +2072,15 @@ fn recovery_readiness_fields(readiness: RecoveryReadiness) -> (&'static str, &'s
     }
 }
 
-/// The store replays and validates all persisted envelopes from the Genesis base during open.
-/// This traversal additionally confirms that every canonical ancestor reaches the Genesis base.
-/// The candidate's hard height bound means this does not establish unbounded Mainnet history.
+/// Re-execute the canonical path from Genesis in bounded segments and compare its resulting
+/// tip, state root and cumulative work with the opened store. This is stronger than checking only
+/// parent links; it remains bounded by the store's currently retained archive until durable
+/// multi-segment history retention is integrated.
 fn canonical_history_complete_from_genesis(
     store: &V04ExecutionCheckpointForkStoreCandidate,
-    profile: &V04ConsensusProfileCandidate,
+    context: &QzbeCheckpointValidationContext<'_>,
     params: &ConsensusParameters,
+    authenticator: &Ed25519TransactionAuthenticator,
 ) -> Result<bool, String> {
     let fork = store.fork_choice();
     let base_tip = fork.base_tip();
@@ -2085,22 +2088,19 @@ fn canonical_history_complete_from_genesis(
         .branch_state(&base_tip)
         .ok_or_else(|| "QZBE recovery gate cannot resolve its base checkpoint".to_string())?;
     let base_height = base_state.ledger().height();
-    if base_height != 0
-        || fork.canonical_height().saturating_sub(base_height)
-            > MAX_V04_EXECUTION_FORK_ARCHIVE_HEIGHT
-    {
+    if base_height != 0 {
         return Ok(false);
     }
 
-    let mut envelopes = BTreeMap::new();
+    let mut envelopes: BTreeMap<[u8; 32], (V04ExecutionPowEnvelope, Vec<u8>)> = BTreeMap::new();
     for bytes in fork.archive_envelopes() {
-        let envelope = V04ExecutionPowEnvelope::decode(&bytes, profile, params)
+        let envelope = V04ExecutionPowEnvelope::decode(&bytes, context.profile, params)
             .map_err(|error| format!("decode QZBE archive for recovery readiness: {error}"))?;
         let digest =
             qzbe_pow_digest(&envelope.header, &envelope.block, params).map_err(|error| {
                 format!("derive QZBE archive digest for recovery readiness: {error}")
             })?;
-        if envelopes.insert(digest, envelope).is_some() {
+        if envelopes.insert(digest, (envelope, bytes)).is_some() {
             return Err("duplicate QZBE archive digest during recovery readiness check".into());
         }
     }
@@ -2108,23 +2108,45 @@ fn canonical_history_complete_from_genesis(
     let mut tip = fork.canonical_tip();
     let mut height = fork.canonical_height();
     let mut visited = 0usize;
+    let mut canonical_envelopes = Vec::with_capacity(height.saturating_sub(base_height) as usize);
     while tip != base_tip {
         if visited >= envelopes.len() {
             return Ok(false);
         }
-        let Some(envelope) = envelopes.get(&tip) else {
+        let Some((envelope, bytes)) = envelopes.get(&tip) else {
             return Ok(false);
         };
         if envelope.header.height != height {
             return Ok(false);
         }
+        canonical_envelopes.push(bytes.clone());
         tip = envelope.header.previous_consensus_hash;
         height = height
             .checked_sub(1)
             .ok_or_else(|| "QZBE recovery ancestry height underflow".to_string())?;
         visited += 1;
     }
-    Ok(height == base_height)
+    if height != base_height {
+        return Ok(false);
+    }
+    canonical_envelopes.reverse();
+
+    let replay = replay_canonical_history_from_genesis(
+        context,
+        params,
+        canonical_envelopes.iter().map(Vec::as_slice),
+        authenticator,
+        MAX_V04_EXECUTION_FORK_ARCHIVE_HEIGHT,
+    )
+    .map_err(|error| format!("QZBE Genesis-rooted segmented replay failed: {error}"))?;
+    let store_state_root = store
+        .canonical_state_root()
+        .map_err(|error| format!("read QZBE canonical state root: {error}"))?;
+    Ok(replay.height == fork.canonical_height()
+        && replay.tip == fork.canonical_tip()
+        && replay.state_root == store_state_root
+        && replay.cumulative_chainwork == fork.canonical_cumulative_work()
+        && replay.blocks_replayed == fork.canonical_height().saturating_sub(base_height))
 }
 
 fn serve_rpc_connection(
@@ -2662,7 +2684,12 @@ fn run(args: Args) -> Result<(), String> {
         None
     };
     let peers_reconciled = reconciled_peer_summary.is_some();
-    let full_history_replayed = canonical_history_complete_from_genesis(&store, &profile, &params)?;
+    let full_history_replayed = canonical_history_complete_from_genesis(
+        &store,
+        &checkpoint_context,
+        &params,
+        &authenticator,
+    )?;
     let recovery_evidence = RecoveryEvidence {
         network_profile: EvidenceStatus::Valid,
         genesis_manifest: EvidenceStatus::Valid,

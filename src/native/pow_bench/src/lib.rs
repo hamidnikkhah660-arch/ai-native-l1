@@ -111,6 +111,8 @@ pub mod private_testnet_v4_hybrid_fork_store_candidate;
 /// Candidate-only PTB2 envelope for linked PoW headers + canonical block-body transport.
 pub mod private_testnet_wire;
 pub mod protocol_profile;
+/// CP-0441 candidate: Genesis-rooted QZBE canonical replay across bounded in-memory segments; durable archive integration remains open.
+pub mod qzbe_history_replay_candidate;
 pub mod qzbe_tx_ingress_candidate;
 pub mod recovery;
 pub mod reference_time;
