@@ -94,7 +94,7 @@ try {
     $bindOutput = @(& $nodeExe --qzbe-v04-peer-smoke --data-dir (Join-Path $root 'invalid-bind') --listen '0.0.0.0:49331' 2>&1)
     $bindExitCode = $LASTEXITCODE
     $ErrorActionPreference = $savedErrorPreference
-    if ($bindExitCode -ne 1 -or (($bindOutput -join [Environment]::NewLine) -notmatch 'refuses all non-loopback listen addresses')) {
+    if ($bindExitCode -ne 1 -or (($bindOutput -join [Environment]::NewLine) -notmatch 'non-loopback QZBE P2P bind requires both --test-easy-pow and --public-testnet-p2p')) {
         throw ("CP-0415 public-bind guard did not fail closed (exit=$bindExitCode): " + ($bindOutput -join [Environment]::NewLine))
     }
     Write-Host 'CP-0415 PUBLIC_BIND_GUARD_PASS'
@@ -183,7 +183,7 @@ try {
     if ($textA -match 'event=qzbe_v04_peer_smoke_failed') { throw ("CP-0415 node A reported runtime failure: " + $textA) }
     if ($textB -match 'event=qzbe_v04_peer_smoke_failed') { throw ("CP-0415 node B reported runtime failure: " + $textB) }
 
-    $pattern = 'event=qzbe_v04_peer_smoke_stopped .*height=2 state_root=([0-9a-f]{64}) tip=([0-9a-f]{64}) generation=2 total_mined_atoms=' + $expectedMinedAtoms + ' observed_account=' + $recipient + ' observed_balance_atoms=2500 accepted_peer_blocks=\d+ sent_peer_blocks=\d+(?: tx_submissions=\d+ mempool_count=\d+)? replay=matched local_only=true public_launch_approved=false'
+    $pattern = 'event=qzbe_v04_peer_smoke_stopped .*height=2 state_root=([0-9a-f]{64}) tip=([0-9a-f]{64}) generation=2 total_mined_atoms=' + $expectedMinedAtoms + ' observed_account=' + $recipient + ' observed_balance_atoms=2500 accepted_peer_blocks=\d+ sent_peer_blocks=\d+(?: tx_submissions=\d+ mempool_count=\d+)? replay=matched tx_rpc_loopback_only=true mainnet=false network_surface=loopback_only local_only=true public_launch_approved=false'
     $finalA = [regex]::Match((Get-Text $logA), $pattern)
     $finalB = [regex]::Match((Get-Text $logB), $pattern)
     if (-not ($finalA.Success -and $finalB.Success)) {
