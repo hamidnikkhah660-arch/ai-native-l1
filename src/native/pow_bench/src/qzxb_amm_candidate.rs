@@ -1,7 +1,7 @@
 //! Candidate native constant-product AMM state machine for QZXB.
 //!
-//! Deterministic arithmetic and atomic state transitions are implemented here, but this module
-//! is NOT yet part of TXN4/QZB4 consensus, node transaction decoding, or persistent snapshots.
+//! Deterministic arithmetic, checksummed snapshots, and atomic state transitions are implemented
+//! here, but this module is NOT yet part of TXN4/QZB4 consensus or node transaction decoding.
 //! It must not be used to claim public-market or Mainnet readiness. Production activation must
 //! bind these transitions to authenticated transactions, canonical block events and state roots.
 use sha2::{Digest, Sha256};
@@ -15,6 +15,11 @@ pub type AmmPairId = [u8; 32];
 pub const AMM_FEE_BPS: u128 = 30;
 pub const AMM_BPS_DENOMINATOR: u128 = 10_000;
 pub const AMM_OUTPUT_MULTIPLIER: u128 = AMM_BPS_DENOMINATOR - AMM_FEE_BPS;
+pub const AMM_SNAPSHOT_MAGIC: [u8; 4] = *b"QAMS";
+pub const AMM_SNAPSHOT_VERSION: u16 = 1;
+pub const MAX_AMM_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SNAPSHOT_ENTRIES: usize = 100_000;
+const AMM_SNAPSHOT_CHECKSUM_DOMAIN: &[u8] = b"QZXB-NATIVE-AMM-SNAPSHOT-CHECK-V1\0";
 const PAIR_ID_DOMAIN: &[u8] = b"QZXB-NATIVE-AMM-PAIR-V1\0";
 const STATE_ROOT_DOMAIN: &[u8] = b"QZXB-NATIVE-AMM-STATE-ROOT-CANDIDATE-V1\0";
 
@@ -37,6 +42,10 @@ pub enum AmmError {
     SlippageLimit,
     InsufficientLiquidity,
     InvariantViolation,
+    SnapshotMalformed,
+    SnapshotChecksumMismatch,
+    SnapshotNonCanonical,
+    SnapshotOversize { actual: usize, limit: usize },
 }
 
 impl fmt::Display for AmmError {
@@ -96,7 +105,13 @@ pub struct SwapReceipt {
 
 impl QzxbAmmStateCandidate {
     pub fn new(max_assets: usize, max_pairs: usize, max_holdings: usize) -> Result<Self, AmmError> {
-        if max_assets == 0 || max_pairs == 0 || max_holdings == 0 {
+        if max_assets == 0
+            || max_pairs == 0
+            || max_holdings == 0
+            || max_assets > MAX_SNAPSHOT_ENTRIES
+            || max_pairs > MAX_SNAPSHOT_ENTRIES
+            || max_holdings > MAX_SNAPSHOT_ENTRIES
+        {
             return Err(AmmError::InvalidResourceLimit);
         }
         Ok(Self {
@@ -534,6 +549,13 @@ impl QzxbAmmStateCandidate {
         {
             return Err(AmmError::InvariantViolation);
         }
+        let total_lp_entries = self.pools.values().try_fold(0usize, |sum, pool| {
+            sum.checked_add(pool.lp_balances.len())
+                .ok_or(AmmError::ArithmeticOverflow)
+        })?;
+        if total_lp_entries > self.max_holdings {
+            return Err(AmmError::TooManyHoldings);
+        }
         if self.registered_assets.iter().any(is_zero) {
             return Err(AmmError::InvariantViolation);
         }
@@ -617,6 +639,203 @@ impl QzxbAmmStateCandidate {
         Ok(hash.finalize().into())
     }
 
+    /// Encode a bounded, checksummed canonical snapshot. This is a candidate codec only:
+    /// the node's durable store and reorg/replay logic do not call it yet.
+    pub fn encode_snapshot(&self) -> Result<Vec<u8>, AmmError> {
+        self.verify_invariants()?;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&AMM_SNAPSHOT_MAGIC);
+        bytes.extend_from_slice(&AMM_SNAPSHOT_VERSION.to_be_bytes());
+        write_snapshot_usize(&mut bytes, self.max_assets)?;
+        write_snapshot_usize(&mut bytes, self.max_pairs)?;
+        write_snapshot_usize(&mut bytes, self.max_holdings)?;
+        write_snapshot_usize(&mut bytes, self.registered_assets.len())?;
+        for asset in &self.registered_assets {
+            bytes.extend_from_slice(asset);
+        }
+        write_snapshot_usize(&mut bytes, self.balances.len())?;
+        for ((asset, account), amount) in &self.balances {
+            bytes.extend_from_slice(asset);
+            bytes.extend_from_slice(account);
+            bytes.extend_from_slice(&amount.to_be_bytes());
+        }
+        write_snapshot_usize(&mut bytes, self.pools.len())?;
+        for (pair_id, pool) in &self.pools {
+            bytes.extend_from_slice(pair_id);
+            bytes.extend_from_slice(&pool.token0);
+            bytes.extend_from_slice(&pool.token1);
+            bytes.extend_from_slice(&pool.reserve0.to_be_bytes());
+            bytes.extend_from_slice(&pool.reserve1.to_be_bytes());
+            bytes.extend_from_slice(&pool.total_lp_shares.to_be_bytes());
+            write_snapshot_usize(&mut bytes, pool.lp_balances.len())?;
+            for (account, shares) in &pool.lp_balances {
+                bytes.extend_from_slice(account);
+                bytes.extend_from_slice(&shares.to_be_bytes());
+            }
+            if bytes.len().saturating_add(32) > MAX_AMM_SNAPSHOT_BYTES {
+                return Err(AmmError::SnapshotOversize {
+                    actual: bytes.len().saturating_add(32),
+                    limit: MAX_AMM_SNAPSHOT_BYTES,
+                });
+            }
+        }
+        if bytes.len().saturating_add(32) > MAX_AMM_SNAPSHOT_BYTES {
+            return Err(AmmError::SnapshotOversize {
+                actual: bytes.len().saturating_add(32),
+                limit: MAX_AMM_SNAPSHOT_BYTES,
+            });
+        }
+        let mut checksum = Sha256::new();
+        checksum.update(AMM_SNAPSHOT_CHECKSUM_DOMAIN);
+        checksum.update(&bytes);
+        bytes.extend_from_slice(&checksum.finalize());
+        Ok(bytes)
+    }
+
+    /// Decode a canonical snapshot and validate every reserve, LP, and account invariant.
+    /// Snapshot checksums detect corruption only; they do not authenticate an operator or prevent rollback.
+    pub fn decode_snapshot(bytes: &[u8]) -> Result<Self, AmmError> {
+        if bytes.len() > MAX_AMM_SNAPSHOT_BYTES {
+            return Err(AmmError::SnapshotOversize {
+                actual: bytes.len(),
+                limit: MAX_AMM_SNAPSHOT_BYTES,
+            });
+        }
+        if bytes.len() < 30 + 32 {
+            return Err(AmmError::SnapshotMalformed);
+        }
+        let checksum_offset = bytes.len() - 32;
+        let mut checksum = Sha256::new();
+        checksum.update(AMM_SNAPSHOT_CHECKSUM_DOMAIN);
+        checksum.update(&bytes[..checksum_offset]);
+        if checksum.finalize().as_slice() != &bytes[checksum_offset..] {
+            return Err(AmmError::SnapshotChecksumMismatch);
+        }
+
+        let body = &bytes[..checksum_offset];
+        let mut cursor = 0usize;
+        if snapshot_take(body, &mut cursor, 4)? != AMM_SNAPSHOT_MAGIC {
+            return Err(AmmError::SnapshotMalformed);
+        }
+        if snapshot_u16(body, &mut cursor)? != AMM_SNAPSHOT_VERSION {
+            return Err(AmmError::SnapshotMalformed);
+        }
+        let max_assets = snapshot_count(body, &mut cursor)?;
+        let max_pairs = snapshot_count(body, &mut cursor)?;
+        let max_holdings = snapshot_count(body, &mut cursor)?;
+        if max_assets == 0
+            || max_pairs == 0
+            || max_holdings == 0
+            || max_assets > MAX_SNAPSHOT_ENTRIES
+            || max_pairs > MAX_SNAPSHOT_ENTRIES
+            || max_holdings > MAX_SNAPSHOT_ENTRIES
+        {
+            return Err(AmmError::SnapshotMalformed);
+        }
+
+        let asset_count = snapshot_count(body, &mut cursor)?;
+        if asset_count > max_assets || asset_count > MAX_SNAPSHOT_ENTRIES {
+            return Err(AmmError::SnapshotMalformed);
+        }
+        let mut registered_assets = BTreeSet::new();
+        for _ in 0..asset_count {
+            let asset: AmmAssetId = snapshot_take(body, &mut cursor, 32)?
+                .try_into()
+                .map_err(|_| AmmError::SnapshotMalformed)?;
+            if !registered_assets.insert(asset) {
+                return Err(AmmError::SnapshotNonCanonical);
+            }
+        }
+
+        let balance_count = snapshot_count(body, &mut cursor)?;
+        if balance_count > max_holdings || balance_count > MAX_SNAPSHOT_ENTRIES {
+            return Err(AmmError::SnapshotMalformed);
+        }
+        let mut balances = BTreeMap::new();
+        for _ in 0..balance_count {
+            let asset: AmmAssetId = snapshot_take(body, &mut cursor, 32)?
+                .try_into()
+                .map_err(|_| AmmError::SnapshotMalformed)?;
+            let account: AmmAccountId = snapshot_take(body, &mut cursor, 32)?
+                .try_into()
+                .map_err(|_| AmmError::SnapshotMalformed)?;
+            let amount = snapshot_u128(body, &mut cursor)?;
+            if balances.insert((asset, account), amount).is_some() {
+                return Err(AmmError::SnapshotNonCanonical);
+            }
+        }
+
+        let pair_count = snapshot_count(body, &mut cursor)?;
+        if pair_count > max_pairs || pair_count > MAX_SNAPSHOT_ENTRIES {
+            return Err(AmmError::SnapshotMalformed);
+        }
+        let mut pools = BTreeMap::new();
+        let mut total_lp_entries = 0usize;
+        for _ in 0..pair_count {
+            let pair_id: AmmPairId = snapshot_take(body, &mut cursor, 32)?
+                .try_into()
+                .map_err(|_| AmmError::SnapshotMalformed)?;
+            let token0: AmmAssetId = snapshot_take(body, &mut cursor, 32)?
+                .try_into()
+                .map_err(|_| AmmError::SnapshotMalformed)?;
+            let token1: AmmAssetId = snapshot_take(body, &mut cursor, 32)?
+                .try_into()
+                .map_err(|_| AmmError::SnapshotMalformed)?;
+            let reserve0 = snapshot_u128(body, &mut cursor)?;
+            let reserve1 = snapshot_u128(body, &mut cursor)?;
+            let total_lp_shares = snapshot_u128(body, &mut cursor)?;
+            let lp_count = snapshot_count(body, &mut cursor)?;
+            total_lp_entries = total_lp_entries
+                .checked_add(lp_count)
+                .ok_or(AmmError::SnapshotMalformed)?;
+            if total_lp_entries > max_holdings || total_lp_entries > MAX_SNAPSHOT_ENTRIES {
+                return Err(AmmError::SnapshotMalformed);
+            }
+            let mut lp_balances = BTreeMap::new();
+            for _ in 0..lp_count {
+                let account: AmmAccountId = snapshot_take(body, &mut cursor, 32)?
+                    .try_into()
+                    .map_err(|_| AmmError::SnapshotMalformed)?;
+                let shares = snapshot_u128(body, &mut cursor)?;
+                if lp_balances.insert(account, shares).is_some() {
+                    return Err(AmmError::SnapshotNonCanonical);
+                }
+            }
+            if pools
+                .insert(
+                    pair_id,
+                    Pool {
+                        token0,
+                        token1,
+                        reserve0,
+                        reserve1,
+                        total_lp_shares,
+                        lp_balances,
+                    },
+                )
+                .is_some()
+            {
+                return Err(AmmError::SnapshotNonCanonical);
+            }
+        }
+        if cursor != body.len() {
+            return Err(AmmError::SnapshotNonCanonical);
+        }
+        let state = Self {
+            registered_assets,
+            balances,
+            pools,
+            max_assets,
+            max_pairs,
+            max_holdings,
+        };
+        state.verify_invariants()?;
+        if state.encode_snapshot()?.as_slice() != bytes {
+            return Err(AmmError::SnapshotNonCanonical);
+        }
+        Ok(state)
+    }
+
     fn ensure_asset(&self, asset: &AmmAssetId) -> Result<(), AmmError> {
         if is_zero(asset) {
             return Err(AmmError::InvalidAssetId);
@@ -670,6 +889,49 @@ impl QzxbAmmStateCandidate {
         self.balances.insert((asset, to), next_destination);
         Ok(())
     }
+}
+
+fn write_snapshot_usize(out: &mut Vec<u8>, value: usize) -> Result<(), AmmError> {
+    let value = u32::try_from(value).map_err(|_| AmmError::SnapshotMalformed)?;
+    out.extend_from_slice(&value.to_be_bytes());
+    Ok(())
+}
+
+fn snapshot_take<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    length: usize,
+) -> Result<&'a [u8], AmmError> {
+    let end = cursor
+        .checked_add(length)
+        .ok_or(AmmError::SnapshotMalformed)?;
+    if end > bytes.len() {
+        return Err(AmmError::SnapshotMalformed);
+    }
+    let result = &bytes[*cursor..end];
+    *cursor = end;
+    Ok(result)
+}
+
+fn snapshot_u16(bytes: &[u8], cursor: &mut usize) -> Result<u16, AmmError> {
+    let value: [u8; 2] = snapshot_take(bytes, cursor, 2)?
+        .try_into()
+        .map_err(|_| AmmError::SnapshotMalformed)?;
+    Ok(u16::from_be_bytes(value))
+}
+
+fn snapshot_count(bytes: &[u8], cursor: &mut usize) -> Result<usize, AmmError> {
+    let value: [u8; 4] = snapshot_take(bytes, cursor, 4)?
+        .try_into()
+        .map_err(|_| AmmError::SnapshotMalformed)?;
+    Ok(u32::from_be_bytes(value) as usize)
+}
+
+fn snapshot_u128(bytes: &[u8], cursor: &mut usize) -> Result<u128, AmmError> {
+    let value: [u8; 16] = snapshot_take(bytes, cursor, 16)?
+        .try_into()
+        .map_err(|_| AmmError::SnapshotMalformed)?;
+    Ok(u128::from_be_bytes(value))
 }
 
 fn ordered_assets(a: AmmAssetId, b: AmmAssetId) -> (AmmAssetId, AmmAssetId) {
@@ -760,6 +1022,40 @@ mod tests {
         assert_eq!(state.balance_of(&A, &TRADER), 895_000);
         assert_eq!(state.balance_of(&B, &TRADER), 895_000);
         state.verify_invariants().unwrap();
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_pool_lp_balances_and_state_root() {
+        let (mut state, pair) = fixture();
+        state
+            .add_liquidity(TRADER, pair, 100_000, 100_000, 100_000)
+            .unwrap();
+        state.swap_exact_in(TRADER, A, B, 1_000, 1).unwrap();
+        let root = state.state_root().unwrap();
+        let encoded = state.encode_snapshot().unwrap();
+        assert_eq!(&encoded[..4], &AMM_SNAPSHOT_MAGIC);
+        let restored = QzxbAmmStateCandidate::decode_snapshot(&encoded).unwrap();
+        assert_eq!(restored, state);
+        assert_eq!(restored.state_root().unwrap(), root);
+        assert_eq!(restored.encode_snapshot().unwrap(), encoded);
+    }
+
+    #[test]
+    fn snapshot_rejects_corruption_and_trailing_bytes() {
+        let (state, _) = fixture();
+        let encoded = state.encode_snapshot().unwrap();
+        let mut corrupt = encoded.clone();
+        corrupt[24] ^= 0x80;
+        assert_eq!(
+            QzxbAmmStateCandidate::decode_snapshot(&corrupt),
+            Err(AmmError::SnapshotChecksumMismatch)
+        );
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(
+            QzxbAmmStateCandidate::decode_snapshot(&trailing),
+            Err(AmmError::SnapshotChecksumMismatch)
+        );
     }
 
     #[test]
