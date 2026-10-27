@@ -13,7 +13,7 @@ COMMITMENT_DOMAIN = b"QUANTUMZXB-QZBE-CHECKPOINT-COMMITMENT-V1\0"
 PREFIX_BYTES = 340
 HISTORY_ENTRY_BYTES = 49
 CHECKSUM_BYTES = 32
-EXPECTED_COMMITMENT = "d7c98b7d090179fc7f68b9d808bf59fd0958eb97bf25e9d10c0297be2c7ac600"
+EXPECTED_COMMITMENT = "e61e49db0f5a2a3eaa68fda2187bc80692469c29317a13f7455ec538f7e607ce"
 
 
 def require(condition: bool, message: str) -> None:
@@ -41,7 +41,7 @@ def main() -> int:
     except ValueError as exc:
         raise SystemExit(f"CP0419_QZBE_CHECKPOINT_ORACLE=FAIL: invalid hex: {exc}") from exc
 
-    require(len(encoded) == 1231, f"unexpected vector length {len(encoded)}")
+    require(len(encoded) == 1333, f"unexpected vector length {len(encoded)}")
     require(encoded[:4] == b"QZCP", "wrong checkpoint magic")
     require(u16(encoded, 4) == 1, "wrong checkpoint schema version")
     require(u16(encoded, 6) == 0, "nonzero flags")
@@ -77,7 +77,7 @@ def main() -> int:
     snapshot_len = u32(encoded, 324)
     history_start = u64(encoded, 328)
     history_count = u32(encoded, 336)
-    require(snapshot_len == 810, f"unexpected QZP4 snapshot length {snapshot_len}")
+    require(snapshot_len == 912, f"unexpected QZP4 snapshot length {snapshot_len}")
     require(history_start == 0, "Genesis target-history start must be zero")
     require(history_count == 1, "Genesis target history must have one entry")
     expected_total = PREFIX_BYTES + snapshot_len + history_count * HISTORY_ENTRY_BYTES + CHECKSUM_BYTES
@@ -87,12 +87,29 @@ def main() -> int:
     snapshot_end = snapshot_start + snapshot_len
     snapshot = encoded[snapshot_start:snapshot_end]
     require(snapshot[:4] == b"QZP4", "nested state snapshot magic mismatch")
-    require(u16(snapshot, 4) == 1, "nested state snapshot version mismatch")
+    require(u16(snapshot, 4) == 2, "nested state snapshot version mismatch")
     require(snapshot[6:38] == encoded[12:44], "nested snapshot network mismatch")
     require(snapshot[38:42] == b"QZCP", "nested v0.4 profile magic mismatch")
     ledger_len = u32(snapshot, 292)
-    require(296 + ledger_len + 64 == len(snapshot), "nested state snapshot lengths mismatch")
-    nested_root = snapshot[296 + ledger_len : 296 + ledger_len + 32]
+    amm_length_offset = 296 + ledger_len
+    require(amm_length_offset + 4 <= len(snapshot), "nested ledger length exceeds state snapshot")
+    amm_len = u32(snapshot, amm_length_offset)
+    require(amm_len == 98, f"unexpected QAMS v2 snapshot length {amm_len}")
+    amm_start = amm_length_offset + 4
+    amm_end = amm_start + amm_len
+    require(amm_end + 64 == len(snapshot), "nested state snapshot lengths mismatch")
+    amm_snapshot = snapshot[amm_start:amm_end]
+    require(amm_snapshot[:4] == b"QAMS", "nested AMM snapshot magic mismatch")
+    require(u16(amm_snapshot, 4) == 2, "nested AMM snapshot version mismatch")
+    require(amm_snapshot[6:38] == encoded[12:44], "nested AMM network mismatch")
+    require(
+        amm_snapshot[-32:]
+        == hashlib.sha256(
+            b"QZXB-NATIVE-AMM-SNAPSHOT-CHECK-V1\0" + amm_snapshot[:-32]
+        ).digest(),
+        "nested AMM snapshot checksum mismatch",
+    )
+    nested_root = snapshot[amm_end : amm_end + 32]
     require(nested_root == encoded[212:244], "nested snapshot state root differs from checkpoint")
     require(snapshot[-32:] == hashlib.sha256(
         b"QUANTUMZXB-V04-PROFILE-BOUND-SNAPSHOT-CHECK-CANDIDATE-V1\0"
