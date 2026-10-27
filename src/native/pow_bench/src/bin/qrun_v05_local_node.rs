@@ -10,7 +10,8 @@ use ai_native_l1_pow_bench::qzbe_tx_ingress_candidate::{
     REQUEST_HEADER_BYTES,
 };
 use ai_native_l1_pow_bench::state_machine::{
-    decode_transaction, transaction_id, AccountId, NetworkId, MAX_TRANSACTION_BYTES,
+    decode_block, decode_transaction, encode_block, transaction_id, AccountId, Block, NetworkId,
+    Transaction, MAX_TRANSACTION_BYTES,
 };
 use ai_native_l1_pow_bench::transaction_auth::{
     account_id_from_public_key, AccountPublicKey, Ed25519TransactionAuthenticator,
@@ -31,6 +32,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const MAX_HTTP_REQUEST: usize = 4096;
 const MAX_HTTP_RESPONSE: usize = 16 * 1024;
 const LOCAL_PROFILE_DOMAIN: &[u8] = b"QUANTUMZXB-QRUN-V05-LOCAL-LOOPBACK-TESTNET\0";
+const BLOCK_MAGIC: &[u8; 4] = b"QRB5";
+const BLOCK_ACK_MAGIC: &[u8; 4] = b"QRA5";
+const BLOCK_PROTOCOL_VERSION: u16 = 1;
+const BLOCK_FRAME_HEADER_BYTES: usize = 10;
+const BLOCK_ACK_BYTES: usize = 47;
+const MAX_BLOCK_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 struct Receipt {
@@ -41,6 +48,7 @@ struct NodeState {
     runtime: QRunV05ExecutionRuntime<Ed25519TransactionAuthenticator>,
     receipts: BTreeMap<[u8; 32], Receipt>,
     profile_id: [u8; 32],
+    block_peers: Vec<SocketAddr>,
 }
 
 #[derive(Clone)]
@@ -51,6 +59,8 @@ struct Config {
     data_dir: PathBuf,
     rpc_listen: SocketAddr,
     tx_listen: SocketAddr,
+    block_listen: SocketAddr,
+    peers: Vec<SocketAddr>,
 }
 
 fn parse_hex32(value: &str, name: &str) -> Result<[u8; 32], String> {
@@ -114,6 +124,7 @@ Initializes the full 10B candidate Genesis in a test-only local store. Both list
         return Err("options must be --name value pairs".into());
     }
     let mut values = BTreeMap::<String, String>::new();
+    let mut peers = Vec::new();
     let mut index = 0;
     while index < args.len() {
         let key = &args[index];
@@ -130,7 +141,9 @@ Initializes the full 10B candidate Genesis in a test-only local store. Both list
         if value.starts_with("--") {
             return Err(format!("missing value for {key}"));
         }
-        if values.insert(key.clone(), value.clone()).is_some() {
+        if key == "--peer" {
+            peers.push(parse_socket(value, "--peer")?);
+        } else if values.insert(key.clone(), value.clone()).is_some() {
             return Err(format!("duplicate option {key}"));
         }
         index += 2;
@@ -142,6 +155,7 @@ Initializes the full 10B candidate Genesis in a test-only local store. Both list
         "--data-dir",
         "--rpc-listen",
         "--tx-listen",
+        "--block-listen",
     ];
     if let Some(key) = values.keys().find(|key| !allowed.contains(&key.as_str())) {
         return Err(format!("unknown option {key}"));
@@ -184,8 +198,20 @@ Initializes the full 10B candidate Genesis in a test-only local store. Both list
             .unwrap_or("127.0.0.1:49340"),
         "--tx-listen",
     )?;
-    if rpc_listen == tx_listen {
-        return Err("RPC and transaction-ingress endpoints must use different sockets".into());
+    let block_listen = parse_socket(
+        values
+            .get("--block-listen")
+            .map(String::as_str)
+            .unwrap_or("127.0.0.1:49341"),
+        "--block-listen",
+    )?;
+    if rpc_listen == tx_listen || rpc_listen == block_listen || tx_listen == block_listen {
+        return Err(
+            "RPC, transaction ingress, and block listeners must use different sockets".into(),
+        );
+    }
+    if peers.iter().any(|peer| *peer == block_listen) {
+        return Err("a node cannot list its own block listener as a peer".into());
     }
     Ok(Config {
         network_id,
@@ -194,6 +220,8 @@ Initializes the full 10B candidate Genesis in a test-only local store. Both list
         data_dir,
         rpc_listen,
         tx_listen,
+        block_listen,
+        peers,
     })
 }
 
@@ -349,6 +377,203 @@ fn serve_rpc(address: SocketAddr, state: Arc<Mutex<NodeState>>) {
     }
 }
 
+fn block_id(block: &Block) -> Result<[u8; 32], String> {
+    let bytes = encode_block(block).map_err(|error| format!("encode block: {error:?}"))?;
+    let mut hash = Sha256::new();
+    hash.update(b"AIN1-BLOCK-ID-V2\0");
+    hash.update(bytes);
+    Ok(hash.finalize().into())
+}
+
+fn encode_block_frame(block: &Block) -> Result<Vec<u8>, String> {
+    let payload = encode_block(block).map_err(|error| format!("encode QRun block: {error:?}"))?;
+    if payload.is_empty()
+        || payload.len() > MAX_BLOCK_FRAME_BYTES
+        || payload.len() > u32::MAX as usize
+    {
+        return Err("QRun block body exceeds the bounded gossip frame".into());
+    }
+    let mut frame = Vec::with_capacity(BLOCK_FRAME_HEADER_BYTES + payload.len());
+    frame.extend_from_slice(BLOCK_MAGIC);
+    frame.extend_from_slice(&BLOCK_PROTOCOL_VERSION.to_be_bytes());
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+
+fn block_ack(status: u8, height: u64, hash: [u8; 32]) -> [u8; BLOCK_ACK_BYTES] {
+    let mut ack = [0u8; BLOCK_ACK_BYTES];
+    ack[..4].copy_from_slice(BLOCK_ACK_MAGIC);
+    ack[4..6].copy_from_slice(&BLOCK_PROTOCOL_VERSION.to_be_bytes());
+    ack[6] = status;
+    ack[7..15].copy_from_slice(&height.to_be_bytes());
+    ack[15..47].copy_from_slice(&hash);
+    ack
+}
+
+fn send_block_to_peer(peer: SocketAddr, block: &Block) -> Result<(), String> {
+    if !peer.ip().is_loopback() {
+        return Err("block gossip peer must be loopback in the local integration profile".into());
+    }
+    let frame = encode_block_frame(block)?;
+    let expected_hash = block_id(block)?;
+    let mut stream = TcpStream::connect_timeout(&peer, Duration::from_secs(2))
+        .map_err(|error| format!("connect block peer {peer}: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| error.to_string())?;
+    stream
+        .write_all(&frame)
+        .map_err(|error| format!("send block to {peer}: {error}"))?;
+    let mut ack = [0u8; BLOCK_ACK_BYTES];
+    stream
+        .read_exact(&mut ack)
+        .map_err(|error| format!("read block ACK from {peer}: {error}"))?;
+    let ack_height = u64::from_be_bytes(ack[7..15].try_into().unwrap());
+    if &ack[..4] != BLOCK_ACK_MAGIC
+        || u16::from_be_bytes([ack[4], ack[5]]) != BLOCK_PROTOCOL_VERSION
+        || ack[6] > 1
+        || ack_height != block.height
+        || ack[15..47] != expected_hash
+    {
+        return Err(format!(
+            "peer {peer} rejected block or returned a mismatched ACK"
+        ));
+    }
+    Ok(())
+}
+
+fn handle_block(stream: &mut TcpStream, state: &Arc<Mutex<NodeState>>) -> Result<(), String> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| error.to_string())?;
+    let mut header = [0u8; BLOCK_FRAME_HEADER_BYTES];
+    stream
+        .read_exact(&mut header)
+        .map_err(|error| format!("read QRun block header: {error}"))?;
+    if &header[..4] != BLOCK_MAGIC
+        || u16::from_be_bytes([header[4], header[5]]) != BLOCK_PROTOCOL_VERSION
+    {
+        return Err("invalid QRun block frame magic/version".into());
+    }
+    let payload_len = u32::from_be_bytes(header[6..10].try_into().unwrap()) as usize;
+    if payload_len == 0 || payload_len > MAX_BLOCK_FRAME_BYTES {
+        return Err("invalid or oversized QRun block frame".into());
+    }
+    let mut payload = vec![0u8; payload_len];
+    stream
+        .read_exact(&mut payload)
+        .map_err(|error| format!("read QRun block body: {error}"))?;
+    let block = decode_block(&payload).map_err(|error| format!("decode QRun block: {error:?}"))?;
+    let id = block_id(&block)?;
+    let (status, height, tip, forward_peers, log) = {
+        let mut locked = state
+            .lock()
+            .map_err(|_| "node state lock poisoned".to_string())?;
+        let current_height = locked.runtime.height();
+        let current_tip = locked.runtime.state().tip_hash();
+        if block.height == current_height && id == current_tip {
+            (
+                1u8,
+                current_height,
+                current_tip,
+                Vec::new(),
+                format!("duplicate height={current_height} hash={}", hex(&id)),
+            )
+        } else if block.height != current_height.saturating_add(1) {
+            (
+                2u8,
+                current_height,
+                current_tip,
+                Vec::new(),
+                format!(
+                    "rejected_nonsequential height={} current={current_height}",
+                    block.height
+                ),
+            )
+        } else {
+            match locked.runtime.import_block(&block) {
+                Ok(summary) => {
+                    for tx in &block.transactions {
+                        if let Ok(txid) = transaction_id(tx) {
+                            locked.receipts.insert(
+                                txid,
+                                Receipt {
+                                    height: summary.height,
+                                },
+                            );
+                        }
+                    }
+                    (
+                        0u8,
+                        summary.height,
+                        summary.block_hash,
+                        locked.block_peers.clone(),
+                        format!(
+                            "imported height={} hash={}",
+                            summary.height,
+                            hex(&summary.block_hash)
+                        ),
+                    )
+                }
+                Err(error) => (
+                    2u8,
+                    current_height,
+                    current_tip,
+                    Vec::new(),
+                    format!("rejected height={} reason={error:?}", block.height),
+                ),
+            }
+        }
+    };
+    stream
+        .write_all(&block_ack(status, height, tip))
+        .map_err(|error| error.to_string())?;
+    println!("qrun_local_block_gossip {log}");
+    if status == 0 {
+        for peer in forward_peers {
+            match send_block_to_peer(peer, &block) {
+                Ok(()) => println!("qrun_local_block_forwarded peer={peer} height={height}"),
+                Err(error) => eprintln!(
+                    "qrun_local_block_forward_failed peer={peer} reason={}",
+                    error.replace(['\r', '\n'], "_")
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn serve_blocks(address: SocketAddr, state: Arc<Mutex<NodeState>>) {
+    let listener = match TcpListener::bind(address) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("qrun_local_block_bind_failed address={address} error={error}");
+            return;
+        }
+    };
+    println!("qrun_local_block_ready address={address} protocol=QRB5/1 loopback_only=true");
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut stream) => {
+                if let Err(error) = handle_block(&mut stream, &state) {
+                    eprintln!(
+                        "qrun_local_block_request_rejected reason={}",
+                        error.replace(['\r', '\n'], "_")
+                    );
+                }
+            }
+            Err(error) => eprintln!("qrun_local_block_accept_error error={error}"),
+        }
+    }
+}
+
 fn reject_ack(transaction_id: [u8; 32], status: TxIngressStatus, count: usize) -> [u8; ACK_BYTES] {
     encode_ack(TxIngressAck {
         status,
@@ -381,6 +606,8 @@ fn handle_transaction(stream: &mut TcpStream, state: &Arc<Mutex<NodeState>>) -> 
         .map_err(|error| format!("invalid TXN2 transaction: {error:?}"))?;
     let txid = transaction_id(&tx).map_err(|error| format!("transaction ID error: {error:?}"))?;
 
+    let mut block_to_broadcast: Option<Block> = None;
+    let mut peers_to_broadcast = Vec::new();
     let (ack, log_line) = {
         let mut locked = state
             .lock()
@@ -403,6 +630,8 @@ fn handle_transaction(stream: &mut TcpStream, state: &Arc<Mutex<NodeState>>) -> 
                                 height: summary.height,
                             },
                         );
+                        block_to_broadcast = Some(block.clone());
+                        peers_to_broadcast = locked.block_peers.clone();
                         (
                             reject_ack(txid, TxIngressStatus::Accepted, 0),
                             format!(
@@ -425,6 +654,20 @@ fn handle_transaction(stream: &mut TcpStream, state: &Arc<Mutex<NodeState>>) -> 
             }
         }
     };
+    for peer in peers_to_broadcast {
+        if let Some(block) = block_to_broadcast.as_ref() {
+            match send_block_to_peer(peer, block) {
+                Ok(()) => println!(
+                    "qrun_local_block_broadcast peer={peer} height={}",
+                    block.height
+                ),
+                Err(error) => eprintln!(
+                    "qrun_local_block_broadcast_failed peer={peer} reason={}",
+                    error.replace(['\r', '\n'], "_")
+                ),
+            }
+        }
+    }
     stream.write_all(&ack).map_err(|error| error.to_string())?;
     println!("qrun_local_tx_ingress {log_line}");
     Ok(())
@@ -455,8 +698,12 @@ fn serve_transactions(address: SocketAddr, state: Arc<Mutex<NodeState>>) {
 }
 
 fn run(config: Config) -> Result<(), String> {
-    if !config.rpc_listen.ip().is_loopback() || !config.tx_listen.ip().is_loopback() {
-        return Err("refusing non-loopback listener".into());
+    if !config.rpc_listen.ip().is_loopback()
+        || !config.tx_listen.ip().is_loopback()
+        || !config.block_listen.ip().is_loopback()
+        || config.peers.iter().any(|peer| !peer.ip().is_loopback())
+    {
+        return Err("refusing non-loopback listener or peer".into());
     }
     fs::create_dir_all(&config.data_dir)
         .map_err(|error| format!("create data directory: {error}"))?;
@@ -503,14 +750,17 @@ fn run(config: Config) -> Result<(), String> {
     println!("height={}", runtime.height());
     println!("rpc_listen={}", config.rpc_listen);
     println!("tx_listen={}", config.tx_listen);
+    println!("block_listen={}", config.block_listen);
+    println!("block_peer_count={}", config.peers.len());
     println!(
-        "security_note=single_process_candidate_execution_not_production_pow_or_peer_consensus"
+        "security_note=loopback_static_block_gossip_test_harness_not_production_pow_or_fork_choice"
     );
 
     let state = Arc::new(Mutex::new(NodeState {
         runtime,
         receipts: BTreeMap::new(),
         profile_id,
+        block_peers: config.peers.clone(),
     }));
     let rpc_state = Arc::clone(&state);
     let rpc_address = config.rpc_listen;
@@ -518,6 +768,9 @@ fn run(config: Config) -> Result<(), String> {
     let tx_state = Arc::clone(&state);
     let tx_address = config.tx_listen;
     std::thread::spawn(move || serve_transactions(tx_address, tx_state));
+    let block_state = Arc::clone(&state);
+    let block_address = config.block_listen;
+    std::thread::spawn(move || serve_blocks(block_address, block_state));
     loop {
         std::thread::park_timeout(Duration::from_secs(3600));
     }
