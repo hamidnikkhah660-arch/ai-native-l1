@@ -6,11 +6,11 @@ Set-Location $repo
 $manifest = '.\src\native\pow_bench\Cargo.toml'
 $null = cargo +stable build --release --manifest-path $manifest --bin devnet_node --bin noise_key_provisioner --bin qzxb_wallet --quiet
 if ($LASTEXITCODE -ne 0) { throw 'CP-0426 QZBE live TXN2 ingress release build failed' }
-$null = cargo +stable test --manifest-path $manifest --bin qzxb_wallet --locked --quiet
+cargo +stable test --manifest-path $manifest --bin qzxb_wallet --locked --quiet
 if ($LASTEXITCODE -ne 0) { throw 'CP-0426 native wallet unit tests failed' }
-$null = cargo +stable test --manifest-path $manifest --lib qzbe_tx_ingress_candidate::tests --locked --quiet
+cargo +stable test --manifest-path $manifest --lib qzbe_tx_ingress_candidate::tests --locked --quiet
 if ($LASTEXITCODE -ne 0) { throw 'CP-0426 QZTS/1 ingress framing tests failed' }
-$null = cargo +stable test --manifest-path $manifest --bin devnet_node --locked --quiet
+cargo +stable test --manifest-path $manifest --bin devnet_node --locked --quiet -- --test-threads=1
 if ($LASTEXITCODE -ne 0) { throw 'CP-0426 QZBE runtime/parser/authentication tests failed' }
 Write-Host 'CP-0426 WALLET_INGRESS_AND_QZBE_UNIT_TESTS_PASS'
 
@@ -151,7 +151,7 @@ try {
         '--observe-account-id', $recipient, '--initial-subsidy-atoms', $subsidy,
         '--blocks-per-halving', $halving, '--data-dir', $dataA, '--listen', $addrA,
         '--trusted-peer-key-hex', $pubB, '--noise-static-private-key-dpapi-file', $keyA,
-        '--mine-blocks', '0', '--run-seconds', '3600', '--stop-after-height', '3'
+        '--mine-blocks', '0', '--run-seconds', '3600', '--stop-after-height', '32'
     )
     $nodeA = Start-Process -FilePath $nodeExe -ArgumentList $argsA -RedirectStandardOutput $stdA -RedirectStandardError $logA -PassThru
     if (-not (Wait-Pattern $logA 'event=qzbe_v04_peer_smoke_ready .*tx_ingress=QZTS/1 .*local_only=true public_launch_approved=false' 20000)) {
@@ -165,7 +165,7 @@ try {
         '--blocks-per-halving', $halving, '--data-dir', $dataB, '--listen', $addrB,
         '--peer', $addrA, '--trusted-peer-key-hex', $pubA,
         '--noise-static-private-key-dpapi-file', $keyB, '--tx-listen', $txAddrB,
-        '--mine-forever', '--stop-after-height', '3'
+        '--mine-forever', '--stop-after-height', '32'
     )
     $nodeB = Start-Process -FilePath $nodeExe -ArgumentList $argsB -RedirectStandardOutput $stdB -RedirectStandardError $logB -PassThru
     if (-not (Wait-Pattern $logB 'event=qzbe_v04_peer_smoke_ready .*tx_ingress=QZTS/1 .*local_only=true public_launch_approved=false' 20000)) {
@@ -186,11 +186,11 @@ try {
     }
     Write-Host 'CP-0426 WALLET_TO_NODE_QZTS_TRANSACTION_ADMISSION_PASS'
 
-    if (-not (Wait-Pattern $logB 'event=qzbe_v04_peer_smoke_stopped .*height=3 .*replay=matched' 3600000)) {
-        throw ("CP-0426 continuous miner did not stop at height 3: " + (Get-Text $stdB) + (Get-Text $logB))
+    if (-not (Wait-Pattern $logB 'event=qzbe_v04_peer_smoke_stopped .*height=32 .*replay=matched' 3600000)) {
+        throw ("CP-0426 continuous miner did not stop at height 32: " + (Get-Text $stdB) + (Get-Text $logB))
     }
-    if (-not (Wait-Pattern $logA 'event=qzbe_v04_peer_smoke_stopped .*height=3 .*replay=matched' 3600000)) {
-        throw ("CP-0426 receiver did not converge/replay at height 3: " + (Get-Text $stdA) + (Get-Text $logA))
+    if (-not (Wait-Pattern $logA 'event=qzbe_v04_peer_smoke_stopped .*height=32 .*replay=matched' 3600000)) {
+        throw ("CP-0426 receiver did not converge/replay at height 32: " + (Get-Text $stdA) + (Get-Text $logA))
     }
     Wait-Process -Id $nodeA.Id -Timeout 15 -ErrorAction SilentlyContinue
     Wait-Process -Id $nodeB.Id -Timeout 15 -ErrorAction SilentlyContinue
@@ -204,8 +204,8 @@ try {
         throw ("CP-0426 missing live TXN2 ingress admission/rejection audit events: " + (Get-Text $logB))
     }
 
-    $finalA = [regex]::Match((Get-Text $logA), 'event=qzbe_v04_peer_smoke_stopped .*height=3 state_root=([0-9a-f]{64}) tip=([0-9a-f]{64}).*observed_balance_atoms=' + $txAmountAtoms + '.*replay=matched')
-    $finalB = [regex]::Match((Get-Text $logB), 'event=qzbe_v04_peer_smoke_stopped .*height=3 state_root=([0-9a-f]{64}) tip=([0-9a-f]{64}).*observed_balance_atoms=' + $txAmountAtoms + '.*replay=matched')
+    $finalA = [regex]::Match((Get-Text $logA), 'event=qzbe_v04_peer_smoke_stopped .*height=32 state_root=([0-9a-f]{64}) tip=([0-9a-f]{64}).*observed_balance_atoms=' + $txAmountAtoms + '.*replay=matched')
+    $finalB = [regex]::Match((Get-Text $logB), 'event=qzbe_v04_peer_smoke_stopped .*height=32 state_root=([0-9a-f]{64}) tip=([0-9a-f]{64}).*observed_balance_atoms=' + $txAmountAtoms + '.*replay=matched')
     if (-not ($finalA.Success -and $finalB.Success)) { throw 'CP-0426 final canonical snapshots/recipient balance/replay are missing.' }
     if ($finalA.Groups[1].Value -ne $finalB.Groups[1].Value -or $finalA.Groups[2].Value -ne $finalB.Groups[2].Value) {
         throw 'CP-0426 receiver and miner canonical state did not converge.'
