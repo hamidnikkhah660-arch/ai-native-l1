@@ -1768,6 +1768,12 @@ fn serve_tx_connection(
             "QZBE transaction ingress only accepts loopback clients in candidate mode".into(),
         );
     }
+    // The listener is polled nonblocking. Explicitly restore blocking mode on the
+    // accepted stream before read_exact so fragmented QZTS/1 writes cannot fail
+    // spuriously with WSAEWOULDBLOCK (10035) on Windows.
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("set TXN2 ingress blocking mode: {error}"))?;
     stream
         .set_nodelay(true)
         .map_err(|error| format!("set TXN2 ingress TCP_NODELAY: {error}"))?;

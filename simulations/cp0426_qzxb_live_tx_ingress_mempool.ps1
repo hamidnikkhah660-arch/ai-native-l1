@@ -146,7 +146,7 @@ $nodeB = $null
 
 try {
     $argsA = @(
-        '--qzbe-v04-peer-smoke', '--network-id', $network, '--owner-id', $owner,
+        '--qzbe-v04-peer-smoke', '--test-easy-pow', '--network-id', $network, '--owner-id', $owner,
         '--miner-id', $miner, '--tx-public-key-hex', $txPublicKey,
         '--observe-account-id', $recipient, '--initial-subsidy-atoms', $subsidy,
         '--blocks-per-halving', $halving, '--data-dir', $dataA, '--listen', $addrA,
@@ -159,7 +159,7 @@ try {
     }
 
     $argsB = @(
-        '--qzbe-v04-peer-smoke', '--network-id', $network, '--owner-id', $owner,
+        '--qzbe-v04-peer-smoke', '--test-easy-pow', '--network-id', $network, '--owner-id', $owner,
         '--miner-id', $miner, '--tx-public-key-hex', $txPublicKey,
         '--observe-account-id', $recipient, '--initial-subsidy-atoms', $subsidy,
         '--blocks-per-halving', $halving, '--data-dir', $dataB, '--listen', $addrB,
@@ -214,6 +214,17 @@ try {
     Write-Host ("CP-0426 TRANSACTION_ID=" + ([regex]::Match($submitText, 'tx_submit_transaction_id_hex=([0-9a-f]{64})')).Groups[1].Value)
     Write-Host ("CP-0426 RECIPIENT_BALANCE_ATOMS=" + $txAmountAtoms)
     Write-Host 'CP-0426 TWO_NODE_STATE_ROOT_TIP_REPLAY_CONVERGENCE_PASS'
+}
+catch {
+    Write-Host 'CP-0426 FAILURE_NODE_A_STDOUT_BEGIN'
+    Write-Host (Get-Text $stdA)
+    Write-Host 'CP-0426 FAILURE_NODE_A_STDERR_BEGIN'
+    Write-Host (Get-Text $logA)
+    Write-Host 'CP-0426 FAILURE_NODE_B_STDOUT_BEGIN'
+    Write-Host (Get-Text $stdB)
+    Write-Host 'CP-0426 FAILURE_NODE_B_STDERR_BEGIN'
+    Write-Host (Get-Text $logB)
+    throw
 }
 finally {
     foreach ($proc in @($nodeA, $nodeB)) {
