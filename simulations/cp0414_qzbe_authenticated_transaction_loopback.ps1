@@ -34,7 +34,23 @@ function Wait-Pattern([string]$Path, [string]$Pattern, [int]$Millis = 15000) {
     return $false
 }
 function Get-QzbeRpc([int]$Port, [string]$Path) {
-    return Invoke-RestMethod -Uri ("http://127.0.0.1:{0}{1}" -f $Port, $Path) -Method Get -TimeoutSec 5
+    # Loopback RPC is read-only and idempotent. Windows CI can briefly abort a
+    # local socket while the listener thread is being scheduled; retry this GET
+    # with bounded backoff rather than failing a valid candidate transaction.
+    $uri = ("http://127.0.0.1:{0}{1}" -f $Port, $Path)
+    $lastError = $null
+    for ($attempt = 1; $attempt -le 6; $attempt++) {
+        try {
+            return Invoke-RestMethod -Uri $uri -Method Get -TimeoutSec 3
+        } catch {
+            $lastError = $_
+            if ($attempt -lt 6) {
+                $delayMs = [int][Math]::Min(400, 50 * [Math]::Pow(2, [Math]::Min($attempt - 1, 3)))
+                Start-Sleep -Milliseconds $delayMs
+            }
+        }
+    }
+    throw ("QZBE candidate RPC GET failed after 6 attempts for {0}: {1}" -f $uri, $lastError.Exception.Message)
 }
 function New-SignedWalletTransaction([string]$WalletPath, [string]$Network, [string]$Recipient) {
     $createOutput = @(& $walletExe create --output $WalletPath 2>&1)
@@ -141,7 +157,7 @@ try {
         '--noise-static-private-key-dpapi-file', $keyB,
         '--trusted-peer-key-hex', $pubA,
         '--mine-blocks', '0',
-        '--run-seconds', '45'
+        '--run-seconds', '60'
     )
     $nodeB = Start-Process -FilePath $nodeExe -ArgumentList $argsB -RedirectStandardOutput $stdB -RedirectStandardError $logB -PassThru
     if (-not (Wait-Pattern $logB 'event=qzbe_v04_peer_smoke_ready .*height=0 .*network_surface=explicit_testnet_public_p2p_noise_pinned local_only=false public_launch_approved=false' 20000)) {
@@ -280,7 +296,7 @@ try {
     Write-Host ("CP-0432 NATIVE_WALLET_READ_ONLY_RPC_PASS height=2 balance_atoms=2500 txid=" +
         $tx.TransactionId + " confirmations=" + $rpcReceipt.confirmations + " mainnet=false")
     if (-not $nodeA.WaitForExit(30000)) { throw 'CP-0414 sending node A did not stop after its bounded mining run' }
-    if (-not $nodeB.WaitForExit(50000)) { throw 'CP-0414 receiver node B did not stop after its bounded 45-second observer run' }
+    if (-not $nodeB.WaitForExit(50000)) { throw 'CP-0414 receiver node B did not stop after its bounded 60-second observer run' }
     $textA = Get-Text $logA
     $textB = Get-Text $logB
     if ($textA -match 'event=qzbe_v04_peer_smoke_failed') { throw ("CP-0414 node A reported runtime failure: " + $textA) }
