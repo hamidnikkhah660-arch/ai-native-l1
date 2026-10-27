@@ -6,8 +6,8 @@
 //! Store checksums detect accidental corruption, not a malicious operator rewriting history.
 use crate::qrun_v05_genesis_candidate::{QRunGenesisError, QRunGenesisV05};
 use crate::state_machine::{
-    AccountId, Block, BlockApplySummary, LedgerState, NetworkId, StateError, Transaction,
-    TransactionAuthenticator, MAX_TOTAL_SUPPLY_ATOMS,
+    decode_block, encode_block, AccountId, Block, BlockApplySummary, LedgerState, NetworkId,
+    StateError, Transaction, TransactionAuthenticator, MAX_TOTAL_SUPPLY_ATOMS,
 };
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
@@ -15,10 +15,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const STORE_MAGIC: [u8; 4] = *b"QRS5";
-const STORE_VERSION: u16 = 1;
+const STORE_VERSION: u16 = 2;
 const STORE_DOMAIN: &[u8] = b"QUANTUMZXB-QRUN-RUNTIME-STORE-V05\0";
 const STORE_CHECKSUM_LEN: usize = 32;
-const STORE_HEADER_LEN: usize = 4 + 2 + 32 + 32 + 32 + 4;
+const STORE_HEADER_V1_LEN: usize = 4 + 2 + 32 + 32 + 32 + 4;
+const STORE_HEADER_LEN: usize = 4 + 2 + 32 + 32 + 32 + 4 + 4;
 const MAX_STORE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +30,8 @@ pub enum QRunV05RuntimeError {
     InvalidStore,
     StoreChecksumMismatch,
     StoreTooLarge,
+    LegacyStoreMissingHistory,
+    StoreHistoryMismatch,
     WrongGenesisIdentity,
     SupplyInvariant { expected: u128, actual: u128 },
     TimestampNotIncreasing { previous: u64, actual: u64 },
@@ -54,6 +57,7 @@ pub struct QRunV05ExecutionRuntime<A: TransactionAuthenticator> {
     owner_account: AccountId,
     genesis_commitment: [u8; 32],
     state: LedgerState,
+    history: Vec<Block>,
     authenticator: A,
     store_path: PathBuf,
 }
@@ -69,36 +73,60 @@ impl<A: TransactionAuthenticator> QRunV05ExecutionRuntime<A> {
     ) -> Result<Self, QRunV05RuntimeError> {
         let genesis = QRunGenesisV05::new(network_id, owner_account)?;
         let store_path = store_path.as_ref().to_path_buf();
-        let state = if store_path.exists() {
+        let mut rewrite_store = !store_path.exists();
+        let (state, history) = if store_path.exists() {
             let bytes = fs::read(&store_path)
                 .map_err(|error| QRunV05RuntimeError::Io(error.to_string()))?;
-            let (stored_network, stored_owner, stored_commitment, snapshot) = decode_store(&bytes)?;
+            let (stored_network, stored_owner, stored_commitment, snapshot, history, version) =
+                decode_store(&bytes)?;
             if stored_network != network_id
                 || stored_owner != owner_account
                 || stored_commitment != genesis.commitment()
             {
                 return Err(QRunV05RuntimeError::WrongGenesisIdentity);
             }
-            let restored = LedgerState::decode_snapshot(snapshot, &network_id)?;
-            Self::check_full_supply(&restored)?;
-            restored
+            let stored_state = LedgerState::decode_snapshot(snapshot, &network_id)?;
+            Self::check_full_supply(&stored_state)?;
+            if version == 1 {
+                let expected_genesis = genesis.ledger().encode_snapshot()?;
+                if stored_state.height() != 0 || expected_genesis.as_slice() != snapshot {
+                    return Err(QRunV05RuntimeError::LegacyStoreMissingHistory);
+                }
+                // Only an untouched Genesis can be migrated from the old snapshot-only format.
+                rewrite_store = true;
+                (genesis.ledger().clone(), Vec::new())
+            } else {
+                if history.len() as u64 != stored_state.height() {
+                    return Err(QRunV05RuntimeError::StoreHistoryMismatch);
+                }
+                let mut replayed = genesis.ledger().clone();
+                for block in &history {
+                    replayed.apply_block(block, &authenticator)?;
+                    Self::check_full_supply(&replayed)?;
+                }
+                let replayed_snapshot = replayed.encode_snapshot()?;
+                if replayed_snapshot.as_slice() != snapshot {
+                    return Err(QRunV05RuntimeError::StoreHistoryMismatch);
+                }
+                (replayed, history)
+            }
         } else {
-            genesis.ledger().clone()
+            (genesis.ledger().clone(), Vec::new())
         };
         let runtime = Self {
             network_id,
             owner_account,
             genesis_commitment: genesis.commitment(),
             state,
+            history,
             authenticator,
             store_path,
         };
-        if !runtime.store_path.exists() {
+        if rewrite_store {
             runtime.persist()?;
         }
         Ok(runtime)
     }
-
     fn check_full_supply(state: &LedgerState) -> Result<(), QRunV05RuntimeError> {
         let actual = state.total_value()?;
         if actual != MAX_TOTAL_SUPPLY_ATOMS {
@@ -117,10 +145,10 @@ impl<A: TransactionAuthenticator> QRunV05ExecutionRuntime<A> {
             self.owner_account,
             self.genesis_commitment,
             &snapshot,
+            &self.history,
         )?;
         atomic_write(&self.store_path, &bytes)
     }
-
     pub fn network_id(&self) -> NetworkId {
         self.network_id
     }
@@ -135,6 +163,10 @@ impl<A: TransactionAuthenticator> QRunV05ExecutionRuntime<A> {
 
     pub fn genesis_commitment(&self) -> [u8; 32] {
         self.genesis_commitment
+    }
+
+    pub fn retained_block_count(&self) -> usize {
+        self.history.len()
     }
 
     pub fn state_root(&self) -> [u8; 32] {
@@ -199,20 +231,21 @@ impl<A: TransactionAuthenticator> QRunV05ExecutionRuntime<A> {
         &mut self,
         block: &Block,
     ) -> Result<BlockApplySummary, QRunV05RuntimeError> {
-        let previous = self.state.clone();
-        let summary = self.state.apply_block(block, &self.authenticator)?;
-        if let Err(error) = Self::check_full_supply(&self.state) {
-            self.state = previous;
-            return Err(error);
-        }
+        // Stage the complete state transition before altering the published runtime state.
+        let mut candidate = self.state.clone();
+        let summary = candidate.apply_block(block, &self.authenticator)?;
+        Self::check_full_supply(&candidate)?;
+
+        let previous = std::mem::replace(&mut self.state, candidate);
+        self.history.push(block.clone());
         if let Err(error) = self.persist() {
+            self.history.pop();
             self.state = previous;
             return Err(error);
         }
         Ok(summary)
     }
 }
-
 fn store_checksum(payload: &[u8]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(STORE_DOMAIN);
@@ -225,51 +258,120 @@ fn encode_store(
     owner_account: AccountId,
     genesis_commitment: [u8; 32],
     snapshot: &[u8],
+    history: &[Block],
 ) -> Result<Vec<u8>, QRunV05RuntimeError> {
-    if snapshot.len() > MAX_STORE_BYTES || snapshot.len() > u32::MAX as usize {
+    if snapshot.len() > u32::MAX as usize || history.len() > u32::MAX as usize {
         return Err(QRunV05RuntimeError::StoreTooLarge);
     }
-    let mut bytes = Vec::with_capacity(STORE_HEADER_LEN + snapshot.len() + STORE_CHECKSUM_LEN);
+    let mut bytes = Vec::with_capacity(
+        STORE_HEADER_LEN + snapshot.len() + STORE_CHECKSUM_LEN + history.len().saturating_mul(64),
+    );
     bytes.extend_from_slice(&STORE_MAGIC);
     bytes.extend_from_slice(&STORE_VERSION.to_be_bytes());
     bytes.extend_from_slice(&network_id);
     bytes.extend_from_slice(&owner_account);
     bytes.extend_from_slice(&genesis_commitment);
     bytes.extend_from_slice(&(snapshot.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(&(history.len() as u32).to_be_bytes());
     bytes.extend_from_slice(snapshot);
+    for block in history {
+        let encoded = encode_block(block).map_err(|_| QRunV05RuntimeError::InvalidStore)?;
+        if encoded.is_empty() || encoded.len() > u32::MAX as usize {
+            return Err(QRunV05RuntimeError::StoreTooLarge);
+        }
+        let needed = bytes
+            .len()
+            .checked_add(4)
+            .and_then(|len| len.checked_add(encoded.len()))
+            .and_then(|len| len.checked_add(STORE_CHECKSUM_LEN))
+            .ok_or(QRunV05RuntimeError::StoreTooLarge)?;
+        if needed > MAX_STORE_BYTES {
+            return Err(QRunV05RuntimeError::StoreTooLarge);
+        }
+        bytes.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&encoded);
+    }
+    if bytes.len().saturating_add(STORE_CHECKSUM_LEN) > MAX_STORE_BYTES {
+        return Err(QRunV05RuntimeError::StoreTooLarge);
+    }
     let checksum = store_checksum(&bytes);
     bytes.extend_from_slice(&checksum);
     Ok(bytes)
 }
 
+/// Version 1 is accepted only for an untouched Genesis and is immediately upgraded.
+/// Version 2 binds the ordered block history into the same checksummed atomic store.
 fn decode_store(
     bytes: &[u8],
-) -> Result<(NetworkId, AccountId, [u8; 32], &[u8]), QRunV05RuntimeError> {
-    if bytes.len() > MAX_STORE_BYTES || bytes.len() < STORE_HEADER_LEN + STORE_CHECKSUM_LEN {
+) -> Result<(NetworkId, AccountId, [u8; 32], &[u8], Vec<Block>, u16), QRunV05RuntimeError> {
+    if bytes.len() > MAX_STORE_BYTES || bytes.len() < STORE_HEADER_V1_LEN + STORE_CHECKSUM_LEN {
         return Err(if bytes.len() > MAX_STORE_BYTES {
             QRunV05RuntimeError::StoreTooLarge
         } else {
             QRunV05RuntimeError::InvalidStore
         });
     }
+    if bytes[..4] != STORE_MAGIC {
+        return Err(QRunV05RuntimeError::InvalidStore);
+    }
+    let version = u16::from_be_bytes([bytes[4], bytes[5]]);
+    if version != 1 && version != STORE_VERSION {
+        return Err(QRunV05RuntimeError::InvalidStore);
+    }
     let payload_len = bytes.len() - STORE_CHECKSUM_LEN;
     let expected_checksum = store_checksum(&bytes[..payload_len]);
     if bytes[payload_len..] != expected_checksum[..] {
         return Err(QRunV05RuntimeError::StoreChecksumMismatch);
     }
-    if bytes[..4] != STORE_MAGIC || u16::from_be_bytes([bytes[4], bytes[5]]) != STORE_VERSION {
-        return Err(QRunV05RuntimeError::InvalidStore);
-    }
+
     let network_id = bytes[6..38].try_into().expect("fixed network ID range");
     let owner = bytes[38..70].try_into().expect("fixed owner range");
     let commitment = bytes[70..102].try_into().expect("fixed commitment range");
     let snapshot_len =
-        u32::from_be_bytes(bytes[102..106].try_into().expect("fixed length range")) as usize;
-    let snapshot_start = STORE_HEADER_LEN;
+        u32::from_be_bytes(bytes[102..106].try_into().expect("fixed snapshot length")) as usize;
+    let (snapshot_start, history_count) = if version == 1 {
+        (STORE_HEADER_V1_LEN, 0usize)
+    } else {
+        let count =
+            u32::from_be_bytes(bytes[106..110].try_into().expect("fixed history count")) as usize;
+        (STORE_HEADER_LEN, count)
+    };
     let snapshot_end = snapshot_start
         .checked_add(snapshot_len)
         .ok_or(QRunV05RuntimeError::InvalidStore)?;
-    if snapshot_end != payload_len {
+    if snapshot_end > payload_len {
+        return Err(QRunV05RuntimeError::InvalidStore);
+    }
+
+    let mut history = Vec::new();
+    let mut cursor = snapshot_end;
+    for _ in 0..history_count {
+        let len_end = cursor
+            .checked_add(4)
+            .ok_or(QRunV05RuntimeError::InvalidStore)?;
+        if len_end > payload_len {
+            return Err(QRunV05RuntimeError::InvalidStore);
+        }
+        let block_len = u32::from_be_bytes(
+            bytes[cursor..len_end]
+                .try_into()
+                .expect("fixed block length"),
+        ) as usize;
+        if block_len == 0 || block_len > MAX_STORE_BYTES {
+            return Err(QRunV05RuntimeError::InvalidStore);
+        }
+        let block_end = len_end
+            .checked_add(block_len)
+            .ok_or(QRunV05RuntimeError::InvalidStore)?;
+        if block_end > payload_len {
+            return Err(QRunV05RuntimeError::InvalidStore);
+        }
+        let block = decode_block(&bytes[len_end..block_end])
+            .map_err(|_| QRunV05RuntimeError::InvalidStore)?;
+        history.push(block);
+        cursor = block_end;
+    }
+    if cursor != payload_len {
         return Err(QRunV05RuntimeError::InvalidStore);
     }
     Ok((
@@ -277,9 +379,10 @@ fn decode_store(
         owner,
         commitment,
         &bytes[snapshot_start..snapshot_end],
+        history,
+        version,
     ))
 }
-
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), QRunV05RuntimeError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| QRunV05RuntimeError::Io(error.to_string()))?;
@@ -386,6 +489,7 @@ mod tests {
             QRunV05ExecutionRuntime::open_or_create(NETWORK, OWNER, TestAuthenticator, &path)
                 .unwrap();
         assert_eq!(reopened.height(), 1);
+        assert_eq!(reopened.retained_block_count(), 1);
         assert_eq!(reopened.balance_atoms(&RECIPIENT), 12_345);
         assert_eq!(
             reopened.total_supply_atoms().unwrap(),
