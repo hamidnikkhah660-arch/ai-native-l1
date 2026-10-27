@@ -120,13 +120,14 @@ try {
     $bindOutput = @(& $nodeExe --data-dir (Join-Path $root 'invalid-bind') --listen '0.0.0.0:49331' 2>&1)
     $bindExitCode = $LASTEXITCODE
     $ErrorActionPreference = $savedErrorPreference
-    if ($bindExitCode -ne 2 -or (($bindOutput -join [Environment]::NewLine) -notmatch 'refuses all non-loopback listen addresses')) {
+    if ($bindExitCode -ne 2 -or (($bindOutput -join [Environment]::NewLine) -notmatch 'requires both --test-easy-pow and --public-testnet-p2p')) {
         throw ("CP-0414 public-bind guard did not fail closed (exit=$bindExitCode): " + ($bindOutput -join [Environment]::NewLine))
     }
     Write-Host 'CP-0414 PUBLIC_BIND_GUARD_PASS'
 
     $argsB = @(
         '--test-easy-pow',
+        '--public-testnet-p2p',
         '--network-id', $network,
         '--owner-id', $owner,
         '--miner-id', $miner,
@@ -135,7 +136,7 @@ try {
         '--initial-subsidy-atoms', $subsidy,
         '--blocks-per-halving', $halving,
         '--data-dir', $dataB,
-        '--listen', "127.0.0.1:$portB",
+        '--listen', "0.0.0.0:$portB",
         '--rpc-listen', "127.0.0.1:$rpcPort",
         '--noise-static-private-key-dpapi-file', $keyB,
         '--trusted-peer-key-hex', $pubA,
@@ -143,9 +144,13 @@ try {
         '--run-seconds', '45'
     )
     $nodeB = Start-Process -FilePath $nodeExe -ArgumentList $argsB -RedirectStandardOutput $stdB -RedirectStandardError $logB -PassThru
-    if (-not (Wait-Pattern $logB 'event=qzbe_v04_peer_smoke_ready .*height=0 .*local_only=true public_launch_approved=false' 20000)) {
-        throw ("CP-0414 receiver node B did not become ready: " + (Get-Text $stdB) + (Get-Text $logB))
+    if (-not (Wait-Pattern $logB 'event=qzbe_v04_peer_smoke_ready .*height=0 .*network_surface=explicit_testnet_public_p2p_noise_pinned local_only=false public_launch_approved=false' 20000)) {
+        throw ("CP-0434 receiver node B did not become ready in explicit public candidate P2P mode: " + (Get-Text $stdB) + (Get-Text $logB))
     }
+    if ((Get-Text $logB) -notmatch 'tx_rpc_loopback_only=true') {
+        throw ("CP-0434 public P2P mode did not explicitly retain loopback-only transaction/RPC listeners: " + (Get-Text $logB))
+    }
+    Write-Host 'CP-0434 PUBLIC_CANDIDATE_P2P_NOISE_PINNED_BIND_PASS'
     $rpcGenesisStatus = Get-QzbeRpc $rpcPort '/v1/status'
     $rpcGenesisBalance = Get-QzbeRpc $rpcPort ("/v1/balance/{0}" -f $recipient)
     if ($rpcGenesisStatus.height -ne 0 -or $rpcGenesisStatus.mainnet -ne $false -or
@@ -281,9 +286,10 @@ try {
     if ($textA -match 'event=qzbe_v04_peer_smoke_failed') { throw ("CP-0414 node A reported runtime failure: " + $textA) }
     if ($textB -match 'event=qzbe_v04_peer_smoke_failed') { throw ("CP-0414 node B reported runtime failure: " + $textB) }
 
-    $pattern = 'event=qzbe_v04_peer_smoke_stopped .*height=2 state_root=([0-9a-f]{64}) tip=([0-9a-f]{64}) generation=2 total_mined_atoms=' + $expectedMinedAtoms + ' observed_account=' + $recipient + ' observed_balance_atoms=2500 accepted_peer_blocks=\d+ sent_peer_blocks=\d+(?: tx_submissions=\d+ mempool_count=\d+)? replay=matched local_only=true public_launch_approved=false'
-    $finalA = [regex]::Match((Get-Text $logA), $pattern)
-    $finalB = [regex]::Match((Get-Text $logB), $pattern)
+    $patternA = 'event=qzbe_v04_peer_smoke_stopped .*height=2 state_root=([0-9a-f]{64}) tip=([0-9a-f]{64}) generation=2 total_mined_atoms=' + $expectedMinedAtoms + ' observed_account=' + $recipient + ' observed_balance_atoms=2500 accepted_peer_blocks=[0-9]+ sent_peer_blocks=[0-9]+ tx_submissions=[0-9]+ mempool_count=[0-9]+ replay=matched tx_rpc_loopback_only=true mainnet=false network_surface=loopback_only local_only=true public_launch_approved=false'
+    $patternB = 'event=qzbe_v04_peer_smoke_stopped .*height=2 state_root=([0-9a-f]{64}) tip=([0-9a-f]{64}) generation=2 total_mined_atoms=' + $expectedMinedAtoms + ' observed_account=' + $recipient + ' observed_balance_atoms=2500 accepted_peer_blocks=[0-9]+ sent_peer_blocks=[0-9]+ tx_submissions=[0-9]+ mempool_count=[0-9]+ replay=matched tx_rpc_loopback_only=true mainnet=false network_surface=explicit_testnet_public_p2p_noise_pinned local_only=false public_launch_approved=false'
+    $finalA = [regex]::Match((Get-Text $logA), $patternA)
+    $finalB = [regex]::Match((Get-Text $logB), $patternB)
     if (-not ($finalA.Success -and $finalB.Success)) {
         throw ("CP-0414 restart/replay summaries missing: " + (Get-Text $logA) + (Get-Text $logB))
     }

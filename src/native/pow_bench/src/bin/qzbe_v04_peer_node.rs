@@ -103,6 +103,7 @@ struct Args {
     stop_after_height: Option<u64>,
     exit_after_mining: bool,
     test_easy_pow: bool,
+    public_testnet_p2p: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,7 +122,7 @@ struct PeerAck {
 }
 
 fn usage() -> &'static str {
-    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --tx-public-key-hex HEX64 --observe-account-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT [--tx-listen 127.0.0.1:PORT] [--rpc-listen 127.0.0.1:PORT] --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 [--trusted-peer-key-hex HEX64 ...] --initial-subsidy-atoms U128 --blocks-per-halving U64 [--tx-recipient-id HEX64 --tx-nonce U64 --tx-amount-atoms U64 --tx-fee-atoms U64 --tx-expires-at U64 --tx-signature-hex HEX128_OR_HEX192] [--probe-invalid-signature-first] [--test-easy-pow] [--peer 127.0.0.1:PORT ...] [--mine-blocks N | --mine-forever] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2 runtime candidate with statically pinned multi-peer loopback connections and an optional bounded QZTS/1 transaction-ingress listener. Each --peer is paired by order with the corresponding --trusted-peer-key-hex; additional trusted keys may authorize inbound peers. Canonical v0.4 Argon2id is the default. --mine-forever continuously mines and broadcasts until interrupted or --stop-after-height is reached; it requires at least one pinned peer and cannot be combined with --mine-blocks or --exit-after-mining. --test-easy-pow is for isolated loopback tests only. No public bind or Mainnet activation."
+    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --tx-public-key-hex HEX64 --observe-account-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT [--tx-listen 127.0.0.1:PORT] [--rpc-listen 127.0.0.1:PORT] --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 [--trusted-peer-key-hex HEX64 ...] --initial-subsidy-atoms U128 --blocks-per-halving U64 [--tx-recipient-id HEX64 --tx-nonce U64 --tx-amount-atoms U64 --tx-fee-atoms U64 --tx-expires-at U64 --tx-signature-hex HEX128_OR_HEX192] [--probe-invalid-signature-first] [--test-easy-pow --public-testnet-p2p] [--peer IP:PORT ...] [--mine-blocks N | --mine-forever] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2 runtime candidate with statically pinned Noise peers and loopback-only transaction/RPC listeners. Each --peer is paired by order with --trusted-peer-key-hex; additional trusted keys authorize inbound peers. Canonical v0.4 Argon2id is the default. --mine-forever continuously mines and broadcasts until interrupted or --stop-after-height is reached; it requires a pinned peer and cannot be combined with --mine-blocks or --exit-after-mining. External P2P bind is available only with BOTH --test-easy-pow and --public-testnet-p2p; all inbound peers still require a configured Noise static-key pin. This is a test-network transport mode, not Mainnet activation; never expose transaction ingress or RPC beyond loopback."
 }
 
 fn parse_hex32(value: &str, name: &str) -> Result<[u8; 32], String> {
@@ -174,6 +175,47 @@ fn ensure_loopback_address(address: SocketAddr, role: &str) -> Result<(), String
         ))
     }
 }
+fn ensure_peer_listen_address(
+    address: SocketAddr,
+    public_testnet_p2p: bool,
+    test_easy_pow: bool,
+) -> Result<(), String> {
+    if address.ip().is_loopback() {
+        return Ok(());
+    }
+    if !public_testnet_p2p || !test_easy_pow {
+        return Err(
+            "non-loopback QZBE P2P bind requires both --test-easy-pow and --public-testnet-p2p"
+                .into(),
+        );
+    }
+    if address.port() == 0 || address.ip().is_multicast() {
+        return Err(
+            "public candidate P2P bind requires a nonzero port and a non-multicast address".into(),
+        );
+    }
+    Ok(())
+}
+
+fn ensure_peer_target_address(
+    address: SocketAddr,
+    public_testnet_p2p: bool,
+    test_easy_pow: bool,
+) -> Result<(), String> {
+    if address.ip().is_loopback() {
+        return Ok(());
+    }
+    if !public_testnet_p2p || !test_easy_pow {
+        return Err(
+            "non-loopback QZBE peer requires both --test-easy-pow and --public-testnet-p2p".into(),
+        );
+    }
+    if address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast() {
+        return Err("public candidate peers require a concrete unicast IP and nonzero port".into());
+    }
+    Ok(())
+}
+
 fn parse_args() -> Result<Option<Args>, String> {
     parse_args_from(env::args().skip(1).collect())
 }
@@ -193,6 +235,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
     let mut defer_configured_transaction = false;
     let mut probe_invalid_signature_first = false;
     let mut test_easy_pow = false;
+    let mut public_testnet_p2p = false;
     let mut i = 0usize;
     while i < tokens.len() {
         let key = tokens[i].as_str();
@@ -233,6 +276,14 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
                 return Err("duplicate option: --test-easy-pow".into());
             }
             test_easy_pow = true;
+            i += 1;
+            continue;
+        }
+        if key == "--public-testnet-p2p" {
+            if public_testnet_p2p {
+                return Err("duplicate option: --public-testnet-p2p".into());
+            }
+            public_testnet_p2p = true;
             i += 1;
             continue;
         }
@@ -303,7 +354,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
         .parse::<SocketAddr>()
         .map_err(|_| "--listen is not a valid socket address".to_string())?;
 
-    ensure_loopback_address(listen, "listen addresses")?;
+    ensure_peer_listen_address(listen, public_testnet_p2p, test_easy_pow)?;
     let tx_listen = values
         .get("--tx-listen")
         .map(|value| {
@@ -345,7 +396,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     for (index, address) in peers.iter().enumerate() {
-        ensure_loopback_address(*address, "peers")?;
+        ensure_peer_target_address(*address, public_testnet_p2p, test_easy_pow)?;
         if *address == listen {
             return Err("--peer cannot refer to this node's own listener".into());
         }
@@ -361,6 +412,9 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
     }
     if peers.len() > 16 {
         return Err("at most 16 statically pinned outbound --peer entries are allowed".into());
+    }
+    if public_testnet_p2p && !test_easy_pow {
+        return Err("--public-testnet-p2p is test-only and requires --test-easy-pow".into());
     }
     let network_id = parse_hex32(&take("--network-id")?, "--network-id")?;
     let owner_id = parse_hex32(&take("--owner-id")?, "--owner-id")?;
@@ -566,6 +620,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
         stop_after_height,
         exit_after_mining,
         test_easy_pow,
+        public_testnet_p2p,
     }))
 }
 
@@ -1160,6 +1215,12 @@ fn serve_connection(
     stream
         .set_nodelay(true)
         .map_err(|error| format!("set inbound TCP_NODELAY: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|error| format!("set bounded inbound Noise read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .map_err(|error| format!("set bounded inbound Noise write timeout: {error}"))?;
     let mut session =
         DevnetNoiseSession::accept(&mut stream, &local_key.0, trusted_peer_keys, network_id)
             .map_err(|error| format!("authenticate inbound peer {peer_addr}: {error}"))?;
@@ -1494,8 +1555,8 @@ fn serve_rpc_connection(
         .set_nodelay(true)
         .map_err(|error| format!("set QZBE RPC TCP_NODELAY: {error}"))?;
     stream
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .map_err(|error| format!("set QZBE RPC read timeout: {error}"))?;
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("set bounded QZBE RPC read timeout: {error}"))?;
     stream
         .set_write_timeout(Some(Duration::from_secs(1)))
         .map_err(|error| format!("set QZBE RPC write timeout: {error}"))?;
@@ -2008,11 +2069,20 @@ fn run(args: Args) -> Result<(), String> {
     let mut relayed_tx_count = 0u64;
     let mut sent_count = 0u64;
     let pow_profile = if args.test_easy_pow {
-        "EXPLICIT_LOCAL_TEST_EASY_POW_8MIB"
+        if args.public_testnet_p2p {
+            "EXPLICIT_PUBLIC_TESTNET_CANDIDATE_EASY_POW_8MIB"
+        } else {
+            "EXPLICIT_LOCAL_TEST_EASY_POW_8MIB"
+        }
     } else {
         "QZXB_V04_ARGON2ID_64MIB"
     };
-    eprintln!("event=qzbe_v04_peer_smoke_ready network_id={} genesis={} profile={} listen={} tx_listen={} rpc_listen={} rpc_read_only=true peer={} height={} root={} tip={} store=QZBE ack=QZA4 tx_ingress=QZTS/1 mempool_max_count={} mempool_max_bytes={} noise=Noise_XX_25519_ChaChaPoly_SHA256 pow_profile={} mining_mode={} tx_policy=registered_or_self_contained_ed25519 local_only=true public_launch_approved=false",
+    let network_surface = if args.public_testnet_p2p {
+        "explicit_testnet_public_p2p_noise_pinned"
+    } else {
+        "loopback_only"
+    };
+    eprintln!("event=qzbe_v04_peer_smoke_ready network_id={} genesis={} profile={} listen={} tx_listen={} rpc_listen={} rpc_read_only=true peer={} height={} root={} tip={} store=QZBE ack=QZA4 tx_ingress=QZTS/1 mempool_max_count={} mempool_max_bytes={} noise=Noise_XX_25519_ChaChaPoly_SHA256 pow_profile={} mining_mode={} tx_policy=registered_or_self_contained_ed25519 tx_rpc_loopback_only=true mainnet=false network_surface={} local_only={} public_launch_approved=false",
         hex(&args.network_id), hex(&genesis_id), hex(&profile_id), args.listen,
         tx_listener_address.map(|address| address.to_string()).unwrap_or_else(|| "disabled".to_string()),
         rpc_listener_address.map(|address| address.to_string()).unwrap_or_else(|| "disabled".to_string()),
@@ -2023,7 +2093,8 @@ fn run(args: Args) -> Result<(), String> {
         },
         initial.height, hex(&initial.state_root), hex(&initial.tip), mempool.limits().max_transactions,
         mempool.limits().max_bytes, pow_profile,
-        if args.mine_forever { "continuous" } else { "bounded" });
+        if args.mine_forever { "continuous" } else { "bounded" },
+        network_surface, !args.public_testnet_p2p);
 
     if args.probe_invalid_signature_first {
         let peer = *args
@@ -2353,9 +2424,11 @@ fn run(args: Args) -> Result<(), String> {
     }
     let recipient_balance = observed_balance(&replayed, &args.observe_account_id);
     let total_mined_atoms = replayed.fork_choice().canonical_state().total_mined_atoms();
-    eprintln!("event=qzbe_v04_peer_smoke_stopped network_id={} profile={} height={} state_root={} tip={} generation={} total_mined_atoms={} observed_account={} observed_balance_atoms={} accepted_peer_blocks={} sent_peer_blocks={} tx_submissions={} mempool_count={} replay=matched local_only=true public_launch_approved=false",
+    eprintln!("event=qzbe_v04_peer_smoke_stopped network_id={} profile={} height={} state_root={} tip={} generation={} total_mined_atoms={} observed_account={} observed_balance_atoms={} accepted_peer_blocks={} sent_peer_blocks={} tx_submissions={} mempool_count={} replay=matched tx_rpc_loopback_only=true mainnet=false network_surface={} local_only={} public_launch_approved=false",
         hex(&args.network_id), hex(&profile_id), final_snapshot.height, hex(&final_snapshot.state_root),
-        hex(&final_snapshot.tip), final_snapshot.generation, total_mined_atoms, hex(&args.observe_account_id), recipient_balance, accepted_count, sent_count, tx_submission_count, mempool.len());
+        hex(&final_snapshot.tip), final_snapshot.generation, total_mined_atoms, hex(&args.observe_account_id), recipient_balance, accepted_count, sent_count, tx_submission_count, mempool.len(),
+        if args.public_testnet_p2p { "explicit_testnet_public_p2p_noise_pinned" } else { "loopback_only" },
+        !args.public_testnet_p2p);
     if final_snapshot.height < initial.height || final_snapshot.tip.iter().all(|byte| *byte == 0) {
         return Err("QZBE replay returned an invalid canonical snapshot".into());
     }
@@ -2388,8 +2461,10 @@ fn main() {
     match parse_args() {
         Ok(None) => println!("{}", usage()),
         Ok(Some(args)) => {
-            if let Err(error) = run(args) {
-                eprintln!("event=qzbe_v04_peer_smoke_failed reason={error} local_only=true public_launch_approved=false");
+            if let Err(error) = run(args.clone()) {
+                eprintln!("event=qzbe_v04_peer_smoke_failed reason={error} tx_rpc_loopback_only=true mainnet=false network_surface={} local_only={} public_launch_approved=false",
+                    if args.public_testnet_p2p { "explicit_testnet_public_p2p_noise_pinned" } else { "loopback_only" },
+                    !args.public_testnet_p2p);
                 process::exit(1);
             }
         }
@@ -2453,6 +2528,7 @@ mod tests {
             stop_after_height: None,
             exit_after_mining: true,
             test_easy_pow: false,
+            public_testnet_p2p: false,
         }
     }
 
@@ -2975,6 +3051,52 @@ mod tests {
     }
 
     #[test]
+    fn public_candidate_p2p_requires_easy_pow_and_never_opens_tx_or_rpc_listeners() {
+        let mut allowed = parser_fixture_tokens(&[("198.51.100.9:49332", &"e6".repeat(32))]);
+        let listen_index = allowed.iter().position(|item| item == "--listen").unwrap();
+        allowed[listen_index + 1] = "0.0.0.0:49331".into();
+        allowed.extend(["--test-easy-pow".into(), "--public-testnet-p2p".into()]);
+        let parsed = parse_args_from(allowed.clone()).unwrap().unwrap();
+        assert_eq!(parsed.listen, "0.0.0.0:49331".parse().unwrap());
+        assert_eq!(parsed.peers, vec!["198.51.100.9:49332".parse().unwrap()]);
+        assert!(parsed.test_easy_pow);
+        assert!(parsed.public_testnet_p2p);
+        assert!(parsed.tx_listen.is_none());
+        assert!(parsed.rpc_listen.is_none());
+
+        let mut no_easy_pow = allowed.clone();
+        no_easy_pow.retain(|value| value != "--test-easy-pow");
+        assert!(parse_args_from(no_easy_pow)
+            .unwrap_err()
+            .contains("requires both --test-easy-pow and --public-testnet-p2p"));
+
+        let mut public_peer_without_flag =
+            parser_fixture_tokens(&[("198.51.100.9:49332", &"e6".repeat(32))]);
+        public_peer_without_flag.push("--test-easy-pow".into());
+        assert!(parse_args_from(public_peer_without_flag)
+            .unwrap_err()
+            .contains("requires both --test-easy-pow and --public-testnet-p2p"));
+
+        let mut external_tx_ingress = allowed.clone();
+        external_tx_ingress.extend(["--tx-listen".into(), "0.0.0.0:49333".into()]);
+        assert!(parse_args_from(external_tx_ingress)
+            .unwrap_err()
+            .contains("refuses all non-loopback transaction-ingress listen addresses"));
+
+        let mut external_rpc = allowed.clone();
+        external_rpc.extend(["--rpc-listen".into(), "0.0.0.0:49334".into()]);
+        assert!(parse_args_from(external_rpc)
+            .unwrap_err()
+            .contains("refuses all non-loopback read-only RPC listen addresses"));
+
+        let mut unspecified_peer = parser_fixture_tokens(&[("0.0.0.0:49332", &"e6".repeat(32))]);
+        unspecified_peer.extend(["--test-easy-pow".into(), "--public-testnet-p2p".into()]);
+        assert!(parse_args_from(unspecified_peer)
+            .unwrap_err()
+            .contains("concrete unicast IP"));
+    }
+
+    #[test]
     fn cli_rejects_non_loopback_addresses_before_startup() {
         let loopback = "127.0.0.1:49331".parse::<SocketAddr>().unwrap();
         let unspecified = "0.0.0.0:49331".parse::<SocketAddr>().unwrap();
@@ -2988,5 +3110,12 @@ mod tests {
             ensure_loopback_address(public, "peers"),
             Err("QZBE runtime candidate refuses all non-loopback peers".into())
         );
+
+        assert!(ensure_peer_listen_address(unspecified, true, true).is_ok());
+        assert!(ensure_peer_listen_address(public, false, true).is_err());
+        assert!(ensure_peer_listen_address(public, true, false).is_err());
+        assert!(ensure_peer_target_address(public, true, true).is_ok());
+        assert!(ensure_peer_target_address(unspecified, true, true).is_err());
+        assert!(ensure_peer_target_address(public, false, true).is_err());
     }
 }
