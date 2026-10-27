@@ -6,8 +6,8 @@
 //! immediately as candidate blocks; it is not production PoW/consensus or a multi-peer node.
 use ai_native_l1_pow_bench::qrun_v05_runtime_candidate::QRunV05ExecutionRuntime;
 use ai_native_l1_pow_bench::qzbe_tx_ingress_candidate::{
-    decode_request_header, encode_ack, TxIngressAck, TxIngressStatus, ACK_BYTES,
-    REQUEST_HEADER_BYTES,
+    decode_ack, decode_request_header, encode_ack, encode_request, TxIngressAck, TxIngressStatus,
+    ACK_BYTES, REQUEST_HEADER_BYTES,
 };
 use ai_native_l1_pow_bench::state_machine::{
     decode_block, decode_transaction, encode_block, transaction_id, AccountId, Block, NetworkId,
@@ -802,6 +802,104 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn submit_test_transaction_over_tcp(
+        state: &Arc<Mutex<NodeState>>,
+        transaction: &Transaction,
+    ) -> TxIngressAck {
+        let wire = ai_native_l1_pow_bench::state_machine::encode_transaction(transaction).unwrap();
+        let request = encode_request(&wire).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let node_state = Arc::clone(state);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            handle_transaction(&mut stream, &node_state).unwrap();
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client.write_all(&request).unwrap();
+        let mut ack_bytes = [0u8; ACK_BYTES];
+        client.read_exact(&mut ack_bytes).unwrap();
+        server.join().unwrap();
+        decode_ack(&ack_bytes).unwrap()
+    }
+
+    #[test]
+    fn wallet_qzts_ingress_executes_valid_signature_and_rejects_invalid_atomically() {
+        use ai_native_l1_pow_bench::state_machine::Transaction;
+        use ai_native_l1_pow_bench::transaction_auth::Ed25519TransactionSigner;
+
+        const NETWORK: NetworkId = [0x51; 32];
+        let signer = Ed25519TransactionSigner::from_seed([0x61; 32]);
+        let owner = signer.account_id();
+        let recipient: AccountId = [0x3b; 32];
+        let authenticator = Ed25519TransactionAuthenticator::select(
+            TransactionAuthenticatorKind::Ed25519V1,
+            [AccountPublicKey {
+                account_id: owner,
+                public_key: signer.public_key(),
+            }],
+        )
+        .unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "qrun-qzts-ingress-{}-{nonce}.qrs",
+            std::process::id()
+        ));
+        let runtime =
+            QRunV05ExecutionRuntime::open_or_create(NETWORK, owner, authenticator, &path).unwrap();
+        let state = Arc::new(Mutex::new(NodeState {
+            runtime,
+            receipts: BTreeMap::new(),
+            profile_id: profile_id(&NETWORK),
+            block_peers: Vec::new(),
+        }));
+        let expires_at = now_unix().unwrap() + 600;
+        let mut valid = Transaction {
+            network_id: NETWORK,
+            sender: owner,
+            recipient,
+            nonce: 1,
+            amount: 123,
+            fee: 5,
+            expires_at,
+            signature: Vec::new(),
+        };
+        signer.sign_transaction_self_contained(&mut valid).unwrap();
+        let accepted = submit_test_transaction_over_tcp(&state, &valid);
+        assert_eq!(accepted.status, TxIngressStatus::Accepted);
+
+        let invalid = Transaction {
+            network_id: NETWORK,
+            sender: owner,
+            recipient,
+            nonce: 2,
+            amount: 500,
+            fee: 7,
+            expires_at,
+            signature: vec![0; 96],
+        };
+        let rejected = submit_test_transaction_over_tcp(&state, &invalid);
+        assert_eq!(rejected.status, TxIngressStatus::Rejected);
+
+        let locked = state.lock().unwrap();
+        assert_eq!(locked.runtime.height(), 1);
+        assert_eq!(locked.runtime.balance_atoms(&recipient), 123);
+        assert_eq!(
+            locked.runtime.owner_balance_atoms(),
+            10_000_000_000u64 * 100_000_000u64 - 128
+        );
+        assert_eq!(
+            locked.runtime.total_supply_atoms().unwrap(),
+            10_000_000_000u128 * 100_000_000u128
+        );
+        assert_eq!(locked.receipts.len(), 1);
+        drop(locked);
+        drop(state);
+        let _ = fs::remove_file(path);
+    }
     #[test]
     fn public_listener_addresses_are_refused() {
         assert!(parse_socket("127.0.0.1:49339", "test").is_ok());
