@@ -1199,6 +1199,7 @@ impl MonetaryLedgerStateV04TransitionCandidate {
             let mut pool_to_sync = None;
             match &signed.operation {
                 AmmOperation::RegisterAsset { .. } => {}
+                AmmOperation::MintTestQuote { .. } => {}
                 AmmOperation::CreatePair { token_a, token_b } => {
                     let pair_id = QzxbAmmStateCandidate::pair_id_for_assets(*token_a, *token_b)?;
                     if ledger

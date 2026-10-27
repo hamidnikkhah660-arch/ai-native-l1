@@ -33,6 +33,11 @@ const MAX_SNAPSHOT_ENTRIES: usize = 100_000;
 const AMM_SNAPSHOT_CHECKSUM_DOMAIN: &[u8] = b"QZXB-NATIVE-AMM-SNAPSHOT-CHECK-V1\0";
 const PAIR_ID_DOMAIN: &[u8] = b"QZXB-NATIVE-AMM-PAIR-V1\0";
 const STATE_ROOT_DOMAIN: &[u8] = b"QZXB-NATIVE-AMM-STATE-ROOT-CANDIDATE-V1\0";
+const TEST_QUOTE_ASSET_ID_DOMAIN: &[u8] = b"QZXB-TESTNET-QUSDT-ASSET-ID-V1\0";
+/// Reserved zero-value testnet identity. Production networks MUST use a different network ID.
+pub const QZXB_PUBLIC_TESTNET_NETWORK_ID: [u8; 32] = [0xD4; 32];
+/// Hard cap for unbacked QUSDT test atoms; this asset is not USDT and has no redemption value.
+pub const MAX_TEST_QUOTE_SUPPLY_ATOMS: u128 = 1_000_000_000_000_000_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AmmError {
@@ -63,6 +68,8 @@ pub enum AmmError {
     NonceMismatch { expected: u64, actual: u64 },
     Expired,
     InvalidSignature,
+    TestQuoteAssetUnavailable,
+    TestQuoteSupplyExceeded,
     UnsupportedOperationVersion(u16),
     UnknownOperation(u8),
     SignatureOversize { actual: usize, limit: usize },
@@ -159,6 +166,10 @@ pub enum AmmOperation {
         amount_in: u128,
         min_amount_out: u128,
     },
+    /// Faucet operation restricted to the reserved zero-value QZXB test network.
+    MintTestQuote {
+        amount: u128,
+    },
 }
 
 impl AmmOperation {
@@ -170,6 +181,7 @@ impl AmmOperation {
             Self::AddLiquidity { .. } => 4,
             Self::RemoveLiquidity { .. } => 5,
             Self::SwapExactIn { .. } => 6,
+            Self::MintTestQuote { .. } => 7,
         }
     }
 
@@ -258,6 +270,12 @@ impl AmmOperation {
                 bytes.extend_from_slice(&amount_in.to_be_bytes());
                 bytes.extend_from_slice(&min_amount_out.to_be_bytes());
             }
+            Self::MintTestQuote { amount } => {
+                if *amount == 0 {
+                    return Err(AmmError::ZeroAmount);
+                }
+                bytes.extend_from_slice(&amount.to_be_bytes());
+            }
         }
         if bytes.len() > MAX_AMM_OPERATION_BYTES {
             return Err(AmmError::OperationOversize {
@@ -328,7 +346,10 @@ impl AmmOperation {
                 amount_in: read128(&payload[64..80])?,
                 min_amount_out: read128(&payload[80..96])?,
             },
-            1..=6 => return Err(AmmError::SnapshotMalformed),
+            7 if payload.len() == 16 => Self::MintTestQuote {
+                amount: read128(payload)?,
+            },
+            1..=7 => return Err(AmmError::SnapshotMalformed),
             other => return Err(AmmError::UnknownOperation(other)),
         };
         if op.encode()?.as_slice() != bytes {
@@ -477,6 +498,17 @@ pub fn qzxb_native_asset_id(network_id: [u8; 32]) -> Result<AmmAssetId, AmmError
     }
     let mut hash = Sha256::new();
     hash.update(NATIVE_ASSET_ID_DOMAIN);
+    hash.update(network_id);
+    Ok(hash.finalize().into())
+}
+
+/// Deterministic ID for a worthless QUSDT-like test token, only on the reserved zero-value network.
+pub fn qzxb_test_quote_asset_id(network_id: [u8; 32]) -> Result<AmmAssetId, AmmError> {
+    if network_id != QZXB_PUBLIC_TESTNET_NETWORK_ID {
+        return Err(AmmError::TestQuoteAssetUnavailable);
+    }
+    let mut hash = Sha256::new();
+    hash.update(TEST_QUOTE_ASSET_ID_DOMAIN);
     hash.update(network_id);
     Ok(hash.finalize().into())
 }
@@ -737,6 +769,28 @@ impl QzxbAmmStateCandidate {
                 *amount_in,
                 *min_amount_out,
             )?),
+            AmmOperation::MintTestQuote { amount } => {
+                let asset = qzxb_test_quote_asset_id(next.network_id)?;
+                if !next.is_asset_registered(&asset) {
+                    next.register_asset(asset)?;
+                }
+                let mut issued = 0u128;
+                for ((existing_asset, _), value) in &next.balances {
+                    if *existing_asset == asset {
+                        issued = issued
+                            .checked_add(*value)
+                            .ok_or(AmmError::ArithmeticOverflow)?;
+                    }
+                }
+                let remaining = MAX_TEST_QUOTE_SUPPLY_ATOMS
+                    .checked_sub(issued)
+                    .ok_or(AmmError::InvariantViolation)?;
+                if *amount > remaining {
+                    return Err(AmmError::TestQuoteSupplyExceeded);
+                }
+                next.credit_genesis_balance(asset, signed.sender, *amount)?;
+                None
+            }
         };
         if !next.nonces.contains_key(&signed.sender) && next.nonces.len() >= next.max_holdings {
             return Err(AmmError::TooManyHoldings);
@@ -1720,6 +1774,56 @@ mod tests {
             Err(AmmError::WrongNetwork)
         );
         assert_eq!(state.state_root().unwrap(), before);
+    }
+
+    #[test]
+    fn test_quote_faucet_is_testnet_only_and_supply_capped() {
+        let network = QZXB_PUBLIC_TESTNET_NETWORK_ID;
+        let mut state = QzxbAmmStateCandidate::new(network, 8, 16, 128).unwrap();
+        let mint = |nonce: u64, amount: u128| {
+            let mut signed = AmmSignedOperation {
+                network_id: network,
+                sender: TRADER,
+                nonce,
+                expires_at: 1_000,
+                operation: AmmOperation::MintTestQuote { amount },
+                signature: Vec::new(),
+            };
+            signed.signature = signed.signing_digest().unwrap().to_vec();
+            signed
+        };
+        state
+            .apply_signed_operation(&mint(1, 100), 10, &DigestAuthenticator)
+            .unwrap();
+        let asset = qzxb_test_quote_asset_id(network).unwrap();
+        assert!(state.is_asset_registered(&asset));
+        assert_eq!(state.balance_of(&asset, &TRADER), 100);
+
+        let before = state.state_root().unwrap();
+        assert_eq!(
+            state.apply_signed_operation(
+                &mint(2, MAX_TEST_QUOTE_SUPPLY_ATOMS),
+                10,
+                &DigestAuthenticator
+            ),
+            Err(AmmError::TestQuoteSupplyExceeded)
+        );
+        assert_eq!(state.state_root().unwrap(), before);
+
+        let non_test_network = [0xAA; 32];
+        let mut non_test = QzxbAmmStateCandidate::new(non_test_network, 8, 16, 128).unwrap();
+        let mut blocked = mint(1, 1);
+        blocked.network_id = non_test_network;
+        blocked.signature = blocked.signing_digest().unwrap().to_vec();
+        assert_eq!(
+            non_test.apply_signed_operation(&blocked, 10, &DigestAuthenticator),
+            Err(AmmError::TestQuoteAssetUnavailable)
+        );
+        assert_eq!(non_test.asset_count(), 0);
+        assert_eq!(
+            qzxb_test_quote_asset_id(non_test_network),
+            Err(AmmError::TestQuoteAssetUnavailable)
+        );
     }
 
     #[test]

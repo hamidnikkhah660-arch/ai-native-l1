@@ -21,7 +21,8 @@ const SELF_CONTAINED_SIGNATURE_BYTES: usize = 32 + 64;
 
 fn usage() -> &'static str {
     "qzxb_amm_client --seed-file PATH [--show-account | --operation ACTION ...] [--submit]\n\
-     Actions: register-asset --asset-id HEX64 | create-pair --token-a HEX64 --token-b HEX64 |\n\
+     Actions: mint-test-quote --amount U128 (reserved zero-value testnet only; not USDT) |\n\
+     register-asset --asset-id HEX64 | create-pair --token-a HEX64 --token-b HEX64 |\n\
      transfer-asset --asset-id HEX64 --recipient HEX64 --amount U128 |\n\
      add-liquidity --pair-id HEX64 --amount0 U128 --amount1 U128 --min-lp U128 |\n\
      remove-liquidity --pair-id HEX64 --shares U128 --min-amount0 U128 --min-amount1 U128 |\n\
@@ -178,6 +179,9 @@ fn parse_seed(path: &str) -> Result<[u8; 32], String> {
 
 fn build_operation(values: &BTreeMap<String, String>) -> Result<AmmOperation, String> {
     match required(values, "--operation")? {
+        "mint-test-quote" => Ok(AmmOperation::MintTestQuote {
+            amount: parse_u128(values, "--amount")?,
+        }),
         "register-asset" => Ok(AmmOperation::RegisterAsset {
             asset_id: parse_hex32(required(values, "--asset-id")?, "--asset-id")?,
         }),

@@ -2376,6 +2376,11 @@ fn serve_rpc_connection(
     if !peer_addr.ip().is_loopback() {
         return Err("read-only RPC accepts loopback clients only".into());
     }
+    // Listener polling is nonblocking; accepted sockets must be restored to blocking mode
+    // before reading HTTP headers, otherwise fragmented requests can spuriously time out on Windows.
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("set QZBE RPC blocking mode: {error}"))?;
     stream
         .set_nodelay(true)
         .map_err(|error| format!("set QZBE RPC TCP_NODELAY: {error}"))?;
