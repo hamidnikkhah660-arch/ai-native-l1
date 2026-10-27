@@ -1,12 +1,13 @@
 //! Local candidate client for signing and submitting QZXB-native AMM operations.
 //!
-//! This is an explicit-submit, zero-value-testnet candidate tool. A QZAS acknowledgement means
-//! only "accepted to the node's in-memory mempool", not block inclusion or settlement. Keep seed
-//! files out of source control and use a dedicated testnet-only key.
+//! This is an explicit-submit, zero-value-testnet candidate tool. Prefer --wallet-file with
+//! QZKW1 Windows CurrentUser-DPAPI custody. Raw seed files require an explicit insecure legacy flag.
+//! A QZAS acknowledgement means only mempool acceptance, not inclusion or settlement.
 use ai_native_l1_pow_bench::qzbe_amm_ingress_candidate::{
     decode_ack, encode_request, operation_id, AmmIngressStatus, AMM_INGRESS_ACK_BYTES,
 };
 use ai_native_l1_pow_bench::qzxb_amm_candidate::{AmmOperation, AmmSignedOperation};
+use ai_native_l1_pow_bench::qzxb_wallet_store_candidate::load_current_user_wallet;
 use ai_native_l1_pow_bench::transaction_auth::Ed25519TransactionSigner;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -20,7 +21,8 @@ const DEFAULT_ENDPOINT: &str = "127.0.0.1:49337";
 const SELF_CONTAINED_SIGNATURE_BYTES: usize = 32 + 64;
 
 fn usage() -> &'static str {
-    "qzxb_amm_client --seed-file PATH [--show-account | --operation ACTION ...] [--submit]\n\
+    "qzxb_amm_client --wallet-file QZKW1_PATH [--show-account | --operation ACTION ...] [--submit]\n\
+     Legacy test fixtures only: --seed-file PATH --allow-insecure-seed-file |\n\
      Actions: mint-test-quote --amount U128 (reserved zero-value testnet only; not USDT) |\n\
      register-asset --asset-id HEX64 | create-pair --token-a HEX64 --token-b HEX64 |\n\
      transfer-asset --asset-id HEX64 --recipient HEX64 --amount U128 |\n\
@@ -37,6 +39,7 @@ fn parse_options(
 ) -> Result<(BTreeMap<String, String>, BTreeSet<String>), String> {
     let value_options: BTreeSet<&'static str> = [
         "--seed-file",
+        "--wallet-file",
         "--network-id",
         "--nonce",
         "--expires-at",
@@ -61,10 +64,14 @@ fn parse_options(
     ]
     .into_iter()
     .collect();
-    let boolean_options: BTreeSet<&'static str> =
-        ["--show-account", "--submit", "--allow-remote-testnet"]
-            .into_iter()
-            .collect();
+    let boolean_options: BTreeSet<&'static str> = [
+        "--show-account",
+        "--submit",
+        "--allow-remote-testnet",
+        "--allow-insecure-seed-file",
+    ]
+    .into_iter()
+    .collect();
     let mut values = BTreeMap::new();
     let mut flags = BTreeSet::new();
     let args: Vec<String> = args.collect();
@@ -175,6 +182,55 @@ fn parse_seed(path: &str) -> Result<[u8; 32], String> {
         return Err("all-zero seed is rejected".into());
     }
     Ok(seed)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CredentialSource {
+    ProtectedWallet(String),
+    InsecureSeedFile(String),
+}
+
+fn credential_source(
+    values: &BTreeMap<String, String>,
+    flags: &BTreeSet<String>,
+) -> Result<CredentialSource, String> {
+    let wallet_path = values.get("--wallet-file");
+    let seed_path = values.get("--seed-file");
+    let allow_insecure = flags.contains("--allow-insecure-seed-file");
+    match (wallet_path, seed_path, allow_insecure) {
+        (Some(_), Some(_), _) => Err("choose exactly one credential source: --wallet-file or --seed-file".into()),
+        (Some(path), None, false) => Ok(CredentialSource::ProtectedWallet(path.clone())),
+        (Some(_), None, true) => Err("--allow-insecure-seed-file is valid only with --seed-file".into()),
+        (None, Some(_), false) => Err("--seed-file is legacy test-only custody; pass --allow-insecure-seed-file explicitly or use --wallet-file".into()),
+        (None, Some(path), true) => Ok(CredentialSource::InsecureSeedFile(path.clone())),
+        (None, None, _) => Err("missing credential source: use --wallet-file PATH (recommended)".into()),
+    }
+}
+
+fn load_signer(
+    values: &BTreeMap<String, String>,
+    flags: &BTreeSet<String>,
+) -> Result<(Ed25519TransactionSigner, &'static str), String> {
+    match credential_source(values, flags)? {
+        CredentialSource::ProtectedWallet(path) => {
+            let wallet = load_current_user_wallet(path)?;
+            let expected_public_key = wallet.public_key();
+            let expected_account_id = wallet.account_id();
+            let signer = wallet.into_signer();
+            if signer.public_key() != expected_public_key
+                || signer.account_id() != expected_account_id
+            {
+                return Err("DPAPI wallet identity verification failed".into());
+            }
+            Ok((signer, "windows-current-user-dpapi-qzkw1"))
+        }
+        CredentialSource::InsecureSeedFile(path) => {
+            let mut seed = parse_seed(&path)?;
+            let signer = Ed25519TransactionSigner::from_seed(seed);
+            seed.fill(0);
+            Ok((signer, "explicit-insecure-seed-file-legacy-test-only"))
+        }
+    }
 }
 
 fn build_operation(values: &BTreeMap<String, String>) -> Result<AmmOperation, String> {
@@ -304,16 +360,14 @@ fn submit(
 fn run() -> Result<(), Box<dyn Error>> {
     let args = env::args().skip(1);
     let (values, flags) = parse_options(args).map_err(|error| format!("{error}\n\n{}", usage()))?;
-    let seed_path =
-        required(&values, "--seed-file").map_err(|error| format!("{error}\n\n{}", usage()))?;
-    let mut seed = parse_seed(seed_path)?;
-    let signer = Ed25519TransactionSigner::from_seed(seed);
-    seed.fill(0);
+    let (signer, wallet_custody) =
+        load_signer(&values, &flags).map_err(|error| format!("{error}\n\n{}", usage()))?;
 
     if flags.contains("--show-account") {
         println!("account_id={}", hex(&signer.account_id()));
         println!("public_key={}", hex(&signer.public_key()));
         println!("signature_mode=self_contained_ed25519_96_bytes");
+        println!("wallet_custody={wallet_custody}");
         println!("warning=keep the seed local; the account must have canonical QZXB and any quote asset balance needed by the requested operation");
         if values.contains_key("--operation") || flags.contains("--submit") {
             return Err("--show-account cannot be combined with --operation or --submit".into());
@@ -331,6 +385,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let signed = sign_operation(&signer, network_id, nonce, expires_at, operation)?;
     let signed_wire = signed.encode()?;
     let operation_digest = operation_id(&signed_wire);
+    println!("wallet_custody={wallet_custody}");
     println!("network_id={}", hex(&network_id));
     println!("sender={}", hex(&signed.sender));
     println!("nonce={}", signed.nonce);
@@ -365,6 +420,54 @@ mod tests {
         AccountPublicKey, Ed25519TransactionAuthenticator, Ed25519TransactionSigner,
         TransactionAuthenticatorKind, ED25519_SIGNATURE_LEN,
     };
+
+    #[test]
+    fn protected_wallet_is_default_and_raw_seed_requires_explicit_opt_in() {
+        let mut values = BTreeMap::new();
+        values.insert("--wallet-file".to_string(), "wallet.qzkw".to_string());
+        let flags = BTreeSet::new();
+        assert_eq!(
+            credential_source(&values, &flags).unwrap(),
+            CredentialSource::ProtectedWallet("wallet.qzkw".into())
+        );
+
+        values.clear();
+        values.insert("--seed-file".to_string(), "seed.hex".to_string());
+        assert!(credential_source(&values, &flags)
+            .unwrap_err()
+            .contains("explicitly"));
+        let flags = ["--allow-insecure-seed-file".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            credential_source(&values, &flags).unwrap(),
+            CredentialSource::InsecureSeedFile("seed.hex".into())
+        );
+    }
+
+    #[test]
+    fn credential_policy_rejects_ambiguous_or_misplaced_insecure_flags() {
+        let values = [
+            ("--wallet-file".to_string(), "wallet.qzkw".to_string()),
+            ("--seed-file".to_string(), "seed.hex".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let flags = BTreeSet::new();
+        assert!(credential_source(&values, &flags)
+            .unwrap_err()
+            .contains("exactly one"));
+
+        let values = [("--wallet-file".to_string(), "wallet.qzkw".to_string())]
+            .into_iter()
+            .collect();
+        let flags = ["--allow-insecure-seed-file".to_string()]
+            .into_iter()
+            .collect();
+        assert!(credential_source(&values, &flags)
+            .unwrap_err()
+            .contains("only with --seed-file"));
+    }
 
     #[test]
     fn builds_self_contained_ed25519_qax1_and_verifies_digest() {

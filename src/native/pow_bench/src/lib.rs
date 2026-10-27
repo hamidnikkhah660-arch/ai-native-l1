@@ -118,6 +118,8 @@ pub mod qzbe_history_replay_candidate;
 pub mod qzbe_tx_ingress_candidate;
 /// Candidate native AMM with QZB4 v3 transition and QZP4/QAMS snapshot integration; not Mainnet-approved.
 pub mod qzxb_amm_candidate;
+/// Read-only, fail-closed loader for Windows CurrentUser-DPAPI QZKW1 wallets; local custody only.
+pub mod qzxb_wallet_store_candidate;
 pub mod recovery;
 pub mod reference_time;
 pub mod reference_time_store;
