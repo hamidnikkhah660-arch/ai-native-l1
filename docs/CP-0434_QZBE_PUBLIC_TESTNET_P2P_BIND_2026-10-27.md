@@ -35,3 +35,7 @@ This validates that the listener can bind in explicit candidate P2P mode while R
 ## Required before any public Mainnet claim
 
 Three independently administered hosts and their actual network paths must still be tested; static Noise trust pins must be provisioned and rotated operationally; rate limits/peer-abuse policy and public node observability need review; the canonical monetary Genesis, producer/importer and state-transition integration must be activated only through the approved profile; Gate 8 external CAS/anti-rollback must be independently deployed and attacked; and fresh-node sync/recovery, wallet recovery, explorer, independent security audit and launch/legal review must pass. No USDT pair or real liquidity is created here.
+
+## Superseding follow-up — CP-0440
+
+The loopback-only transaction-ingress statements above describe the CP-0434 revision at that time. CP-0440 adds a separate, explicit test-only public transaction-ingress option, gated by --test-easy-pow --public-testnet-p2p --public-testnet-tx-ingress and a concrete --tx-listen address. The read-only RPC still requires loopback. See [CP-0440](CP-0440_PUBLIC_TESTNET_TX_INGRESS_CANDIDATE_2026-10-27.md) for the new scope and limitations. This does not prove an external client can reach the host and does not close Gate 13 or authorize Mainnet.

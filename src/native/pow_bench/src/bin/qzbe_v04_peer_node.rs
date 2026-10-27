@@ -116,6 +116,7 @@ struct Args {
     exit_after_mining: bool,
     test_easy_pow: bool,
     public_testnet_p2p: bool,
+    public_testnet_tx_ingress: bool,
     sync_from_peers: bool,
 }
 
@@ -338,7 +339,7 @@ fn archive_sync_digest(envelopes: &[Vec<u8>]) -> Result<[u8; 32], String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --tx-public-key-hex HEX64 --observe-account-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT [--tx-listen 127.0.0.1:PORT] [--rpc-listen 127.0.0.1:PORT] --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 [--trusted-peer-key-hex HEX64 ...] --initial-subsidy-atoms U128 --blocks-per-halving U64 [--tx-recipient-id HEX64 --tx-nonce U64 --tx-amount-atoms U64 --tx-fee-atoms U64 --tx-expires-at U64 --tx-signature-hex HEX128_OR_HEX192] [--probe-invalid-signature-first] [--test-easy-pow --public-testnet-p2p] [--sync-from-peers] [--peer IP:PORT ...] [--mine-blocks N | --mine-forever] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2 runtime candidate with statically pinned Noise peers and loopback-only transaction/RPC listeners. Each --peer is paired by order with --trusted-peer-key-hex; additional trusted keys authorize inbound peers. Canonical v0.4 Argon2id is the default. --mine-forever continuously mines and broadcasts until interrupted or --stop-after-height is reached; it requires a pinned peer and cannot be combined with --mine-blocks or --exit-after-mining. External P2P bind is available only with BOTH --test-easy-pow and --public-testnet-p2p; all inbound peers still require a configured Noise static-key pin. This is a test-network transport mode, not Mainnet activation; never expose transaction ingress or RPC beyond loopback."
+    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --tx-public-key-hex HEX64 --observe-account-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT [--tx-listen 127.0.0.1:PORT] [--rpc-listen 127.0.0.1:PORT] --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 [--trusted-peer-key-hex HEX64 ...] --initial-subsidy-atoms U128 --blocks-per-halving U64 [--tx-recipient-id HEX64 --tx-nonce U64 --tx-amount-atoms U64 --tx-fee-atoms U64 --tx-expires-at U64 --tx-signature-hex HEX128_OR_HEX192] [--probe-invalid-signature-first] [--test-easy-pow --public-testnet-p2p [--public-testnet-tx-ingress]] [--sync-from-peers] [--peer IP:PORT ...] [--mine-blocks N | --mine-forever] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2 runtime candidate with statically pinned Noise peers. Transaction ingress and read-only RPC default to loopback; public transaction ingress is available only for an explicit zero-value testnet using --test-easy-pow --public-testnet-p2p --public-testnet-tx-ingress, while read-only RPC remains loopback-only. Each --peer is paired by order with --trusted-peer-key-hex; additional trusted keys authorize inbound peers. Canonical v0.4 Argon2id is the default. --mine-forever continuously mines and broadcasts until interrupted or --stop-after-height is reached; it requires a pinned peer and cannot be combined with --mine-blocks or --exit-after-mining. External P2P bind is available only with BOTH --test-easy-pow and --public-testnet-p2p; all inbound peers still require a configured Noise static-key pin. Public transaction ingress is unaudited, easy-PoW testnet only and carries no real-value guarantee; it is not Mainnet activation. Read-only RPC remains loopback-only."
 }
 
 fn parse_hex32(value: &str, name: &str) -> Result<[u8; 32], String> {
@@ -391,6 +392,32 @@ fn ensure_loopback_address(address: SocketAddr, role: &str) -> Result<(), String
         ))
     }
 }
+fn ensure_tx_listen_address(
+    address: SocketAddr,
+    public_testnet_tx_ingress: bool,
+    public_testnet_p2p: bool,
+    test_easy_pow: bool,
+) -> Result<(), String> {
+    if address.ip().is_loopback() {
+        return Ok(());
+    }
+    if !public_testnet_tx_ingress {
+        return Err(
+            "non-loopback transaction ingress requires explicit --public-testnet-tx-ingress".into(),
+        );
+    }
+    if !public_testnet_p2p || !test_easy_pow {
+        return Err("--public-testnet-tx-ingress requires both --test-easy-pow and --public-testnet-p2p; it is zero-value testnet only".into());
+    }
+    if address.port() == 0 || address.ip().is_multicast() {
+        return Err(
+            "public testnet transaction ingress requires a nonzero port and non-multicast bind"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn ensure_peer_listen_address(
     address: SocketAddr,
     public_testnet_p2p: bool,
@@ -452,6 +479,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
     let mut probe_invalid_signature_first = false;
     let mut test_easy_pow = false;
     let mut public_testnet_p2p = false;
+    let mut public_testnet_tx_ingress = false;
     let mut sync_from_peers = false;
     let mut i = 0usize;
     while i < tokens.len() {
@@ -501,6 +529,14 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
                 return Err("duplicate option: --public-testnet-p2p".into());
             }
             public_testnet_p2p = true;
+            i += 1;
+            continue;
+        }
+        if key == "--public-testnet-tx-ingress" {
+            if public_testnet_tx_ingress {
+                return Err("duplicate option: --public-testnet-tx-ingress".into());
+            }
+            public_testnet_tx_ingress = true;
             i += 1;
             continue;
         }
@@ -589,7 +625,12 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
         })
         .transpose()?;
     if let Some(address) = tx_listen {
-        ensure_loopback_address(address, "transaction-ingress listen addresses")?;
+        ensure_tx_listen_address(
+            address,
+            public_testnet_tx_ingress,
+            public_testnet_p2p,
+            test_easy_pow,
+        )?;
         if address == listen {
             return Err("--tx-listen must use a different socket from --listen".into());
         }
@@ -640,6 +681,15 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
     }
     if public_testnet_p2p && !test_easy_pow {
         return Err("--public-testnet-p2p is test-only and requires --test-easy-pow".into());
+    }
+    if public_testnet_tx_ingress && !(test_easy_pow && public_testnet_p2p) {
+        return Err(
+            "--public-testnet-tx-ingress requires both --test-easy-pow and --public-testnet-p2p"
+                .into(),
+        );
+    }
+    if public_testnet_tx_ingress && tx_listen.is_none() {
+        return Err("--public-testnet-tx-ingress requires --tx-listen".into());
     }
     if sync_from_peers && !(public_testnet_p2p && test_easy_pow) {
         return Err("--sync-from-peers is restricted to the explicit zero-value test profile (--test-easy-pow --public-testnet-p2p)".into());
@@ -852,6 +902,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
         exit_after_mining,
         test_easy_pow,
         public_testnet_p2p,
+        public_testnet_tx_ingress,
         sync_from_peers,
     }))
 }
@@ -1966,6 +2017,28 @@ fn lookup_transaction(
     })
 }
 
+fn network_surface_fields(
+    peer_listen: SocketAddr,
+    tx_listen: Option<SocketAddr>,
+    rpc_listen: Option<SocketAddr>,
+    public_testnet_p2p: bool,
+    public_testnet_tx_ingress: bool,
+) -> (&'static str, bool) {
+    let local_only = peer_listen.ip().is_loopback()
+        && tx_listen.is_none_or(|address| address.ip().is_loopback())
+        && rpc_listen.is_none_or(|address| address.ip().is_loopback());
+    let surface = if !peer_listen.ip().is_loopback() {
+        "explicit_testnet_public_p2p_noise_pinned"
+    } else if public_testnet_tx_ingress {
+        "loopback_peer_listener_public_zero_value_tx_ingress"
+    } else if public_testnet_p2p {
+        "outbound_testnet_p2p_loopback_listener"
+    } else {
+        "loopback_only"
+    };
+    (surface, local_only)
+}
+
 fn recovery_readiness_fields(readiness: RecoveryReadiness) -> (&'static str, &'static str) {
     match readiness {
         RecoveryReadiness::Ready => ("READY", "all_recovery_checks_valid"),
@@ -2293,10 +2366,11 @@ fn serve_tx_connection(
     peers: &[SocketAddr],
     outbound_peer_keys: &[[u8; 32]],
     relayed_tx_count: &mut u64,
+    allow_public_testnet_tx_ingress: bool,
 ) -> Result<(), String> {
-    if !peer_addr.ip().is_loopback() {
+    if !peer_addr.ip().is_loopback() && !allow_public_testnet_tx_ingress {
         return Err(
-            "QZBE transaction ingress only accepts loopback clients in candidate mode".into(),
+            "QZBE transaction ingress only accepts loopback clients unless explicit public testnet ingress is enabled".into(),
         );
     }
     // The listener is polled nonblocking. Explicitly restore blocking mode on the
@@ -2421,6 +2495,7 @@ fn poll_tx_connections(
     peers: &[SocketAddr],
     outbound_peer_keys: &[[u8; 32]],
     relayed_tx_count: &mut u64,
+    allow_public_testnet_tx_ingress: bool,
 ) -> Result<(), String> {
     while let Some((mut stream, peer_addr)) = pending.pop_front() {
         *submission_count = submission_count.saturating_add(1);
@@ -2444,6 +2519,7 @@ fn poll_tx_connections(
             peers,
             outbound_peer_keys,
             relayed_tx_count,
+            allow_public_testnet_tx_ingress,
         ) {
             eprintln!(
                 "event=qzbe_v04_tx_connection_rejected peer={} reason={}",
@@ -2476,6 +2552,7 @@ fn poll_tx_connections(
                     peers,
                     outbound_peer_keys,
                     relayed_tx_count,
+                    allow_public_testnet_tx_ingress,
                 ) {
                     eprintln!(
                         "event=qzbe_v04_tx_connection_rejected peer={} reason={}",
@@ -2646,9 +2723,8 @@ fn run(args: Args) -> Result<(), String> {
         .set_nonblocking(true)
         .map_err(|error| format!("set QZBE listener nonblocking: {error}"))?;
     let tx_listener = if let Some(address) = args.tx_listen {
-        let tx_listener = TcpListener::bind(address).map_err(|error| {
-            format!("bind loopback QZBE transaction ingress {address}: {error}")
-        })?;
+        let tx_listener = TcpListener::bind(address)
+            .map_err(|error| format!("bind QZBE transaction ingress {address}: {error}"))?;
         tx_listener
             .set_nonblocking(true)
             .map_err(|error| format!("set QZBE transaction ingress nonblocking: {error}"))?;
@@ -2689,12 +2765,14 @@ fn run(args: Args) -> Result<(), String> {
     } else {
         "QZXB_V04_ARGON2ID_64MIB"
     };
-    let network_surface = if args.public_testnet_p2p {
-        "explicit_testnet_public_p2p_noise_pinned"
-    } else {
-        "loopback_only"
-    };
-    eprintln!("event=qzbe_v04_peer_smoke_ready network_id={} genesis={} profile={} listen={} tx_listen={} rpc_listen={} rpc_read_only=true peer={} height={} root={} tip={} store=QZBE ack=QZA4 tx_ingress=QZTS/1 mempool_max_count={} mempool_max_bytes={} noise=Noise_XX_25519_ChaChaPoly_SHA256 pow_profile={} mining_mode={} tx_policy=registered_or_self_contained_ed25519 tx_rpc_loopback_only=true mainnet=false network_surface={} local_only={} public_launch_approved=false",
+    let (network_surface, local_only) = network_surface_fields(
+        args.listen,
+        tx_listener_address,
+        rpc_listener_address,
+        args.public_testnet_p2p,
+        args.public_testnet_tx_ingress,
+    );
+    eprintln!("event=qzbe_v04_peer_smoke_ready network_id={} genesis={} profile={} listen={} tx_listen={} rpc_listen={} rpc_read_only=true peer={} height={} root={} tip={} store=QZBE ack=QZA4 tx_ingress=QZTS/1 tx_ingress_surface={} rpc_loopback_only=true mempool_max_count={} mempool_max_bytes={} noise=Noise_XX_25519_ChaChaPoly_SHA256 pow_profile={} mining_mode={} tx_policy=registered_or_self_contained_ed25519 mainnet=false network_surface={} local_only={} public_launch_approved=false",
         hex(&args.network_id), hex(&genesis_id), hex(&profile_id), args.listen,
         tx_listener_address.map(|address| address.to_string()).unwrap_or_else(|| "disabled".to_string()),
         rpc_listener_address.map(|address| address.to_string()).unwrap_or_else(|| "disabled".to_string()),
@@ -2703,10 +2781,12 @@ fn run(args: Args) -> Result<(), String> {
         } else {
             args.peers.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
         },
-        initial.height, hex(&initial.state_root), hex(&initial.tip), mempool.limits().max_transactions,
+        initial.height, hex(&initial.state_root), hex(&initial.tip),
+        if args.public_testnet_tx_ingress { "public_zero_value_testnet_only" } else { "loopback_only" },
+        mempool.limits().max_transactions,
         mempool.limits().max_bytes, pow_profile,
         if args.mine_forever { "continuous" } else { "bounded" },
-        network_surface, !args.public_testnet_p2p);
+        network_surface, local_only);
 
     if args.probe_invalid_signature_first {
         let peer = *args
@@ -2780,6 +2860,7 @@ fn run(args: Args) -> Result<(), String> {
                 &args.peers,
                 &args.trusted_peer_keys,
                 &mut relayed_tx_count,
+                args.public_testnet_tx_ingress,
             )?;
             poll_rpc_connections(
                 rpc_listener.as_ref(),
@@ -2851,6 +2932,7 @@ fn run(args: Args) -> Result<(), String> {
             &args.peers,
             &args.trusted_peer_keys,
             &mut relayed_tx_count,
+            args.public_testnet_tx_ingress,
         )?;
         reconcile_pending_mempool(&store, &authenticator, &mut mempool)?;
         let parent_tip = store.canonical_tip();
@@ -2925,6 +3007,7 @@ fn run(args: Args) -> Result<(), String> {
                     &args.peers,
                     &args.trusted_peer_keys,
                     &mut relayed_tx_count,
+                args.public_testnet_tx_ingress,
                 )?;
                 reconcile_pending_mempool(&store, &authenticator, &mut mempool)?;
                 continue;
@@ -2996,6 +3079,7 @@ fn run(args: Args) -> Result<(), String> {
                 &args.peers,
                 &args.trusted_peer_keys,
                 &mut relayed_tx_count,
+                args.public_testnet_tx_ingress,
             )?;
             poll_rpc_connections(
                 rpc_listener.as_ref(),
@@ -3147,6 +3231,7 @@ mod tests {
             exit_after_mining: true,
             test_easy_pow: false,
             public_testnet_p2p: false,
+            public_testnet_tx_ingress: false,
             sync_from_peers: false,
         }
     }
@@ -3330,7 +3415,7 @@ mod tests {
         ]);
         assert!(parse_args_from(non_loopback)
             .unwrap_err()
-            .contains("refuses all non-loopback transaction-ingress listen addresses"));
+            .contains("explicit --public-testnet-tx-ingress"));
 
         let mut same_socket = parser_fixture_tokens(&[]);
         same_socket.extend([
@@ -3877,7 +3962,7 @@ mod tests {
     }
 
     #[test]
-    fn public_candidate_p2p_requires_easy_pow_and_never_opens_tx_or_rpc_listeners() {
+    fn public_candidate_tx_ingress_requires_explicit_zero_value_testnet_flag() {
         let mut allowed = parser_fixture_tokens(&[("198.51.100.9:49332", &"e6".repeat(32))]);
         let listen_index = allowed.iter().position(|item| item == "--listen").unwrap();
         allowed[listen_index + 1] = "0.0.0.0:49331".into();
@@ -3905,9 +3990,28 @@ mod tests {
 
         let mut external_tx_ingress = allowed.clone();
         external_tx_ingress.extend(["--tx-listen".into(), "0.0.0.0:49333".into()]);
-        assert!(parse_args_from(external_tx_ingress)
+        assert!(parse_args_from(external_tx_ingress.clone())
             .unwrap_err()
-            .contains("refuses all non-loopback transaction-ingress listen addresses"));
+            .contains("explicit --public-testnet-tx-ingress"));
+
+        external_tx_ingress.push("--public-testnet-tx-ingress".into());
+        let public_tx = parse_args_from(external_tx_ingress.clone())
+            .unwrap()
+            .unwrap();
+        assert!(public_tx.public_testnet_tx_ingress);
+        assert_eq!(public_tx.tx_listen, Some("0.0.0.0:49333".parse().unwrap()));
+
+        let mut public_tx_without_tx_listener = allowed.clone();
+        public_tx_without_tx_listener.push("--public-testnet-tx-ingress".into());
+        assert!(parse_args_from(public_tx_without_tx_listener)
+            .unwrap_err()
+            .contains("requires --tx-listen"));
+
+        let mut public_tx_without_easy_pow = external_tx_ingress.clone();
+        public_tx_without_easy_pow.retain(|value| value != "--test-easy-pow");
+        assert!(parse_args_from(public_tx_without_easy_pow)
+            .unwrap_err()
+            .contains("requires both --test-easy-pow and --public-testnet-p2p"));
 
         let mut external_rpc = allowed.clone();
         external_rpc.extend(["--rpc-listen".into(), "0.0.0.0:49334".into()]);
@@ -3920,6 +4024,40 @@ mod tests {
         assert!(parse_args_from(unspecified_peer)
             .unwrap_err()
             .contains("concrete unicast IP"));
+    }
+
+    #[test]
+    fn network_surface_telemetry_matches_actual_listener_addresses() {
+        let loopback = "127.0.0.1:49331".parse::<SocketAddr>().unwrap();
+        let wildcard = "0.0.0.0:49331".parse::<SocketAddr>().unwrap();
+        assert_eq!(
+            network_surface_fields(loopback, None, None, false, false),
+            ("loopback_only", true)
+        );
+        assert_eq!(
+            network_surface_fields(loopback, Some(wildcard), None, true, true),
+            ("loopback_peer_listener_public_zero_value_tx_ingress", false)
+        );
+        assert_eq!(
+            network_surface_fields(wildcard, None, None, true, false),
+            ("explicit_testnet_public_p2p_noise_pinned", false)
+        );
+        assert_eq!(
+            network_surface_fields(loopback, None, None, true, false),
+            ("outbound_testnet_p2p_loopback_listener", true)
+        );
+    }
+
+    #[test]
+    fn public_tx_ingress_bind_is_explicit_testnet_only() {
+        let loopback = "127.0.0.1:49333".parse::<SocketAddr>().unwrap();
+        let wildcard = "0.0.0.0:49333".parse::<SocketAddr>().unwrap();
+        assert!(ensure_tx_listen_address(loopback, false, false, false).is_ok());
+        assert!(ensure_tx_listen_address(wildcard, false, true, true).is_err());
+        assert!(ensure_tx_listen_address(wildcard, true, false, true).is_err());
+        assert!(ensure_tx_listen_address(wildcard, true, true, false).is_err());
+        assert!(ensure_tx_listen_address(wildcard, true, true, true).is_ok());
+        assert!(ensure_tx_listen_address("0.0.0.0:0".parse().unwrap(), true, true, true).is_err());
     }
 
     #[test]
