@@ -1,7 +1,7 @@
 # Liquidity, Market-Data Platforms and Public-Launch Readiness — v0.1
 
-Date: 2026-10-21
-Status: Engineering/commercial readiness assessment. No native market, liquidity pool, production listing or listing approval is claimed.
+Date: 2026-10-27
+Status: Engineering/commercial readiness assessment reconciled to the CP-0422 v0.4 allocation decision. No native market, liquidity pool, production listing or listing approval is claimed.
 
 ## Executive view
 
@@ -9,7 +9,7 @@ QuantumZXB already has a public project site, curated source repository, technic
 
 **The proposed native QZXB coin and the QX ERC-20 experiment on Ethereum Sepolia are different assets.** Never submit the Sepolia QX contract as the native QZXB coin. No native Mainnet, native explorer, live native market price, trading pair, liquidity, confirmed sponsor, independent security audit, or verified project revenue is established in the current public evidence.
 
-The current design uses a 10,000,000,000-coin supply cap with 4B founder / 3B mining-security / 3B public-goods allocation envelopes. The current four-year halving profile is candidate arithmetic only; Gate 2 remains open. The proposed sponsor allocation is carved out of the founder's allocation and is not cash, issued market liquidity, or a guaranteed payment.
+The current owner-directed v0.4 policy uses a 10,000,000,000-QZXB design cap with eight exclusive allocation ceilings: 3B mining/network security (30%) and seven 1B categories (10% each)—community airdrop, exchange/market-integration/liquidity partnerships, marketing/promotional partners, developers/security contributors, financial/strategic supporters, protocol burn reserve, and founder. The founder ceiling is 1B QZXB (10%), as recorded in [CP-0422](CP-0422_CANONICAL_TOKENOMICS_DECISION_2026-10-26.md); the former 4B/3B/3B split is historical v0.3 only. These are ceilings, not minted balances, current circulating supply, sponsor awards or liquidity. The v0.4 Genesis candidate currently credits only the 1B owner allocation; mining subsidy and all other category releases require deterministic canonical runtime rules and independent conformance evidence. Gate 2 remains OPEN. Any sponsor/contributor award must stay within an approved v0.4 category cap and is not cash, issued market liquidity, or a guaranteed payment.
 
 ## 1. Platform requirements and present gap
 
