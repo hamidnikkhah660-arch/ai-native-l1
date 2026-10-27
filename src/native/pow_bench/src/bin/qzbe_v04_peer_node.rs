@@ -616,8 +616,8 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
     if sync_from_peers && !(public_testnet_p2p && test_easy_pow) {
         return Err("--sync-from-peers is restricted to the explicit zero-value test profile (--test-easy-pow --public-testnet-p2p)".into());
     }
-    if sync_from_peers && peers.is_empty() {
-        return Err("--sync-from-peers requires at least one pinned --peer".into());
+    if sync_from_peers && peers.len() < 2 {
+        return Err("--sync-from-peers requires at least two statically pinned --peer entries for history agreement".into());
     }
     let network_id = parse_hex32(&take("--network-id")?, "--network-id")?;
     let owner_id = parse_hex32(&take("--owner-id")?, "--owner-id")?;
@@ -3083,9 +3083,22 @@ mod tests {
         ]);
         assert!(parse_args_from(no_peer)
             .unwrap_err()
-            .contains("--sync-from-peers requires at least one pinned --peer"));
+            .contains("--sync-from-peers requires at least two statically pinned --peer entries"));
 
-        let mut valid = parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        let mut one_peer = parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        one_peer.extend([
+            "--test-easy-pow".into(),
+            "--public-testnet-p2p".into(),
+            "--sync-from-peers".into(),
+        ]);
+        assert!(parse_args_from(one_peer)
+            .unwrap_err()
+            .contains("--sync-from-peers requires at least two statically pinned --peer entries"));
+
+        let mut valid = parser_fixture_tokens(&[
+            ("127.0.0.1:49332", &"e6".repeat(32)),
+            ("127.0.0.1:49335", &"f7".repeat(32)),
+        ]);
         valid.extend([
             "--test-easy-pow".into(),
             "--public-testnet-p2p".into(),
@@ -3096,7 +3109,10 @@ mod tests {
         assert!(parsed.test_easy_pow && parsed.public_testnet_p2p);
         assert_eq!(
             parsed.peers,
-            vec!["127.0.0.1:49332".parse::<SocketAddr>().unwrap()]
+            vec![
+                "127.0.0.1:49332".parse::<SocketAddr>().unwrap(),
+                "127.0.0.1:49335".parse::<SocketAddr>().unwrap()
+            ]
         );
     }
 

@@ -31,6 +31,14 @@ function Wait-Pattern([string]$Path, [string]$Pattern, [int]$Millis = 30000) {
     }
     return $false
 }
+function Wait-Count([string]$Path, [string]$Pattern, [int]$Count, [int]$Millis = 30000) {
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    while ($watch.ElapsedMilliseconds -lt $Millis) {
+        if (@(Select-String -Path $Path -Pattern $Pattern -ErrorAction SilentlyContinue).Count -ge $Count) { return $true }
+        Start-Sleep -Milliseconds 50
+    }
+    return $false
+}
 function Provision-Key([string]$Path, [string]$Network) {
     $out = @(& $keyExe --output $Path --network-id-hex $Network 2>&1)
     if ($LASTEXITCODE -ne 0) { throw ("CP-0437 Noise key provisioning failed: " + ($out -join [Environment]::NewLine)) }
@@ -113,22 +121,25 @@ $portA = Get-FreePort
 $portB = Get-FreePort
 $portC = Get-FreePort
 $rpcPortA = Get-FreePort
+$rpcPortB = Get-FreePort
 $rpcPortC = Get-FreePort
-$ports = @($portA, $portB, $portC, $rpcPortA, $rpcPortC)
+$ports = @($portA, $portB, $portC, $rpcPortA, $rpcPortB, $rpcPortC)
 while (($ports | Select-Object -Unique).Count -ne $ports.Count) {
-    $portB = Get-FreePort; $portC = Get-FreePort; $rpcPortA = Get-FreePort; $rpcPortC = Get-FreePort
-    $ports = @($portA, $portB, $portC, $rpcPortA, $rpcPortC)
+    $portB = Get-FreePort; $portC = Get-FreePort; $rpcPortA = Get-FreePort; $rpcPortB = Get-FreePort; $rpcPortC = Get-FreePort
+    $ports = @($portA, $portB, $portC, $rpcPortA, $rpcPortB, $rpcPortC)
 }
 $addrA = "127.0.0.1:$portA"
 $addrB = "127.0.0.1:$portB"
 $addrC = "127.0.0.1:$portC"
 $rpcA = "127.0.0.1:$rpcPortA"
+$rpcB = "127.0.0.1:$rpcPortB"
 $rpcC = "127.0.0.1:$rpcPortC"
 $subsidy = '35673515981'
 $halving = '4204800'
 $nodeA = $null
 $nodeB = $null
 $nodeC = $null
+$testPassed = $false
 
 try {
     # Node A is a loopback-only RPC/archive source and pins keys for both clients.
@@ -153,18 +164,23 @@ try {
         '--network-id', $network, '--owner-id', $owner, '--miner-id', $miner,
         '--tx-public-key-hex', $txPublicKey, '--observe-account-id', $recipient,
         '--initial-subsidy-atoms', $subsidy, '--blocks-per-halving', $halving,
-        '--data-dir', $dataB, '--listen', $addrB, '--peer', $addrA,
-        '--trusted-peer-key-hex', $pubA, '--noise-static-private-key-dpapi-file', $keyB,
-        '--mine-forever', '--stop-after-height', '3'
+        '--data-dir', $dataB, '--listen', $addrB, '--rpc-listen', $rpcB, '--peer', $addrA,
+        '--trusted-peer-key-hex', $pubA, '--trusted-peer-key-hex', $pubC, '--noise-static-private-key-dpapi-file', $keyB,
+        '--mine-blocks', '3', '--run-seconds', '180'
     )
     $nodeB = Start-Process -FilePath $nodeExe -ArgumentList $argsB -RedirectStandardOutput $stdB -RedirectStandardError $logB -PassThru
-    if (-not (Wait-Pattern $logB 'event=qzbe_v04_peer_smoke_stopped .*height=3 .*replay=matched' 60000)) {
-        throw ("CP-0437 mining peer failed to reach three blocks: " + (Get-Text $stdB) + (Get-Text $logB))
-    }
-    $null = Wait-RpcHeight $rpcA 3 30000
+    $null = Wait-RpcHeight $rpcB 3 60000
+    $null = Wait-RpcHeight $rpcA 3 60000
     $sourceStatus = Get-RpcStatus $rpcA
-    if ([int]$sourceStatus.height -ne 3 -or $sourceStatus.mainnet -ne $false -or $sourceStatus.read_only -ne $true) {
-        throw ("CP-0437 source did not report test-only height 3: " + ($sourceStatus | ConvertTo-Json -Compress))
+    $sourceStatusB = Get-RpcStatus $rpcB
+    if ([int]$sourceStatus.height -ne 3 -or [int]$sourceStatusB.height -ne 3 -or
+        $sourceStatus.mainnet -ne $false -or $sourceStatus.read_only -ne $true -or
+        $sourceStatusB.mainnet -ne $false -or $sourceStatusB.read_only -ne $true -or
+        $sourceStatus.genesis_id -ne $sourceStatusB.genesis_id -or
+        $sourceStatus.profile_id -ne $sourceStatusB.profile_id -or
+        $sourceStatus.tip -ne $sourceStatusB.tip -or
+        $sourceStatus.state_root -ne $sourceStatusB.state_root) {
+        throw ("CP-0437 source peer histories did not converge: sourceA=" + ($sourceStatus | ConvertTo-Json -Compress) + " sourceB=" + ($sourceStatusB | ConvertTo-Json -Compress))
     }
 
     # Node C starts from a fresh Genesis store and imports A's authenticated, bounded history.
@@ -175,12 +191,20 @@ try {
         '--initial-subsidy-atoms', $subsidy, '--blocks-per-halving', $halving,
         '--data-dir', $dataC, '--listen', $addrC, '--rpc-listen', $rpcC,
         '--peer', $addrA, '--trusted-peer-key-hex', $pubA,
+        '--peer', $addrB, '--trusted-peer-key-hex', $pubB,
         '--noise-static-private-key-dpapi-file', $keyC,
         '--mine-blocks', '0', '--run-seconds', '60'
     )
     $nodeC = Start-Process -FilePath $nodeExe -ArgumentList $argsC -RedirectStandardOutput $stdC -RedirectStandardError $logC -PassThru
     if (-not (Wait-Pattern $logC 'event=qzbe_v04_archive_sync_complete .*height=3 .*work=' 30000)) {
         throw ("CP-0437 fresh node did not complete archive sync: " + (Get-Text $stdC) + (Get-Text $logC))
+    }
+    if (-not (Wait-Count $logC 'event=qzbe_v04_archive_sync_complete .*height=3 .*work=' 2 30000)) {
+        throw ("CP-0437 expected convergent sync results from two pinned peers; observed " + @(Select-String -Path $logC -Pattern 'event=qzbe_v04_archive_sync_complete .*height=3 .*work=' -ErrorAction SilentlyContinue).Count + ": " + (Get-Text $logC))
+    }
+    $syncEvents = @(Select-String -Path $logC -Pattern 'event=qzbe_v04_archive_sync_complete .*height=3 .*work=')
+    if ($syncEvents.Count -ne 2) {
+        throw ("CP-0437 expected exactly two pinned-peer sync results; observed " + $syncEvents.Count + ": " + (Get-Text $logC))
     }
     if (-not (Wait-Pattern $logC 'event=qzbe_v04_peer_smoke_ready .*mainnet=false .*public_launch_approved=false' 30000)) {
         throw ("CP-0437 fresh node failed to become test-ready after sync: " + (Get-Text $stdC) + (Get-Text $logC))
@@ -191,9 +215,10 @@ try {
         throw ("CP-0437 source/fresh-node status mismatch: source=" + ($sourceStatus | ConvertTo-Json -Compress) + " fresh=" + ($freshStatus | ConvertTo-Json -Compress))
     }
 
-    Write-Host 'CP-0437 FRESH_NODE_ARCHIVE_SYNC_TIP_ROOT_WORK_CONVERGENCE_PASS'
-    Write-Host ("CP-0437 source_height=" + $sourceStatus.height + " fresh_height=" + $freshStatus.height + " tip=" + $freshStatus.tip + " root=" + $freshStatus.state_root)
-    Write-Host 'CP-0437 zero-value, loopback-local exercise only; not Mainnet readiness evidence.'
+    $testPassed = $true
+    Write-Host 'CP-0437 TWO_PINNED_PEER_FRESH_NODE_ARCHIVE_SYNC_TIP_ROOT_WORK_CONVERGENCE_PASS'
+    Write-Host ("CP-0437 sourceA_height=" + $sourceStatus.height + " sourceB_height=" + $sourceStatusB.height + " fresh_height=" + $freshStatus.height + " tip=" + $freshStatus.tip + " root=" + $freshStatus.state_root)
+    Write-Host 'CP-0437 zero-value, loopback-local exercise with three local processes; not independent-operator or Mainnet readiness evidence.'
 }
 finally {
     foreach ($proc in @($nodeB, $nodeC, $nodeA)) {
@@ -201,5 +226,10 @@ finally {
             try { if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } } catch {}
         }
     }
-    Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    if ($testPassed) {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    else {
+        Write-Host ("CP-0437 failure artifacts retained at " + $root)
+    }
 }
