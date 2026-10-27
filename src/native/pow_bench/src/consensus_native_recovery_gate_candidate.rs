@@ -1,10 +1,12 @@
 //! CP-0428 candidate: fail-closed readiness gate for consensus-native recovery.
 //!
-//! This is a pure policy model. It is not yet called by the QZBE node or the default node runtime.
-//! A node may report READY only after its canonical profile and Genesis are pinned, the full
-//! history has been replayed and validated, and peer reconciliation plus state-root and
-//! cumulative-work agreement have completed. A stale local snapshot is not freshness evidence.
-//! Operator independence and the actual peer transport must be established outside this module.
+//! This pure policy model is wired into the QZBE candidate node for point-in-time startup recovery
+//! classification and the loopback read-only status RPC. It is not a continuously refreshed or
+//! production Mainnet gate. A node may report recovery READY only after its canonical profile and
+//! Genesis are pinned, retained history is replayed and validated, and pinned-peer reconciliation
+//! plus state-root and cumulative-work agreement have completed. A stale local snapshot is not
+//! freshness evidence. Operator independence and production transport must be established outside
+//! this module; READY here never implies public-launch approval.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvidenceStatus {

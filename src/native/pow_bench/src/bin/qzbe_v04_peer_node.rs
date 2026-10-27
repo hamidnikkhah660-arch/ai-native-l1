@@ -8,13 +8,16 @@
 
 use ai_native_l1_pow_bench::{
     consensus::{ConsensusParameters, Uint256},
+    consensus_native_recovery_gate_candidate::{
+        EvidenceStatus, RecoveryCheck, RecoveryEvidence, RecoveryFault, RecoveryReadiness,
+    },
     devnet_noise_transport_candidate::{DevnetNoiseSession, MAX_NOISE_APPLICATION_RECORD_BYTES},
     monetary_genesis_v04_candidate::GenesisManifestV04,
     monetary_issuance_v04_candidate::V04MiningIssuanceScheduleCandidate,
     monetary_pow_v04_candidate::{
         qzbe_pow_digest, V04ExecutionForkChoiceOutcome, V04ExecutionPowEnvelope,
         MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES, MAX_QZBE_MINING_ATTEMPTS,
-        MAX_V04_EXECUTION_FORK_ARCHIVE_BLOCKS,
+        MAX_V04_EXECUTION_FORK_ARCHIVE_BLOCKS, MAX_V04_EXECUTION_FORK_ARCHIVE_HEIGHT,
     },
     monetary_pow_v04_checkpoint_candidate::{
         QzbeCheckpointRecord, QzbeCheckpointValidationContext,
@@ -146,6 +149,31 @@ struct ArchiveSyncHeader {
     envelope_count: usize,
     total_bytes: usize,
     archive_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArchivePeerSummary {
+    height: u64,
+    tip: [u8; 32],
+    state_root: [u8; 32],
+    cumulative_chainwork: [u8; 32],
+}
+
+fn reconcile_archive_peer_summaries(
+    summaries: &[ArchivePeerSummary],
+) -> Result<ArchivePeerSummary, String> {
+    let Some(first) = summaries.first().copied() else {
+        return Err("archive recovery requires at least two pinned peer summaries".into());
+    };
+    if summaries.len() < 2 {
+        return Err("archive recovery requires at least two pinned peer summaries".into());
+    }
+    if summaries.iter().any(|summary| *summary != first) {
+        return Err(
+            "pinned archive peers disagree on canonical height/tip/state-root/chainwork".into(),
+        );
+    }
+    Ok(first)
 }
 
 fn encode_archive_sync_request(
@@ -1488,7 +1516,7 @@ fn sync_archive_from_peer(
     store: &mut V04ExecutionCheckpointForkStoreCandidate,
     context: &QzbeCheckpointValidationContext<'_>,
     authenticator: &Ed25519TransactionAuthenticator,
-) -> Result<(), String> {
+) -> Result<ArchivePeerSummary, String> {
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(10))
         .map_err(|error| format!("connect to pinned QZBE archive peer {address}: {error}"))?;
     stream
@@ -1571,7 +1599,12 @@ fn sync_archive_from_peer(
     eprintln!("event=qzbe_v04_archive_sync_complete peer={} height={} tip={} root={} imported_or_seen={} bytes={} work={} generation={}",
         address, actual.height, hex(&actual.tip), hex(&actual.state_root), envelopes.len(),
         total_bytes, hex(&actual_work), actual.generation);
-    Ok(())
+    Ok(ArchivePeerSummary {
+        height: actual.height,
+        tip: actual.tip,
+        state_root: actual.state_root,
+        cumulative_chainwork: actual_work,
+    })
 }
 
 fn serve_connection(
@@ -1933,6 +1966,94 @@ fn lookup_transaction(
     })
 }
 
+fn recovery_readiness_fields(readiness: RecoveryReadiness) -> (&'static str, &'static str) {
+    match readiness {
+        RecoveryReadiness::Ready => ("READY", "all_recovery_checks_valid"),
+        RecoveryReadiness::Syncing(check) => (
+            "SYNCING",
+            match check {
+                RecoveryCheck::NetworkProfile => "network_profile_pending",
+                RecoveryCheck::GenesisManifest => "genesis_manifest_pending",
+                RecoveryCheck::FullHistoryReplay => "full_history_replay_pending",
+                RecoveryCheck::PeerReconciliation => "peer_reconciliation_pending",
+                RecoveryCheck::StateRootAgreement => "state_root_agreement_pending",
+                RecoveryCheck::CumulativeChainworkAgreement => {
+                    "cumulative_chainwork_agreement_pending"
+                }
+            },
+        ),
+        RecoveryReadiness::Quarantined(fault) => (
+            "QUARANTINED",
+            match fault {
+                RecoveryFault::NetworkProfileMismatch => "network_profile_mismatch",
+                RecoveryFault::GenesisManifestMismatch => "genesis_manifest_mismatch",
+                RecoveryFault::InvalidHistoricalBlockOrReplay => {
+                    "invalid_historical_block_or_replay"
+                }
+                RecoveryFault::ConflictingPeerHistory => "conflicting_peer_history",
+                RecoveryFault::CanonicalStateRootMismatch => "canonical_state_root_mismatch",
+                RecoveryFault::CumulativeChainworkMismatch => "cumulative_chainwork_mismatch",
+            },
+        ),
+    }
+}
+
+/// The store replays and validates all persisted envelopes from the Genesis base during open.
+/// This traversal additionally confirms that every canonical ancestor reaches the Genesis base.
+/// The candidate's hard height bound means this does not establish unbounded Mainnet history.
+fn canonical_history_complete_from_genesis(
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    profile: &V04ConsensusProfileCandidate,
+    params: &ConsensusParameters,
+) -> Result<bool, String> {
+    let fork = store.fork_choice();
+    let base_tip = fork.base_tip();
+    let base_state = fork
+        .branch_state(&base_tip)
+        .ok_or_else(|| "QZBE recovery gate cannot resolve its base checkpoint".to_string())?;
+    let base_height = base_state.ledger().height();
+    if base_height != 0
+        || fork.canonical_height().saturating_sub(base_height)
+            > MAX_V04_EXECUTION_FORK_ARCHIVE_HEIGHT
+    {
+        return Ok(false);
+    }
+
+    let mut envelopes = BTreeMap::new();
+    for bytes in fork.archive_envelopes() {
+        let envelope = V04ExecutionPowEnvelope::decode(&bytes, profile, params)
+            .map_err(|error| format!("decode QZBE archive for recovery readiness: {error}"))?;
+        let digest =
+            qzbe_pow_digest(&envelope.header, &envelope.block, params).map_err(|error| {
+                format!("derive QZBE archive digest for recovery readiness: {error}")
+            })?;
+        if envelopes.insert(digest, envelope).is_some() {
+            return Err("duplicate QZBE archive digest during recovery readiness check".into());
+        }
+    }
+
+    let mut tip = fork.canonical_tip();
+    let mut height = fork.canonical_height();
+    let mut visited = 0usize;
+    while tip != base_tip {
+        if visited >= envelopes.len() {
+            return Ok(false);
+        }
+        let Some(envelope) = envelopes.get(&tip) else {
+            return Ok(false);
+        };
+        if envelope.header.height != height {
+            return Ok(false);
+        }
+        tip = envelope.header.previous_consensus_hash;
+        height = height
+            .checked_sub(1)
+            .ok_or_else(|| "QZBE recovery ancestry height underflow".to_string())?;
+        visited += 1;
+    }
+    Ok(height == base_height)
+}
+
 fn serve_rpc_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
@@ -1942,6 +2063,7 @@ fn serve_rpc_connection(
     network_id: &[u8; 32],
     genesis_id: &[u8; 32],
     profile_id: &[u8; 32],
+    recovery_readiness: RecoveryReadiness,
 ) -> Result<(), String> {
     if !peer_addr.ip().is_loopback() {
         return Err("read-only RPC accepts loopback clients only".into());
@@ -2015,10 +2137,13 @@ fn serve_rpc_connection(
         }
     };
     let body = match command {
-        RpcCommand::Status => format!(
-            "{{\"ok\":true,\"network_id\":\"{}\",\"genesis_id\":\"{}\",\"profile_id\":\"{}\",\"height\":{},\"tip\":\"{}\",\"state_root\":\"{}\",\"generation\":{},\"mainnet\":false,\"read_only\":true}}",
-            hex(network_id), hex(genesis_id), hex(profile_id), current.height, hex(&current.tip), hex(&current.state_root), current.generation
-        ),
+        RpcCommand::Status => {
+            let (recovery_status, recovery_detail) = recovery_readiness_fields(recovery_readiness);
+            format!(
+                "{{\"ok\":true,\"network_id\":\"{}\",\"genesis_id\":\"{}\",\"profile_id\":\"{}\",\"height\":{},\"tip\":\"{}\",\"state_root\":\"{}\",\"generation\":{},\"recovery_readiness_at_startup\":\"{}\",\"recovery_detail_at_startup\":\"{}\",\"mainnet\":false,\"public_launch_approved\":false,\"read_only\":true}}",
+                hex(network_id), hex(genesis_id), hex(profile_id), current.height, hex(&current.tip), hex(&current.state_root), current.generation, recovery_status, recovery_detail
+            )
+        },
         RpcCommand::Balance(account) => format!(
             "{{\"ok\":true,\"network_id\":\"{}\",\"genesis_id\":\"{}\",\"profile_id\":\"{}\",\"account_id\":\"{}\",\"balance_atoms\":{},\"height\":{},\"tip\":\"{}\",\"state_root\":\"{}\",\"generation\":{},\"mainnet\":false,\"read_only\":true}}",
             hex(network_id), hex(genesis_id), hex(profile_id), hex(&account), observed_balance(store, &account), current.height, hex(&current.tip), hex(&current.state_root), current.generation
@@ -2055,6 +2180,7 @@ fn poll_rpc_connections(
     network_id: &[u8; 32],
     genesis_id: &[u8; 32],
     profile_id: &[u8; 32],
+    recovery_readiness: RecoveryReadiness,
 ) -> Result<(), String> {
     let Some(listener) = listener else {
         return Ok(());
@@ -2063,7 +2189,15 @@ fn poll_rpc_connections(
         match listener.accept() {
             Ok((stream, peer_addr)) => {
                 if let Err(error) = serve_rpc_connection(
-                    stream, peer_addr, store, mempool, params, network_id, genesis_id, profile_id,
+                    stream,
+                    peer_addr,
+                    store,
+                    mempool,
+                    params,
+                    network_id,
+                    genesis_id,
+                    profile_id,
+                    recovery_readiness,
                 ) {
                     eprintln!(
                         "event=qzbe_v04_rpc_request_rejected peer={} reason={}",
@@ -2415,13 +2549,14 @@ fn run(args: Args) -> Result<(), String> {
         &authenticator,
     )
     .map_err(|error| format!("open checkpoint-rooted local QZBE store: {error}"))?;
+    let mut peer_summaries = Vec::new();
     if args.sync_from_peers {
         for (index, peer) in args.peers.iter().enumerate() {
             eprintln!(
                 "event=qzbe_v04_archive_sync_started peer={} mode=explicit_testnet_only",
                 peer
             );
-            sync_archive_from_peer(
+            let summary = sync_archive_from_peer(
                 *peer,
                 &secret.0,
                 &args.trusted_peer_keys[index],
@@ -2432,8 +2567,63 @@ fn run(args: Args) -> Result<(), String> {
                 &checkpoint_context,
                 &authenticator,
             )?;
+            peer_summaries.push(summary);
         }
     }
+    let reconciled_peer_summary = if args.sync_from_peers {
+        let summary = reconcile_archive_peer_summaries(&peer_summaries)?;
+        eprintln!(
+            "event=qzbe_v04_archive_peers_converged peers={} height={} tip={} root={} work={}",
+            peer_summaries.len(),
+            summary.height,
+            hex(&summary.tip),
+            hex(&summary.state_root),
+            hex(&summary.cumulative_chainwork)
+        );
+        Some(summary)
+    } else {
+        None
+    };
+    let peers_reconciled = reconciled_peer_summary.is_some();
+    let full_history_replayed = canonical_history_complete_from_genesis(&store, &profile, &params)?;
+    let recovery_evidence = RecoveryEvidence {
+        network_profile: EvidenceStatus::Valid,
+        genesis_manifest: EvidenceStatus::Valid,
+        full_history_replay: if full_history_replayed {
+            EvidenceStatus::Valid
+        } else {
+            EvidenceStatus::Invalid
+        },
+        peer_reconciliation: if peers_reconciled {
+            EvidenceStatus::Valid
+        } else {
+            EvidenceStatus::Pending
+        },
+        state_root_agreement: if peers_reconciled {
+            EvidenceStatus::Valid
+        } else {
+            EvidenceStatus::Pending
+        },
+        cumulative_chainwork_agreement: if peers_reconciled {
+            EvidenceStatus::Valid
+        } else {
+            EvidenceStatus::Pending
+        },
+        conflicting_peer_history: false,
+    };
+    let recovery_readiness = recovery_evidence.evaluate();
+    if matches!(recovery_readiness, RecoveryReadiness::Quarantined(_)) {
+        let (_, detail) = recovery_readiness_fields(recovery_readiness);
+        return Err(format!(
+            "QZBE recovery gate quarantined node startup: {detail}"
+        ));
+    }
+    let (recovery_status, recovery_detail) = recovery_readiness_fields(recovery_readiness);
+    eprintln!(
+        "event=qzbe_v04_recovery_readiness_at_startup status={} detail={} full_history_replayed={} pinned_peer_reconciliation={} independent_operator_attestation=false mainnet=false public_launch_approved=false",
+        recovery_status, recovery_detail, full_history_replayed, peers_reconciled
+    );
+
     let initial = snapshot(&store)?;
     let mut mempool = BoundedMempool::new(MempoolLimits::default())
         .map_err(|error| format!("configure bounded QZBE transaction mempool: {error:?}"))?;
@@ -2599,6 +2789,7 @@ fn run(args: Args) -> Result<(), String> {
                 &args.network_id,
                 &genesis_id,
                 &profile_id,
+                recovery_readiness,
             )?;
             reconcile_pending_mempool(&store, &authenticator, &mut mempool)?;
             if !mempool.is_empty() {
@@ -2692,6 +2883,7 @@ fn run(args: Args) -> Result<(), String> {
                     &args.network_id,
                     &genesis_id,
                     &profile_id,
+                    recovery_readiness,
                 ) {
                     mining_rpc_error = Some(error);
                     return true;
@@ -2813,6 +3005,7 @@ fn run(args: Args) -> Result<(), String> {
                 &args.network_id,
                 &genesis_id,
                 &profile_id,
+                recovery_readiness,
             )?;
             reconcile_pending_mempool(&store, &authenticator, &mut mempool)?;
             if args
@@ -3475,6 +3668,47 @@ mod tests {
         assert!(decode_ack(&bytes, &[0x32; 32], &[0x41; 32]).is_err());
         assert!(decode_ack(&bytes, &[0x31; 32], &[0x42; 32]).is_err());
         assert!(decode_ack(&bytes[..bytes.len() - 1], &[0x31; 32], &[0x41; 32]).is_err());
+    }
+
+    #[test]
+    fn pinned_archive_peers_must_agree_on_canonical_tip_root_and_chainwork() {
+        let first = ArchivePeerSummary {
+            height: 5,
+            tip: [0x11; 32],
+            state_root: [0x22; 32],
+            cumulative_chainwork: [0x33; 32],
+        };
+        assert_eq!(reconcile_archive_peer_summaries(&[first, first]), Ok(first));
+        let conflicting = ArchivePeerSummary {
+            tip: [0x44; 32],
+            ..first
+        };
+        assert!(reconcile_archive_peer_summaries(&[first, conflicting])
+            .unwrap_err()
+            .contains("disagree"));
+        assert!(reconcile_archive_peer_summaries(&[first])
+            .unwrap_err()
+            .contains("at least two"));
+    }
+
+    #[test]
+    fn recovery_readiness_rpc_labels_are_explicit_and_fail_closed() {
+        assert_eq!(
+            recovery_readiness_fields(RecoveryReadiness::Syncing(
+                RecoveryCheck::PeerReconciliation
+            )),
+            ("SYNCING", "peer_reconciliation_pending")
+        );
+        assert_eq!(
+            recovery_readiness_fields(RecoveryReadiness::Ready),
+            ("READY", "all_recovery_checks_valid")
+        );
+        assert_eq!(
+            recovery_readiness_fields(RecoveryReadiness::Quarantined(
+                RecoveryFault::ConflictingPeerHistory
+            )),
+            ("QUARANTINED", "conflicting_peer_history")
+        );
     }
 
     #[test]

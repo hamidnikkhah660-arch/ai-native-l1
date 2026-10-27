@@ -18,7 +18,7 @@ pub mod chain_admission;
 pub mod chain_import;
 pub mod chain_view;
 pub mod consensus;
-/// CP-0428 pure fail-closed readiness-gate model for a consensus-native recovery alternative; not yet wired to node startup.
+/// CP-0428 fail-closed recovery classification for the QZBE candidate node; not a Mainnet activation gate.
 pub mod consensus_native_recovery_gate_candidate;
 pub mod credential_binding;
 /// Candidate-only bounded Noise XX transport pinned to an explicit peer trust set.
