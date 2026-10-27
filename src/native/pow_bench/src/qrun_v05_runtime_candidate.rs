@@ -391,7 +391,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn runtime_executes_real_ed25519_signed_transfer() {
         use crate::transaction_auth::{
             AccountPublicKey, Ed25519TransactionAuthenticator, Ed25519TransactionSigner,
@@ -438,6 +437,7 @@ mod tests {
         drop(runtime);
         let _ = fs::remove_file(path);
     }
+    #[test]
     fn runtime_rejects_wrong_genesis_identity_and_bad_signatures() {
         let path = store_path();
         let runtime =
