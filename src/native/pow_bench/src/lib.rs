@@ -425,3 +425,5 @@ mod tests {
 pub mod token_forge;
 
 pub mod qrun_v05_genesis_candidate;
+/// QRun v0.5 Genesis-bound transfer execution and snapshot candidate; not yet node/P2P wired.
+pub mod qrun_v05_runtime_candidate;
