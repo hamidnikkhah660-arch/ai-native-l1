@@ -140,7 +140,7 @@ try {
         '--noise-static-private-key-dpapi-file', $keyB,
         '--trusted-peer-key-hex', $pubA,
         '--mine-blocks', '0',
-        '--run-seconds', '5'
+        '--run-seconds', '45'
     )
     $nodeB = Start-Process -FilePath $nodeExe -ArgumentList $argsB -RedirectStandardOutput $stdB -RedirectStandardError $logB -PassThru
     if (-not (Wait-Pattern $logB 'event=qzbe_v04_peer_smoke_ready .*height=0 .*local_only=true public_launch_approved=false' 20000)) {
@@ -224,6 +224,7 @@ try {
     if (-not (Wait-Pattern $logB 'event=qzbe_v04_peer_block_accepted .*height=2 .*accepted_count=2' 15000)) {
         throw ("CP-0414 receiver B did not accept both QZBE blocks: " + (Get-Text $logB))
     }
+    if ($nodeB.HasExited) { throw ("CP-0414 receiver B exited before canonical state queries: " + (Get-Text $logB)) }
     $rpcFinalStatus = Get-QzbeRpc $rpcPort '/v1/status'
     $rpcFinalBalance = Get-QzbeRpc $rpcPort ("/v1/balance/{0}" -f $recipient)
     if ($rpcFinalStatus.height -ne 2 -or $rpcFinalBalance.height -ne 2 -or
@@ -274,7 +275,7 @@ try {
     Write-Host ("CP-0432 NATIVE_WALLET_READ_ONLY_RPC_PASS height=2 balance_atoms=2500 txid=" +
         $tx.TransactionId + " confirmations=" + $rpcReceipt.confirmations + " mainnet=false")
     if (-not $nodeA.WaitForExit(30000)) { throw 'CP-0414 sending node A did not stop after its bounded mining run' }
-    if (-not $nodeB.WaitForExit(10000)) { throw 'CP-0414 receiver node B did not stop after its bounded observer run' }
+    if (-not $nodeB.WaitForExit(50000)) { throw 'CP-0414 receiver node B did not stop after its bounded 45-second observer run' }
     $textA = Get-Text $logA
     $textB = Get-Text $logB
     if ($textA -match 'event=qzbe_v04_peer_smoke_failed') { throw ("CP-0414 node A reported runtime failure: " + $textA) }

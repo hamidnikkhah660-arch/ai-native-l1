@@ -19,12 +19,12 @@ The test requires all of the following:
 
 The fixture uses a fresh random wallet, so TXID and state root intentionally change between runs. The last successful local run emitted:
 
-- CP-0433 NATIVE_WALLET_SIGN_AND_QZTS_SUBMIT_PASS txid=11adeb5bc9e19f98271c402af7f0d1fac31fbc08bd22f3b144a3be038c570c7b status=accepted
+- CP-0433 NATIVE_WALLET_SIGN_AND_QZTS_SUBMIT_PASS txid=9f466e2d3c2ccadb9b8564f8863ed7d65bc1954b69a6f4c7ce1e66b793d93956 status=accepted
 - CP-0414 READ_ONLY_RPC_CANONICAL_TXID_RECEIPT_PASS ... block_height=1 confirmations=2
 - CP-0432 NATIVE_WALLET_READ_ONLY_RPC_PASS height=2 balance_atoms=2500 ... confirmations=2 mainnet=false
 - CP-0414 QZBE_AUTHENTICATED_TXN_TWO_NODE_PASS ... invalid_signature=atomically_rejected replay=matched public_bind=denied
 
-The run completed with exit code 0 in 26.76 seconds.
+After fixing the receiver lifetime for slower CI runners and correcting a script line ending, the repeatable local Release run completed with exit code 0 in 46.51 seconds. The last observed state root was b9809ddc71b098806f4d45c2e83b9a1ac6ca4f636394eabfed9ea7bfe1cf653e and tip was d02f48f67b8d9467b16a0681ce83c1137be260a2c4b8cbbb04b5f00ad324fae9; these values are expected to vary with each freshly generated wallet.
 
 ## Safety and scope
 
