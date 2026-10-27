@@ -121,6 +121,34 @@ impl PrivateTestnetForkChoice {
             .map(|branch| branch.envelope.clone())
             .collect()
     }
+
+    /// Return only the selected canonical path, ordered from its first block to the tip.
+    /// The method walks authenticated parent digests; archive insertion/replay has already
+    /// validated every envelope, but the bounded walk still fails closed if invariants drift.
+    pub fn canonical_envelopes(&self) -> Result<Vec<Vec<u8>>, ForkChoiceError> {
+        let mut reversed = Vec::new();
+        let mut tip = self.canonical.chain_tip().tip_hash;
+        while tip != self.genesis_tip {
+            if reversed.len() >= MAX_FORK_ARCHIVE_HEIGHT as usize {
+                return Err(ForkChoiceError::ReplayIncomplete);
+            }
+            let branch = self
+                .branches
+                .get(&tip)
+                .ok_or(ForkChoiceError::UnknownParent)?;
+            let candidate =
+                decode_candidate_network_block(&branch.envelope).map_err(ForkChoiceError::Wire)?;
+            let digest = pow_digest(&candidate.header, self.params.pow)
+                .map_err(ForkChoiceError::InvalidPow)?;
+            if digest != tip {
+                return Err(ForkChoiceError::DigestMismatch);
+            }
+            tip = candidate.header.previous_consensus_hash;
+            reversed.push(branch.envelope.clone());
+        }
+        reversed.reverse();
+        Ok(reversed)
+    }
     pub fn archive_envelopes_bounded(
         &self,
         max_blocks: usize,

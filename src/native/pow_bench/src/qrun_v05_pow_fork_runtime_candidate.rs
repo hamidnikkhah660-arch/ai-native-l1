@@ -16,7 +16,7 @@ use crate::{
     },
     qrun_v05_genesis_candidate::{QRunGenesisError, QRunGenesisV05},
     state_machine::{
-        AccountId, Block, LedgerState, NetworkId, StateError, Transaction,
+        transaction_id, AccountId, Block, LedgerState, NetworkId, StateError, Transaction,
         TransactionAuthenticator, MAX_TOTAL_SUPPLY_ATOMS,
     },
 };
@@ -295,6 +295,27 @@ impl QRunV05PowForkRuntime {
     pub fn canonical_state(&self) -> &LedgerState {
         self.store.archive().canonical_chain().state()
     }
+
+    /// Rebuild transaction locations from the selected branch after restart or reorganization.
+    /// A transaction present only in a losing branch is never reported as canonically included.
+    pub fn canonical_transaction_locations(
+        &self,
+    ) -> Result<Vec<([u8; 32], u64)>, QRunV05PowRuntimeError> {
+        let envelopes = self
+            .store
+            .archive()
+            .canonical_envelopes()
+            .map_err(|error| QRunV05PowRuntimeError::InvalidCandidate(error.to_string()))?;
+        let mut locations = Vec::new();
+        for envelope in envelopes {
+            let candidate = decode_candidate_network_block(&envelope)?;
+            for transaction in &candidate.block.transactions {
+                locations.push((transaction_id(transaction)?, candidate.block.height));
+            }
+        }
+        Ok(locations)
+    }
+
     pub fn retained_branch_count(&self) -> usize {
         self.store.archive().archive_len()
     }
