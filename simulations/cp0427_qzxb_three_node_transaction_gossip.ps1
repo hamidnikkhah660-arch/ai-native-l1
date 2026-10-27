@@ -158,7 +158,7 @@ $nodeC = $null
 
 try {
     $argsA = @(
-        '--qzbe-v04-peer-smoke', '--network-id', $network, '--owner-id', $owner,
+        '--qzbe-v04-peer-smoke', '--test-easy-pow', '--network-id', $network, '--owner-id', $owner,
         '--miner-id', $miner, '--tx-public-key-hex', $txPublicKey,
         '--observe-account-id', $recipient, '--initial-subsidy-atoms', $subsidy,
         '--blocks-per-halving', $halving, '--data-dir', $dataA, '--listen', $addrA,
@@ -171,7 +171,7 @@ try {
     }
 
     $argsC = @(
-        '--qzbe-v04-peer-smoke', '--network-id', $network, '--owner-id', $owner,
+        '--qzbe-v04-peer-smoke', '--test-easy-pow', '--network-id', $network, '--owner-id', $owner,
         '--miner-id', $miner, '--tx-public-key-hex', $txPublicKey,
         '--observe-account-id', $recipient, '--initial-subsidy-atoms', $subsidy,
         '--blocks-per-halving', $halving, '--data-dir', $dataC, '--listen', $addrC,
@@ -184,7 +184,7 @@ try {
     }
 
     $argsB = @(
-        '--qzbe-v04-peer-smoke', '--network-id', $network, '--owner-id', $owner,
+        '--qzbe-v04-peer-smoke', '--test-easy-pow', '--network-id', $network, '--owner-id', $owner,
         '--miner-id', $miner, '--tx-public-key-hex', $txPublicKey,
         '--observe-account-id', $recipient, '--initial-subsidy-atoms', $subsidy,
         '--blocks-per-halving', $halving, '--data-dir', $dataB, '--listen', $addrB,
