@@ -85,7 +85,7 @@ impl<A: TransactionAuthenticator> QRunV05ExecutionRuntime<A> {
         } else {
             genesis.ledger().clone()
         };
-        let mut runtime = Self {
+        let runtime = Self {
             network_id,
             owner_account,
             genesis_commitment: genesis.commitment(),
@@ -391,6 +391,53 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn runtime_executes_real_ed25519_signed_transfer() {
+        use crate::transaction_auth::{
+            AccountPublicKey, Ed25519TransactionAuthenticator, Ed25519TransactionSigner,
+            TransactionAuthenticatorKind,
+        };
+
+        let signer = Ed25519TransactionSigner::from_seed([0x61; 32]);
+        let owner = signer.account_id();
+        let recipient: AccountId = [0x72; 32];
+        let authenticator = Ed25519TransactionAuthenticator::select(
+            TransactionAuthenticatorKind::Ed25519V1,
+            vec![AccountPublicKey {
+                account_id: owner,
+                public_key: signer.public_key(),
+            }],
+        )
+        .unwrap();
+        let path = store_path();
+        let mut runtime =
+            QRunV05ExecutionRuntime::open_or_create(NETWORK, owner, authenticator, &path).unwrap();
+        let mut tx = Transaction {
+            network_id: NETWORK,
+            sender: owner,
+            recipient,
+            nonce: 1,
+            amount: 1_000,
+            fee: 10,
+            expires_at: 100,
+            signature: Vec::new(),
+        };
+        signer.sign_transaction(&mut tx).unwrap();
+        let block = runtime.build_next_block(1, vec![tx]).unwrap();
+        runtime.import_block(&block).unwrap();
+
+        assert_eq!(runtime.balance_atoms(&recipient), 1_000);
+        assert_eq!(
+            runtime.owner_balance_atoms(),
+            MAX_TOTAL_SUPPLY_ATOMS as u64 - 1_010
+        );
+        assert_eq!(
+            runtime.total_supply_atoms().unwrap(),
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
+        drop(runtime);
+        let _ = fs::remove_file(path);
+    }
     fn runtime_rejects_wrong_genesis_identity_and_bad_signatures() {
         let path = store_path();
         let runtime =
