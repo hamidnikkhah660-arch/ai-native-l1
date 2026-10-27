@@ -26,6 +26,10 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      - name: Verify QZXB confirmed-swap candle engine
+        working-directory: .
+        run: node --test tools/qzxb-market/candles.test.mjs
+
       - name: Install stable formatter
         run: |
           rustup update stable
@@ -70,6 +74,10 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Verify QZXB confirmed-swap candle engine
+        shell: pwsh
+        run: node --test tools/qzxb-market/candles.test.mjs
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
