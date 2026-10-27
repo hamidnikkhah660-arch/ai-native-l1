@@ -975,6 +975,123 @@ mod tests {
     }
 
     #[test]
+    fn qrun_full_supply_survives_durable_pow_reorg_and_restart() {
+        let dir = TestDir::new();
+        let qrun_genesis =
+            crate::qrun_v05_genesis_candidate::QRunGenesisV05::new([0x51; 32], [0x2a; 32]).unwrap();
+        let genesis = qrun_genesis.ledger().clone();
+        let expected_supply = crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS;
+        assert_eq!(genesis.total_value().unwrap(), expected_supply);
+        let params = params();
+        let mut source_chain = crate::private_testnet_driver::PrivateTestnetChain::new(
+            genesis.clone(),
+            params.clone(),
+        )
+        .unwrap();
+        let (branch_a, digest_a) = envelope(&source_chain, &params, 100, 10);
+        let (branch_b, digest_b) = envelope(&source_chain, &params, 100, 11);
+        assert_ne!(digest_a, digest_b);
+
+        let mut store = PrivateTestnetForkStore::open(
+            &dir.0,
+            genesis.clone(),
+            params.clone(),
+            &EmptyAuthenticator,
+            &FixedClock,
+        )
+        .unwrap();
+        store
+            .submit(&branch_a, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+        store
+            .submit(&branch_b, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+        let tied_tip = if digest_a < digest_b {
+            digest_a
+        } else {
+            digest_b
+        };
+        assert_eq!(store.canonical_tip(), tied_tip);
+        assert_eq!(
+            store
+                .archive()
+                .canonical_chain()
+                .state()
+                .total_value()
+                .unwrap(),
+            expected_supply
+        );
+        drop(store);
+
+        // Extend the losing height-1 branch. The durable store must select the greater-work
+        // descendant even after its parent was not canonical, and it must survive a full restart.
+        let losing_parent = if digest_a > digest_b {
+            &branch_a
+        } else {
+            &branch_b
+        };
+        let decoded_parent = decode_candidate_network_block(losing_parent).unwrap();
+        source_chain
+            .append_live(
+                &decoded_parent.block,
+                &decoded_parent.header,
+                None,
+                &EmptyAuthenticator,
+                &FixedClock,
+            )
+            .unwrap();
+        let (child, child_digest) = child_envelope(&source_chain, &params, 101, 12);
+        let mut reopened = PrivateTestnetForkStore::open(
+            &dir.0,
+            genesis.clone(),
+            params.clone(),
+            &EmptyAuthenticator,
+            &FixedClock,
+        )
+        .unwrap();
+        reopened
+            .submit(&child, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+        assert_eq!(reopened.canonical_tip(), child_digest);
+        assert_eq!(reopened.canonical_height(), 2);
+        assert_eq!(
+            reopened
+                .archive()
+                .canonical_chain()
+                .state()
+                .total_value()
+                .unwrap(),
+            expected_supply
+        );
+        let expected_root = reopened.archive().canonical_chain().state().state_root();
+        drop(reopened);
+
+        let final_store = PrivateTestnetForkStore::open(
+            &dir.0,
+            genesis,
+            params,
+            &EmptyAuthenticator,
+            &FixedClock,
+        )
+        .unwrap();
+        assert_eq!(final_store.canonical_tip(), child_digest);
+        assert_eq!(final_store.canonical_height(), 2);
+        assert_eq!(
+            final_store.archive().canonical_chain().state().state_root(),
+            expected_root
+        );
+        assert_eq!(
+            final_store
+                .archive()
+                .canonical_chain()
+                .state()
+                .total_value()
+                .unwrap(),
+            expected_supply
+        );
+    }
+
+    #[test]
     fn stale_pid_text_does_not_block_os_lock_recovery() {
         let dir = TestDir::new();
         fs::write(dir.0.join(LOCK_NAME), b"pid=4294967295\n").unwrap();
