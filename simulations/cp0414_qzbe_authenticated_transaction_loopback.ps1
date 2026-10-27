@@ -296,7 +296,7 @@ try {
     Write-Host ("CP-0432 NATIVE_WALLET_READ_ONLY_RPC_PASS height=2 balance_atoms=2500 txid=" +
         $tx.TransactionId + " confirmations=" + $rpcReceipt.confirmations + " mainnet=false")
     if (-not $nodeA.WaitForExit(30000)) { throw 'CP-0414 sending node A did not stop after its bounded mining run' }
-    if (-not $nodeB.WaitForExit(50000)) { throw 'CP-0414 receiver node B did not stop after its bounded 60-second observer run' }
+    if (-not $nodeB.WaitForExit(70000)) { throw 'CP-0414 receiver node B did not stop after its bounded 60-second observer run' }
     $textA = Get-Text $logA
     $textB = Get-Text $logB
     if ($textA -match 'event=qzbe_v04_peer_smoke_failed') { throw ("CP-0414 node A reported runtime failure: " + $textA) }
