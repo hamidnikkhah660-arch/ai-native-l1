@@ -133,6 +133,10 @@ impl<A: TransactionAuthenticator> QRunV05ExecutionRuntime<A> {
         self.state.height()
     }
 
+    pub fn genesis_commitment(&self) -> [u8; 32] {
+        self.genesis_commitment
+    }
+
     pub fn state_root(&self) -> [u8; 32] {
         self.state.state_root()
     }
