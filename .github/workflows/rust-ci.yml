@@ -1,4 +1,4 @@
-﻿name: Rust validation
+name: Rust validation
 
 on:
   push:
@@ -109,3 +109,6 @@ jobs:
       - name: Run explicit public zero-value Devnet transport and state convergence
         shell: pwsh
         run: ./simulations/cp0429_public_zero_value_devnet_transport.ps1
+      - name: Run QZBE fresh-node bounded archive sync and state convergence
+        shell: pwsh
+        run: ./simulations/cp0437_qzbe_fresh_node_archive_sync.ps1

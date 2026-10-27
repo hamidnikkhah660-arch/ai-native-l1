@@ -14,6 +14,7 @@ use ai_native_l1_pow_bench::{
     monetary_pow_v04_candidate::{
         qzbe_pow_digest, V04ExecutionForkChoiceOutcome, V04ExecutionPowEnvelope,
         MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES, MAX_QZBE_MINING_ATTEMPTS,
+        MAX_V04_EXECUTION_FORK_ARCHIVE_BLOCKS,
     },
     monetary_pow_v04_checkpoint_candidate::{
         QzbeCheckpointRecord, QzbeCheckpointValidationContext,
@@ -53,6 +54,14 @@ use std::{
 const ACK_MAGIC: &[u8; 4] = b"QZA4";
 const ACK_VERSION: u16 = 1;
 const ACK_BYTES: usize = 183;
+const ARCHIVE_SYNC_REQUEST_MAGIC: &[u8; 4] = b"QZSR";
+const ARCHIVE_SYNC_HEADER_MAGIC: &[u8; 4] = b"QZSH";
+const ARCHIVE_SYNC_VERSION: u16 = 1;
+const ARCHIVE_SYNC_REQUEST_BYTES: usize = 4 + 2 + 2 + 32 + 32;
+const ARCHIVE_SYNC_HEADER_BYTES: usize = 4 + 2 + 2 + 32 + 32 + 8 + 32 + 32 + 8 + 32 + 4 + 8 + 32;
+const MAX_ARCHIVE_SYNC_BLOCKS: usize = MAX_V04_EXECUTION_FORK_ARCHIVE_BLOCKS;
+const MAX_ARCHIVE_SYNC_BYTES: usize = 64 * 1024 * 1024;
+const ARCHIVE_SYNC_DIGEST_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-ARCHIVE-SYNC-V1\0";
 /// Root-level immutable profile lock for every QZBE candidate data directory.
 /// Legacy PTB2/PFS2 and PMT3/PMT4 entrypoints detect its presence and fail closed.
 const QZBE_RUNTIME_PROFILE_FILE: &str = "qzbe-runtime.profile";
@@ -104,6 +113,7 @@ struct Args {
     exit_after_mining: bool,
     test_easy_pow: bool,
     public_testnet_p2p: bool,
+    sync_from_peers: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,8 +131,186 @@ struct PeerAck {
     snapshot: Snapshot,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArchiveSyncRequest {
+    genesis_id: [u8; 32],
+    profile_id: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArchiveSyncHeader {
+    genesis_id: [u8; 32],
+    profile_id: [u8; 32],
+    snapshot: Snapshot,
+    cumulative_chainwork: [u8; 32],
+    envelope_count: usize,
+    total_bytes: usize,
+    archive_digest: [u8; 32],
+}
+
+fn encode_archive_sync_request(
+    genesis_id: [u8; 32],
+    profile_id: [u8; 32],
+) -> [u8; ARCHIVE_SYNC_REQUEST_BYTES] {
+    let mut bytes = Vec::with_capacity(ARCHIVE_SYNC_REQUEST_BYTES);
+    bytes.extend_from_slice(ARCHIVE_SYNC_REQUEST_MAGIC);
+    bytes.extend_from_slice(&ARCHIVE_SYNC_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&0u16.to_be_bytes());
+    bytes.extend_from_slice(&genesis_id);
+    bytes.extend_from_slice(&profile_id);
+    bytes.try_into().expect("fixed archive sync request width")
+}
+
+fn decode_archive_sync_request(bytes: &[u8]) -> Result<ArchiveSyncRequest, String> {
+    if bytes.len() != ARCHIVE_SYNC_REQUEST_BYTES || &bytes[..4] != ARCHIVE_SYNC_REQUEST_MAGIC {
+        return Err("QZBE archive-sync request magic or length mismatch".into());
+    }
+    if u16::from_be_bytes([bytes[4], bytes[5]]) != ARCHIVE_SYNC_VERSION
+        || u16::from_be_bytes([bytes[6], bytes[7]]) != 0
+    {
+        return Err("unsupported or noncanonical QZBE archive-sync request version/flags".into());
+    }
+    let genesis_id: [u8; 32] = bytes[8..40]
+        .try_into()
+        .map_err(|_| "archive-sync Genesis width mismatch")?;
+    let profile_id: [u8; 32] = bytes[40..72]
+        .try_into()
+        .map_err(|_| "archive-sync profile width mismatch")?;
+    if genesis_id.iter().all(|byte| *byte == 0) || profile_id.iter().all(|byte| *byte == 0) {
+        return Err("QZBE archive-sync request has a zero Genesis/profile binding".into());
+    }
+    Ok(ArchiveSyncRequest {
+        genesis_id,
+        profile_id,
+    })
+}
+
+fn encode_archive_sync_header(
+    header: &ArchiveSyncHeader,
+) -> Result<[u8; ARCHIVE_SYNC_HEADER_BYTES], String> {
+    if header.genesis_id.iter().all(|byte| *byte == 0)
+        || header.profile_id.iter().all(|byte| *byte == 0)
+        || header.snapshot.tip.iter().all(|byte| *byte == 0)
+        || header.snapshot.state_root.iter().all(|byte| *byte == 0)
+        || header.envelope_count > MAX_ARCHIVE_SYNC_BLOCKS
+        || header.total_bytes > MAX_ARCHIVE_SYNC_BYTES
+        || (header.envelope_count == 0) != (header.total_bytes == 0)
+    {
+        return Err("QZBE archive-sync header has invalid bindings or exceeds caps".into());
+    }
+    let count =
+        u32::try_from(header.envelope_count).map_err(|_| "archive-sync block count overflow")?;
+    let total_bytes =
+        u64::try_from(header.total_bytes).map_err(|_| "archive-sync byte count overflow")?;
+    let mut bytes = Vec::with_capacity(ARCHIVE_SYNC_HEADER_BYTES);
+    bytes.extend_from_slice(ARCHIVE_SYNC_HEADER_MAGIC);
+    bytes.extend_from_slice(&ARCHIVE_SYNC_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&0u16.to_be_bytes());
+    bytes.extend_from_slice(&header.genesis_id);
+    bytes.extend_from_slice(&header.profile_id);
+    bytes.extend_from_slice(&header.snapshot.height.to_be_bytes());
+    bytes.extend_from_slice(&header.snapshot.tip);
+    bytes.extend_from_slice(&header.snapshot.state_root);
+    bytes.extend_from_slice(&header.snapshot.generation.to_be_bytes());
+    bytes.extend_from_slice(&header.cumulative_chainwork);
+    bytes.extend_from_slice(&count.to_be_bytes());
+    bytes.extend_from_slice(&total_bytes.to_be_bytes());
+    bytes.extend_from_slice(&header.archive_digest);
+    bytes
+        .try_into()
+        .map_err(|_| "QZBE archive-sync header width mismatch".into())
+}
+
+fn decode_archive_sync_header(bytes: &[u8]) -> Result<ArchiveSyncHeader, String> {
+    if bytes.len() != ARCHIVE_SYNC_HEADER_BYTES || &bytes[..4] != ARCHIVE_SYNC_HEADER_MAGIC {
+        return Err("QZBE archive-sync header magic or length mismatch".into());
+    }
+    if u16::from_be_bytes([bytes[4], bytes[5]]) != ARCHIVE_SYNC_VERSION
+        || u16::from_be_bytes([bytes[6], bytes[7]]) != 0
+    {
+        return Err("unsupported or noncanonical QZBE archive-sync header version/flags".into());
+    }
+    let genesis_id = bytes[8..40]
+        .try_into()
+        .map_err(|_| "archive-sync Genesis width mismatch")?;
+    let profile_id = bytes[40..72]
+        .try_into()
+        .map_err(|_| "archive-sync profile width mismatch")?;
+    let height = u64::from_be_bytes(
+        bytes[72..80]
+            .try_into()
+            .map_err(|_| "archive-sync height width mismatch")?,
+    );
+    let tip = bytes[80..112]
+        .try_into()
+        .map_err(|_| "archive-sync tip width mismatch")?;
+    let state_root = bytes[112..144]
+        .try_into()
+        .map_err(|_| "archive-sync state-root width mismatch")?;
+    let generation = u64::from_be_bytes(
+        bytes[144..152]
+            .try_into()
+            .map_err(|_| "archive-sync generation width mismatch")?,
+    );
+    let cumulative_chainwork = bytes[152..184]
+        .try_into()
+        .map_err(|_| "archive-sync chainwork width mismatch")?;
+    let envelope_count = u32::from_be_bytes(
+        bytes[184..188]
+            .try_into()
+            .map_err(|_| "archive-sync block count width mismatch")?,
+    ) as usize;
+    let total_bytes_u64 = u64::from_be_bytes(
+        bytes[188..196]
+            .try_into()
+            .map_err(|_| "archive-sync byte count width mismatch")?,
+    );
+    let total_bytes = usize::try_from(total_bytes_u64)
+        .map_err(|_| "archive-sync byte count does not fit memory size")?;
+    let archive_digest = bytes[196..228]
+        .try_into()
+        .map_err(|_| "archive-sync digest width mismatch")?;
+    let header = ArchiveSyncHeader {
+        genesis_id,
+        profile_id,
+        snapshot: Snapshot {
+            height,
+            tip,
+            state_root,
+            generation,
+        },
+        cumulative_chainwork,
+        envelope_count,
+        total_bytes,
+        archive_digest,
+    };
+    if header.genesis_id.iter().all(|byte| *byte == 0)
+        || header.profile_id.iter().all(|byte| *byte == 0)
+        || header.snapshot.tip.iter().all(|byte| *byte == 0)
+        || header.snapshot.state_root.iter().all(|byte| *byte == 0)
+        || header.envelope_count > MAX_ARCHIVE_SYNC_BLOCKS
+        || header.total_bytes > MAX_ARCHIVE_SYNC_BYTES
+        || (header.envelope_count == 0) != (header.total_bytes == 0)
+    {
+        return Err("QZBE archive-sync response has invalid bindings or exceeds caps".into());
+    }
+    Ok(header)
+}
+
+fn archive_sync_digest(envelopes: &[Vec<u8>]) -> Result<[u8; 32], String> {
+    let mut hash = Sha256::new();
+    hash.update(ARCHIVE_SYNC_DIGEST_DOMAIN);
+    for envelope in envelopes {
+        let len =
+            u32::try_from(envelope.len()).map_err(|_| "archive-sync envelope length overflow")?;
+        hash.update(len.to_be_bytes());
+        hash.update(envelope);
+    }
+    Ok(hash.finalize().into())
+}
+
 fn usage() -> &'static str {
-    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --tx-public-key-hex HEX64 --observe-account-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT [--tx-listen 127.0.0.1:PORT] [--rpc-listen 127.0.0.1:PORT] --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 [--trusted-peer-key-hex HEX64 ...] --initial-subsidy-atoms U128 --blocks-per-halving U64 [--tx-recipient-id HEX64 --tx-nonce U64 --tx-amount-atoms U64 --tx-fee-atoms U64 --tx-expires-at U64 --tx-signature-hex HEX128_OR_HEX192] [--probe-invalid-signature-first] [--test-easy-pow --public-testnet-p2p] [--peer IP:PORT ...] [--mine-blocks N | --mine-forever] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2 runtime candidate with statically pinned Noise peers and loopback-only transaction/RPC listeners. Each --peer is paired by order with --trusted-peer-key-hex; additional trusted keys authorize inbound peers. Canonical v0.4 Argon2id is the default. --mine-forever continuously mines and broadcasts until interrupted or --stop-after-height is reached; it requires a pinned peer and cannot be combined with --mine-blocks or --exit-after-mining. External P2P bind is available only with BOTH --test-easy-pow and --public-testnet-p2p; all inbound peers still require a configured Noise static-key pin. This is a test-network transport mode, not Mainnet activation; never expose transaction ingress or RPC beyond loopback."
+    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --tx-public-key-hex HEX64 --observe-account-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT [--tx-listen 127.0.0.1:PORT] [--rpc-listen 127.0.0.1:PORT] --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 [--trusted-peer-key-hex HEX64 ...] --initial-subsidy-atoms U128 --blocks-per-halving U64 [--tx-recipient-id HEX64 --tx-nonce U64 --tx-amount-atoms U64 --tx-fee-atoms U64 --tx-expires-at U64 --tx-signature-hex HEX128_OR_HEX192] [--probe-invalid-signature-first] [--test-easy-pow --public-testnet-p2p] [--sync-from-peers] [--peer IP:PORT ...] [--mine-blocks N | --mine-forever] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2 runtime candidate with statically pinned Noise peers and loopback-only transaction/RPC listeners. Each --peer is paired by order with --trusted-peer-key-hex; additional trusted keys authorize inbound peers. Canonical v0.4 Argon2id is the default. --mine-forever continuously mines and broadcasts until interrupted or --stop-after-height is reached; it requires a pinned peer and cannot be combined with --mine-blocks or --exit-after-mining. External P2P bind is available only with BOTH --test-easy-pow and --public-testnet-p2p; all inbound peers still require a configured Noise static-key pin. This is a test-network transport mode, not Mainnet activation; never expose transaction ingress or RPC beyond loopback."
 }
 
 fn parse_hex32(value: &str, name: &str) -> Result<[u8; 32], String> {
@@ -236,6 +424,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
     let mut probe_invalid_signature_first = false;
     let mut test_easy_pow = false;
     let mut public_testnet_p2p = false;
+    let mut sync_from_peers = false;
     let mut i = 0usize;
     while i < tokens.len() {
         let key = tokens[i].as_str();
@@ -284,6 +473,14 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
                 return Err("duplicate option: --public-testnet-p2p".into());
             }
             public_testnet_p2p = true;
+            i += 1;
+            continue;
+        }
+        if key == "--sync-from-peers" {
+            if sync_from_peers {
+                return Err("duplicate option: --sync-from-peers".into());
+            }
+            sync_from_peers = true;
             i += 1;
             continue;
         }
@@ -415,6 +612,12 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
     }
     if public_testnet_p2p && !test_easy_pow {
         return Err("--public-testnet-p2p is test-only and requires --test-easy-pow".into());
+    }
+    if sync_from_peers && !(public_testnet_p2p && test_easy_pow) {
+        return Err("--sync-from-peers is restricted to the explicit zero-value test profile (--test-easy-pow --public-testnet-p2p)".into());
+    }
+    if sync_from_peers && peers.is_empty() {
+        return Err("--sync-from-peers requires at least one pinned --peer".into());
     }
     let network_id = parse_hex32(&take("--network-id")?, "--network-id")?;
     let owner_id = parse_hex32(&take("--owner-id")?, "--owner-id")?;
@@ -621,6 +824,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
         exit_after_mining,
         test_easy_pow,
         public_testnet_p2p,
+        sync_from_peers,
     }))
 }
 
@@ -1196,6 +1400,180 @@ fn write_peer_tx_ack(
         .map_err(|error| format!("send encrypted QZTA/1 transaction ACK: {error}"))
 }
 
+fn ordered_archive_envelopes(
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    context: &QzbeCheckpointValidationContext<'_>,
+) -> Result<Vec<Vec<u8>>, String> {
+    let envelopes = store
+        .fork_choice()
+        .archive_envelopes_bounded(MAX_ARCHIVE_SYNC_BLOCKS, MAX_ARCHIVE_SYNC_BYTES)
+        .map_err(|error| format!("QZBE archive-sync export refused: {error}"))?;
+    let mut ordered = Vec::with_capacity(envelopes.len());
+    let mut total_bytes = 0usize;
+    for bytes in envelopes {
+        total_bytes = total_bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| "QZBE archive-sync byte count overflow".to_string())?;
+        if total_bytes > MAX_ARCHIVE_SYNC_BYTES {
+            return Err("QZBE archive-sync export exceeds its byte cap".into());
+        }
+        let envelope = V04ExecutionPowEnvelope::decode(&bytes, context.profile, context.params)
+            .map_err(|error| format!("decode archived QZBE envelope: {error}"))?;
+        let digest = qzbe_pow_digest(&envelope.header, &envelope.block, context.params)
+            .map_err(|error| format!("digest archived QZBE envelope: {error}"))?;
+        ordered.push((envelope.header.height, digest, bytes));
+    }
+    ordered.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    Ok(ordered.into_iter().map(|(_, _, bytes)| bytes).collect())
+}
+
+fn serve_archive_sync(
+    session: &mut DevnetNoiseSession,
+    stream: &mut TcpStream,
+    request_bytes: &[u8],
+    profile_id: &[u8; 32],
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    context: &QzbeCheckpointValidationContext<'_>,
+) -> Result<(), String> {
+    let request = decode_archive_sync_request(request_bytes)?;
+    let genesis_id = context
+        .manifest
+        .manifest_hash()
+        .map_err(|error| format!("hash archive-sync Genesis: {error:?}"))?;
+    if request.genesis_id != genesis_id || &request.profile_id != profile_id {
+        return Err("QZBE archive-sync request Genesis/profile mismatch".into());
+    }
+    let envelopes = ordered_archive_envelopes(store, context)?;
+    let total_bytes = envelopes
+        .iter()
+        .try_fold(0usize, |sum, envelope| sum.checked_add(envelope.len()))
+        .ok_or_else(|| "QZBE archive-sync total-byte overflow".to_string())?;
+    let header = ArchiveSyncHeader {
+        genesis_id,
+        profile_id: *profile_id,
+        snapshot: snapshot(store)?,
+        cumulative_chainwork: store
+            .fork_choice()
+            .canonical_cumulative_work()
+            .to_be_bytes(),
+        envelope_count: envelopes.len(),
+        total_bytes,
+        archive_digest: archive_sync_digest(&envelopes)?,
+    };
+    let header_bytes = encode_archive_sync_header(&header)?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .map_err(|error| format!("set QZBE archive-sync write timeout: {error}"))?;
+    session
+        .write_record(stream, &header_bytes)
+        .map_err(|error| format!("send QZBE archive-sync header: {error}"))?;
+    for envelope in &envelopes {
+        session
+            .write_record(stream, envelope)
+            .map_err(|error| format!("send QZBE archived envelope: {error}"))?;
+    }
+    eprintln!("event=qzbe_v04_archive_sync_served height={} tip={} root={} envelopes={} bytes={} digest={}",
+        header.snapshot.height, hex(&header.snapshot.tip), hex(&header.snapshot.state_root),
+        header.envelope_count, header.total_bytes, hex(&header.archive_digest));
+    Ok(())
+}
+
+fn sync_archive_from_peer(
+    address: SocketAddr,
+    local_key: &[u8; 32],
+    peer_key: &[u8; 32],
+    network_id: &[u8; 32],
+    genesis_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    store: &mut V04ExecutionCheckpointForkStoreCandidate,
+    context: &QzbeCheckpointValidationContext<'_>,
+    authenticator: &Ed25519TransactionAuthenticator,
+) -> Result<(), String> {
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(10))
+        .map_err(|error| format!("connect to pinned QZBE archive peer {address}: {error}"))?;
+    stream
+        .set_nodelay(true)
+        .map_err(|error| format!("configure archive peer TCP_NODELAY: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .map_err(|error| format!("set archive-sync read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .map_err(|error| format!("set archive-sync write timeout: {error}"))?;
+    let mut session = DevnetNoiseSession::connect(&mut stream, local_key, peer_key, network_id)
+        .map_err(|error| format!("authenticate archive-sync Noise session: {error}"))?;
+    let request = encode_archive_sync_request(*genesis_id, *profile_id);
+    session
+        .write_record(&mut stream, &request)
+        .map_err(|error| format!("send QZBE archive-sync request: {error}"))?;
+    let header_bytes = session
+        .read_record(&mut stream)
+        .map_err(|error| format!("read QZBE archive-sync header: {error}"))?;
+    let header = decode_archive_sync_header(&header_bytes)?;
+    if &header.genesis_id != genesis_id || &header.profile_id != profile_id {
+        return Err("pinned peer returned a different QZBE Genesis/profile".into());
+    }
+
+    let mut envelopes = Vec::with_capacity(header.envelope_count);
+    let mut total_bytes = 0usize;
+    let mut previous_key: Option<(u64, [u8; 32])> = None;
+    for _ in 0..header.envelope_count {
+        let bytes = session
+            .read_record(&mut stream)
+            .map_err(|error| format!("read QZBE archive-sync envelope: {error}"))?;
+        if bytes.len() > MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES {
+            return Err("QZBE archive-sync peer sent an oversized block".into());
+        }
+        total_bytes = total_bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| "QZBE archive-sync received-byte overflow".to_string())?;
+        if total_bytes > MAX_ARCHIVE_SYNC_BYTES {
+            return Err("QZBE archive-sync response exceeds its byte cap".into());
+        }
+        let decoded = V04ExecutionPowEnvelope::decode(&bytes, context.profile, context.params)
+            .map_err(|error| format!("decode peer-supplied archived block: {error}"))?;
+        let digest = qzbe_pow_digest(&decoded.header, &decoded.block, context.params)
+            .map_err(|error| format!("digest peer-supplied archived block: {error}"))?;
+        let key = (decoded.header.height, digest);
+        if previous_key.is_some_and(|previous| key < previous) {
+            return Err("QZBE archive-sync blocks are not in canonical height/digest order".into());
+        }
+        previous_key = Some(key);
+        envelopes.push(bytes);
+    }
+    if total_bytes != header.total_bytes
+        || archive_sync_digest(&envelopes)? != header.archive_digest
+    {
+        return Err("QZBE archive-sync byte count or digest mismatch".into());
+    }
+
+    for bytes in &envelopes {
+        store
+            .submit(bytes, context, authenticator)
+            .map_err(|error| format!("validate/import QZBE archive-sync block: {error}"))?;
+    }
+    let actual = snapshot(store)?;
+    let actual_work = store
+        .fork_choice()
+        .canonical_cumulative_work()
+        .to_be_bytes();
+    if actual.height != header.snapshot.height
+        || actual.tip != header.snapshot.tip
+        || actual.state_root != header.snapshot.state_root
+        || actual_work != header.cumulative_chainwork
+    {
+        return Err(format!(
+            "QZBE archive-sync did not converge to pinned peer {}: local height/tip/root/work={}/{}/{}/{} peer={}/{}/{}/{}",
+            address, actual.height, hex(&actual.tip), hex(&actual.state_root), hex(&actual_work),
+            header.snapshot.height, hex(&header.snapshot.tip), hex(&header.snapshot.state_root), hex(&header.cumulative_chainwork)
+        ));
+    }
+    eprintln!("event=qzbe_v04_archive_sync_complete peer={} height={} tip={} root={} imported_or_seen={} bytes={} work={} generation={}",
+        address, actual.height, hex(&actual.tip), hex(&actual.state_root), envelopes.len(),
+        total_bytes, hex(&actual_work), actual.generation);
+    Ok(())
+}
+
 fn serve_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
@@ -1211,6 +1589,7 @@ fn serve_connection(
     outbound_peer_keys: &[[u8; 32]],
     relayed_tx_count: &mut u64,
     accepted_count: &mut u64,
+    allow_archive_sync: bool,
 ) -> Result<(), String> {
     stream
         .set_nodelay(true)
@@ -1232,7 +1611,23 @@ fn serve_connection(
     let remote_peer_key = *session.remote_static_public_key();
     let candidate = session
         .read_record(&mut stream)
-        .map_err(|error| format!("read encrypted QZBE/QZTG peer frame: {error}"))?;
+        .map_err(|error| format!("read encrypted QZBE/QZTG/QZSR peer frame: {error}"))?;
+    if candidate.starts_with(ARCHIVE_SYNC_REQUEST_MAGIC) {
+        if !allow_archive_sync {
+            return Err(
+                "QZBE archive sync is available only in explicit zero-value public-testnet mode"
+                    .into(),
+            );
+        }
+        return serve_archive_sync(
+            &mut session,
+            &mut stream,
+            &candidate,
+            profile,
+            store,
+            checkpoint_context,
+        );
+    }
     if candidate.starts_with(GOSSIP_MAGIC) {
         let transaction_wire = match decode_gossip_frame(profile, &candidate) {
             Ok(wire) => wire,
@@ -1698,6 +2093,7 @@ fn poll_connections(
     relayed_tx_count: &mut u64,
     accepted_count: &mut u64,
     message_count: &mut u64,
+    allow_archive_sync: bool,
 ) -> Result<(), String> {
     loop {
         match listener.accept() {
@@ -1721,6 +2117,7 @@ fn poll_connections(
                     outbound_peer_keys,
                     relayed_tx_count,
                     accepted_count,
+                    allow_archive_sync,
                 ) {
                     eprintln!(
                         "event=qzbe_v04_peer_connection_rejected peer={} reason={}",
@@ -2018,6 +2415,25 @@ fn run(args: Args) -> Result<(), String> {
         &authenticator,
     )
     .map_err(|error| format!("open checkpoint-rooted local QZBE store: {error}"))?;
+    if args.sync_from_peers {
+        for (index, peer) in args.peers.iter().enumerate() {
+            eprintln!(
+                "event=qzbe_v04_archive_sync_started peer={} mode=explicit_testnet_only",
+                peer
+            );
+            sync_archive_from_peer(
+                *peer,
+                &secret.0,
+                &args.trusted_peer_keys[index],
+                &args.network_id,
+                &genesis_id,
+                &profile_id,
+                &mut store,
+                &checkpoint_context,
+                &authenticator,
+            )?;
+        }
+    }
     let initial = snapshot(&store)?;
     let mut mempool = BoundedMempool::new(MempoolLimits::default())
         .map_err(|error| format!("configure bounded QZBE transaction mempool: {error:?}"))?;
@@ -2159,6 +2575,7 @@ fn run(args: Args) -> Result<(), String> {
                 &mut relayed_tx_count,
                 &mut accepted_count,
                 &mut message_count,
+                args.public_testnet_p2p && args.test_easy_pow,
             )?;
             poll_tx_connections(
                 tx_listener.as_ref(),
@@ -2228,6 +2645,7 @@ fn run(args: Args) -> Result<(), String> {
             &mut relayed_tx_count,
             &mut accepted_count,
             &mut message_count,
+            args.public_testnet_p2p && args.test_easy_pow,
         )?;
         poll_tx_connections(
             tx_listener.as_ref(),
@@ -2371,6 +2789,7 @@ fn run(args: Args) -> Result<(), String> {
                 &mut relayed_tx_count,
                 &mut accepted_count,
                 &mut message_count,
+                args.public_testnet_p2p && args.test_easy_pow,
             )?;
             poll_tx_connections(
                 tx_listener.as_ref(),
@@ -2535,6 +2954,7 @@ mod tests {
             exit_after_mining: true,
             test_easy_pow: false,
             public_testnet_p2p: false,
+            sync_from_peers: false,
         }
     }
 
@@ -2639,6 +3059,45 @@ mod tests {
         assert!(parse_args_from(missing_pin)
             .unwrap_err()
             .contains("corresponding --trusted-peer-key-hex"));
+    }
+
+    #[test]
+    fn archive_sync_flag_is_test_only_and_requires_a_pinned_peer() {
+        let mut non_test = parser_fixture_tokens(&[]);
+        non_test.extend([
+            "--trusted-peer-key-hex".into(),
+            "e6".repeat(32),
+            "--sync-from-peers".into(),
+        ]);
+        assert!(parse_args_from(non_test)
+            .unwrap_err()
+            .contains("restricted to the explicit zero-value test profile"));
+
+        let mut no_peer = parser_fixture_tokens(&[]);
+        no_peer.extend([
+            "--trusted-peer-key-hex".into(),
+            "e6".repeat(32),
+            "--test-easy-pow".into(),
+            "--public-testnet-p2p".into(),
+            "--sync-from-peers".into(),
+        ]);
+        assert!(parse_args_from(no_peer)
+            .unwrap_err()
+            .contains("--sync-from-peers requires at least one pinned --peer"));
+
+        let mut valid = parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        valid.extend([
+            "--test-easy-pow".into(),
+            "--public-testnet-p2p".into(),
+            "--sync-from-peers".into(),
+        ]);
+        let parsed = parse_args_from(valid).unwrap().unwrap();
+        assert!(parsed.sync_from_peers);
+        assert!(parsed.test_easy_pow && parsed.public_testnet_p2p);
+        assert_eq!(
+            parsed.peers,
+            vec!["127.0.0.1:49332".parse::<SocketAddr>().unwrap()]
+        );
     }
 
     #[test]
@@ -2870,6 +3329,117 @@ mod tests {
             "wrong-width lock is preserved, never reset"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archive_sync_request_and_header_roundtrip_with_fixed_widths() {
+        let genesis_id = [0x31; 32];
+        let profile_id = [0x42; 32];
+        let request = encode_archive_sync_request(genesis_id, profile_id);
+        assert_eq!(request.len(), ARCHIVE_SYNC_REQUEST_BYTES);
+        assert_eq!(
+            decode_archive_sync_request(&request).unwrap(),
+            ArchiveSyncRequest {
+                genesis_id,
+                profile_id
+            }
+        );
+
+        let header = ArchiveSyncHeader {
+            genesis_id,
+            profile_id,
+            snapshot: Snapshot {
+                height: 7,
+                tip: [0x53; 32],
+                state_root: [0x64; 32],
+                generation: 9,
+            },
+            cumulative_chainwork: [0x75; 32],
+            envelope_count: 2,
+            total_bytes: 1234,
+            archive_digest: [0x86; 32],
+        };
+        let encoded = encode_archive_sync_header(&header).unwrap();
+        assert_eq!(encoded.len(), ARCHIVE_SYNC_HEADER_BYTES);
+        assert_eq!(decode_archive_sync_header(&encoded).unwrap(), header);
+    }
+
+    #[test]
+    fn archive_sync_rejects_wrong_versions_flags_trailing_bytes_and_zero_bindings() {
+        let genesis_id = [0x31; 32];
+        let profile_id = [0x42; 32];
+        let request = encode_archive_sync_request(genesis_id, profile_id);
+        let mut wrong_version = request;
+        wrong_version[5] = 2;
+        assert!(decode_archive_sync_request(&wrong_version).is_err());
+        let mut nonzero_flags = request;
+        nonzero_flags[7] = 1;
+        assert!(decode_archive_sync_request(&nonzero_flags).is_err());
+        assert!(decode_archive_sync_request(&request[..request.len() - 1]).is_err());
+        assert!(
+            decode_archive_sync_request(&encode_archive_sync_request([0; 32], profile_id)).is_err()
+        );
+
+        let header = ArchiveSyncHeader {
+            genesis_id,
+            profile_id,
+            snapshot: Snapshot {
+                height: 0,
+                tip: [0x53; 32],
+                state_root: [0x64; 32],
+                generation: 0,
+            },
+            cumulative_chainwork: [0; 32],
+            envelope_count: 0,
+            total_bytes: 0,
+            archive_digest: archive_sync_digest(&[]).unwrap(),
+        };
+        let mut encoded = encode_archive_sync_header(&header).unwrap();
+        encoded[5] = 2;
+        assert!(decode_archive_sync_header(&encoded).is_err());
+        let mut encoded = encode_archive_sync_header(&header).unwrap();
+        encoded[7] = 1;
+        assert!(decode_archive_sync_header(&encoded).is_err());
+        let mut encoded = encode_archive_sync_header(&header).unwrap().to_vec();
+        encoded.push(0);
+        assert!(decode_archive_sync_header(&encoded).is_err());
+    }
+
+    #[test]
+    fn archive_sync_digest_binds_order_and_bytes() {
+        let a = vec![vec![1, 2, 3], vec![4, 5]];
+        let b = vec![vec![4, 5], vec![1, 2, 3]];
+        let c = vec![vec![1, 2, 4], vec![4, 5]];
+        assert_ne!(
+            archive_sync_digest(&a).unwrap(),
+            archive_sync_digest(&b).unwrap()
+        );
+        assert_ne!(
+            archive_sync_digest(&a).unwrap(),
+            archive_sync_digest(&c).unwrap()
+        );
+    }
+
+    #[test]
+    fn archive_sync_header_refuses_unbounded_count_or_bytes() {
+        let mut header = ArchiveSyncHeader {
+            genesis_id: [0x31; 32],
+            profile_id: [0x42; 32],
+            snapshot: Snapshot {
+                height: 0,
+                tip: [0x53; 32],
+                state_root: [0x64; 32],
+                generation: 0,
+            },
+            cumulative_chainwork: [0; 32],
+            envelope_count: MAX_ARCHIVE_SYNC_BLOCKS + 1,
+            total_bytes: 1,
+            archive_digest: [0x86; 32],
+        };
+        assert!(encode_archive_sync_header(&header).is_err());
+        header.envelope_count = 1;
+        header.total_bytes = MAX_ARCHIVE_SYNC_BYTES + 1;
+        assert!(encode_archive_sync_header(&header).is_err());
     }
 
     #[test]
