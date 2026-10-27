@@ -2,7 +2,7 @@
 
 on:
   push:
-    branches: [main, "ci/**", "public/**"]
+    branches: [main, "ci/**", "public/**", "work/qzbe-v04-persistent-mining-20261026"]
   pull_request:
     branches: [main]
   workflow_dispatch:
