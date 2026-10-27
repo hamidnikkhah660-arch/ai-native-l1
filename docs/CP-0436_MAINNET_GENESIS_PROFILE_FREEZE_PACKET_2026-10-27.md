@@ -1,4 +1,4 @@
-# CP-0423 — Mainnet Genesis and Issuance Freeze Packet (v0.4 candidate)
+# CP-0436 — Mainnet Genesis and Issuance Freeze Packet (v0.4 candidate)
 
 Date: 2026-10-27
 Status: Candidate freeze packet — not an activated Mainnet profile.
