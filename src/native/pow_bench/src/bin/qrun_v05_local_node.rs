@@ -817,4 +817,94 @@ mod tests {
         assert_eq!(profile_id(&network), profile_id(&network));
         assert_ne!(profile_id(&network), profile_id(&[0x52; 32]));
     }
+    #[test]
+    fn loopback_gossip_imports_signed_block_and_duplicate_is_idempotent() {
+        use ai_native_l1_pow_bench::transaction_auth::Ed25519TransactionSigner;
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::SystemTime;
+
+        const NETWORK: NetworkId = [0x51; 32];
+        let signer = Ed25519TransactionSigner::from_seed([0x61; 32]);
+        let owner = signer.account_id();
+        let recipient: AccountId = [0x3b; 32];
+        let authenticator = || {
+            Ed25519TransactionAuthenticator::select(
+                TransactionAuthenticatorKind::Ed25519V1,
+                [AccountPublicKey {
+                    account_id: owner,
+                    public_key: signer.public_key(),
+                }],
+            )
+            .unwrap()
+        };
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path1 =
+            std::env::temp_dir().join(format!("qrun-node1-{}-{nonce}.qrs", std::process::id()));
+        let path2 =
+            std::env::temp_dir().join(format!("qrun-node2-{}-{nonce}.qrs", std::process::id()));
+        let mut producer =
+            QRunV05ExecutionRuntime::open_or_create(NETWORK, owner, authenticator(), &path1)
+                .unwrap();
+        let receiver_runtime =
+            QRunV05ExecutionRuntime::open_or_create(NETWORK, owner, authenticator(), &path2)
+                .unwrap();
+
+        let now = now_unix().unwrap();
+        let mut transaction = Transaction {
+            network_id: NETWORK,
+            sender: owner,
+            recipient,
+            nonce: 1,
+            amount: 777,
+            fee: 3,
+            expires_at: now + 600,
+            signature: Vec::new(),
+        };
+        signer
+            .sign_transaction_self_contained(&mut transaction)
+            .unwrap();
+        let block = producer
+            .build_next_block(now + 1, vec![transaction])
+            .unwrap();
+        producer.import_block(&block).unwrap();
+
+        let receiver_state = Arc::new(Mutex::new(NodeState {
+            runtime: receiver_runtime,
+            receipts: BTreeMap::new(),
+            profile_id: profile_id(&NETWORK),
+            block_peers: Vec::new(),
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap();
+        let serving_state = Arc::clone(&receiver_state);
+        let serve = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                handle_block(&mut stream, &serving_state).unwrap();
+            }
+        });
+
+        send_block_to_peer(peer, &block).unwrap();
+        send_block_to_peer(peer, &block).unwrap();
+        serve.join().unwrap();
+
+        let state = receiver_state.lock().unwrap();
+        assert_eq!(state.runtime.height(), 1);
+        assert_eq!(state.runtime.balance_atoms(&recipient), 777);
+        assert_eq!(
+            state.runtime.total_supply_atoms().unwrap(),
+            10_000_000_000u128 * 100_000_000u128
+        );
+        assert_eq!(state.runtime.state_root(), producer.state_root());
+        assert_eq!(state.receipts.len(), 1);
+        drop(state);
+        drop(receiver_state);
+        drop(producer);
+        let _ = fs::remove_file(path1);
+        let _ = fs::remove_file(path2);
+    }
 }
