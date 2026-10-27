@@ -381,6 +381,213 @@ mod tests {
         params
     }
 
+    fn make_test_envelope<A: TransactionAuthenticator>(
+        chain: &crate::private_testnet_driver::PrivateTestnetChain,
+        params: &ConsensusParameters,
+        transactions: Vec<Transaction>,
+        timestamp: u64,
+        nonce: u64,
+        authenticator: &A,
+    ) -> Vec<u8> {
+        let mut block = Block {
+            height: chain.state().height() + 1,
+            timestamp,
+            parent_hash: chain.state().tip_hash(),
+            state_root: [0; 32],
+            transactions,
+        };
+        block.state_root = chain
+            .state()
+            .preview_state_root_after(&block, authenticator)
+            .unwrap();
+        let header = PowHeader {
+            protocol_version: params.protocol_version,
+            network_id: chain.state().network_id(),
+            height: block.height,
+            timestamp,
+            parent_hash: block.parent_hash,
+            previous_consensus_hash: chain.chain_tip().tip_hash,
+            state_root: block.state_root,
+            target: chain.expected_target(None).unwrap(),
+            nonce,
+        };
+        encode_candidate_network_block(&header, &block).unwrap()
+    }
+
+    #[test]
+    fn reorg_drops_receipts_from_losing_branch_and_restores_winning_branch_index() {
+        use crate::{
+            consensus::pow_digest,
+            private_testnet_wire::decode_candidate_network_block,
+            transaction_auth::{
+                AccountPublicKey, Ed25519TransactionAuthenticator, Ed25519TransactionSigner,
+                TransactionAuthenticatorKind,
+            },
+        };
+
+        let dir = TestDir::new();
+        let network = [0x51; 32];
+        let signer = Ed25519TransactionSigner::from_seed([0x47; 32]);
+        let owner = signer.account_id();
+        let recipient_a = [0x81; 32];
+        let recipient_b = [0x82; 32];
+        let authenticator = Ed25519TransactionAuthenticator::select(
+            TransactionAuthenticatorKind::Ed25519V1,
+            [AccountPublicKey {
+                account_id: owner,
+                public_key: signer.public_key(),
+            }],
+        )
+        .unwrap();
+        let clock = FixedClock;
+        let params = params();
+        let genesis = QRunGenesisV05::new(network, owner).unwrap();
+        let base_chain = crate::private_testnet_driver::PrivateTestnetChain::new(
+            genesis.ledger().clone(),
+            params.clone(),
+        )
+        .unwrap();
+
+        let mut tx_a = Transaction {
+            network_id: network,
+            sender: owner,
+            recipient: recipient_a,
+            nonce: 1,
+            amount: 111,
+            fee: 1,
+            expires_at: 10_000,
+            signature: Vec::new(),
+        };
+        signer.sign_transaction(&mut tx_a).unwrap();
+        let mut tx_b = Transaction {
+            network_id: network,
+            sender: owner,
+            recipient: recipient_b,
+            nonce: 1,
+            amount: 222,
+            fee: 1,
+            expires_at: 10_000,
+            signature: Vec::new(),
+        };
+        signer.sign_transaction(&mut tx_b).unwrap();
+
+        let envelope_a = make_test_envelope(
+            &base_chain,
+            &params,
+            vec![tx_a.clone()],
+            100,
+            10,
+            &authenticator,
+        );
+        let envelope_b = make_test_envelope(
+            &base_chain,
+            &params,
+            vec![tx_b.clone()],
+            100,
+            11,
+            &authenticator,
+        );
+        let digest_a = pow_digest(
+            &decode_candidate_network_block(&envelope_a).unwrap().header,
+            params.pow,
+        )
+        .unwrap();
+        let digest_b = pow_digest(
+            &decode_candidate_network_block(&envelope_b).unwrap().header,
+            params.pow,
+        )
+        .unwrap();
+        assert_ne!(digest_a, digest_b);
+
+        let (winner, loser, winner_txid, loser_txid) = if digest_a < digest_b {
+            (
+                &envelope_a,
+                &envelope_b,
+                transaction_id(&tx_a).unwrap(),
+                transaction_id(&tx_b).unwrap(),
+            )
+        } else {
+            (
+                &envelope_b,
+                &envelope_a,
+                transaction_id(&tx_b).unwrap(),
+                transaction_id(&tx_a).unwrap(),
+            )
+        };
+
+        let mut runtime = QRunV05PowForkRuntime::open(
+            &dir.0,
+            network,
+            owner,
+            params.clone(),
+            &authenticator,
+            &clock,
+        )
+        .unwrap();
+        runtime
+            .submit_block(winner, &authenticator, &clock)
+            .unwrap();
+        assert_eq!(
+            runtime.canonical_transaction_locations().unwrap(),
+            vec![(winner_txid, 1)]
+        );
+        runtime.submit_block(loser, &authenticator, &clock).unwrap();
+        assert_eq!(
+            runtime.canonical_transaction_locations().unwrap(),
+            vec![(winner_txid, 1)]
+        );
+
+        // Extend the losing branch so cumulative work makes that branch canonical.
+        let decoded_loser = decode_candidate_network_block(loser).unwrap();
+        let mut losing_chain = crate::private_testnet_driver::PrivateTestnetChain::new(
+            genesis.ledger().clone(),
+            params.clone(),
+        )
+        .unwrap();
+        losing_chain
+            .append_live(
+                &decoded_loser.block,
+                &decoded_loser.header,
+                None,
+                &authenticator,
+                &clock,
+            )
+            .unwrap();
+        let child = make_test_envelope(&losing_chain, &params, Vec::new(), 101, 12, &authenticator);
+        runtime
+            .submit_block(&child, &authenticator, &clock)
+            .unwrap();
+
+        assert_eq!(runtime.canonical_height(), 2);
+        assert_eq!(
+            runtime.canonical_transaction_locations().unwrap(),
+            vec![(loser_txid, 1)]
+        );
+        assert_eq!(
+            runtime
+                .canonical_state()
+                .account(
+                    &decode_candidate_network_block(loser)
+                        .unwrap()
+                        .block
+                        .transactions[0]
+                        .recipient
+                )
+                .unwrap()
+                .balance,
+            if loser_txid == transaction_id(&tx_a).unwrap() {
+                111
+            } else {
+                222
+            }
+        );
+        assert_eq!(
+            runtime.canonical_state().total_value().unwrap(),
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
+        assert_ne!(winner_txid, loser_txid);
+    }
+
     #[test]
     fn qrun_pow_runtime_mines_persists_and_reopens_full_supply_chain() {
         let dir = TestDir::new();
