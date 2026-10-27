@@ -11,10 +11,12 @@ This change adds a deterministic Rust candidate for a permissionless constant-pr
 - Bounded in-memory asset balances, pool custody accounts, and LP-share accounting.
 - Initial/proportional liquidity add and proportional liquidity removal.
 - Exact-input swaps with a 30-basis-point fee, checked integer arithmetic, a caller-supplied minimum output, and the constant-product non-decrease check.
+- Versioned canonical `QAO1` operation wire format and `QAX1` signed envelope covering asset registration, pair creation, transfers, liquidity add/remove and swaps.
+- Domain-separated signing digest bound to network ID, sender, nonce, expiry and operation payload; authenticated atomic execution checks the caller-supplied inclusion timestamp, registered authenticator, sequential per-AMM-account nonce and signature before commit; the live block validator does not call this path yet.
 - Clone-then-commit execution so failed operations preserve the original state.
-- Deterministic candidate state root over asset IDs, holdings, reserves, LP shares, and the fee-policy constants.
-- Bounded canonical `QAMS` snapshot codec with version, limits, checksummed body, canonical re-encoding check, and invariant verification after decode.
-- Unit tests for pair canonicalization, duplicate/unknown assets, liquidity add/remove, successful swap, fee/invariant behavior, optimal-ratio deposits, slippage rollback, arithmetic-overflow rollback, snapshot round-trip, and corrupt/trailing snapshot rejection.
+- Deterministic candidate state root over network ID, asset IDs, holdings, per-AMM-account nonces, reserves, LP shares, and the fee-policy constants.
+- Bounded canonical `QAMS` v2 snapshot codec binds network ID and AMM nonces as well as balances/reserves/LP shares, with limits, checksum, canonical re-encoding and invariant verification after decode.
+- 13 focused tests cover pair canonicalization, duplicate/unknown assets, liquidity add/remove, successful swap, fee/invariant behavior, optimal-ratio deposits, slippage rollback, arithmetic-overflow rollback, snapshot round-trip/corruption, signed wire round-trip, replay/expiry/network/signature rejection, permissionless pair creation, and a real Ed25519 verifier.
 
 ## Verification
 
@@ -29,6 +31,6 @@ cargo test --manifest-path src/native/pow_bench/Cargo.toml qzxb_amm_candidate --
 
 **This is not a public DEX or Mainnet activation.** The candidate module does not yet serialize AMM calls into the canonical TXN4/QZB4 transaction format, execute them in the node's block transition, include its state root inside the canonical consensus state root, wire the `QAMS` codec into the node's durable/reorg-safe snapshots, or emit finalized native swap events to the candle indexer. The codec is a candidate API and is not called by the live runtime. Its `credit_genesis_balance` helper is for test/genesis construction only and is not an authenticated mint route.
 
-A production activation must integrate all of those boundaries atomically, preserve legacy-wire compatibility or deliberately version the protocol, cover rollback/reorg/replay and resource exhaustion, and pass independent security review. In particular, a symbol named USDT is not proof of USDT backing: the quote asset must have a verifiable representation and supply/redemption model on the selected network.
+A production activation must integrate all of those boundaries atomically, share/reconcile AMM account nonces with the canonical native account/transaction model (they are currently separate), preserve legacy-wire compatibility or deliberately version the QZB4/TXN4 protocol, cover rollback/reorg/replay and resource exhaustion, and pass independent security review. In particular, a symbol named USDT is not proof of USDT backing: the quote asset must have a verifiable representation and supply/redemption model on the selected network.
 
 The existing confirmed-swap candle engine is an indexer, not an AMM; it only creates OHLCV from canonical, sufficiently confirmed swap logs. It must be given finalized events from the native AMM before real hourly, daily, weekly, and monthly candles can appear.

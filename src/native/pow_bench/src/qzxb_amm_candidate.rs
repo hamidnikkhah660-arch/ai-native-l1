@@ -4,6 +4,7 @@
 //! here, but this module is NOT yet part of TXN4/QZB4 consensus or node transaction decoding.
 //! It must not be used to claim public-market or Mainnet readiness. Production activation must
 //! bind these transitions to authenticated transactions, canonical block events and state roots.
+use crate::state_machine::TransactionAuthenticator;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -16,8 +17,15 @@ pub const AMM_FEE_BPS: u128 = 30;
 pub const AMM_BPS_DENOMINATOR: u128 = 10_000;
 pub const AMM_OUTPUT_MULTIPLIER: u128 = AMM_BPS_DENOMINATOR - AMM_FEE_BPS;
 pub const AMM_SNAPSHOT_MAGIC: [u8; 4] = *b"QAMS";
-pub const AMM_SNAPSHOT_VERSION: u16 = 1;
+pub const AMM_SNAPSHOT_VERSION: u16 = 2;
 pub const MAX_AMM_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
+pub const AMM_OPERATION_MAGIC: [u8; 4] = *b"QAO1";
+pub const AMM_OPERATION_VERSION: u16 = 1;
+pub const AMM_SIGNED_OPERATION_MAGIC: [u8; 4] = *b"QAX1";
+pub const AMM_SIGNED_OPERATION_VERSION: u16 = 1;
+pub const MAX_AMM_OPERATION_BYTES: usize = 256;
+pub const MAX_AMM_SIGNATURE_BYTES: usize = 4 * 1024;
+const AMM_OPERATION_SIGNING_DOMAIN: &[u8] = b"QZXB-AMM-OPERATION-SIGN-V1\0";
 const MAX_SNAPSHOT_ENTRIES: usize = 100_000;
 const AMM_SNAPSHOT_CHECKSUM_DOMAIN: &[u8] = b"QZXB-NATIVE-AMM-SNAPSHOT-CHECK-V1\0";
 const PAIR_ID_DOMAIN: &[u8] = b"QZXB-NATIVE-AMM-PAIR-V1\0";
@@ -46,6 +54,17 @@ pub enum AmmError {
     SnapshotChecksumMismatch,
     SnapshotNonCanonical,
     SnapshotOversize { actual: usize, limit: usize },
+    InvalidNetworkId,
+    WrongNetwork,
+    InvalidNonce,
+    NonceMismatch { expected: u64, actual: u64 },
+    Expired,
+    InvalidSignature,
+    UnsupportedOperationVersion(u16),
+    UnknownOperation(u8),
+    SignatureOversize { actual: usize, limit: usize },
+    OperationOversize { actual: usize, limit: usize },
+    SignedOperationOversize { actual: usize, limit: usize },
 }
 
 impl fmt::Display for AmmError {
@@ -67,9 +86,11 @@ struct Pool {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QzxbAmmStateCandidate {
+    network_id: [u8; 32],
     registered_assets: BTreeSet<AmmAssetId>,
     balances: BTreeMap<(AmmAssetId, AmmAccountId), u128>,
     pools: BTreeMap<AmmPairId, Pool>,
+    nonces: BTreeMap<AmmAccountId, u64>,
     max_assets: usize,
     max_pairs: usize,
     max_holdings: usize,
@@ -103,8 +124,359 @@ pub struct SwapReceipt {
     pub reserve1_after: u128,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AmmOperation {
+    RegisterAsset {
+        asset_id: AmmAssetId,
+    },
+    CreatePair {
+        token_a: AmmAssetId,
+        token_b: AmmAssetId,
+    },
+    TransferAsset {
+        asset_id: AmmAssetId,
+        recipient: AmmAccountId,
+        amount: u128,
+    },
+    AddLiquidity {
+        pair_id: AmmPairId,
+        amount0_desired: u128,
+        amount1_desired: u128,
+        min_lp_shares: u128,
+    },
+    RemoveLiquidity {
+        pair_id: AmmPairId,
+        shares: u128,
+        min_amount0_out: u128,
+        min_amount1_out: u128,
+    },
+    SwapExactIn {
+        token_in: AmmAssetId,
+        token_out: AmmAssetId,
+        amount_in: u128,
+        min_amount_out: u128,
+    },
+}
+
+impl AmmOperation {
+    pub fn tag(&self) -> u8 {
+        match self {
+            Self::RegisterAsset { .. } => 1,
+            Self::CreatePair { .. } => 2,
+            Self::TransferAsset { .. } => 3,
+            Self::AddLiquidity { .. } => 4,
+            Self::RemoveLiquidity { .. } => 5,
+            Self::SwapExactIn { .. } => 6,
+        }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, AmmError> {
+        let mut bytes = Vec::with_capacity(MAX_AMM_OPERATION_BYTES);
+        bytes.extend_from_slice(&AMM_OPERATION_MAGIC);
+        bytes.extend_from_slice(&AMM_OPERATION_VERSION.to_be_bytes());
+        bytes.push(self.tag());
+        bytes.push(0);
+        match self {
+            Self::RegisterAsset { asset_id } => {
+                if is_zero(asset_id) {
+                    return Err(AmmError::InvalidAssetId);
+                }
+                bytes.extend_from_slice(asset_id);
+            }
+            Self::CreatePair { token_a, token_b } => {
+                QzxbAmmStateCandidate::pair_id_for_assets(*token_a, *token_b)?;
+                bytes.extend_from_slice(token_a);
+                bytes.extend_from_slice(token_b);
+            }
+            Self::TransferAsset {
+                asset_id,
+                recipient,
+                amount,
+            } => {
+                if is_zero(asset_id) {
+                    return Err(AmmError::InvalidAssetId);
+                }
+                if is_zero(recipient) {
+                    return Err(AmmError::InvalidAccountId);
+                }
+                if *amount == 0 {
+                    return Err(AmmError::ZeroAmount);
+                }
+                bytes.extend_from_slice(asset_id);
+                bytes.extend_from_slice(recipient);
+                bytes.extend_from_slice(&amount.to_be_bytes());
+            }
+            Self::AddLiquidity {
+                pair_id,
+                amount0_desired,
+                amount1_desired,
+                min_lp_shares,
+            } => {
+                if is_zero(pair_id) {
+                    return Err(AmmError::PairNotFound);
+                }
+                if *amount0_desired == 0 || *amount1_desired == 0 || *min_lp_shares == 0 {
+                    return Err(AmmError::ZeroAmount);
+                }
+                bytes.extend_from_slice(pair_id);
+                bytes.extend_from_slice(&amount0_desired.to_be_bytes());
+                bytes.extend_from_slice(&amount1_desired.to_be_bytes());
+                bytes.extend_from_slice(&min_lp_shares.to_be_bytes());
+            }
+            Self::RemoveLiquidity {
+                pair_id,
+                shares,
+                min_amount0_out,
+                min_amount1_out,
+            } => {
+                if is_zero(pair_id) {
+                    return Err(AmmError::PairNotFound);
+                }
+                if *shares == 0 || *min_amount0_out == 0 || *min_amount1_out == 0 {
+                    return Err(AmmError::ZeroAmount);
+                }
+                bytes.extend_from_slice(pair_id);
+                bytes.extend_from_slice(&shares.to_be_bytes());
+                bytes.extend_from_slice(&min_amount0_out.to_be_bytes());
+                bytes.extend_from_slice(&min_amount1_out.to_be_bytes());
+            }
+            Self::SwapExactIn {
+                token_in,
+                token_out,
+                amount_in,
+                min_amount_out,
+            } => {
+                QzxbAmmStateCandidate::pair_id_for_assets(*token_in, *token_out)?;
+                if *amount_in == 0 || *min_amount_out == 0 {
+                    return Err(AmmError::ZeroAmount);
+                }
+                bytes.extend_from_slice(token_in);
+                bytes.extend_from_slice(token_out);
+                bytes.extend_from_slice(&amount_in.to_be_bytes());
+                bytes.extend_from_slice(&min_amount_out.to_be_bytes());
+            }
+        }
+        if bytes.len() > MAX_AMM_OPERATION_BYTES {
+            return Err(AmmError::OperationOversize {
+                actual: bytes.len(),
+                limit: MAX_AMM_OPERATION_BYTES,
+            });
+        }
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, AmmError> {
+        if bytes.len() > MAX_AMM_OPERATION_BYTES {
+            return Err(AmmError::OperationOversize {
+                actual: bytes.len(),
+                limit: MAX_AMM_OPERATION_BYTES,
+            });
+        }
+        if bytes.len() < 8 {
+            return Err(AmmError::SnapshotMalformed);
+        }
+        if bytes[..4] != AMM_OPERATION_MAGIC {
+            return Err(AmmError::SnapshotMalformed);
+        }
+        let version = u16::from_be_bytes([bytes[4], bytes[5]]);
+        if version != AMM_OPERATION_VERSION {
+            return Err(AmmError::UnsupportedOperationVersion(version));
+        }
+        if bytes[7] != 0 {
+            return Err(AmmError::SnapshotNonCanonical);
+        }
+        let tag = bytes[6];
+        let payload = &bytes[8..];
+        let read32 = |slice: &[u8]| -> Result<[u8; 32], AmmError> {
+            slice.try_into().map_err(|_| AmmError::SnapshotMalformed)
+        };
+        let read128 = |slice: &[u8]| -> Result<u128, AmmError> {
+            let value: [u8; 16] = slice.try_into().map_err(|_| AmmError::SnapshotMalformed)?;
+            Ok(u128::from_be_bytes(value))
+        };
+        let op = match tag {
+            1 if payload.len() == 32 => Self::RegisterAsset {
+                asset_id: read32(payload)?,
+            },
+            2 if payload.len() == 64 => Self::CreatePair {
+                token_a: read32(&payload[..32])?,
+                token_b: read32(&payload[32..])?,
+            },
+            3 if payload.len() == 80 => Self::TransferAsset {
+                asset_id: read32(&payload[..32])?,
+                recipient: read32(&payload[32..64])?,
+                amount: read128(&payload[64..80])?,
+            },
+            4 if payload.len() == 80 => Self::AddLiquidity {
+                pair_id: read32(&payload[..32])?,
+                amount0_desired: read128(&payload[32..48])?,
+                amount1_desired: read128(&payload[48..64])?,
+                min_lp_shares: read128(&payload[64..80])?,
+            },
+            5 if payload.len() == 80 => Self::RemoveLiquidity {
+                pair_id: read32(&payload[..32])?,
+                shares: read128(&payload[32..48])?,
+                min_amount0_out: read128(&payload[48..64])?,
+                min_amount1_out: read128(&payload[64..80])?,
+            },
+            6 if payload.len() == 96 => Self::SwapExactIn {
+                token_in: read32(&payload[..32])?,
+                token_out: read32(&payload[32..64])?,
+                amount_in: read128(&payload[64..80])?,
+                min_amount_out: read128(&payload[80..96])?,
+            },
+            1..=6 => return Err(AmmError::SnapshotMalformed),
+            other => return Err(AmmError::UnknownOperation(other)),
+        };
+        if op.encode()?.as_slice() != bytes {
+            return Err(AmmError::SnapshotNonCanonical);
+        }
+        Ok(op)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmmSignedOperation {
+    pub network_id: [u8; 32],
+    pub sender: AmmAccountId,
+    pub nonce: u64,
+    pub expires_at: u64,
+    pub operation: AmmOperation,
+    pub signature: Vec<u8>,
+}
+
+impl AmmSignedOperation {
+    pub fn signing_digest(&self) -> Result<[u8; 32], AmmError> {
+        if is_zero(&self.network_id) {
+            return Err(AmmError::InvalidNetworkId);
+        }
+        if is_zero(&self.sender) {
+            return Err(AmmError::InvalidAccountId);
+        }
+        if self.nonce == 0 {
+            return Err(AmmError::InvalidNonce);
+        }
+        if self.expires_at == 0 {
+            return Err(AmmError::Expired);
+        }
+        let operation = self.operation.encode()?;
+        let mut hash = Sha256::new();
+        hash.update(AMM_OPERATION_SIGNING_DOMAIN);
+        hash.update(self.network_id);
+        hash.update(self.sender);
+        hash.update(self.nonce.to_be_bytes());
+        hash.update(self.expires_at.to_be_bytes());
+        hash.update((operation.len() as u32).to_be_bytes());
+        hash.update(operation);
+        Ok(hash.finalize().into())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, AmmError> {
+        let operation = self.operation.encode()?;
+        if self.signature.is_empty() {
+            return Err(AmmError::InvalidSignature);
+        }
+        if self.signature.len() > MAX_AMM_SIGNATURE_BYTES {
+            return Err(AmmError::SignatureOversize {
+                actual: self.signature.len(),
+                limit: MAX_AMM_SIGNATURE_BYTES,
+            });
+        }
+        let _ = self.signing_digest()?;
+        let mut bytes = Vec::with_capacity(
+            4 + 2 + 32 + 32 + 8 + 8 + 2 + operation.len() + 2 + self.signature.len(),
+        );
+        bytes.extend_from_slice(&AMM_SIGNED_OPERATION_MAGIC);
+        bytes.extend_from_slice(&AMM_SIGNED_OPERATION_VERSION.to_be_bytes());
+        bytes.extend_from_slice(&self.network_id);
+        bytes.extend_from_slice(&self.sender);
+        bytes.extend_from_slice(&self.nonce.to_be_bytes());
+        bytes.extend_from_slice(&self.expires_at.to_be_bytes());
+        bytes.extend_from_slice(&(operation.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(&operation);
+        bytes.extend_from_slice(&(self.signature.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(&self.signature);
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, AmmError> {
+        if bytes.len() > MAX_AMM_OPERATION_BYTES + MAX_AMM_SIGNATURE_BYTES + 128 {
+            return Err(AmmError::SignedOperationOversize {
+                actual: bytes.len(),
+                limit: MAX_AMM_OPERATION_BYTES + MAX_AMM_SIGNATURE_BYTES + 128,
+            });
+        }
+        if bytes.len() < 4 + 2 + 32 + 32 + 8 + 8 + 2 + 2 {
+            return Err(AmmError::SnapshotMalformed);
+        }
+        if bytes[..4] != AMM_SIGNED_OPERATION_MAGIC {
+            return Err(AmmError::SnapshotMalformed);
+        }
+        let version = u16::from_be_bytes([bytes[4], bytes[5]]);
+        if version != AMM_SIGNED_OPERATION_VERSION {
+            return Err(AmmError::UnsupportedOperationVersion(version));
+        }
+        let mut cursor = 6usize;
+        let network_id: [u8; 32] = snapshot_take(bytes, &mut cursor, 32)?
+            .try_into()
+            .map_err(|_| AmmError::SnapshotMalformed)?;
+        let sender: AmmAccountId = snapshot_take(bytes, &mut cursor, 32)?
+            .try_into()
+            .map_err(|_| AmmError::SnapshotMalformed)?;
+        let nonce = u64::from_be_bytes(
+            snapshot_take(bytes, &mut cursor, 8)?
+                .try_into()
+                .map_err(|_| AmmError::SnapshotMalformed)?,
+        );
+        let expires_at = u64::from_be_bytes(
+            snapshot_take(bytes, &mut cursor, 8)?
+                .try_into()
+                .map_err(|_| AmmError::SnapshotMalformed)?,
+        );
+        let operation_len = snapshot_u16(bytes, &mut cursor)? as usize;
+        if operation_len == 0 || operation_len > MAX_AMM_OPERATION_BYTES {
+            return Err(AmmError::SnapshotMalformed);
+        }
+        let operation = AmmOperation::decode(snapshot_take(bytes, &mut cursor, operation_len)?)?;
+        let signature_len = snapshot_u16(bytes, &mut cursor)? as usize;
+        if signature_len == 0 {
+            return Err(AmmError::InvalidSignature);
+        }
+        if signature_len > MAX_AMM_SIGNATURE_BYTES {
+            return Err(AmmError::SignatureOversize {
+                actual: signature_len,
+                limit: MAX_AMM_SIGNATURE_BYTES,
+            });
+        }
+        let signature = snapshot_take(bytes, &mut cursor, signature_len)?.to_vec();
+        if cursor != bytes.len() {
+            return Err(AmmError::SnapshotNonCanonical);
+        }
+        let signed = Self {
+            network_id,
+            sender,
+            nonce,
+            expires_at,
+            operation,
+            signature,
+        };
+        if signed.encode()?.as_slice() != bytes {
+            return Err(AmmError::SnapshotNonCanonical);
+        }
+        Ok(signed)
+    }
+}
+
 impl QzxbAmmStateCandidate {
-    pub fn new(max_assets: usize, max_pairs: usize, max_holdings: usize) -> Result<Self, AmmError> {
+    pub fn new(
+        network_id: [u8; 32],
+        max_assets: usize,
+        max_pairs: usize,
+        max_holdings: usize,
+    ) -> Result<Self, AmmError> {
+        if is_zero(&network_id) {
+            return Err(AmmError::InvalidNetworkId);
+        }
         if max_assets == 0
             || max_pairs == 0
             || max_holdings == 0
@@ -115,9 +487,11 @@ impl QzxbAmmStateCandidate {
             return Err(AmmError::InvalidResourceLimit);
         }
         Ok(Self {
+            network_id,
             registered_assets: BTreeSet::new(),
             balances: BTreeMap::new(),
             pools: BTreeMap::new(),
+            nonces: BTreeMap::new(),
             max_assets,
             max_pairs,
             max_holdings,
@@ -176,6 +550,112 @@ impl QzxbAmmStateCandidate {
         self.pools.len()
     }
 
+    pub fn network_id(&self) -> [u8; 32] {
+        self.network_id
+    }
+
+    pub fn operation_nonce(&self, account: &AmmAccountId) -> u64 {
+        self.nonces.get(account).copied().unwrap_or(0)
+    }
+
+    /// Authenticate and atomically execute one AMM operation in the candidate state.
+    /// Inclusion time is supplied by the block-transition caller; this method never reads the wall clock.
+    pub fn apply_signed_operation<A: TransactionAuthenticator>(
+        &mut self,
+        signed: &AmmSignedOperation,
+        inclusion_timestamp: u64,
+        authenticator: &A,
+    ) -> Result<(), AmmError> {
+        let _ = signed.encode()?;
+        if signed.network_id != self.network_id {
+            return Err(AmmError::WrongNetwork);
+        }
+        if inclusion_timestamp == 0 || signed.expires_at <= inclusion_timestamp {
+            return Err(AmmError::Expired);
+        }
+        let expected_nonce = self
+            .operation_nonce(&signed.sender)
+            .checked_add(1)
+            .ok_or(AmmError::InvalidNonce)?;
+        if signed.nonce != expected_nonce {
+            return Err(AmmError::NonceMismatch {
+                expected: expected_nonce,
+                actual: signed.nonce,
+            });
+        }
+        let digest = signed.signing_digest()?;
+        authenticator
+            .verify(&signed.sender, &digest, &signed.signature)
+            .map_err(|_| AmmError::InvalidSignature)?;
+
+        let mut next = self.clone();
+        match &signed.operation {
+            AmmOperation::RegisterAsset { asset_id } => next.register_asset(*asset_id)?,
+            AmmOperation::CreatePair { token_a, token_b } => {
+                next.create_pair(*token_a, *token_b)?;
+            }
+            AmmOperation::TransferAsset {
+                asset_id,
+                recipient,
+                amount,
+            } => {
+                next.ensure_asset(asset_id)?;
+                next.ensure_user_account(&signed.sender)?;
+                next.ensure_user_account(recipient)?;
+                next.move_balance(*asset_id, signed.sender, *recipient, *amount)?;
+            }
+            AmmOperation::AddLiquidity {
+                pair_id,
+                amount0_desired,
+                amount1_desired,
+                min_lp_shares,
+            } => {
+                next.add_liquidity(
+                    signed.sender,
+                    *pair_id,
+                    *amount0_desired,
+                    *amount1_desired,
+                    *min_lp_shares,
+                )?;
+            }
+            AmmOperation::RemoveLiquidity {
+                pair_id,
+                shares,
+                min_amount0_out,
+                min_amount1_out,
+            } => {
+                next.remove_liquidity(
+                    signed.sender,
+                    *pair_id,
+                    *shares,
+                    *min_amount0_out,
+                    *min_amount1_out,
+                )?;
+            }
+            AmmOperation::SwapExactIn {
+                token_in,
+                token_out,
+                amount_in,
+                min_amount_out,
+            } => {
+                next.swap_exact_in(
+                    signed.sender,
+                    *token_in,
+                    *token_out,
+                    *amount_in,
+                    *min_amount_out,
+                )?;
+            }
+        }
+        if !next.nonces.contains_key(&signed.sender) && next.nonces.len() >= next.max_holdings {
+            return Err(AmmError::TooManyHoldings);
+        }
+        next.nonces.insert(signed.sender, signed.nonce);
+        next.verify_invariants()?;
+        *self = next;
+        Ok(())
+    }
+
     pub fn pair_id_for_assets(a: AmmAssetId, b: AmmAssetId) -> Result<AmmPairId, AmmError> {
         if is_zero(&a) || is_zero(&b) {
             return Err(AmmError::InvalidAssetId);
@@ -206,6 +686,7 @@ impl QzxbAmmStateCandidate {
         // The pair ID doubles as the deterministic internal custody account. Refuse a
         // collision with any pre-existing user account or LP holder.
         if self.balances.keys().any(|(_, account)| *account == pair_id)
+            || self.nonces.contains_key(&pair_id)
             || self
                 .pools
                 .values()
@@ -543,9 +1024,13 @@ impl QzxbAmmStateCandidate {
     }
 
     pub fn verify_invariants(&self) -> Result<(), AmmError> {
+        if is_zero(&self.network_id) {
+            return Err(AmmError::InvalidNetworkId);
+        }
         if self.registered_assets.len() > self.max_assets
             || self.pools.len() > self.max_pairs
             || self.balances.len() > self.max_holdings
+            || self.nonces.len() > self.max_holdings
         {
             return Err(AmmError::InvariantViolation);
         }
@@ -556,7 +1041,11 @@ impl QzxbAmmStateCandidate {
         if total_lp_entries > self.max_holdings {
             return Err(AmmError::TooManyHoldings);
         }
-        if self.registered_assets.iter().any(is_zero) {
+        if self.registered_assets.iter().any(is_zero)
+            || self.nonces.iter().any(|(account, nonce)| {
+                is_zero(account) || *nonce == 0 || self.is_pool_account(account)
+            })
+        {
             return Err(AmmError::InvariantViolation);
         }
         for ((asset, account), amount) in &self.balances {
@@ -608,6 +1097,7 @@ impl QzxbAmmStateCandidate {
         self.verify_invariants()?;
         let mut hash = Sha256::new();
         hash.update(STATE_ROOT_DOMAIN);
+        hash.update(self.network_id);
         // Bind fee policy to the candidate state commitment so implementations using a different
         // fee schedule cannot silently report the same empty-state root.
         hash.update(AMM_FEE_BPS.to_be_bytes());
@@ -621,6 +1111,11 @@ impl QzxbAmmStateCandidate {
             hash.update(asset);
             hash.update(account);
             hash.update(amount.to_be_bytes());
+        }
+        hash.update((self.nonces.len() as u64).to_be_bytes());
+        for (account, nonce) in &self.nonces {
+            hash.update(account);
+            hash.update(nonce.to_be_bytes());
         }
         hash.update((self.pools.len() as u64).to_be_bytes());
         for (pair_id, pool) in &self.pools {
@@ -646,6 +1141,7 @@ impl QzxbAmmStateCandidate {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&AMM_SNAPSHOT_MAGIC);
         bytes.extend_from_slice(&AMM_SNAPSHOT_VERSION.to_be_bytes());
+        bytes.extend_from_slice(&self.network_id);
         write_snapshot_usize(&mut bytes, self.max_assets)?;
         write_snapshot_usize(&mut bytes, self.max_pairs)?;
         write_snapshot_usize(&mut bytes, self.max_holdings)?;
@@ -658,6 +1154,11 @@ impl QzxbAmmStateCandidate {
             bytes.extend_from_slice(asset);
             bytes.extend_from_slice(account);
             bytes.extend_from_slice(&amount.to_be_bytes());
+        }
+        write_snapshot_usize(&mut bytes, self.nonces.len())?;
+        for (account, nonce) in &self.nonces {
+            bytes.extend_from_slice(account);
+            bytes.extend_from_slice(&nonce.to_be_bytes());
         }
         write_snapshot_usize(&mut bytes, self.pools.len())?;
         for (pair_id, pool) in &self.pools {
@@ -701,7 +1202,7 @@ impl QzxbAmmStateCandidate {
                 limit: MAX_AMM_SNAPSHOT_BYTES,
             });
         }
-        if bytes.len() < 30 + 32 {
+        if bytes.len() < 62 + 32 {
             return Err(AmmError::SnapshotMalformed);
         }
         let checksum_offset = bytes.len() - 32;
@@ -719,6 +1220,12 @@ impl QzxbAmmStateCandidate {
         }
         if snapshot_u16(body, &mut cursor)? != AMM_SNAPSHOT_VERSION {
             return Err(AmmError::SnapshotMalformed);
+        }
+        let network_id: [u8; 32] = snapshot_take(body, &mut cursor, 32)?
+            .try_into()
+            .map_err(|_| AmmError::SnapshotMalformed)?;
+        if is_zero(&network_id) {
+            return Err(AmmError::InvalidNetworkId);
         }
         let max_assets = snapshot_count(body, &mut cursor)?;
         let max_pairs = snapshot_count(body, &mut cursor)?;
@@ -761,6 +1268,25 @@ impl QzxbAmmStateCandidate {
                 .map_err(|_| AmmError::SnapshotMalformed)?;
             let amount = snapshot_u128(body, &mut cursor)?;
             if balances.insert((asset, account), amount).is_some() {
+                return Err(AmmError::SnapshotNonCanonical);
+            }
+        }
+
+        let nonce_count = snapshot_count(body, &mut cursor)?;
+        if nonce_count > max_holdings || nonce_count > MAX_SNAPSHOT_ENTRIES {
+            return Err(AmmError::SnapshotMalformed);
+        }
+        let mut nonces = BTreeMap::new();
+        for _ in 0..nonce_count {
+            let account: AmmAccountId = snapshot_take(body, &mut cursor, 32)?
+                .try_into()
+                .map_err(|_| AmmError::SnapshotMalformed)?;
+            let nonce = u64::from_be_bytes(
+                snapshot_take(body, &mut cursor, 8)?
+                    .try_into()
+                    .map_err(|_| AmmError::SnapshotMalformed)?,
+            );
+            if nonces.insert(account, nonce).is_some() {
                 return Err(AmmError::SnapshotNonCanonical);
             }
         }
@@ -822,9 +1348,11 @@ impl QzxbAmmStateCandidate {
             return Err(AmmError::SnapshotNonCanonical);
         }
         let state = Self {
+            network_id,
             registered_assets,
             balances,
             pools,
+            nonces,
             max_assets,
             max_pairs,
             max_holdings,
@@ -962,19 +1490,272 @@ fn integer_sqrt(n: u128) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transaction_auth::{
+        AccountPublicKey, Ed25519TransactionAuthenticator, Ed25519TransactionSigner,
+        TransactionAuthenticatorKind,
+    };
 
+    const NETWORK: [u8; 32] = [0xAA; 32];
     const A: AmmAssetId = [1; 32];
     const B: AmmAssetId = [2; 32];
+    const C: AmmAssetId = [9; 32];
     const TRADER: AmmAccountId = [3; 32];
+    const OTHER: AmmAccountId = [4; 32];
+
+    struct DigestAuthenticator;
+
+    impl TransactionAuthenticator for DigestAuthenticator {
+        fn verify(
+            &self,
+            sender: &AmmAccountId,
+            signing_digest: &[u8; 32],
+            signature: &[u8],
+        ) -> Result<(), ()> {
+            if !is_zero(sender) && signature == signing_digest {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+    }
+
+    fn signed_operation(
+        sender: AmmAccountId,
+        nonce: u64,
+        operation: AmmOperation,
+    ) -> AmmSignedOperation {
+        let mut signed = AmmSignedOperation {
+            network_id: NETWORK,
+            sender,
+            nonce,
+            expires_at: 1_000,
+            operation,
+            signature: vec![0; 32],
+        };
+        signed.signature = signed.signing_digest().unwrap().to_vec();
+        signed
+    }
 
     fn fixture() -> (QzxbAmmStateCandidate, AmmPairId) {
-        let mut state = QzxbAmmStateCandidate::new(8, 16, 128).unwrap();
+        let mut state = QzxbAmmStateCandidate::new(NETWORK, 8, 16, 128).unwrap();
         state.register_asset(A).unwrap();
         state.register_asset(B).unwrap();
         state.credit_genesis_balance(A, TRADER, 1_000_000).unwrap();
         state.credit_genesis_balance(B, TRADER, 1_000_000).unwrap();
         let pair = state.create_pair(B, A).unwrap();
         (state, pair)
+    }
+
+    #[test]
+    fn signed_operation_wire_round_trips_and_signing_digest_binds_payload() {
+        let signed = signed_operation(
+            TRADER,
+            1,
+            AmmOperation::TransferAsset {
+                asset_id: A,
+                recipient: OTHER,
+                amount: 123,
+            },
+        );
+        let encoded = signed.encode().unwrap();
+        assert_eq!(&encoded[..4], &AMM_SIGNED_OPERATION_MAGIC);
+        assert_eq!(AmmSignedOperation::decode(&encoded).unwrap(), signed);
+
+        let mut changed = signed.clone();
+        changed.operation = AmmOperation::TransferAsset {
+            asset_id: A,
+            recipient: OTHER,
+            amount: 124,
+        };
+        assert_ne!(
+            signed.signing_digest().unwrap(),
+            changed.signing_digest().unwrap()
+        );
+
+        let mut corrupted = encoded.clone();
+        corrupted.push(0);
+        assert_eq!(
+            AmmSignedOperation::decode(&corrupted),
+            Err(AmmError::SnapshotNonCanonical)
+        );
+    }
+
+    #[test]
+    fn authenticated_operations_enforce_network_nonce_expiry_and_signature_atomically() {
+        let mut state = QzxbAmmStateCandidate::new(NETWORK, 8, 16, 128).unwrap();
+        let register = signed_operation(TRADER, 1, AmmOperation::RegisterAsset { asset_id: A });
+        state
+            .apply_signed_operation(&register, 10, &DigestAuthenticator)
+            .unwrap();
+        assert_eq!(state.operation_nonce(&TRADER), 1);
+        assert_eq!(state.asset_count(), 1);
+
+        assert_eq!(
+            state.apply_signed_operation(&register, 10, &DigestAuthenticator),
+            Err(AmmError::NonceMismatch {
+                expected: 2,
+                actual: 1
+            })
+        );
+        let before = state.state_root().unwrap();
+
+        let mut bad_signature =
+            signed_operation(TRADER, 2, AmmOperation::RegisterAsset { asset_id: B });
+        bad_signature.signature[0] ^= 1;
+        assert_eq!(
+            state.apply_signed_operation(&bad_signature, 10, &DigestAuthenticator),
+            Err(AmmError::InvalidSignature)
+        );
+        assert_eq!(state.state_root().unwrap(), before);
+
+        let mut expired = signed_operation(TRADER, 2, AmmOperation::RegisterAsset { asset_id: B });
+        expired.expires_at = 10;
+        expired.signature = expired.signing_digest().unwrap().to_vec();
+        assert_eq!(
+            state.apply_signed_operation(&expired, 10, &DigestAuthenticator),
+            Err(AmmError::Expired)
+        );
+        assert_eq!(state.state_root().unwrap(), before);
+
+        let mut wrong_network =
+            signed_operation(TRADER, 2, AmmOperation::RegisterAsset { asset_id: B });
+        wrong_network.network_id = [0xBB; 32];
+        wrong_network.signature = wrong_network.signing_digest().unwrap().to_vec();
+        assert_eq!(
+            state.apply_signed_operation(&wrong_network, 10, &DigestAuthenticator),
+            Err(AmmError::WrongNetwork)
+        );
+        assert_eq!(state.state_root().unwrap(), before);
+    }
+
+    #[test]
+    fn production_ed25519_authenticator_verifies_amm_operation_signature() {
+        let signer = Ed25519TransactionSigner::from_seed([0x44; 32]);
+        let authenticator = Ed25519TransactionAuthenticator::select(
+            TransactionAuthenticatorKind::Ed25519V1,
+            [AccountPublicKey {
+                account_id: signer.account_id(),
+                public_key: signer.public_key(),
+            }],
+        )
+        .unwrap();
+        let mut state = QzxbAmmStateCandidate::new(NETWORK, 8, 16, 128).unwrap();
+        let mut signed = AmmSignedOperation {
+            network_id: NETWORK,
+            sender: signer.account_id(),
+            nonce: 1,
+            expires_at: 1_000,
+            operation: AmmOperation::RegisterAsset { asset_id: A },
+            signature: Vec::new(),
+        };
+        signed.signature = signer.sign_digest(&signed.signing_digest().unwrap());
+        state
+            .apply_signed_operation(&signed, 10, &authenticator)
+            .unwrap();
+        assert_eq!(state.operation_nonce(&signer.account_id()), 1);
+        assert_eq!(state.asset_count(), 1);
+
+        let before = state.state_root().unwrap();
+        let mut forged = signed.clone();
+        forged.nonce = 2;
+        // Do not re-sign after changing the nonce: the Ed25519 verifier must reject it atomically.
+        assert_eq!(
+            state.apply_signed_operation(&forged, 10, &authenticator),
+            Err(AmmError::InvalidSignature)
+        );
+        assert_eq!(state.state_root().unwrap(), before);
+    }
+
+    #[test]
+    fn authenticated_pair_creation_liquidity_and_swap_execute_with_replay_protection() {
+        let mut state = QzxbAmmStateCandidate::new(NETWORK, 8, 16, 128).unwrap();
+        state
+            .apply_signed_operation(
+                &signed_operation(TRADER, 1, AmmOperation::RegisterAsset { asset_id: A }),
+                10,
+                &DigestAuthenticator,
+            )
+            .unwrap();
+        state
+            .apply_signed_operation(
+                &signed_operation(TRADER, 2, AmmOperation::RegisterAsset { asset_id: B }),
+                10,
+                &DigestAuthenticator,
+            )
+            .unwrap();
+        state.credit_genesis_balance(A, TRADER, 1_000_000).unwrap();
+        state.credit_genesis_balance(B, TRADER, 1_000_000).unwrap();
+
+        let pair = QzxbAmmStateCandidate::pair_id_for_assets(A, B).unwrap();
+        state
+            .apply_signed_operation(
+                &signed_operation(
+                    TRADER,
+                    3,
+                    AmmOperation::CreatePair {
+                        token_a: A,
+                        token_b: B,
+                    },
+                ),
+                10,
+                &DigestAuthenticator,
+            )
+            .unwrap();
+        state
+            .apply_signed_operation(
+                &signed_operation(
+                    TRADER,
+                    4,
+                    AmmOperation::AddLiquidity {
+                        pair_id: pair,
+                        amount0_desired: 100_000,
+                        amount1_desired: 100_000,
+                        min_lp_shares: 100_000,
+                    },
+                ),
+                10,
+                &DigestAuthenticator,
+            )
+            .unwrap();
+        state
+            .apply_signed_operation(
+                &signed_operation(
+                    TRADER,
+                    5,
+                    AmmOperation::SwapExactIn {
+                        token_in: A,
+                        token_out: B,
+                        amount_in: 1_000,
+                        min_amount_out: 1,
+                    },
+                ),
+                10,
+                &DigestAuthenticator,
+            )
+            .unwrap();
+        assert_eq!(state.operation_nonce(&TRADER), 5);
+        assert!(state.balance_of(&B, &TRADER) > 900_000);
+        assert!(state.reserves(&pair).unwrap().1 > 100_000);
+        assert_eq!(
+            state.apply_signed_operation(
+                &signed_operation(
+                    TRADER,
+                    5,
+                    AmmOperation::SwapExactIn {
+                        token_in: A,
+                        token_out: B,
+                        amount_in: 1_000,
+                        min_amount_out: 1
+                    }
+                ),
+                10,
+                &DigestAuthenticator
+            ),
+            Err(AmmError::NonceMismatch {
+                expected: 6,
+                actual: 5
+            })
+        );
     }
 
     #[test]
@@ -1031,6 +1812,10 @@ mod tests {
             .add_liquidity(TRADER, pair, 100_000, 100_000, 100_000)
             .unwrap();
         state.swap_exact_in(TRADER, A, B, 1_000, 1).unwrap();
+        let register = signed_operation(TRADER, 1, AmmOperation::RegisterAsset { asset_id: C });
+        state
+            .apply_signed_operation(&register, 10, &DigestAuthenticator)
+            .unwrap();
         let root = state.state_root().unwrap();
         let encoded = state.encode_snapshot().unwrap();
         assert_eq!(&encoded[..4], &AMM_SNAPSHOT_MAGIC);
@@ -1094,7 +1879,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_assets_and_zero_or_same_asset_pair() {
-        let mut state = QzxbAmmStateCandidate::new(2, 2, 2).unwrap();
+        let mut state = QzxbAmmStateCandidate::new(NETWORK, 2, 2, 2).unwrap();
         state.register_asset(A).unwrap();
         assert_eq!(state.create_pair(A, B), Err(AmmError::UnknownAsset));
         assert_eq!(
