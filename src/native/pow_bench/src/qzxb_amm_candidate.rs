@@ -230,6 +230,7 @@ impl QzxbAmmStateCandidate {
         Ok(pool.lp_balances.get(account).copied().unwrap_or(0))
     }
 
+    /// Add liquidity; `amount_a` and `amount_b` are desired amounts for canonical token0 and token1.
     pub fn add_liquidity(
         &mut self,
         provider: AmmAccountId,
@@ -585,6 +586,10 @@ impl QzxbAmmStateCandidate {
         self.verify_invariants()?;
         let mut hash = Sha256::new();
         hash.update(STATE_ROOT_DOMAIN);
+        // Bind fee policy to the candidate state commitment so implementations using a different
+        // fee schedule cannot silently report the same empty-state root.
+        hash.update(AMM_FEE_BPS.to_be_bytes());
+        hash.update(AMM_BPS_DENOMINATOR.to_be_bytes());
         hash.update((self.registered_assets.len() as u64).to_be_bytes());
         for asset in &self.registered_assets {
             hash.update(asset);
@@ -737,6 +742,23 @@ mod tests {
         assert!(receipt.reserve0_after * receipt.reserve1_after >= old_k);
         assert_eq!(state.balance_of(&A, &TRADER), 899_000);
         assert_eq!(state.balance_of(&B, &TRADER), 900_000 + receipt.amount_out);
+        state.verify_invariants().unwrap();
+    }
+
+    #[test]
+    fn subsequent_liquidity_uses_optimal_ratio_and_only_debits_used_amounts() {
+        let (mut state, pair) = fixture();
+        state
+            .add_liquidity(TRADER, pair, 100_000, 100_000, 100_000)
+            .unwrap();
+        let added = state
+            .add_liquidity(TRADER, pair, 10_000, 5_000, 5_000)
+            .unwrap();
+        assert_eq!(added.amount0_used, 5_000);
+        assert_eq!(added.amount1_used, 5_000);
+        assert_eq!(added.lp_shares_minted, 5_000);
+        assert_eq!(state.balance_of(&A, &TRADER), 895_000);
+        assert_eq!(state.balance_of(&B, &TRADER), 895_000);
         state.verify_invariants().unwrap();
     }
 
