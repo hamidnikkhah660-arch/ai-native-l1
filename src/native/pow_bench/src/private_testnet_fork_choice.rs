@@ -535,4 +535,42 @@ mod tests {
             Err(ForkChoiceError::ArchiveExportLimitExceeded)
         );
     }
+
+    #[test]
+    fn qrun_full_supply_survives_pow_fork_choice_and_archive_replay() {
+        let qrun_genesis =
+            crate::qrun_v05_genesis_candidate::QRunGenesisV05::new([0x51; 32], [0x2a; 32]).unwrap();
+        let genesis = qrun_genesis.ledger().clone();
+        let expected_supply = crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS;
+        assert_eq!(genesis.total_value().unwrap(), expected_supply);
+
+        let params = params();
+        let chain = PrivateTestnetChain::new(genesis.clone(), params.clone()).unwrap();
+        let (envelope, _) = candidate(&chain, &params, 100, 0);
+        let mut archive = PrivateTestnetForkChoice::new(genesis.clone(), params.clone()).unwrap();
+        archive
+            .insert_encoded(&envelope, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+
+        assert_eq!(
+            archive.canonical_chain().state().total_value().unwrap(),
+            expected_supply
+        );
+        let replayed = PrivateTestnetForkChoice::rebuild_from_envelopes(
+            genesis,
+            params,
+            archive.archive_envelopes(),
+            &EmptyAuthenticator,
+            &FixedClock,
+        )
+        .unwrap();
+        assert_eq!(
+            replayed.canonical_chain().state().total_value().unwrap(),
+            expected_supply
+        );
+        assert_eq!(
+            replayed.canonical_chain().chain_tip(),
+            archive.canonical_chain().chain_tip()
+        );
+    }
 }
