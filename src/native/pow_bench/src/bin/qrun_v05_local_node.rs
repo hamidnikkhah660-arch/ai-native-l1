@@ -104,7 +104,13 @@ Initializes the full 10B candidate Genesis in a test-only local store. Both list
             "explicit --local-testnet flag is required; this binary never launches Mainnet".into(),
         );
     }
-    if args.len() % 2 != 0 {
+    if args
+        .iter()
+        .filter(|arg| arg.as_str() != "--local-testnet")
+        .count()
+        % 2
+        != 0
+    {
         return Err("options must be --name value pairs".into());
     }
     let mut values = BTreeMap::<String, String>::new();
