@@ -1,5 +1,7 @@
 > **Current-policy note (2026-10-26):** allocation wording follows policy v0.4 and the founder-directed CP-0422 decision: 10B QZXB design cap, 1B / 10% founder allocation, and seven other category ceilings. No production Genesis, mainnet, or liquid native-coin market is represented as launched. Historical engineering/test claims retain their original review dates.
 
+> **Superseded for the future QRun Mainnet target by CP-0437 (2026-10-28).** This document preserves the prior v0.4 decision for audit/history; it is not the current Genesis target.
+
 # QuantumZXB - AI-Native L1 Native Coin and Ecosystem White Paper
 ## Version 0.3 - Public Technical Engineering White Paper and Allocation Addendum
 

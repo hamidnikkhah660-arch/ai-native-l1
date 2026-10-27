@@ -13,6 +13,7 @@ mod windows_wallet {
         },
         transaction_auth::Ed25519TransactionSigner,
     };
+    use sha2::{Digest, Sha256};
     use std::{
         env,
         ffi::c_void,
@@ -41,8 +42,18 @@ mod windows_wallet {
         }
     }
 
+    fn wipe_string(value: &mut String) {
+        unsafe {
+            value.as_mut_vec().fill(0);
+        }
+        value.clear();
+    }
+
     enum Command {
         Create {
+            output: PathBuf,
+        },
+        Restore {
             output: PathBuf,
         },
         Address {
@@ -361,6 +372,14 @@ mod windows_wallet {
                 }
                 Ok(Command::Create { output })
             }
+            "restore" => {
+                let values = options(&args[1..], &["--output"])?;
+                let output = PathBuf::from(required(&values, "--output")?);
+                if !output.is_absolute() || output.file_name().is_none() {
+                    return Err("--output must be an absolute file path".into());
+                }
+                Ok(Command::Restore { output })
+            }
             "address" => {
                 let values = options(&args[1..], &["--wallet"])?;
                 let wallet = PathBuf::from(required(&values, "--wallet")?);
@@ -504,6 +523,9 @@ mod windows_wallet {
     extern "system" {
         fn LocalFree(memory: *mut c_void) -> *mut c_void;
         fn GetLastError() -> u32;
+        fn GetStdHandle(std_handle: u32) -> *mut c_void;
+        fn GetConsoleMode(handle: *mut c_void, mode: *mut u32) -> i32;
+        fn SetConsoleMode(handle: *mut c_void, mode: u32) -> i32;
     }
 
     fn dpapi_protect(
@@ -654,12 +676,27 @@ mod windows_wallet {
         Ok(())
     }
 
-    fn create_wallet(path: &Path) -> Result<(), String> {
-        let mut seed = SecretSeed([0u8; 32]);
-        getrandom::getrandom(&mut seed.0)
-            .map_err(|_| "operating-system random key generation failed".to_string())?;
+    /// Derive a QZXB signing seed deterministically from a standard 12-word English BIP39 phrase.
+    /// This is chain-specific and is not the Bitcoin/EVM BIP32 derivation path.
+    fn derive_signing_seed(mnemonic: &bip39::Mnemonic) -> SecretSeed {
+        let mut mnemonic_seed = mnemonic.to_seed("");
+        let mut hasher = Sha256::new();
+        hasher.update(b"QUANTUMZXB-ED25519-SEED-FROM-BIP39-V1\0");
+        hasher.update(&mnemonic_seed);
+        let digest = hasher.finalize();
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&digest);
+        mnemonic_seed.fill(0);
+        SecretSeed(seed)
+    }
+
+    fn save_wallet_from_seed(
+        path: &Path,
+        seed: SecretSeed,
+        recovery_phrase: Option<&str>,
+    ) -> Result<(), String> {
         if seed.0.iter().all(|byte| *byte == 0) {
-            return Err("operating-system random source returned an invalid seed".into());
+            return Err("wallet signing seed is invalid".into());
         }
         let signer = Ed25519TransactionSigner::from_seed(seed.0);
         let public_key = signer.public_key();
@@ -678,10 +715,86 @@ mod windows_wallet {
         save_new_wallet(path, &envelope)?;
         println!("wallet_file={}", path.display());
         println!("wallet_format=QZKW1_Windows_CurrentUser_DPAPI");
+        println!("wallet_derivation=QZXB-BIP39-12-Ed25519-v1");
         println!("public_key_hex={}", hex(&public_key));
         println!("account_id_hex={}", hex(&account_id));
         println!("private_key_output=none");
         println!("mainnet_balance=not_created");
+        if let Some(phrase) = recovery_phrase {
+            println!("recovery_phrase_words=12");
+            println!("recovery_phrase={phrase}");
+            println!("recovery_phrase_warning=write_on_paper; never_share_or_store_in_cloud");
+        }
+        Ok(())
+    }
+
+    fn create_wallet(path: &Path) -> Result<(), String> {
+        let mut entropy = [0u8; 16];
+        getrandom::getrandom(&mut entropy)
+            .map_err(|_| "operating-system random entropy generation failed".to_string())?;
+        if entropy.iter().all(|byte| *byte == 0) {
+            entropy.fill(0);
+            return Err("operating-system random source returned invalid entropy".into());
+        }
+        let mnemonic = bip39::Mnemonic::from_entropy_in(bip39::Language::English, &entropy)
+            .map_err(|_| "could not create a standard 12-word BIP39 mnemonic".to_string())?;
+        entropy.fill(0);
+        let mut phrase = mnemonic.to_string();
+        let seed = derive_signing_seed(&mnemonic);
+        let result = save_wallet_from_seed(path, seed, Some(&phrase));
+        wipe_string(&mut phrase);
+        result
+    }
+
+    fn read_secret_line() -> Result<String, String> {
+        const STD_INPUT_HANDLE: u32 = (-10i32) as u32;
+        const ENABLE_ECHO_INPUT: u32 = 0x0004;
+        let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        let mut original_mode = 0u32;
+        let has_console =
+            !handle.is_null() && unsafe { GetConsoleMode(handle, &mut original_mode) } != 0;
+        if has_console && unsafe { SetConsoleMode(handle, original_mode & !ENABLE_ECHO_INPUT) } == 0
+        {
+            return Err("could not disable console echo; recovery phrase input aborted".into());
+        }
+        let mut phrase = String::new();
+        let read_result = io::stdin().read_line(&mut phrase);
+        if has_console {
+            let restored = unsafe { SetConsoleMode(handle, original_mode) } != 0;
+            println!();
+            if !restored {
+                wipe_string(&mut phrase);
+                return Err("could not restore console mode after secret input".into());
+            }
+        }
+        read_result.map_err(|_| {
+            wipe_string(&mut phrase);
+            "could not read recovery phrase from standard input".to_string()
+        })?;
+        if phrase.trim().is_empty() {
+            wipe_string(&mut phrase);
+            return Err("recovery phrase input was empty".into());
+        }
+        Ok(phrase)
+    }
+
+    fn restore_wallet(path: &Path) -> Result<(), String> {
+        eprintln!("Enter the 12-word English BIP39 recovery phrase. Console input is masked.");
+        let mut phrase = read_secret_line()?;
+        let mut normalized = phrase.split_whitespace().collect::<Vec<_>>().join(" ");
+        wipe_string(&mut phrase);
+        let mnemonic = match bip39::Mnemonic::parse_in(bip39::Language::English, &normalized) {
+            Ok(value) => value,
+            Err(_) => {
+                wipe_string(&mut normalized);
+                return Err("recovery phrase is invalid: expected a valid 12-word English BIP39 phrase and checksum".into());
+            }
+        };
+        wipe_string(&mut normalized);
+        let seed = derive_signing_seed(&mnemonic);
+        save_wallet_from_seed(path, seed, None)?;
+        println!("restore_status=success");
+        println!("recovery_phrase_saved_to_disk=no");
         Ok(())
     }
 
@@ -874,6 +987,7 @@ Default signature mode embeds the public key with its Ed25519 signature so the s
                 Ok(())
             }
             Ok(Command::Create { output }) => create_wallet(&output),
+            Ok(Command::Restore { output }) => restore_wallet(&output),
             Ok(Command::Address { wallet }) => address(&wallet),
             Ok(Command::RpcStatus { rpc }) => rpc_status(rpc),
             Ok(Command::Balance { rpc, account_id }) => rpc_balance(rpc, account_id),
@@ -956,6 +1070,23 @@ Default signature mode embeds the public key with its Ed25519 signature so the s
             assert!(parse_hex32("12", "test").is_err());
             assert!(parse_hex32(&"g0".repeat(32), "test").is_err());
             assert_eq!(parse_hex32(&"ab".repeat(32), "test").unwrap(), [0xab; 32]);
+        }
+
+        #[test]
+        fn bip39_recovery_derivation_is_deterministic_and_checks_the_phrase() {
+            let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+            let a = bip39::Mnemonic::parse_in(bip39::Language::English, phrase).unwrap();
+            let b = bip39::Mnemonic::parse_in(bip39::Language::English, phrase).unwrap();
+            let seed_a = derive_signing_seed(&a);
+            let seed_b = derive_signing_seed(&b);
+            let signer_a = Ed25519TransactionSigner::from_seed(seed_a.0);
+            let signer_b = Ed25519TransactionSigner::from_seed(seed_b.0);
+            assert_eq!(signer_a.public_key(), signer_b.public_key());
+            assert_eq!(signer_a.account_id(), signer_b.account_id());
+            assert!(bip39::Mnemonic::parse_in(
+                bip39::Language::English,
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon"
+            ).is_err());
         }
 
         #[test]

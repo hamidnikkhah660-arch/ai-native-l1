@@ -23,6 +23,7 @@ serde_json = "=1.0.154"
 snow = "=0.9.6"
 # FIPS 204 ML-DSA-65 implementation; its arithmetic/NTT/serialization components are formally verified, but deployment still requires an external review.
 libcrux-ml-dsa = "=0.0.4"
+bip39 = "=2.1.0"
 
 [profile.release]
 opt-level = 3

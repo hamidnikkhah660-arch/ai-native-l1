@@ -423,3 +423,5 @@ mod tests {
 }
 
 pub mod token_forge;
+
+pub mod qrun_v05_genesis_candidate;

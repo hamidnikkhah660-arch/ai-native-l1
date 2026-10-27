@@ -98,7 +98,21 @@ An isolated EVM lab pins revm and explores call/create, storage, gas, rollback a
 
 The codebase covers bounded wire parsing and ingress/worker queues, authenticated peer-session research, state-commitment candidates, fork/reorg history replay, archive paging, snapshot/store recovery models and process-crash tests. The next qualification stage adds an independently administered monotonic trust provider and tests across independently operated hosts and storage-failure conditions.
 
-## Native coin design and tokenomics (owner-directed policy v0.4)
+## QRun / QZXB native coin ? latest owner direction
+
+The latest direction (CP-0437, 28 October 2026) targets an independent **QRun** L1 with a fixed **10,000,000,000 QZXB** total supply, all credited to one owner account at Genesis. Because the full cap would be issued up front, later minting and miner subsidies must be zero; block producers would use fee-only compensation. The 4B founder model is retired and must not be selectable by the future QRun Mainnet profile.
+
+**Important:** CP-0437 is not a Mainnet launch claim. The new code currently builds and tests an in-memory Genesis candidate only; the canonical node runtime, persistent consensus/reorg path and production activation are not yet integrated. Do not treat any candidate balance as real or spendable until the independent QRun network is launched and the balance is verified on multiple nodes.
+
+- **Latest owner direction:** CP-0437 ? QRun full-supply Genesis direction (docs/CP-0437_QRUN_FULL_SUPPLY_GENESIS_DIRECTION_2026-10-28.md)
+- **Windows wallet app:** run tools/QZXB-Wallet.cmd to open QZXB Wallet ? QRun. The 12-word recovery phrase is shown once and must be backed up offline.
+- **Production gate status:** Mainnet is not launched; Gate 2/Gate 8 runtime and external review remain open.
+
+<details>
+<summary>Historic v0.4 allocation proposal ? superseded for the QRun Mainnet target</summary>
+
+## Historic native coin design and tokenomics (owner-directed policy v0.4)
+
 
 The planned maximum native QZXB supply is **10,000,000,000 coins**: **30% mining/network-security rewards (3B); 10% community airdrop (1B); 10% exchange, market-integration and liquidity partnerships (1B); 10% major marketing partners (1B); 10% developers/security contributors (1B); 10% financial/strategic supporters (1B); 10% protocol burn reserve (1B); and 10% owner allocation (1B)**. The eight buckets total exactly 100%.
 
@@ -111,6 +125,8 @@ These are planned allocations, not active Genesis issuance, circulating supply, 
 - **Production gate status:** Gate 2 and Gate 8 remain open; native QZXB mainnet and a liquid native-coin market are not launched.
 
 The former 4B founder / 3B mining / 3B public-goods proposal is preserved only as versioned historical protocol/test material and is superseded for current allocation planning by policy v0.4. The CP-0422 canonical decision records the 1B / 10% founder ceiling and explains the version boundary. `simulations/sponsor_allocation_checker.py` preserves CP-0343 v0.3 historical arithmetic only; it must not be used as the current v0.4 allocator. `simulations/quantumzxb_tokenomics_checker.py` is the current v0.4 allocation/documentation preflight. The separate QX ERC-20 deployment on Ethereum Sepolia is a test asset, not the native QZXB coin or a production market.
+
+</details>
 
 ## Current engineering validation
 

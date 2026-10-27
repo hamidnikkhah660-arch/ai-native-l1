@@ -45,6 +45,8 @@ jobs:
 
       - name: Verify CP-0422 canonical tokenomics and historical-version boundary
         run: python3 ../../../simulations/quantumzxb_tokenomics_checker.py
+      - name: Verify CP-0437 QRun full-supply Genesis direction
+        run: python3 ../../../simulations/qrun_full_genesis_direction_checker.py
       - name: Verify CP-0419 QZBE checkpoint golden vector independently
         run: python3 ../../../simulations/cp0419_qzbe_checkpoint_oracle.py
       - name: Verify CP-0421 QZBE checkpoint-base durable suffix store

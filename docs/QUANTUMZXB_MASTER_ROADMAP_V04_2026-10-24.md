@@ -1,4 +1,6 @@
 # QuantumZXB — Master Engineering and Public-Launch Roadmap v0.4
+
+> **Superseded for the future QRun Mainnet target by CP-0437 (2026-10-28).** This document preserves the prior v0.4 decision for audit/history; it is not the current Genesis target.
 Date: 2026-10-24
 Status: evidence-based planning checkpoint. No Mainnet launch date, exchange listing, token price, or liquidity outcome is promised.
 

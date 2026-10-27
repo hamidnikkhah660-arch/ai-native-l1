@@ -1,5 +1,7 @@
 # CP-0422 — Canonical Tokenomics Decision and Runtime Reconciliation
 
+> **Superseded for the future QRun Mainnet target by CP-0437 (2026-10-28).** This document preserves the prior v0.4 decision for audit/history; it is not the current Genesis target.
+
 **Date:** 2026-10-26
 **Status:** Founder economic decision recorded. Repository reconciliation is in progress; this document does not claim production integration or network launch.
 
