@@ -17,6 +17,10 @@ This package is data ingestion, not a token bridge, AMM deployment, liquidity po
 
 **Current status (2026-10-27):** the repository does not establish a native QZXB Mainnet or QZXB/USDT pool, so no live QZXB/USDT candles exist yet. The existing Sepolia QX ERC-20 is a separate test asset and must not be presented as native QZXB. Do not attach real funds or market claims to this candidate before the native asset/wrapped-asset policy, pair, liquidity and data-source identities are approved and verified.
 
+## Candidate native wallet client
+
+The Rust CLI `cargo run --manifest-path src/native/pow_bench/Cargo.toml --bin qzxb_amm_client -- ...` can sign QAX1 AMM operations locally and submit them over QZAS/1 to the candidate node. Use a **dedicated testnet-only** Ed25519 seed file with exactly 64 hex characters; keep it outside the repository and never send the seed to an RPC node. Start with `--show-account`, then run an operation without `--submit` to inspect the signed payload before explicitly submitting. The default endpoint is loopback `127.0.0.1:49337`; remote testnet submission requires `--allow-remote-testnet` explicitly. A mempool ACK is not block inclusion or finality. This client does not mint or back USDT and is not approved for real funds or Mainnet.
+
 ## Tests
 
 Run with Node.js:
