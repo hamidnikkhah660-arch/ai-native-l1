@@ -1,7 +1,6 @@
 //! Read-only loader for QZKW1 Windows CurrentUser-DPAPI wallets.
 //! The secret is never written to a file or emitted by this module. This is local Windows custody,
 //! not a portable backup, HSM, or production-wallet certification.
-#[cfg(windows)]
 use crate::transaction_auth::Ed25519TransactionSigner;
 use std::path::Path;
 #[cfg(windows)]
@@ -44,7 +43,6 @@ impl ProtectedWallet {
         self.account_id
     }
     /// Consumes this protected wallet to produce the signer without returning raw seed bytes.
-    #[cfg(windows)]
     pub fn into_signer(self) -> Ed25519TransactionSigner {
         Ed25519TransactionSigner::from_seed(self.seed.0)
     }
