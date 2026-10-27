@@ -194,7 +194,7 @@ try {
         if ($text -match 'event=qzbe_v04_peer_smoke_failed') { throw ("CP-0418 node runtime failed: " + $text) }
         if ($text -match 'event=qzbe_v04_peer_connection_rejected') { throw ("CP-0418 unexpected Noise/peer rejection: " + $text) }
     }
-    $pattern = 'event=qzbe_v04_peer_smoke_stopped .*height=2 state_root=([0-9a-f]{64}) tip=([0-9a-f]{64}) generation=2 total_mined_atoms=' + $expectedMinedAtoms + ' observed_account=' + $recipient + ' observed_balance_atoms=2500 accepted_peer_blocks=\d+ sent_peer_blocks=\d+(?: tx_submissions=\d+ mempool_count=\d+)? replay=matched tx_rpc_loopback_only=true mainnet=false network_surface=loopback_only local_only=true public_launch_approved=false'
+    $pattern = 'event=qzbe_v04_peer_smoke_stopped .*height=2 state_root=([0-9a-f]{64}) tip=([0-9a-f]{64}) generation=2 total_mined_atoms=' + $expectedMinedAtoms + ' observed_account=' + $recipient + ' observed_balance_atoms=2500 accepted_peer_blocks=\d+ sent_peer_blocks=\d+(?: tx_submissions=\d+ mempool_count=\d+)?(?: amm_submissions=\d+ amm_mempool_count=\d+)? replay=matched tx_rpc_loopback_only=true mainnet=false network_surface=loopback_only local_only=true public_launch_approved=false'
     $finalA = [regex]::Match($textA, $pattern)
     $finalB = [regex]::Match($textB, $pattern)
     $finalC = [regex]::Match($textC, $pattern)
