@@ -20,6 +20,7 @@ The source repository and project website are public, and we are actively inviti
 - **Current economics:** [10B Genesis direction and superseded emission model](economics.html).
 - **Release status:** [Current source branch, test inventory, production blockers](status.html).
 - **Contributions and sponsorship:** [How to submit a review, work plan or funding proposal](contribute.html).
+- **Technical readiness and sponsorship milestones:** [M0–M6 deliverables, evidence gates, proposal format and zero-budget fallback](docs/QRUN_TECHNICAL_READINESS_AND_SPONSORSHIP_PLAN_V1_2026-10-29.md).
 - **Source and contribution issues:** https://github.com/hamidnikkhah660-arch/ai-native-l1
 - **Latest experimental QRun source (not a production release):** [work branch](https://github.com/hamidnikkhah660-arch/ai-native-l1/tree/work/qzbe-v04-persistent-mining-20261026).
 - **Engineering white paper:** [QuantumZXB Native Coin White Paper v0.3](docs/QUANTUMZXB_NATIVE_COIN_WHITEPAPER_V03.md)

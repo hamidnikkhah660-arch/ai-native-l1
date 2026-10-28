@@ -37,6 +37,7 @@ The active experimental branch is separate from the public curated main baseline
 - Cryptography guide: https://hamidnikkhah660-arch.github.io/ai-native-l1/cryptography.html
 - Current supply / economics guide: https://hamidnikkhah660-arch.github.io/ai-native-l1/economics.html
 - Current release status: https://hamidnikkhah660-arch.github.io/ai-native-l1/status.html
+- Technical readiness and sponsorship milestone plan: https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/docs/QRUN_TECHNICAL_READINESS_AND_SPONSORSHIP_PLAN_V1_2026-10-29.md
 - Contributions / sponsorship: https://hamidnikkhah660-arch.github.io/ai-native-l1/contribute.html
 - Public source: https://github.com/hamidnikkhah660-arch/ai-native-l1
 - Latest experimental source branch (not a production release): https://github.com/hamidnikkhah660-arch/ai-native-l1/tree/work/qzbe-v04-persistent-mining-20261026
