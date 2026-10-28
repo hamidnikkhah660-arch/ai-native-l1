@@ -81,7 +81,7 @@ const QRUN_MAINNET_RELEASE_BLOCKERS: &[&str] = &[
     "production consensus profile is not frozen and proven by at least three independent operators",
     "full-history validation/recovery and independently verifiable checkpoint rollover are not integrated",
     "adversarial multi-host restart/reorg/partition/transaction-relay tests and independent security review are incomplete",
-    "the exhaustive locked all-target test suite has not completed successfully for this release candidate",
+    "external Mainnet P2P reachability, independent public operations, and monitored recovery have not been verified",
 ];
 
 #[derive(Clone)]
