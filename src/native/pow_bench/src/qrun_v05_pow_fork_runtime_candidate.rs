@@ -14,6 +14,7 @@ use crate::{
     private_testnet_wire::{
         decode_candidate_network_block, encode_candidate_network_block, PrivateTestnetWireError,
     },
+    qrun_v05_checkpoint_candidate::{QRunCheckpointError, QRunV05PowCheckpoint},
     qrun_v05_genesis_candidate::{QRunGenesisError, QRunGenesisV05},
     state_machine::{
         transaction_id, AccountId, Block, LedgerState, NetworkId, StateError, Transaction,
@@ -322,6 +323,24 @@ impl QRunV05PowForkRuntime {
     pub fn manifest_anchor(&self) -> Result<[u8; 32], QRunV05PowRuntimeError> {
         self.store.manifest_anchor().map_err(Into::into)
     }
+
+    /// Export a canonical, profile-bound checkpoint for the long-term archive pipeline.
+    /// A non-Genesis checkpoint must link to the prior checkpoint commitment. Export does not
+    /// itself make the checkpoint trusted; consumers must obtain its commitment independently.
+    pub fn export_checkpoint(
+        &self,
+        parent_checkpoint_commitment: [u8; 32],
+    ) -> Result<Vec<u8>, QRunCheckpointError> {
+        let chain = self.store.archive().canonical_chain();
+        QRunV05PowCheckpoint::capture(
+            self.network_id,
+            self.genesis_commitment,
+            &self.params,
+            chain,
+            parent_checkpoint_commitment,
+        )?
+        .encode(&self.params)
+    }
 }
 
 #[cfg(test)]
@@ -619,6 +638,26 @@ mod tests {
         assert_eq!(
             runtime.canonical_state().total_value().unwrap(),
             MAX_TOTAL_SUPPLY_ATOMS
+        );
+        let checkpoint_bytes = runtime.export_checkpoint([0x91; 32]).unwrap();
+        let checkpoint_commitment = QRunV05PowCheckpoint::commitment_for_bytes(&checkpoint_bytes);
+        let restored_checkpoint = QRunV05PowCheckpoint::decode_anchored(
+            &checkpoint_bytes,
+            &network,
+            &runtime.genesis_commitment(),
+            &params,
+            checkpoint_commitment,
+            1,
+        )
+        .unwrap();
+        assert_eq!(restored_checkpoint.height, 1);
+        assert_eq!(
+            restored_checkpoint.state_root,
+            runtime.canonical_state_root()
+        );
+        assert_eq!(
+            restored_checkpoint.cumulative_work,
+            runtime.store.archive().canonical_chain().cumulative_work()
         );
         let root = runtime.canonical_state_root();
         let commitment = runtime.genesis_commitment();
