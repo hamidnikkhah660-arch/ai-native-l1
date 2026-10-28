@@ -180,7 +180,7 @@ impl PrivateTestnetForkStore {
         authenticator: &A,
         clock: &dyn ReferenceTimeProvider,
     ) -> Result<Self, ForkStoreError> {
-        Self::open_inner(directory, genesis, params, authenticator, clock, None)
+        Self::open_inner(directory, genesis, params, authenticator, clock, None, None)
     }
 
     /// Open only when the stored PFS2 manifest matches an anchor provisioned independently
@@ -200,6 +200,29 @@ impl PrivateTestnetForkStore {
             authenticator,
             clock,
             Some(expected_manifest_anchor),
+            None,
+        )
+    }
+
+    /// Open a bounded suffix store rooted at a previously authenticated checkpoint chain.
+    /// Persist the checkpoint record/commitment separately and supply it again on every restart.
+    pub fn open_from_base_chain<A: TransactionAuthenticator>(
+        directory: impl AsRef<Path>,
+        base_chain: crate::private_testnet_driver::PrivateTestnetChain,
+        params: ConsensusParameters,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+        expected_manifest_anchor: Option<[u8; 32]>,
+    ) -> Result<Self, ForkStoreError> {
+        let base_state = base_chain.state().clone();
+        Self::open_inner(
+            directory,
+            base_state,
+            params,
+            authenticator,
+            clock,
+            expected_manifest_anchor,
+            Some(base_chain),
         )
     }
 
@@ -210,6 +233,7 @@ impl PrivateTestnetForkStore {
         authenticator: &A,
         clock: &dyn ReferenceTimeProvider,
         expected_manifest_anchor: Option<[u8; 32]>,
+        base_chain: Option<crate::private_testnet_driver::PrivateTestnetChain>,
     ) -> Result<Self, ForkStoreError> {
         params.validate()?;
         let directory = directory.as_ref().to_path_buf();
@@ -217,7 +241,14 @@ impl PrivateTestnetForkStore {
         let writer_lock = acquire_writer_lock(&directory)?;
 
         let profile_fingerprint = profile_fingerprint(&genesis, &params)?;
-        let empty = PrivateTestnetForkChoice::new(genesis.clone(), params.clone())?;
+        let empty = match base_chain.as_ref() {
+            Some(base) => PrivateTestnetForkChoice::from_base_chain(
+                genesis.clone(),
+                params.clone(),
+                base.clone(),
+            )?,
+            None => PrivateTestnetForkChoice::new(genesis.clone(), params.clone())?,
+        };
         let genesis_tip = empty.canonical_chain().chain_tip().tip_hash;
         let manifest_path = directory.join(MANIFEST_NAME);
 
@@ -262,13 +293,23 @@ impl PrivateTestnetForkStore {
                     }
                     envelopes.push(bytes);
                 }
-                let archive = PrivateTestnetForkChoice::rebuild_from_envelopes(
-                    genesis.clone(),
-                    params.clone(),
-                    envelopes,
-                    authenticator,
-                    clock,
-                )?;
+                let archive = match base_chain.as_ref() {
+                    Some(base) => PrivateTestnetForkChoice::rebuild_from_base_chain(
+                        genesis.clone(),
+                        params.clone(),
+                        base.clone(),
+                        envelopes,
+                        authenticator,
+                        clock,
+                    )?,
+                    None => PrivateTestnetForkChoice::rebuild_from_envelopes(
+                        genesis.clone(),
+                        params.clone(),
+                        envelopes,
+                        authenticator,
+                        clock,
+                    )?,
+                };
                 let replayed_tip = archive.canonical_chain().chain_tip().tip_hash;
                 if replayed_tip != manifest.canonical_tip {
                     return Err(ForkStoreError::CanonicalTipMismatch);

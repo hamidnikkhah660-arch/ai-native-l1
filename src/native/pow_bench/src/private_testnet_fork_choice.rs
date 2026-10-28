@@ -79,6 +79,8 @@ struct StoredBranch {
 pub struct PrivateTestnetForkChoice {
     genesis: LedgerState,
     params: ConsensusParameters,
+    /// Trusted base chain for this bounded fork segment (Genesis or an anchored checkpoint).
+    base_chain: PrivateTestnetChain,
     genesis_tip: [u8; 32],
     canonical: PrivateTestnetChain,
     branches: BTreeMap<[u8; 32], StoredBranch>,
@@ -92,8 +94,29 @@ impl PrivateTestnetForkChoice {
         Ok(Self {
             genesis,
             params,
+            base_chain: canonical.clone(),
             genesis_tip,
             canonical,
+            branches: BTreeMap::new(),
+            reorg_count: 0,
+        })
+    }
+
+    /// Start a new bounded fork segment from a previously validated QRun checkpoint chain.
+    /// The caller must independently authenticate the checkpoint before calling this method.
+    pub fn from_base_chain(
+        base_state: LedgerState,
+        params: ConsensusParameters,
+        base_chain: PrivateTestnetChain,
+    ) -> Result<Self, ConsensusError> {
+        params.validate()?;
+        let base_tip = base_chain.chain_tip().tip_hash;
+        Ok(Self {
+            genesis: base_state,
+            params,
+            base_chain: base_chain.clone(),
+            genesis_tip: base_tip,
+            canonical: base_chain,
             branches: BTreeMap::new(),
             reorg_count: 0,
         })
@@ -183,7 +206,12 @@ impl PrivateTestnetForkChoice {
         clock: &dyn ReferenceTimeProvider,
     ) -> Result<ForkChoiceOutcome, ForkChoiceError> {
         let candidate = decode_candidate_network_block(envelope).map_err(ForkChoiceError::Wire)?;
-        if candidate.header.height > MAX_FORK_ARCHIVE_HEIGHT {
+        let maximum_segment_height = self
+            .base_chain
+            .state()
+            .height()
+            .saturating_add(MAX_FORK_ARCHIVE_HEIGHT);
+        if candidate.header.height > maximum_segment_height {
             return Err(ForkChoiceError::BranchHeightExceeded);
         }
         let digest =
@@ -209,8 +237,7 @@ impl PrivateTestnetForkChoice {
 
         let parent_tip = candidate.header.previous_consensus_hash;
         let mut parent_chain = if parent_tip == self.genesis_tip {
-            PrivateTestnetChain::new(self.genesis.clone(), self.params.clone())
-                .map_err(ForkChoiceError::InvalidPow)?
+            self.base_chain.clone()
         } else {
             self.branches
                 .get(&parent_tip)
@@ -265,8 +292,7 @@ impl PrivateTestnetForkChoice {
 
     fn select_best_tip(&self) -> ([u8; 32], PrivateTestnetChain) {
         let mut best_tip = self.genesis_tip;
-        let mut best_chain = PrivateTestnetChain::new(self.genesis.clone(), self.params.clone())
-            .expect("fork store parameters were validated at construction");
+        let mut best_chain = self.base_chain.clone();
 
         for (digest, branch) in &self.branches {
             if branch.chain.compare_to(&best_chain) == Ordering::Greater {
@@ -320,6 +346,37 @@ impl PrivateTestnetForkChoice {
 
         let expected_count = ordered.len();
         let mut archive = Self::new(genesis, params).map_err(ForkChoiceError::InvalidPow)?;
+        for (_, _, envelope) in ordered {
+            archive.insert_encoded(&envelope, authenticator, clock)?;
+        }
+        if archive.archive_len() != expected_count {
+            return Err(ForkChoiceError::ReplayIncomplete);
+        }
+        Ok(archive)
+    }
+
+    /// Rebuild a checkpoint-rooted suffix archive in deterministic height/digest order.
+    pub fn rebuild_from_base_chain<A: TransactionAuthenticator>(
+        base_state: LedgerState,
+        params: ConsensusParameters,
+        base_chain: PrivateTestnetChain,
+        envelopes: impl IntoIterator<Item = Vec<u8>>,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+    ) -> Result<Self, ForkChoiceError> {
+        let mut ordered = Vec::new();
+        for envelope in envelopes {
+            let decoded =
+                decode_candidate_network_block(&envelope).map_err(ForkChoiceError::Wire)?;
+            let digest =
+                pow_digest(&decoded.header, params.pow).map_err(ForkChoiceError::InvalidPow)?;
+            ordered.push((decoded.header.height, digest, envelope));
+        }
+        ordered.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+        let expected_count = ordered.len();
+        let mut archive = Self::from_base_chain(base_state, params, base_chain)
+            .map_err(ForkChoiceError::InvalidPow)?;
         for (_, _, envelope) in ordered {
             archive.insert_encoded(&envelope, authenticator, clock)?;
         }

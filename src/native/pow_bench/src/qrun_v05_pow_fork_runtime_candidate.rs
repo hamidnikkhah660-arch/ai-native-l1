@@ -36,6 +36,7 @@ pub enum QRunV05PowRuntimeError {
     InvalidCandidate(String),
     MiningExhausted { attempts: u64 },
     UnknownArchivedBranch,
+    Checkpoint(QRunCheckpointError),
 }
 
 impl From<QRunGenesisError> for QRunV05PowRuntimeError {
@@ -61,6 +62,11 @@ impl From<PrivateTestnetWireError> for QRunV05PowRuntimeError {
 impl From<StateError> for QRunV05PowRuntimeError {
     fn from(error: StateError) -> Self {
         Self::Ledger(error)
+    }
+}
+impl From<QRunCheckpointError> for QRunV05PowRuntimeError {
+    fn from(error: QRunCheckpointError) -> Self {
+        Self::Checkpoint(error)
     }
 }
 
@@ -91,6 +97,42 @@ impl QRunV05PowForkRuntime {
             authenticator,
             clock,
             None,
+            None,
+        )
+    }
+
+    /// Open a new durable suffix store from an independently anchored QRCP checkpoint.
+    /// The caller must retain checkpoint bytes and its commitment outside the mutable store.
+    pub fn open_from_checkpoint<A: TransactionAuthenticator>(
+        directory: impl AsRef<Path>,
+        network_id: NetworkId,
+        owner_account: AccountId,
+        params: ConsensusParameters,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+        checkpoint_bytes: &[u8],
+        checkpoint_commitment: [u8; 32],
+        minimum_checkpoint_height: u64,
+        expected_manifest_anchor: Option<[u8; 32]>,
+    ) -> Result<Self, QRunV05PowRuntimeError> {
+        let genesis = QRunGenesisV05::new(network_id, owner_account)?;
+        let base_chain = QRunV05PowCheckpoint::restore_chain_anchored(
+            checkpoint_bytes,
+            &network_id,
+            &genesis.commitment(),
+            &params,
+            checkpoint_commitment,
+            minimum_checkpoint_height,
+        )?;
+        Self::open_inner(
+            directory,
+            network_id,
+            owner_account,
+            params,
+            authenticator,
+            clock,
+            expected_manifest_anchor,
+            Some(base_chain),
         )
     }
 
@@ -112,6 +154,7 @@ impl QRunV05PowForkRuntime {
             authenticator,
             clock,
             Some(expected_manifest_anchor),
+            None,
         )
     }
 
@@ -123,6 +166,7 @@ impl QRunV05PowForkRuntime {
         authenticator: &A,
         clock: &dyn ReferenceTimeProvider,
         anchor: Option<[u8; 32]>,
+        base_chain: Option<PrivateTestnetChain>,
     ) -> Result<Self, QRunV05PowRuntimeError> {
         params.validate()?;
         if params.issuance.maximum_supply() != MAX_TOTAL_SUPPLY_ATOMS
@@ -143,22 +187,32 @@ impl QRunV05PowForkRuntime {
             });
         }
         let genesis_commitment = genesis.commitment();
-        let store = match anchor {
-            Some(expected) => PrivateTestnetForkStore::open_anchored(
+        let store = match base_chain {
+            Some(base) => PrivateTestnetForkStore::open_from_base_chain(
                 directory,
-                genesis.ledger().clone(),
+                base,
                 params.clone(),
                 authenticator,
                 clock,
-                expected,
+                anchor,
             )?,
-            None => PrivateTestnetForkStore::open(
-                directory,
-                genesis.ledger().clone(),
-                params.clone(),
-                authenticator,
-                clock,
-            )?,
+            None => match anchor {
+                Some(expected) => PrivateTestnetForkStore::open_anchored(
+                    directory,
+                    genesis.ledger().clone(),
+                    params.clone(),
+                    authenticator,
+                    clock,
+                    expected,
+                )?,
+                None => PrivateTestnetForkStore::open(
+                    directory,
+                    genesis.ledger().clone(),
+                    params.clone(),
+                    authenticator,
+                    clock,
+                )?,
+            },
         };
         let runtime = Self {
             network_id,
@@ -685,6 +739,60 @@ mod tests {
             restored_chain.state().total_value().unwrap(),
             MAX_TOTAL_SUPPLY_ATOMS
         );
+        // Exercise checkpoint-rooted durable suffix storage, not only checkpoint decoding.
+        let suffix_dir = TestDir::new();
+        let mut segmented = QRunV05PowForkRuntime::open_from_checkpoint(
+            &suffix_dir.0,
+            network,
+            owner,
+            params.clone(),
+            &EmptyAuthenticator,
+            &FixedClock,
+            &checkpoint_bytes,
+            checkpoint_commitment,
+            1,
+            None,
+        )
+        .unwrap();
+        assert_eq!(segmented.canonical_height(), 1);
+        assert_eq!(
+            segmented.canonical_tip(),
+            restored_chain.chain_tip().tip_hash
+        );
+        assert_eq!(
+            segmented.canonical_state_root(),
+            runtime.canonical_state_root()
+        );
+        let continuation = segmented
+            .mine_candidate(101, Vec::new(), &EmptyAuthenticator, 1)
+            .unwrap();
+        segmented
+            .submit_block(&continuation, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+        assert_eq!(segmented.canonical_height(), 2);
+        assert_eq!(
+            segmented.canonical_state().total_value().unwrap(),
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
+        let suffix_root = segmented.canonical_state_root();
+        let suffix_manifest_anchor = segmented.manifest_anchor().unwrap();
+        drop(segmented);
+        let segmented_reopened = QRunV05PowForkRuntime::open_from_checkpoint(
+            &suffix_dir.0,
+            network,
+            owner,
+            params.clone(),
+            &EmptyAuthenticator,
+            &FixedClock,
+            &checkpoint_bytes,
+            checkpoint_commitment,
+            1,
+            Some(suffix_manifest_anchor),
+        )
+        .unwrap();
+        assert_eq!(segmented_reopened.canonical_height(), 2);
+        assert_eq!(segmented_reopened.canonical_state_root(), suffix_root);
+
         let root = runtime.canonical_state_root();
         let commitment = runtime.genesis_commitment();
         drop(runtime);
