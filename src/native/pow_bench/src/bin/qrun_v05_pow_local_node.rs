@@ -144,7 +144,7 @@ fn parse_config() -> Result<Config, String> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
             "QRun v0.5 local-loopback PoW integration node (test-only; never Mainnet)\n\
-Usage: qrun_v05_local_node --local-testnet --network-id-hex HEX64 \
+Usage: qrun_v05_pow_local_node --local-testnet --network-id-hex HEX64 \
 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH \
 [--rpc-listen 127.0.0.1:49339] [--tx-listen 127.0.0.1:49340]\n\
 Authenticated candidate peers: --noise-private-key-file NPK1 --peer 127.0.0.1:PORT --peer-static-public-key-hex HEX64 (repeat peer and pin together).\n\

@@ -125,3 +125,7 @@ jobs:
       - name: Run QZBE fresh-node bounded archive sync and state convergence
         shell: pwsh
         run: ./simulations/cp0437_qzbe_fresh_node_archive_sync.ps1
+
+      - name: Run QRun authenticated startup sync and fail-closed listener guard
+        shell: pwsh
+        run: ./simulations/cp0449_qrun_authenticated_startup_sync_loopback.ps1
