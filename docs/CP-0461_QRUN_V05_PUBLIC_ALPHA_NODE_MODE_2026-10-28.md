@@ -50,4 +50,20 @@ The example is a command template, not proof of public reachability. A remote pe
 
 This candidate preserves the project's already-selected **10-billion QZXB full-supply Genesis allocation** and **zero post-Genesis block subsidy**. That is economically different from Bitcoin v0.1, which issued new BTC through block rewards rather than preminting its entire cap to one Genesis owner. If “exactly Bitcoin” is also intended to mean Bitcoin-style issuance, the next protocol version needs a newly committed Genesis with no full-supply owner premine, a deterministic halving/subsidy schedule, block-committed or consensus-derived rewards, and updated wire/profile vectors; that is a consensus/economics change, not a reason to block public P2P behind a cloud CAS service.
 
-The current mode also lacks automatic peer discovery and transaction-pool gossip. Transactions can be submitted by a local wallet to the node's loopback transaction ingress, then propagated as valid QFP5 blocks. This is a public-alpha path, not yet a complete Bitcoin-equivalent wallet/P2P experience. The public listener has not been started from this change, and remote Internet reachability has not been verified.
+The current mode also lacks automatic peer discovery and transaction-pool gossip. Transactions can be submitted by a local wallet to the node's loopback transaction ingress, then propagated as valid QFP5 blocks. This is a public-alpha path, not yet a complete Bitcoin-equivalent wallet/P2P experience.
+
+## First seed launch on the development host
+
+On 2026-10-28, the release binary was built, a network-bound DPAPI-protected NPK1 key was created at `C:\QRun\node.npk1`, and the seed process was started using the command above. The process reported:
+- `mainnet=false`, `network_class=public_alpha_experimental_not_mainnet`
+- Genesis height `0`, full supply `10,000,000,000 QZXB`, subsidy `0`
+- P2P listener `0.0.0.0:49341`; RPC `127.0.0.1:49339`; transaction ingress `127.0.0.1:49340`
+- Local TCP probes to all three ports succeeded; no external peer had connected at the time of verification.
+
+The current remote shell is not elevated. Attempting to install a narrowly scoped Windows Firewall rule returned `Access is denied`, so external Internet reachability is **not verified**. In an elevated PowerShell session, the host operator can allow only the QRun P2P executable/port with:
+
+```powershell
+New-NetFirewallRule -DisplayName "QRun Public Alpha P2P 49341" -Direction Inbound -Action Allow -Enabled True -Profile Any -Program "C:\Users\ASUS\Desktop\AI_NATIVE_L1_G2_G8_20261024\src\native\pow_bench\target\release\qrun_v05_pow_local_node.exe" -Protocol TCP -LocalPort 49341 -EdgeTraversalPolicy Block
+```
+
+If the host is behind NAT, TCP 49341 also needs forwarding to the host's private LAN address. Do not expose ports 49339 or 49340; those remain local-only.
