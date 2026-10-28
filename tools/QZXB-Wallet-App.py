@@ -1,5 +1,5 @@
-﻿#!/usr/bin/env python3
-"""QZXB Wallet — QRun desktop frontend for the native Windows wallet engine."""
+#!/usr/bin/env python3
+"""QRun Wallet — QZXB desktop frontend for the native Windows wallet engine."""
 from __future__ import annotations
 
 import os
@@ -10,7 +10,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-APP_NAME = "QZXB Wallet — QRun"
+APP_NAME = "QRun Wallet — QZXB"
 ACCENT = "#718CFF"
 BG = "#0B1220"
 PANEL = "#111D30"
@@ -89,8 +89,8 @@ class QZXBWalletApp:
         header.pack(fill="x", pady=(0, 17))
         titlebox = ttk.Frame(header)
         titlebox.pack(side="left", fill="x", expand=True)
-        ttk.Label(titlebox, text="QZXB WALLET", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(titlebox, text="QRun • Quantum Run • Native QZXB", style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
+        ttk.Label(titlebox, text="QRun WALLET", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(titlebox, text="QRun Blockchain • Native coin: QZXB", style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
         self.mainnet_badge = tk.Label(header, text="MAINNET NOT LAUNCHED", bg="#392D20",
                                       fg=WARN, padx=12, pady=9, font=("Segoe UI", 9, "bold"))
         self.mainnet_badge.pack(side="right", padx=(12, 0), pady=6)
@@ -187,7 +187,7 @@ class QZXBWalletApp:
 
     def create_wallet(self) -> None:
         if self.wallet_path.exists():
-            messagebox.showwarning("QZXB Wallet", "A wallet already exists at this path. Existing keys are never overwritten. Restore to a new file or select your existing wallet.")
+            messagebox.showwarning("QRun Wallet", "A wallet already exists at this path. Existing keys are never overwritten. Restore to a new file or select your existing wallet.")
             self.refresh_wallet()
             return
         try:
@@ -214,7 +214,7 @@ class QZXBWalletApp:
                 self.refresh_wallet()
                 messagebox.showinfo("Wallet creation cancelled", "The newly created wallet file was removed because its recovery phrase was not confirmed as backed up.")
                 return
-            messagebox.showinfo("QZXB Wallet", "Wallet file created and locally protected. Your recovery phrase was shown once. Mainnet balance is not created because the production network is not launched.")
+            messagebox.showinfo("QRun Wallet", "Wallet file created and locally protected. Your recovery phrase was shown once. Mainnet balance is not created because the production network is not launched.")
         except Exception as exc:
             messagebox.showerror("Create wallet", str(exc))
         finally:
@@ -225,7 +225,7 @@ class QZXBWalletApp:
         if len(words) != 12:
             return False
         dlg = tk.Toplevel(self.root)
-        dlg.title("QZXB Wallet — recovery phrase")
+        dlg.title("QRun Wallet — recovery phrase")
         dlg.configure(bg="#FFFFFF")
         dlg.resizable(False, False)
         dlg.transient(self.root)
@@ -263,7 +263,7 @@ class QZXBWalletApp:
 
     def restore_wallet(self) -> None:
         dlg = tk.Toplevel(self.root)
-        dlg.title("Restore QZXB wallet")
+        dlg.title("Restore QRun wallet")
         dlg.configure(bg="#FFFFFF")
         dlg.geometry("640x310")
         dlg.resizable(False, False)
@@ -287,7 +287,7 @@ class QZXBWalletApp:
         def browse() -> None:
             destination = filedialog.asksaveasfilename(
                 parent=dlg, initialdir=str(self.home), initialfile="wallet-restored.qzw1",
-                defaultextension=".qzw1", filetypes=[("QZXB wallet", "*.qzw1")])
+                defaultextension=".qzw1", filetypes=[("QRun wallet (QZXB)", "*.qzw1")])
             if destination:
                 dest_var.set(destination)
         ttk.Button(dest_row, text="Browse…", style="Secondary.TButton", command=browse).pack(side="left", padx=(8, 0))
@@ -332,7 +332,7 @@ class QZXBWalletApp:
         phrase_var.set("")
         self.refresh_wallet()
         if result_box["ok"]:
-            messagebox.showinfo("QZXB Wallet", "Wallet restored and protected for this Windows user. No recovery phrase was saved in the wallet file.")
+            messagebox.showinfo("QRun Wallet", "Wallet restored and protected for this Windows user. No recovery phrase was saved in the wallet file.")
 
     def copy_account(self) -> None:
         value = self.account_var.get().strip()
@@ -369,6 +369,6 @@ if __name__ == "__main__":
     if "--self-test" in sys.argv:
         raise SystemExit(self_test())
     if os.name != "nt":
-        print("QZXB Wallet requires Windows DPAPI.")
+        print("QRun Wallet requires Windows DPAPI.")
         raise SystemExit(2)
     QZXBWalletApp().run()

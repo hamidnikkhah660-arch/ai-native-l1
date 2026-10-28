@@ -1,11 +1,13 @@
-# QuantumZXB - AI-Native Layer-1 Engineering Project
+# QRun (کیوران) — QZXB Native Layer-1 Project
 
-**QuantumZXB** is the public working identity of an independently developed native Layer-1 and programmable-ecosystem project. The source combines a Rust-native ledger research programme, deterministic state/recovery candidates, ML-DSA-65 and hybrid-identity research, an isolated EVM/revm smart-contract laboratory, and a roadmap toward an AI-native developer ecosystem.
+**QRun** is the brand and public-facing name of the native Layer-1 project; the native coin ticker is **QZXB**, and the network name is **QRun Blockchain**. QZXB expands to **Quantum Zeta eXecution Blockchain** (Q = Quantum, Z = Zeta, X = eXecution, B = Blockchain). The Persian brand reading is «کیوران». The source combines a Rust-native ledger research programme, deterministic state/recovery candidates, ML-DSA-65 and hybrid-identity research, an isolated EVM/revm smart-contract laboratory, and a roadmap toward an AI-native developer ecosystem.
+
+- **Official naming and brand usage:** [CP-0464 QRun / QZXB Brand Identity](docs/CP-0464_QRUN_QZXB_BRAND_IDENTITY_2026-10-29.md)
 
 - **Global project site:** https://hamidnikkhah660-arch.github.io/ai-native-l1/
 - **Source and contribution issues:** https://github.com/hamidnikkhah660-arch/ai-native-l1
-- **Engineering white paper:** [QuantumZXB Native Coin White Paper v0.3](docs/QUANTUMZXB_NATIVE_COIN_WHITEPAPER_V03.md)
-- **Master roadmap:** [QuantumZXB Engineering & Public-Launch Roadmap v0.4](docs/QUANTUMZXB_MASTER_ROADMAP_V04_2026-10-24.md) - evidence-based gates; not a launch approval.
+- **Engineering white paper:** [QRun / QZXB White Paper v0.3 (historical)](docs/QUANTUMZXB_NATIVE_COIN_WHITEPAPER_V03.md)
+- **Master roadmap:** [QRun Engineering & Public-Launch Roadmap v0.4](docs/QUANTUMZXB_MASTER_ROADMAP_V04_2026-10-24.md) - evidence-based gates; not a launch approval.
 - **Standing launch policy (CP-0443):** [Bitcoin-inspired permissionless-first gate](docs/CP-0443_BITCOIN_INSPIRED_PERMISSIONLESS_LAUNCH_GATE_2026-10-28.md) - do not wait for exchange listings, platform indexing, sponsors, or external sign-off to publish a permissionless protocol; retain concrete consensus, wallet, network, supply and asset-backing blockers for the features claimed.
 - **Technical review and test evidence:** [CP-0343 report](docs/CP_0343_TECHNICAL_REVIEW_AND_TEST_RESULTS.md)
 - **Latest halving visualization and emission-data checkpoint:** [CP-0349](docs/CP_0349_REPRODUCIBLE_CANDIDATE_HALVING_VISUALIZATION_2026-10-21.md)
@@ -23,9 +25,9 @@
 - **Gate 2 v0.4 canonical Genesis manifest candidate (CP-0392):** [Versioned manifest and independent Python vectors](docs/CP_0392_V04_CANONICAL_GENESIS_MANIFEST_CANDIDATE_2026-10-24.md) - candidate-only; not wired into the node runtime.
 - **Gate 2 v0.4 allocation-accounting candidate (CP-0391):** [Eight-bucket counters, burn/supply invariants and tests](docs/CP_0391_GATE2_V04_ALLOCATION_ACCOUNTING_CANDIDATE_2026-10-24.md) - candidate-only; not yet wired to Genesis, live runtime, fork store or external anti-rollback.
 - **Publication checkpoint:** [CP-0344](docs/CP_0344_PUBLIC_DOCUMENTATION_REFRESH_2026-10-20.md)
-- **Founder/sponsor/contributor economics:** [Current tokenomics policy v0.4](docs/FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V04_2026-10-24.md)
+- **Historical v0.4 tokenomics proposal:** [Superseded allocation policy](docs/FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V04_2026-10-24.md); the current QRun Genesis direction is CP-0437 (10B at Genesis, zero later issuance and zero block subsidy).
 - **Current curated source baseline:** [v0.1.1-source](https://github.com/hamidnikkhah660-arch/ai-native-l1/releases/tag/v0.1.1-source)
-- **Founder profile and collaboration contact:** [Founder / AI research profile](docs/FOUNDER_PROFILE_AND_COLLABORATION.md) - email: [hamidnikkhah660@gmail.com](mailto:hamidnikkhah660@gmail.com?subject=QuantumZXB%20collaboration)
+- **Founder profile and collaboration contact:** [Founder / AI research profile](docs/FOUNDER_PROFILE_AND_COLLABORATION.md) - email: [hamidnikkhah660@gmail.com](mailto:hamidnikkhah660@gmail.com?subject=QRun%20collaboration)
 - **Fixed-scope paid engineering offer (G1):** [Rust/protocol reproducibility and AI/ML sprint, deliverables, acceptance criteria, and payment terms](docs/ENGINEERING_SERVICE_OFFER_V01.md)
 - **Public launch compliance / G0 readiness (not legal advice):** [MiCAR, donation status, payout and owner-side verification checklist](docs/CP_0372_G0_PUBLIC_LAUNCH_COMPLIANCE_CHECKLIST_2026-10-22.md)
 - **Mainnet architecture boundary (Gate 2 / Gate 8):** [PMT4/PFM4 runtime, loopback-only smoke limits and production prerequisites](docs/CP_0373_GATE2_PFM4_RUNTIME_PRODUCTION_BOUNDARY_2026-10-22.md)
@@ -72,11 +74,11 @@
 - **Sponsorship and contributor discussion:** [Public issue #1](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/1)
 - **Previous public documentation release:** [v0.2.0-docs](https://github.com/hamidnikkhah660-arch/ai-native-l1/releases/tag/v0.2.0-docs)
 
-## Support QuantumZXB's open-source development
+## Support QRun's open-source development
 
-QuantumZXB has a project page on Giveth; check the [official campaign page](https://giveth.io/project/quantumzxb) directly for its current status and any available donation options. Wallet control, actual receipts, payout access, gas or third-party costs, and tax treatment are not certified by this repository. Donations, if available, are voluntary support for public-benefit open-source engineering, reproducible testing, technical documentation, developer tools, and independent technical review when resources are available.
+QRun has a project page on Giveth; check the [official campaign page](https://giveth.io/project/quantumzxb) directly for its current status and any available donation options. Wallet control, actual receipts, payout access, gas or third-party costs, and tax treatment are not certified by this repository. Donations, if available, are voluntary support for public-benefit open-source engineering, reproducible testing, technical documentation, developer tools, and independent technical review when resources are available.
 
-**[Support QuantumZXB on Giveth](https://giveth.io/project/quantumzxb)**
+**[Support QRun on Giveth](https://giveth.io/project/quantumzxb)**
 
 Transparency note: the native QZXB mainnet and a liquid native-coin market have not launched. Donations are not a purchase of QZXB tokens or an investment; no token rewards, profits, financial returns, or guaranteed outcomes are promised. As of the initial campaign check on 2026-10-21, Giveth showed the direct project page as active with donations enabled, public directory review still pending, and GIVbacks status not eligible. These platform statuses may change; consult the live campaign page for current status. No donations are claimed here.
 
@@ -98,7 +100,7 @@ An isolated EVM lab pins revm and explores call/create, storage, gas, rollback a
 
 The codebase covers bounded wire parsing and ingress/worker queues, authenticated peer-session research, state-commitment candidates, fork/reorg history replay, archive paging, snapshot/store recovery models and process-crash tests. The next qualification stage adds an independently administered monotonic trust provider and tests across independently operated hosts and storage-failure conditions.
 
-## QRun / QZXB native coin ? latest owner direction
+## QRun Blockchain / QZXB native coin — current owner direction
 
 The latest direction (CP-0437, 28 October 2026) targets an independent **QRun** L1 with a fixed **10,000,000,000 QZXB** total supply, all credited to one owner account at Genesis. Because the full cap would be issued up front, later minting and miner subsidies must be zero; block producers would use fee-only compensation. The 4B founder model is retired and must not be selectable by the future QRun Mainnet profile.
 
@@ -111,9 +113,10 @@ The latest direction (CP-0437, 28 October 2026) targets an independent **QRun** 
 - **CP-0453 QFP5 chain/store candidate integration:** QRun-specific driver admission, mode-locked fork choice and a separate Genesis-rooted PFS2 profile now replay QFP5 history; tests preserve the exact 10B candidate Genesis across external-anchor restart and reject legacy/PTB2 cross-profile input. Public node/P2P/RPC, checkpoint rollover, real monotonic anchor provider and production review remain open (docs/CP-0453_QRUN_V05_FEE_ONLY_CHAIN_STORE_INTEGRATION_2026-10-28.md).
 - **CP-0454 QFP5 transport guards:** authenticated Noise record limits include QFP5; typed block-record helpers reject PTB2 downgrade, and old PTB2 runtimes/listeners reject QFP5 during submit, relay, sync and archive paths. This does not enable public networking; peer provisioning/rotation, end-to-end multi-host integration and post-quantum security remain open (docs/CP-0454_QRUN_QFP5_NOISE_TRANSPORT_GUARDS_2026-10-28.md).
 - **CP-0455 QRun PFS2 external-CAS protocol candidate:** every wrapped QFP5 commit is staged in a bounded QAP1 pending record, requires a pinned signed ML-DSA-65 CAS receipt before manifest publication, and recovers exact pre/post-CAS crash windows without guessing. Local mock-provider tests cover CAS rejection, lost response and restart after remote commit. A real independent provider, off-machine record custody, production node integration, and independent review remain required (docs/CP-0455_QRUN_V05_PFS2_EXTERNAL_CAS_COMMIT_PROTOCOL_2026-10-28.md).
-- **Windows wallet app:** run tools/QZXB-Wallet.cmd to open QZXB Wallet ? QRun. The 12-word recovery phrase is shown once and must be backed up offline.
+- **Windows wallet app:** run tools/QZXB-Wallet.cmd to open QRun Wallet (QZXB). The 12-word recovery phrase is shown once and must be backed up offline.
 - **Production gate status:** Mainnet is not launched; Gate 2/Gate 8 runtime and external review remain open.
 - **Latest QRun/QZXB release audit (2026-10-29):** [CP-0463 repository audit and release decision](docs/CP-0463_QRUN_REPOSITORY_AUDIT_AND_RELEASE_DECISION_2026-10-29.md).
+- **Official brand decision (2026-10-29):** [CP-0464 QRun / QZXB Brand Identity](docs/CP-0464_QRUN_QZXB_BRAND_IDENTITY_2026-10-29.md).
 
 <details>
 <summary>Historic v0.4 allocation proposal ? superseded for the QRun Mainnet target</summary>
@@ -127,11 +130,11 @@ These are planned allocations, not active Genesis issuance, circulating supply, 
 
 - **Current allocation policy:** [Tokenomics and Distribution Policy v0.4](docs/FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V04_2026-10-24.md)
 - **Canonical founder allocation decision:** [CP-0422 â€” 10B cap / 1B founder / historical-version boundary](docs/CP-0422_CANONICAL_TOKENOMICS_DECISION_2026-10-26.md)
-- **Current white paper:** [QuantumZXB Native Coin White Paper v0.3](docs/QUANTUMZXB_NATIVE_COIN_WHITEPAPER_V03.md)
-- **Current engineering roadmap:** [QuantumZXB Engineering & Ecosystem Roadmap v0.4](docs/QUANTUMZXB_MASTER_ROADMAP_V04_2026-10-24.md)
+- **Historical white paper:** [QRun / QZXB White Paper v0.3 (historical)](docs/QUANTUMZXB_NATIVE_COIN_WHITEPAPER_V03.md)
+- **Historical engineering roadmap:** [QRun Engineering & Ecosystem Roadmap v0.4](docs/QUANTUMZXB_MASTER_ROADMAP_V04_2026-10-24.md)
 - **Production gate status:** Gate 2 and Gate 8 remain open; native QZXB mainnet and a liquid native-coin market are not launched.
 
-The former 4B founder / 3B mining / 3B public-goods proposal is preserved only as versioned historical protocol/test material and is superseded for current allocation planning by policy v0.4. The CP-0422 canonical decision records the 1B / 10% founder ceiling and explains the version boundary. `simulations/sponsor_allocation_checker.py` preserves CP-0343 v0.3 historical arithmetic only; it must not be used as the current v0.4 allocator. `simulations/quantumzxb_tokenomics_checker.py` is the current v0.4 allocation/documentation preflight. The separate QX ERC-20 deployment on Ethereum Sepolia is a test asset, not the native QZXB coin or a production market.
+The former 4B founder / 3B mining / 3B public-goods proposal and the subsequent v0.4 eight-bucket model are preserved only as versioned historical protocol/test material; both are superseded for the current QRun Genesis direction by CP-0437. The CP-0422 canonical decision records the 1B / 10% founder ceiling and explains the version boundary. `simulations/sponsor_allocation_checker.py` preserves CP-0343 v0.3 historical arithmetic only; it must not be used as the current v0.4 allocator. `simulations/quantumzxb_tokenomics_checker.py` is the current v0.4 allocation/documentation preflight. The separate QX ERC-20 deployment on Ethereum Sepolia is a test asset, not the native QZXB coin or a production market.
 
 </details>
 
@@ -162,7 +165,7 @@ The public curated tree at source commit c3a5474aea60d3925f45ccc5f964f1229e4565e
 
 ## Founder background and direct proposals
 
-The founder profile now reflects the founder-confirmed **Ph.D. in Artificial Intelligence (completed 2024; institution omitted by request)** and summarises the AI, quantum-machine-learning, fuzzy/evolutionary optimisation, and post-quantum blockchain research described in the supplied CV and the engineering demonstrated in this repository. Sponsors, Rust/protocol engineers, cryptography reviewers, EVM developers, AI/LLM researchers, academic groups, grant programmes, infrastructure providers, exchanges and market-data platforms can send a concrete proposal to [hamidnikkhah660@gmail.com](mailto:hamidnikkhah660@gmail.com?subject=QuantumZXB%20collaboration). Exchange or data-platform contact is for technical diligence/readiness discussion only; no listing or market is represented as live. See the [liquidity and public-launch readiness plan](docs/LIQUIDITY_MARKET_DATA_AND_PUBLIC_LAUNCH_READINESS_V01.md).
+The founder profile now reflects the founder-confirmed **Ph.D. in Artificial Intelligence (completed 2024; institution omitted by request)** and summarises the AI, quantum-machine-learning, fuzzy/evolutionary optimisation, and post-quantum blockchain research described in the supplied CV and the engineering demonstrated in this repository. Sponsors, Rust/protocol engineers, cryptography reviewers, EVM developers, AI/LLM researchers, academic groups, grant programmes, infrastructure providers, exchanges and market-data platforms can send a concrete proposal to [hamidnikkhah660@gmail.com](mailto:hamidnikkhah660@gmail.com?subject=QRun%20collaboration). Exchange or data-platform contact is for technical diligence/readiness discussion only; no listing or market is represented as live. See the [liquidity and public-launch readiness plan](docs/LIQUIDITY_MARKET_DATA_AND_PUBLIC_LAUNCH_READINESS_V01.md).
 
 ## Mining and performance status
 

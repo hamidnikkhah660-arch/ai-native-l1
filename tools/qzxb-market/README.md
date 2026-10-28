@@ -1,4 +1,4 @@
-# QZXB market-data candle engine (candidate)
+# QRun Blockchain / QZXB Market-Data Candle Engine (Candidate)
 
 This repository module computes hourly (`1h`), daily (`1d`), Monday-UTC weekly (`1w`) and calendar-month (`1M`) OHLC candles from confirmed AMM swap logs. Price is quote-token units per base-token unit, normalized for token decimals with integer arithmetic; volume fields remain atomic-unit strings. Empty candles are never fabricated.
 
