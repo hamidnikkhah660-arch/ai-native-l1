@@ -135,8 +135,9 @@ impl QRunV05NoiseSession {
 
     /// Bitcoin-style public-P2P initiator: establishes an encrypted Noise session bound to the
     /// exact network and consensus profile without requiring a preconfigured remote-key pin.
-    /// The remote key is learned from the authenticated Noise transcript; all received blocks
-    /// must still pass normal consensus validation. Do not use this for RPC or CAS receipts.
+    /// The remote static key is learned from the Noise transcript, but without an out-of-band pin
+    /// the remote identity is not independently authenticated. All received blocks must still pass
+    /// normal consensus validation. Do not use this for RPC authorization or CAS receipts.
     pub fn connect_public(
         stream: &mut TcpStream,
         local_static_private_key: &[u8; 32],
@@ -232,10 +233,11 @@ impl QRunV05NoiseSession {
         )
     }
 
-    /// Bitcoin-style inbound peer mode: authenticate the Noise transcript, network ID and profile,
-    /// but do not require an out-of-band identity pin for the remote node. This is appropriate
-    /// only for a public PoW P2P listener whose blocks are fully validated by consensus; it must
-    /// never be used for RPC authorization or trusted checkpoint/CAS receipt signatures.
+    /// Bitcoin-style inbound peer mode: establish an encrypted Noise session with network/profile
+    /// context, without requiring an out-of-band identity pin for the remote node. The remote
+    /// static key is learned from the transcript but its identity is not independently authenticated
+    /// without an explicit pin. Use only for public PoW P2P whose blocks are fully validated by
+    /// consensus; never use for RPC authorization or trusted checkpoint/CAS receipt signatures.
     pub fn accept_public(
         stream: &mut TcpStream,
         local_static_private_key: &[u8; 32],

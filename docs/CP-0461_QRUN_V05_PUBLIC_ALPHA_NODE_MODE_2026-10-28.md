@@ -1,7 +1,7 @@
 # CP-0461 — QRun v0.5 Bitcoin-style public-alpha peer mode
 
 **Date:** 2026-10-28
-**Status:** Public-alpha mode implemented and locally tested. This is a runnable public-P2P candidate, not a claim that an internet-reachable network has already been started.
+**Status:** Public-alpha mode implemented and locally tested; a seed process is running on one Windows host. Remote Internet reachability is not yet verified.
 
 ## Why this mode exists
 
@@ -11,8 +11,8 @@ The explicit --public-alpha mode is separate from --local-testnet:
 - It selects ConsensusParameters::qrun_v05_calibrated_candidate() instead of the trivial smoke target.
 - It defaults the P2P block listener to 0.0.0.0:49341 and permits numeric IP peer addresses outside loopback.
 - It continues to bind RPC and transaction ingress to loopback by default, so unauthenticated administrative APIs are not exposed to the Internet.
-- It requires a network-bound Noise static private key stored in a Windows CurrentUser DPAPI NPK1 file. The Noise session encrypts records and binds both network ID and consensus-profile fingerprint. Remote peer keys can be pinned for known seeds, but are not mandatory for ordinary inbound/outbound public P2P.
-- It allows bounded authenticated startup sync from configured peers. The current seed list is manually supplied through --peer IP:PORT; automatic DNS seed discovery, peer address exchange, transaction mempool gossip and broad DoS/rate limiting are not implemented yet.
+- It requires a network-bound Noise static private key stored in a Windows CurrentUser DPAPI NPK1 file. The Noise session encrypts records and binds both network ID and consensus-profile fingerprint. Remote peer keys can be pinned for known seeds, but are not mandatory for ordinary public P2P. With no pin, the session is encrypted but the remote peer identity is not independently authenticated; a peer may also choose to pin trusted seed keys.
+- It allows bounded encrypted startup sync from configured peers. The current seed list is manually supplied through --peer IP:PORT; pin a seed's static key when independent peer identity is needed. Automatic DNS seed discovery, peer address exchange, transaction mempool gossip and broad DoS/rate limiting are not implemented yet.
 - The normal QFP5 block importer, PoW verification, state transition, fork choice and durable PFS2 store remain responsible for accepting received blocks; an encrypted connection alone never makes a block valid.
 
 ## Local checks

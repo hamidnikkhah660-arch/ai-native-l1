@@ -150,7 +150,7 @@ fn parse_config() -> Result<Config, String> {
 Local test: qrun_v05_pow_local_node --local-testnet --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH\n\
 Public alpha: qrun_v05_pow_local_node --public-alpha --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH --noise-private-key-file NPK1\n\
 P2P uses --block-listen 0.0.0.0:49341 in public-alpha mode; RPC and transaction ingress remain loopback-only. Optional outbound peers use repeated --peer IP:PORT; optionally provide one --peer-static-public-key-hex HEX64 per configured peer to pin them.\n\
-Public alpha uses the measured QRun v0.5 candidate profile, accepts authenticated Noise inbound peers without identity pins, validates every block using the shared network/profile and consensus rules, and keeps CAS optional. It is experimental and is not a claim of production readiness."
+Public alpha uses the measured QRun v0.5 candidate profile, accepts encrypted Noise sessions from inbound peers without requiring identity pins, validates every block using the shared network/profile and consensus rules, and keeps CAS optional. Unpinned Noise peers are not independently identity-authenticated; use optional seed pins for that property. It is experimental and is not a claim of production readiness."
         );
         return Err("__help__".into());
     }
@@ -1562,7 +1562,7 @@ fn run(config: Config) -> Result<(), String> {
     println!(
         "peer_transport={}",
         if config.public_alpha {
-            "qrun_v05_noise_xx_open_inbound_pinned_outbound"
+            "qrun_v05_noise_xx_open_public_peers_optional_seed_pins"
         } else if config.noise_private_key_file.is_some() {
             "qrun_v05_noise_xx_pinned_candidate"
         } else {
