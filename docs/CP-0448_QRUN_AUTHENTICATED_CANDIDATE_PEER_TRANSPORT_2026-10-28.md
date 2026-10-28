@@ -10,7 +10,7 @@ Status: implemented and locally tested as a candidate transport integration. Not
 - Wired optional authenticated peer sessions into `qrun_v05_pow_local_node` block exchange. A node configured with an NPK1 protected private key requires the configured pinned-key trust set on inbound connections and refuses plaintext fallback if an outbound peer's key pin is missing. Block acknowledgments use the same encrypted session.
 - Added `qrun_v05_noise_keygen`, which creates a Noise static keypair, stores the private key using Windows CurrentUser DPAPI bound to the supplied network ID, and prints only the public key. The utility refuses to overwrite an existing key file.
 - In-memory node and ephemeral copies of Noise private keys are explicitly zeroed on drop/after use where the code controls their lifecycle.
-- Added an authenticated two-node integration test that propagates an empty block and a signed transfer and verifies matching canonical tip/state root, recipient balance and receipt. Added a regression test confirming the existing local node still rejects non-loopback binds; the parser also rejects duplicate peer sockets.
+- Added an authenticated two-node integration test that propagates an empty block and a signed transfer and verifies matching canonical tip/state root, recipient balance and receipt. Added a regression test proving an authenticated outbound peer with a missing pin fails without sending plaintext, and a separate test confirming non-loopback binds remain rejected; the parser also rejects duplicate peer sockets.
 
 ## Validation
 

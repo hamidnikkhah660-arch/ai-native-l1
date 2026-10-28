@@ -1234,6 +1234,26 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_mode_refuses_unpinned_peer_instead_of_plaintext_fallback() {
+        let dir = TestDir::new();
+        let network = [0x53; 32];
+        let signer = Ed25519TransactionSigner::from_seed([0x37; 32]);
+        let state = Arc::new(Mutex::new(node_state(&dir.0, network, &signer)));
+        state.lock().unwrap().noise_private_key = Some([0xA3; 32]);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap();
+
+        let error = send_block_to_peer(peer, b"not-a-block", &state).unwrap_err();
+        assert!(error.contains("authenticated block peer config is incomplete"));
+
+        listener.set_nonblocking(true).unwrap();
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
     fn smoke_node_public_listener_guard_remains_fail_closed() {
         assert!(parse_socket("0.0.0.0:49341", "--block-listen").is_err());
         assert!(parse_socket("192.0.2.10:49341", "--block-listen").is_err());
