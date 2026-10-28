@@ -4,6 +4,7 @@
 
 - **Official naming and brand usage:** [CP-0464 QRun / QZXB Brand Identity](docs/CP-0464_QRUN_QZXB_BRAND_IDENTITY_2026-10-29.md)
 - **Mainnet/public-trading release decision:** [CP-0465 QRun Mainnet and QZXB/USDT Go/No-Go](docs/CP-0465_QRUN_MAINNET_PUBLIC_TRADING_NO_GO_2026-10-29.md) — current candidate is not released as public Mainnet and no QZXB/USDT market is verified.
+- **Zero-budget real-liquidity route:** [CP-0466 — Zero-Budget Route to Genuine QZXB Liquidity](docs/CP-0466_QRUN_ZERO_BUDGET_REAL_LIQUIDITY_PATH_2026-10-29.md) — compares native-first market prerequisites with a clearly separate buyer-funded EVM auction; no market or funding is claimed.
 
 - **Global project site:** https://hamidnikkhah660-arch.github.io/ai-native-l1/
 - **Source and contribution issues:** https://github.com/hamidnikkhah660-arch/ai-native-l1
