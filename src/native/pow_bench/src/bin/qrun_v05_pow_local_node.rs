@@ -8,7 +8,9 @@ use ai_native_l1_pow_bench::chain_admission::SystemClockReferenceTime;
 use ai_native_l1_pow_bench::consensus::{ConsensusParameters, PowAlgorithm, Uint256};
 use ai_native_l1_pow_bench::noise_key_provisioning::load_protected_noise_private_key;
 use ai_native_l1_pow_bench::private_testnet_wire::decode_candidate_network_block;
-use ai_native_l1_pow_bench::qrun_v05_noise_transport_candidate::QRunV05NoiseSession;
+use ai_native_l1_pow_bench::qrun_v05_noise_transport_candidate::{
+    QRunV05NoiseSession, MAX_NOISE_APPLICATION_RECORD_BYTES,
+};
 use ai_native_l1_pow_bench::qrun_v05_pow_fork_runtime_candidate::QRunV05PowForkRuntime;
 use ai_native_l1_pow_bench::qzbe_tx_ingress_candidate::{
     decode_request_header, encode_ack, TxIngressAck, TxIngressStatus, ACK_BYTES,
@@ -42,6 +44,12 @@ const BLOCK_PROTOCOL_VERSION: u16 = 2;
 const BLOCK_FRAME_HEADER_BYTES: usize = 10;
 const BLOCK_ACK_BYTES: usize = 47;
 const MAX_BLOCK_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const SYNC_REQUEST_MAGIC: &[u8; 4] = b"QRS5";
+const SYNC_RESPONSE_MAGIC: &[u8; 4] = b"QRR5";
+const SYNC_PROTOCOL_VERSION: u16 = 1;
+const SYNC_REQUEST_BYTES: usize = 20;
+const SYNC_RESPONSE_HEADER_BYTES: usize = 120;
+const MAX_SYNC_PAGE_BLOCKS: usize = 16;
 
 #[derive(Clone)]
 struct Receipt {
@@ -94,6 +102,7 @@ struct Config {
     peers: Vec<SocketAddr>,
     noise_private_key_file: Option<PathBuf>,
     peer_static_public_keys: Vec<[u8; 32]>,
+    sync_on_start: bool,
 }
 
 fn parse_hex32(value: &str, name: &str) -> Result<[u8; 32], String> {
@@ -138,7 +147,8 @@ fn parse_config() -> Result<Config, String> {
 Usage: qrun_v05_local_node --local-testnet --network-id-hex HEX64 \
 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH \
 [--rpc-listen 127.0.0.1:49339] [--tx-listen 127.0.0.1:49340]\n\
-Initializes the full 10B candidate Genesis in a test-only local store. All listeners and peers must use loopback. To select pinned Noise XX for candidate peers, pass --noise-private-key-file NPK1 and pair each --peer with --peer-static-public-key-hex. Public binds remain forbidden."
+Authenticated candidate peers: --noise-private-key-file NPK1 --peer 127.0.0.1:PORT --peer-static-public-key-hex HEX64 (repeat peer and pin together).\n\
+Optional --sync-on-start true requests bounded authenticated catch-up from pinned peers before listeners bind. The binary remains loopback-only and uses an insecure smoke target; it is not Mainnet."
         );
         return Err("__help__".into());
     }
@@ -193,6 +203,7 @@ Initializes the full 10B candidate Genesis in a test-only local store. All liste
         "--tx-listen",
         "--block-listen",
         "--noise-private-key-file",
+        "--sync-on-start",
     ];
     if let Some(key) = values.keys().find(|key| !allowed.contains(&key.as_str())) {
         return Err(format!("unknown option {key}"));
@@ -256,6 +267,20 @@ Initializes the full 10B candidate Genesis in a test-only local store. All liste
         }
     }
     let noise_private_key_file = values.get("--noise-private-key-file").map(PathBuf::from);
+    let sync_on_start = match values
+        .get("--sync-on-start")
+        .map(String::as_str)
+        .unwrap_or("false")
+    {
+        "true" => true,
+        "false" => false,
+        _ => return Err("--sync-on-start must be exactly true or false".into()),
+    };
+    if sync_on_start && noise_private_key_file.is_none() {
+        return Err(
+            "--sync-on-start requires --noise-private-key-file and pinned peer keys".into(),
+        );
+    }
     if noise_private_key_file.is_some() {
         if peer_static_public_keys.len() != peers.len() || peers.is_empty() {
             return Err("authenticated peer mode requires exactly one --peer-static-public-key-hex for each --peer, with at least one pinned peer".into());
@@ -289,6 +314,7 @@ Initializes the full 10B candidate Genesis in a test-only local store. All liste
         peers,
         noise_private_key_file,
         peer_static_public_keys,
+        sync_on_start,
     })
 }
 
@@ -495,6 +521,204 @@ fn decode_block_frame(frame: &[u8]) -> Result<Vec<u8>, String> {
     Ok(frame[BLOCK_FRAME_HEADER_BYTES..].to_vec())
 }
 
+#[derive(Debug)]
+struct CanonicalSyncResponse {
+    base_height: u64,
+    height: u64,
+    base_tip: [u8; 32],
+    canonical_tip: [u8; 32],
+    state_root: [u8; 32],
+    envelopes: Vec<Vec<u8>>,
+}
+
+fn max_sync_response_block_bytes(max_blocks: usize) -> Result<usize, String> {
+    if max_blocks == 0 || max_blocks > MAX_SYNC_PAGE_BLOCKS {
+        return Err("canonical sync page block count is outside the allowed range".into());
+    }
+    MAX_NOISE_APPLICATION_RECORD_BYTES
+        .checked_sub(SYNC_RESPONSE_HEADER_BYTES + 4 * max_blocks)
+        .ok_or_else(|| "canonical sync page budget underflows the Noise record bound".into())
+}
+
+fn encode_sync_request(
+    start_height: u64,
+    max_blocks: usize,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let max_record_bytes = max_sync_response_block_bytes(max_blocks)?;
+    if start_height == 0
+        || max_bytes == 0
+        || max_bytes > max_record_bytes
+        || max_bytes > u32::MAX as usize
+    {
+        return Err("canonical sync request is outside the allowed height/size bounds".into());
+    }
+    let mut request = Vec::with_capacity(SYNC_REQUEST_BYTES);
+    request.extend_from_slice(SYNC_REQUEST_MAGIC);
+    request.extend_from_slice(&SYNC_PROTOCOL_VERSION.to_be_bytes());
+    request.extend_from_slice(&start_height.to_be_bytes());
+    request.extend_from_slice(&(max_blocks as u16).to_be_bytes());
+    request.extend_from_slice(&(max_bytes as u32).to_be_bytes());
+    Ok(request)
+}
+
+fn decode_sync_request(request: &[u8]) -> Result<(u64, usize, usize), String> {
+    if request.len() != SYNC_REQUEST_BYTES
+        || &request[..4] != SYNC_REQUEST_MAGIC
+        || u16::from_be_bytes([request[4], request[5]]) != SYNC_PROTOCOL_VERSION
+    {
+        return Err("invalid canonical sync request magic/version/length".into());
+    }
+    let start_height = u64::from_be_bytes(request[6..14].try_into().unwrap());
+    let max_blocks = u16::from_be_bytes(request[14..16].try_into().unwrap()) as usize;
+    let max_bytes = u32::from_be_bytes(request[16..20].try_into().unwrap()) as usize;
+    encode_sync_request(start_height, max_blocks, max_bytes)?;
+    Ok((start_height, max_blocks, max_bytes))
+}
+
+fn encode_sync_response(
+    base_height: u64,
+    height: u64,
+    base_tip: [u8; 32],
+    canonical_tip: [u8; 32],
+    state_root: [u8; 32],
+    envelopes: &[Vec<u8>],
+) -> Result<Vec<u8>, String> {
+    if envelopes.len() > MAX_SYNC_PAGE_BLOCKS {
+        return Err("canonical sync response has too many blocks".into());
+    }
+    let mut response = Vec::with_capacity(SYNC_RESPONSE_HEADER_BYTES);
+    response.extend_from_slice(SYNC_RESPONSE_MAGIC);
+    response.extend_from_slice(&SYNC_PROTOCOL_VERSION.to_be_bytes());
+    response.extend_from_slice(&base_height.to_be_bytes());
+    response.extend_from_slice(&height.to_be_bytes());
+    response.extend_from_slice(&base_tip);
+    response.extend_from_slice(&canonical_tip);
+    response.extend_from_slice(&state_root);
+    response.extend_from_slice(&(envelopes.len() as u16).to_be_bytes());
+    for envelope in envelopes {
+        if envelope.is_empty() || envelope.len() > u32::MAX as usize {
+            return Err("canonical sync response has an invalid envelope length".into());
+        }
+        response.extend_from_slice(&(envelope.len() as u32).to_be_bytes());
+        response.extend_from_slice(envelope);
+        if response.len() > MAX_NOISE_APPLICATION_RECORD_BYTES {
+            return Err("canonical sync response exceeds the bounded Noise record size".into());
+        }
+    }
+    Ok(response)
+}
+
+fn decode_sync_response(
+    response: &[u8],
+    max_blocks: usize,
+    max_bytes: usize,
+) -> Result<CanonicalSyncResponse, String> {
+    let allowed_bytes = max_sync_response_block_bytes(max_blocks)?.min(max_bytes);
+    if response.len() < SYNC_RESPONSE_HEADER_BYTES
+        || response.len() > MAX_NOISE_APPLICATION_RECORD_BYTES
+        || &response[..4] != SYNC_RESPONSE_MAGIC
+        || u16::from_be_bytes([response[4], response[5]]) != SYNC_PROTOCOL_VERSION
+    {
+        return Err("invalid canonical sync response magic/version/length".into());
+    }
+    let base_height = u64::from_be_bytes(response[6..14].try_into().unwrap());
+    let height = u64::from_be_bytes(response[14..22].try_into().unwrap());
+    let base_tip: [u8; 32] = response[22..54].try_into().unwrap();
+    let canonical_tip: [u8; 32] = response[54..86].try_into().unwrap();
+    let state_root: [u8; 32] = response[86..118].try_into().unwrap();
+    let count = u16::from_be_bytes([response[118], response[119]]) as usize;
+    if count > max_blocks || count > MAX_SYNC_PAGE_BLOCKS || base_height > height {
+        return Err("canonical sync response violates the requested bounds".into());
+    }
+    let mut offset = SYNC_RESPONSE_HEADER_BYTES;
+    let mut total_bytes = 0usize;
+    let mut envelopes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let length_end = offset
+            .checked_add(4)
+            .ok_or("sync response length overflow")?;
+        if length_end > response.len() {
+            return Err("truncated canonical sync envelope length".into());
+        }
+        let length = u32::from_be_bytes(response[offset..length_end].try_into().unwrap()) as usize;
+        offset = length_end;
+        if length == 0 {
+            return Err("canonical sync response contains an empty block envelope".into());
+        }
+        let envelope_end = offset
+            .checked_add(length)
+            .ok_or("sync response length overflow")?;
+        if envelope_end > response.len() {
+            return Err("truncated canonical sync block envelope".into());
+        }
+        total_bytes = total_bytes
+            .checked_add(length)
+            .ok_or("sync response byte budget overflow")?;
+        if total_bytes > allowed_bytes {
+            return Err("canonical sync response exceeds its requested byte budget".into());
+        }
+        envelopes.push(response[offset..envelope_end].to_vec());
+        offset = envelope_end;
+    }
+    if offset != response.len() {
+        return Err("canonical sync response contains trailing bytes".into());
+    }
+    if count > 0 && height < base_height.saturating_add(count as u64) {
+        return Err("canonical sync response range extends beyond its advertised tip".into());
+    }
+    Ok(CanonicalSyncResponse {
+        base_height,
+        height,
+        base_tip,
+        canonical_tip,
+        state_root,
+        envelopes,
+    })
+}
+
+fn serve_sync_request(
+    request: &[u8],
+    session: &mut QRunV05NoiseSession,
+    stream: &mut TcpStream,
+    state: &Arc<Mutex<NodeState>>,
+) -> Result<(), String> {
+    let (start_height, max_blocks, max_bytes) = decode_sync_request(request)?;
+    let (base_height, height, base_tip, canonical_tip, state_root, envelopes) = {
+        let locked = state
+            .lock()
+            .map_err(|_| "node state lock poisoned".to_string())?;
+        let envelopes = locked
+            .runtime
+            .canonical_envelopes_range(start_height, max_blocks, max_bytes)
+            .map_err(|error| format!("export canonical sync range: {error:?}"))?;
+        (
+            locked.runtime.archive_base_height(),
+            locked.runtime.canonical_height(),
+            locked.runtime.archive_base_tip(),
+            locked.runtime.canonical_tip(),
+            locked.runtime.canonical_state_root(),
+            envelopes,
+        )
+    };
+    let response = encode_sync_response(
+        base_height,
+        height,
+        base_tip,
+        canonical_tip,
+        state_root,
+        &envelopes,
+    )?;
+    session
+        .write_record(stream, &response)
+        .map_err(|error| format!("write encrypted canonical sync response: {error}"))?;
+    println!(
+        "qrun_pow_local_canonical_sync_served start_height={start_height} count={} tip_height={height} base_height={base_height}",
+        envelopes.len()
+    );
+    Ok(())
+}
+
 fn block_ack(status: u8, height: u64, hash: [u8; 32]) -> [u8; BLOCK_ACK_BYTES] {
     let mut ack = [0u8; BLOCK_ACK_BYTES];
     ack[..4].copy_from_slice(BLOCK_ACK_MAGIC);
@@ -647,6 +871,190 @@ fn send_block_to_peer(
     }
 }
 
+/// Request one bounded canonical page from a statically pinned authenticated peer, then
+/// independently validate and persist every returned PTB2 block before reporting progress.
+fn request_sync_page_authenticated(
+    peer: SocketAddr,
+    state: &Arc<Mutex<NodeState>>,
+    max_blocks: usize,
+    max_bytes: usize,
+) -> Result<(u64, u64), String> {
+    if !peer.ip().is_loopback() {
+        return Err("peer must be loopback in the local PoW integration profile".into());
+    }
+    let (
+        network_id,
+        profile_id,
+        local_private_key,
+        remote_static_public_key,
+        start_height,
+        local_height,
+        local_tip,
+    ) = {
+        let locked = state
+            .lock()
+            .map_err(|_| "node state lock poisoned".to_string())?;
+        let local_height = locked.runtime.canonical_height();
+        (
+            locked.runtime.network_id(),
+            locked.profile_id,
+            locked
+                .noise_private_key
+                .ok_or("authenticated sync requires a local Noise key")?,
+            *locked
+                .peer_static_keys_by_addr
+                .get(&peer)
+                .ok_or("authenticated sync requires a pinned key for the peer")?,
+            local_height
+                .checked_add(1)
+                .ok_or("local chain height overflow")?,
+            local_height,
+            locked.runtime.canonical_tip(),
+        )
+    };
+    let request = encode_sync_request(start_height, max_blocks, max_bytes)?;
+    let local_private_key = EphemeralNoisePrivateKey(local_private_key);
+    let mut stream = TcpStream::connect_timeout(&peer, Duration::from_secs(2))
+        .map_err(|error| format!("connect authenticated sync peer {peer}: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(6)))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(6)))
+        .map_err(|error| error.to_string())?;
+    let mut session = QRunV05NoiseSession::connect(
+        &mut stream,
+        &local_private_key.0,
+        &remote_static_public_key,
+        &network_id,
+        &profile_id,
+    )
+    .map_err(|error| format!("Noise XX sync authentication failed: {error}"))?;
+    if session.remote_static_public_key() != &remote_static_public_key {
+        return Err("sync peer static key differs from the configured pin".into());
+    }
+    session
+        .write_record(&mut stream, &request)
+        .map_err(|error| format!("send encrypted canonical sync request: {error}"))?;
+    let response_bytes = session
+        .read_record(&mut stream)
+        .map_err(|error| format!("read encrypted canonical sync response: {error}"))?;
+    let response = decode_sync_response(&response_bytes, max_blocks, max_bytes)?;
+
+    if response.base_height > local_height {
+        return Err(format!(
+            "peer checkpoint base {} is ahead of local height {}; obtain an independently authenticated checkpoint first",
+            response.base_height, local_height
+        ));
+    }
+    if response.base_height == local_height && response.base_tip != local_tip {
+        return Err("peer base tip does not match the local canonical tip".into());
+    }
+    if response.height < local_height && !response.envelopes.is_empty() {
+        return Err("peer returned blocks despite advertising a lower canonical height".into());
+    }
+    if response.envelopes.len() as u64 > response.height.saturating_sub(local_height) {
+        return Err(
+            "peer returned more blocks than its advertised canonical height permits".into(),
+        );
+    }
+
+    for envelope in &response.envelopes {
+        let candidate = decode_candidate_network_block(envelope)
+            .map_err(|error| format!("decode synced PTB2 block: {error:?}"))?;
+        let mut locked = state
+            .lock()
+            .map_err(|_| "node state lock poisoned".to_string())?;
+        let expected_height = locked
+            .runtime
+            .canonical_height()
+            .checked_add(1)
+            .ok_or("local chain height overflow")?;
+        if candidate.block.height != expected_height {
+            return Err(format!(
+                "synced block height {} is not the expected next height {expected_height}",
+                candidate.block.height
+            ));
+        }
+        if candidate.header.previous_consensus_hash != locked.runtime.canonical_tip() {
+            return Err("synced block does not extend the local canonical tip".into());
+        }
+        let previous_count = locked.runtime.retained_branch_count();
+        let submit_result = {
+            let NodeState {
+                runtime,
+                authenticator,
+                clock,
+                ..
+            } = &mut *locked;
+            runtime.submit_block(envelope, authenticator, clock)
+        };
+        submit_result
+            .map_err(|error| format!("local consensus rejected synced block: {error:?}"))?;
+        if locked.runtime.retained_branch_count() > previous_count {
+            locked.refresh_receipts()?;
+        }
+    }
+
+    let locked = state
+        .lock()
+        .map_err(|_| "node state lock poisoned".to_string())?;
+    let current_height = locked.runtime.canonical_height();
+    if current_height < response.height && response.envelopes.is_empty() {
+        return Err("sync peer made no progress while advertising a higher tip".into());
+    }
+    if current_height == response.height
+        && (locked.runtime.canonical_tip() != response.canonical_tip
+            || locked.runtime.canonical_state_root() != response.state_root)
+    {
+        return Err(
+            "local canonical tip/state root does not match the peer's advertised tip".into(),
+        );
+    }
+    println!(
+        "qrun_pow_authenticated_sync_page peer={peer} received={} local_height={} peer_height={}",
+        response.envelopes.len(),
+        current_height,
+        response.height
+    );
+    Ok((current_height, response.height))
+}
+
+/// Catch up with a pinned peer over bounded authenticated pages. No peer-supplied checkpoint
+/// is adopted automatically; if the advertised trusted base is ahead of our state this fails.
+fn sync_from_peer_authenticated(
+    peer: SocketAddr,
+    state: &Arc<Mutex<NodeState>>,
+    max_blocks: usize,
+    max_bytes: usize,
+) -> Result<u64, String> {
+    if max_blocks == 0 || max_blocks > MAX_SYNC_PAGE_BLOCKS {
+        return Err("canonical sync page block count is outside the allowed range".into());
+    }
+    let max_pages = (1_024usize + max_blocks - 1) / max_blocks + 1;
+    let mut previous_height = state
+        .lock()
+        .map_err(|_| "node state lock poisoned".to_string())?
+        .runtime
+        .canonical_height();
+
+    for _ in 0..max_pages {
+        let (local_height, peer_height) =
+            request_sync_page_authenticated(peer, state, max_blocks, max_bytes)?;
+        if local_height > peer_height {
+            return Err("pinned sync peer is behind the local canonical chain".into());
+        }
+        if local_height == peer_height {
+            return Ok(local_height);
+        }
+        if local_height <= previous_height {
+            return Err("authenticated sync stopped making canonical-height progress".into());
+        }
+        previous_height = local_height;
+    }
+    Err("authenticated sync exceeded the bounded catch-up page budget".into())
+}
+
 fn handle_block(stream: &mut TcpStream, state: &Arc<Mutex<NodeState>>) -> Result<(), String> {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -682,9 +1090,13 @@ fn handle_block(stream: &mut TcpStream, state: &Arc<Mutex<NodeState>>) -> Result
         None
     };
     let payload = if let Some(session) = noise_session.as_mut() {
-        let frame = session
-            .read_record(stream)
-            .map_err(|error| format!("read authenticated encrypted QRun block frame: {error}"))?;
+        let frame = session.read_record(stream).map_err(|error| {
+            format!("read authenticated encrypted QRun application record: {error}")
+        })?;
+        if frame.starts_with(SYNC_REQUEST_MAGIC) {
+            serve_sync_request(&frame, session, stream, state)?;
+            return Ok(());
+        }
         decode_block_frame(&frame)?
     } else {
         let mut header = [0u8; BLOCK_FRAME_HEADER_BYTES];
@@ -1044,6 +1456,35 @@ fn run(config: Config) -> Result<(), String> {
         .map_err(|_| "node state lock poisoned".to_string())?
         .refresh_receipts()?;
 
+    if config.sync_on_start {
+        let page_bytes = max_sync_response_block_bytes(MAX_SYNC_PAGE_BLOCKS)?;
+        let mut synced = false;
+        let mut last_error = "no pinned peers configured".to_string();
+        for peer in &config.peers {
+            match sync_from_peer_authenticated(*peer, &state, MAX_SYNC_PAGE_BLOCKS, page_bytes) {
+                Ok(height) => {
+                    println!(
+                        "qrun_pow_authenticated_startup_sync_complete peer={peer} height={height}"
+                    );
+                    synced = true;
+                    break;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "qrun_pow_authenticated_startup_sync_failed peer={peer} reason={}",
+                        error.replace(['\r', '\n'], "_")
+                    );
+                    last_error = error;
+                }
+            }
+        }
+        if !synced {
+            return Err(format!(
+                "authenticated startup sync requested but every pinned peer failed: {last_error}"
+            ));
+        }
+    }
+
     // StoreWriterLock is deliberately single-writer. Keep all listener work on this one event
     // loop rather than moving the OS lock and its Windows OVERLAPPED state between worker threads.
     let rpc_listener =
@@ -1151,6 +1592,15 @@ mod tests {
         network: NetworkId,
         signer: &Ed25519TransactionSigner,
     ) -> NodeState {
+        node_state_with_params(directory, network, signer, smoke_params())
+    }
+
+    fn node_state_with_params(
+        directory: &Path,
+        network: NetworkId,
+        signer: &Ed25519TransactionSigner,
+        params: ConsensusParameters,
+    ) -> NodeState {
         let owner = signer.account_id();
         let authenticator = Ed25519TransactionAuthenticator::select(
             TransactionAuthenticatorKind::Ed25519V1,
@@ -1161,7 +1611,6 @@ mod tests {
         )
         .unwrap();
         let clock = SystemClockReferenceTime;
-        let params = smoke_params();
         let profile_params = params.clone();
         let runtime =
             QRunV05PowForkRuntime::open(directory, network, owner, params, &authenticator, &clock)
@@ -1259,6 +1708,40 @@ mod tests {
         let (mut stream, _) = listener.accept().unwrap();
         handle_block(&mut stream, receiver).unwrap();
         client.join().unwrap();
+    }
+
+    #[test]
+    fn bounded_sync_wire_rejects_bad_versions_trailing_bytes_and_budget_overruns() {
+        let request = encode_sync_request(7, 2, 1_024).unwrap();
+        assert_eq!(decode_sync_request(&request).unwrap(), (7, 2, 1_024));
+        let mut bad_request = request.clone();
+        bad_request[0] ^= 0x40;
+        assert!(decode_sync_request(&bad_request).is_err());
+        assert!(encode_sync_request(0, 2, 1_024).is_err());
+        assert!(encode_sync_request(7, 0, 1_024).is_err());
+
+        let envelope = vec![0xAB; 8];
+        let response =
+            encode_sync_response(0, 9, [1; 32], [2; 32], [3; 32], &[envelope.clone()]).unwrap();
+        let decoded = decode_sync_response(&response, 1, 8).unwrap();
+        assert_eq!(decoded.envelopes, vec![envelope.clone()]);
+        assert_eq!(decoded.height, 9);
+        assert!(decode_sync_response(&response, 1, 7).is_err());
+        assert!(decode_sync_response(&response, 0, 8).is_err());
+
+        let mut trailing = response.clone();
+        trailing.push(0);
+        assert!(decode_sync_response(&trailing, 1, 8).is_err());
+        let two_envelopes = encode_sync_response(
+            0,
+            9,
+            [1; 32],
+            [2; 32],
+            [3; 32],
+            &[envelope.clone(), envelope],
+        )
+        .unwrap();
+        assert!(decode_sync_response(&two_envelopes, 1, 64).is_err());
     }
 
     #[test]
@@ -1407,6 +1890,368 @@ mod tests {
             second.receipts.get(&txid).map(|receipt| receipt.height),
             Some(2)
         );
+    }
+
+    #[test]
+    fn fresh_node_catches_up_canonical_signed_transfer_over_authenticated_sync_page() {
+        let source_dir = TestDir::new();
+        let receiver_dir = TestDir::new();
+        let network = [0x55; 32];
+        let signer = Ed25519TransactionSigner::from_seed([0x38; 32]);
+        let owner = signer.account_id();
+        let recipient = [0x7a; 32];
+        let source = Arc::new(Mutex::new(node_state(&source_dir.0, network, &signer)));
+        let receiver = Arc::new(Mutex::new(node_state(&receiver_dir.0, network, &signer)));
+        let timestamp = now_unix().unwrap();
+
+        let first_envelope = {
+            let mut node = source.lock().unwrap();
+            let auth = &node.authenticator;
+            node.runtime
+                .mine_candidate(timestamp, Vec::new(), auth, 1)
+                .unwrap()
+        };
+        {
+            let mut node = source.lock().unwrap();
+            let NodeState {
+                runtime,
+                authenticator,
+                clock,
+                ..
+            } = &mut *node;
+            runtime
+                .submit_block(&first_envelope, authenticator, clock)
+                .unwrap();
+        }
+
+        let mut tx = Transaction {
+            network_id: network,
+            sender: owner,
+            recipient,
+            nonce: 1,
+            amount: 2_500,
+            fee: 1,
+            expires_at: timestamp + 3_600,
+            signature: Vec::new(),
+        };
+        signer.sign_transaction(&mut tx).unwrap();
+        let second_envelope = {
+            let mut node = source.lock().unwrap();
+            let auth = &node.authenticator;
+            node.runtime
+                .mine_candidate(timestamp + 1, vec![tx.clone()], auth, 1)
+                .unwrap()
+        };
+        {
+            let mut node = source.lock().unwrap();
+            let NodeState {
+                runtime,
+                authenticator,
+                clock,
+                ..
+            } = &mut *node;
+            runtime
+                .submit_block(&second_envelope, authenticator, clock)
+                .unwrap();
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap();
+        let (mut source_private, source_public) = test_noise_keypair();
+        let (mut receiver_private, receiver_public) = test_noise_keypair();
+        {
+            let mut node = source.lock().unwrap();
+            node.noise_private_key = Some(source_private);
+            node.trusted_peer_static_keys = vec![receiver_public];
+        }
+        {
+            let mut node = receiver.lock().unwrap();
+            node.noise_private_key = Some(receiver_private);
+            node.trusted_peer_static_keys = vec![source_public];
+            node.peer_static_keys_by_addr.insert(peer, source_public);
+            receiver_private.fill(0);
+        }
+
+        let page_budget = max_sync_response_block_bytes(8).unwrap();
+        let (base_height, peer_height, base_tip, peer_tip, peer_root, peer_envelopes, peer_profile) = {
+            let node = source.lock().unwrap();
+            let envelopes = node
+                .runtime
+                .canonical_envelopes_range(1, 8, page_budget)
+                .unwrap();
+            (
+                node.runtime.archive_base_height(),
+                node.runtime.canonical_height(),
+                node.runtime.archive_base_tip(),
+                node.runtime.canonical_tip(),
+                node.runtime.canonical_state_root(),
+                envelopes,
+                node.profile_id,
+            )
+        };
+        let accepted = listener.try_clone().unwrap();
+        let mut server_private = source_private;
+        source_private.fill(0);
+        let network_for_server = network;
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = accepted.accept().unwrap();
+            let trusted_client = [receiver_public];
+            let mut session = QRunV05NoiseSession::accept(
+                &mut stream,
+                &server_private,
+                &trusted_client,
+                &network_for_server,
+                &peer_profile,
+            )
+            .unwrap();
+            let request = session.read_record(&mut stream).unwrap();
+            let (start_height, max_blocks, max_bytes) = decode_sync_request(&request).unwrap();
+            assert_eq!(start_height, 1);
+            assert_eq!(max_blocks, 8);
+            assert_eq!(max_bytes, page_budget);
+            let response = encode_sync_response(
+                base_height,
+                peer_height,
+                base_tip,
+                peer_tip,
+                peer_root,
+                &peer_envelopes,
+            )
+            .unwrap();
+            session.write_record(&mut stream, &response).unwrap();
+            server_private.fill(0);
+        });
+        let synced_height = sync_from_peer_authenticated(peer, &receiver, 8, page_budget).unwrap();
+        server.join().unwrap();
+
+        let source = source.lock().unwrap();
+        let receiver = receiver.lock().unwrap();
+        assert_eq!(synced_height, 2);
+        assert_eq!(
+            receiver.runtime.canonical_height(),
+            source.runtime.canonical_height()
+        );
+        assert_eq!(
+            receiver.runtime.canonical_tip(),
+            source.runtime.canonical_tip()
+        );
+        assert_eq!(
+            receiver.runtime.canonical_state_root(),
+            source.runtime.canonical_state_root()
+        );
+        assert_eq!(
+            receiver
+                .runtime
+                .canonical_state()
+                .account(&recipient)
+                .unwrap()
+                .balance,
+            2_500
+        );
+        assert_eq!(
+            receiver.runtime.canonical_state().total_value().unwrap(),
+            ai_native_l1_pow_bench::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+        );
+        assert_eq!(
+            receiver
+                .receipts
+                .get(&transaction_id(&tx).unwrap())
+                .map(|receipt| receipt.height),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn fresh_node_catches_up_multiple_pages_through_authenticated_sync_handler() {
+        let source_dir = TestDir::new();
+        let receiver_dir = TestDir::new();
+        let source_path = source_dir.0.clone();
+        let network = [0x56; 32];
+        let seed = [0x39; 32];
+        let signer = Ed25519TransactionSigner::from_seed(seed);
+        let mut sync_params = smoke_params();
+        sync_params.pow.memory_kib = 8;
+        let owner = signer.account_id();
+        let recipient = [0x7b; 32];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap();
+
+        let (mut server_private, server_public) = test_noise_keypair();
+        let (mut receiver_private, receiver_public) = test_noise_keypair();
+        let receiver = Arc::new(Mutex::new(node_state_with_params(
+            &receiver_dir.0,
+            network,
+            &signer,
+            sync_params.clone(),
+        )));
+        {
+            let mut node = receiver.lock().unwrap();
+            node.noise_private_key = Some(receiver_private);
+            node.trusted_peer_static_keys = vec![server_public];
+            node.peer_static_keys_by_addr.insert(peer, server_public);
+            receiver_private.fill(0);
+        }
+
+        let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
+        let server_params = sync_params.clone();
+        let server = std::thread::spawn(move || {
+            let signer = Ed25519TransactionSigner::from_seed(seed);
+            let mut source = node_state_with_params(&source_path, network, &signer, server_params);
+            source.noise_private_key = Some(server_private);
+            source.trusted_peer_static_keys = vec![receiver_public];
+            server_private.fill(0);
+            let source = Arc::new(Mutex::new(source));
+            let timestamp = now_unix().unwrap();
+
+            let first_envelope = {
+                let mut node = source.lock().unwrap();
+                let auth = &node.authenticator;
+                node.runtime
+                    .mine_candidate(timestamp, Vec::new(), auth, 1)
+                    .unwrap()
+            };
+            {
+                let mut node = source.lock().unwrap();
+                let NodeState {
+                    runtime,
+                    authenticator,
+                    clock,
+                    ..
+                } = &mut *node;
+                runtime
+                    .submit_block(&first_envelope, authenticator, clock)
+                    .unwrap();
+            }
+
+            let mut tx = Transaction {
+                network_id: network,
+                sender: owner,
+                recipient,
+                nonce: 1,
+                amount: 2_500,
+                fee: 1,
+                expires_at: timestamp + 3_600,
+                signature: Vec::new(),
+            };
+            signer.sign_transaction(&mut tx).unwrap();
+            let txid = transaction_id(&tx).unwrap();
+            let second_envelope = {
+                let mut node = source.lock().unwrap();
+                let auth = &node.authenticator;
+                node.runtime
+                    .mine_candidate(timestamp + 1, vec![tx], auth, 1)
+                    .unwrap()
+            };
+            {
+                let mut node = source.lock().unwrap();
+                let NodeState {
+                    runtime,
+                    authenticator,
+                    clock,
+                    ..
+                } = &mut *node;
+                runtime
+                    .submit_block(&second_envelope, authenticator, clock)
+                    .unwrap();
+            }
+
+            for height in 3..=18 {
+                let envelope = {
+                    let mut node = source.lock().unwrap();
+                    let auth = &node.authenticator;
+                    node.runtime
+                        .mine_candidate(timestamp + height, Vec::new(), auth, 1)
+                        .unwrap()
+                };
+                let mut node = source.lock().unwrap();
+                let NodeState {
+                    runtime,
+                    authenticator,
+                    clock,
+                    ..
+                } = &mut *node;
+                runtime
+                    .submit_block(&envelope, authenticator, clock)
+                    .unwrap();
+            }
+
+            source.lock().unwrap().refresh_receipts().unwrap();
+            // The handshake deadline starts only after PoW fixture construction is complete.
+            ready_sender.send(()).unwrap();
+            // Serve three 8-block-bounded requests through the real authenticated node handler.
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                handle_block(&mut stream, &source).unwrap();
+            }
+
+            let node = source.lock().unwrap();
+            (
+                txid,
+                node.runtime.canonical_height(),
+                node.runtime.canonical_tip(),
+                node.runtime.canonical_state_root(),
+                node.runtime
+                    .canonical_state()
+                    .account(&recipient)
+                    .unwrap()
+                    .balance,
+                node.runtime.canonical_state().total_value().unwrap(),
+                node.receipts.get(&txid).map(|receipt| receipt.height),
+            )
+        });
+
+        ready_receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("PoW fixture and authenticated sync listener should become ready");
+        let page_budget = max_sync_response_block_bytes(8).unwrap();
+        let synced_height = sync_from_peer_authenticated(peer, &receiver, 8, page_budget).unwrap();
+        let (
+            txid,
+            source_height,
+            source_tip,
+            source_root,
+            source_balance,
+            source_supply,
+            source_receipt,
+        ) = server.join().unwrap();
+        let receiver = receiver.lock().unwrap();
+
+        assert_eq!(synced_height, 18);
+        assert_eq!(source_height, 18);
+        assert_eq!(receiver.runtime.canonical_height(), source_height);
+        assert_eq!(receiver.runtime.canonical_tip(), source_tip);
+        assert_eq!(receiver.runtime.canonical_state_root(), source_root);
+        assert_eq!(
+            receiver
+                .runtime
+                .canonical_state()
+                .account(&recipient)
+                .unwrap()
+                .balance,
+            2_500
+        );
+        assert_eq!(
+            receiver
+                .runtime
+                .canonical_state()
+                .account(&recipient)
+                .unwrap()
+                .balance,
+            source_balance
+        );
+        assert_eq!(
+            receiver.runtime.canonical_state().total_value().unwrap(),
+            source_supply
+        );
+        assert_eq!(
+            source_supply,
+            ai_native_l1_pow_bench::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+        );
+        assert_eq!(
+            receiver.receipts.get(&txid).map(|receipt| receipt.height),
+            Some(2)
+        );
+        assert_eq!(source_receipt, Some(2));
     }
 
     #[test]

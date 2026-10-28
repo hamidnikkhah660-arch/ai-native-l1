@@ -30,6 +30,7 @@ pub enum ForkChoiceError {
     ArchiveExportLimitExceeded,
     BranchHeightExceeded,
     ReplayIncomplete,
+    CanonicalRangeBeforeBase,
 }
 
 impl std::fmt::Display for ForkChoiceError {
@@ -48,6 +49,10 @@ impl std::fmt::Display for ForkChoiceError {
             Self::ArchiveExportLimitExceeded => write!(f, "fork archive export budget exceeded"),
             Self::BranchHeightExceeded => write!(f, "fork archive height limit exceeded"),
             Self::ReplayIncomplete => write!(f, "fork archive replay did not consume every block"),
+            Self::CanonicalRangeBeforeBase => write!(
+                f,
+                "requested canonical range predates this checkpoint-rooted archive segment"
+            ),
         }
     }
 }
@@ -130,6 +135,11 @@ impl PrivateTestnetForkChoice {
         self.genesis_tip
     }
 
+    /// Height of the authenticated base state (zero for a Genesis-rooted archive).
+    pub fn base_height(&self) -> u64 {
+        self.base_chain.state().height()
+    }
+
     pub fn reorg_count(&self) -> u64 {
         self.reorg_count
     }
@@ -172,6 +182,75 @@ impl PrivateTestnetForkChoice {
         reversed.reverse();
         Ok(reversed)
     }
+
+    /// Export a bounded canonical block range beginning at an absolute block height.
+    /// The returned blocks are ordered by height and no more than the requested block
+    /// and byte budgets are cloned into the response. A checkpoint-rooted segment cannot
+    /// serve historical heights at/below its base height; callers must obtain that
+    /// checkpoint through an independently authenticated channel.
+    pub fn canonical_envelopes_range(
+        &self,
+        start_height: u64,
+        max_blocks: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<Vec<u8>>, ForkChoiceError> {
+        if start_height == 0
+            || max_blocks == 0
+            || max_blocks > MAX_FORK_ARCHIVE_BLOCKS
+            || max_bytes == 0
+        {
+            return Err(ForkChoiceError::ArchiveExportLimitExceeded);
+        }
+        if self.base_height() > 0 && start_height <= self.base_height() {
+            return Err(ForkChoiceError::CanonicalRangeBeforeBase);
+        }
+
+        let mut selected_reversed: Vec<&[u8]> = Vec::new();
+        let mut tip = self.canonical.chain_tip().tip_hash;
+        while tip != self.genesis_tip {
+            if selected_reversed.len() >= MAX_FORK_ARCHIVE_HEIGHT as usize {
+                return Err(ForkChoiceError::ReplayIncomplete);
+            }
+            let branch = self
+                .branches
+                .get(&tip)
+                .ok_or(ForkChoiceError::UnknownParent)?;
+            let candidate =
+                decode_candidate_network_block(&branch.envelope).map_err(ForkChoiceError::Wire)?;
+            let digest = pow_digest(&candidate.header, self.params.pow)
+                .map_err(ForkChoiceError::InvalidPow)?;
+            if digest != tip {
+                return Err(ForkChoiceError::DigestMismatch);
+            }
+            if candidate.block.height < start_height {
+                break;
+            }
+            selected_reversed.push(&branch.envelope);
+            tip = candidate.header.previous_consensus_hash;
+        }
+
+        selected_reversed.reverse();
+        let mut output = Vec::new();
+        let mut total_bytes = 0usize;
+        for envelope in selected_reversed {
+            if output.len() >= max_blocks {
+                break;
+            }
+            let next_bytes = total_bytes
+                .checked_add(envelope.len())
+                .ok_or(ForkChoiceError::ArchiveExportLimitExceeded)?;
+            if next_bytes > max_bytes {
+                if output.is_empty() {
+                    return Err(ForkChoiceError::ArchiveExportLimitExceeded);
+                }
+                break;
+            }
+            output.push(envelope.to_vec());
+            total_bytes = next_bytes;
+        }
+        Ok(output)
+    }
+
     pub fn archive_envelopes_bounded(
         &self,
         max_blocks: usize,
@@ -618,6 +697,79 @@ mod tests {
         assert_eq!(
             archive.archive_envelopes_bounded(1, envelope_bytes - 1),
             Err(ForkChoiceError::ArchiveExportLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn canonical_range_export_is_ordered_bounded_and_respects_checkpoint_base() {
+        let params = params();
+        let genesis = genesis();
+        let mut archive = PrivateTestnetForkChoice::new(genesis.clone(), params.clone()).unwrap();
+
+        let mut accepted = Vec::new();
+        for (timestamp, nonce) in [(100, 10), (101, 11), (102, 12)] {
+            let parent = archive.canonical_chain().clone();
+            let (envelope, _) = candidate(&parent, &params, timestamp, nonce);
+            archive
+                .insert_encoded(&envelope, &EmptyAuthenticator, &FixedClock)
+                .unwrap();
+            accepted.push(envelope);
+        }
+
+        let page = archive.canonical_envelopes_range(1, 2, usize::MAX).unwrap();
+        assert_eq!(page, accepted[..2]);
+        let last_page = archive.canonical_envelopes_range(3, 2, usize::MAX).unwrap();
+        assert_eq!(last_page, vec![accepted[2].clone()]);
+        assert_eq!(
+            archive.canonical_envelopes_range(1, 2, accepted[0].len() - 1),
+            Err(ForkChoiceError::ArchiveExportLimitExceeded)
+        );
+        assert_eq!(
+            archive.canonical_envelopes_range(0, 1, usize::MAX),
+            Err(ForkChoiceError::ArchiveExportLimitExceeded)
+        );
+        assert_eq!(
+            archive.canonical_envelopes_range(1, 0, usize::MAX),
+            Err(ForkChoiceError::ArchiveExportLimitExceeded)
+        );
+
+        let checkpoint_chain = {
+            let mut chain = PrivateTestnetChain::new(genesis.clone(), params.clone()).unwrap();
+            let first = decode_candidate_network_block(&accepted[0]).unwrap();
+            chain
+                .append_live(
+                    &first.block,
+                    &first.header,
+                    None,
+                    &EmptyAuthenticator,
+                    &FixedClock,
+                )
+                .unwrap();
+            chain
+        };
+        let checkpoint_state = checkpoint_chain.state().clone();
+        let mut suffix = PrivateTestnetForkChoice::from_base_chain(
+            checkpoint_state,
+            params.clone(),
+            checkpoint_chain,
+        )
+        .unwrap();
+        assert_eq!(
+            suffix.canonical_envelopes_range(1, 1, usize::MAX),
+            Err(ForkChoiceError::CanonicalRangeBeforeBase)
+        );
+        let base = suffix.canonical_chain().clone();
+        let (child, _) = candidate(&base, &params, 101, 21);
+        suffix
+            .insert_encoded(&child, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+        assert_eq!(
+            suffix.canonical_envelopes_range(1, 1, usize::MAX),
+            Err(ForkChoiceError::CanonicalRangeBeforeBase)
+        );
+        assert_eq!(
+            suffix.canonical_envelopes_range(2, 1, usize::MAX).unwrap(),
+            vec![child]
         );
     }
 

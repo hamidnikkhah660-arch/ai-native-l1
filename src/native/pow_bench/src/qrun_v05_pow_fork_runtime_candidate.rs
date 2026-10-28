@@ -351,6 +351,30 @@ impl QRunV05PowForkRuntime {
         self.store.archive().canonical_chain().state()
     }
 
+    /// Height of the latest trusted checkpoint/base for bounded archive-range service.
+    pub fn archive_base_height(&self) -> u64 {
+        self.store.archive().base_height()
+    }
+
+    /// Digest of the trusted checkpoint/base tip for bounded archive-range service.
+    pub fn archive_base_tip(&self) -> [u8; 32] {
+        self.store.archive().genesis_tip()
+    }
+
+    /// Export a size-bounded page of the canonical chain at absolute heights.
+    /// Historical data before the checkpoint base must come from a separately authenticated source.
+    pub fn canonical_envelopes_range(
+        &self,
+        start_height: u64,
+        max_blocks: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<Vec<u8>>, QRunV05PowRuntimeError> {
+        self.store
+            .archive()
+            .canonical_envelopes_range(start_height, max_blocks, max_bytes)
+            .map_err(|error| QRunV05PowRuntimeError::InvalidCandidate(error.to_string()))
+    }
+
     /// Rebuild transaction locations from the selected branch after restart or reorganization.
     /// A transaction present only in a losing branch is never reported as canonically included.
     pub fn canonical_transaction_locations(

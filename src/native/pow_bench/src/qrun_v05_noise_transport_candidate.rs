@@ -11,15 +11,15 @@ use crate::{
     private_testnet_wire::MAX_PRIVATE_TESTNET_ENVELOPE_BYTES,
 };
 
-/// Largest bounded application frame for QRun's length-prefixed PTB2 block frame.
-/// Reserve the fixed 10-byte frame header in addition to the largest bounded candidate envelope.
-const QRUN_BLOCK_FRAME_OVERHEAD_BYTES: usize = 10;
+/// Largest bounded application record for a PTB2 frame or a bounded sync response.
+/// The sync response reserves space for metadata and fixed-width per-block length prefixes.
+const QRUN_SYNC_RESPONSE_OVERHEAD_BYTES: usize = 256;
 pub const MAX_NOISE_APPLICATION_RECORD_BYTES: usize =
     if MAX_PRIVATE_TESTNET_ENVELOPE_BYTES > MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES {
         MAX_PRIVATE_TESTNET_ENVELOPE_BYTES
     } else {
         MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES
-    } + QRUN_BLOCK_FRAME_OVERHEAD_BYTES;
+    } + QRUN_SYNC_RESPONSE_OVERHEAD_BYTES;
 use snow::{params::NoiseParams, Builder, TransportState};
 use std::{
     io::{self, Read, Write},
@@ -501,7 +501,7 @@ mod tests {
         assert_eq!(
             MAX_NOISE_APPLICATION_RECORD_BYTES,
             MAX_PRIVATE_TESTNET_ENVELOPE_BYTES.max(MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES)
-                + QRUN_BLOCK_FRAME_OVERHEAD_BYTES
+                + QRUN_SYNC_RESPONSE_OVERHEAD_BYTES
         );
         assert!(MAX_NOISE_APPLICATION_RECORD_BYTES >= MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES);
     }
