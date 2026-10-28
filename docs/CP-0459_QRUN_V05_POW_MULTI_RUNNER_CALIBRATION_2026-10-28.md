@@ -42,6 +42,8 @@ The resulting 32-byte big-endian target is:
 
 The machine-readable candidate is `profiles/qrun_v05_consensus_calibration_candidate.json`; `simulations/qrun_v05_consensus_calibration_oracle.py` verifies the captured measurements, conservative selection, integer target derivation, fixed-supply constraints, and unfrozen/not-activated flags.
 
+The Rust consensus module now exposes `ConsensusParameters::qrun_v05_calibrated_candidate()` using this exact initial target, 64 MiB Argon2id parameters, a 30-second target interval, a 2,016-block retarget window, and bounded 4x adjustment. A dedicated fee-only issuance parameter constructor yields zero subsidy at every height while retaining the 10-billion-coin maximum. Unit tests compare those values to the calibration artifact and check bounded retarget behavior. This creates one explicit, testable parameter candidate; it does not yet replace the deliberately easy profile in loopback node fixtures or freeze public consensus.
+
 ## Remaining consensus and launch gates
 
 This is not a frozen production difficulty profile. Before freezing it, run measurements under at least three independently operated infrastructure operators, capture CPU architecture/model and power/energy where practical, and stress the actual target-adjustment implementation against sudden hashrate changes, slow/fast timestamps, timestamp manipulation, long gaps, fork reorganizations, and restart/replay. The exact profile fingerprint must be bound and enforced consistently by production block production, import, replay, fork choice, and restart.
