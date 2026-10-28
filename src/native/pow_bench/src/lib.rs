@@ -427,6 +427,8 @@ pub mod token_forge;
 /// QRun canonical checkpoint codec with profile binding and external anti-rollback anchor checks.
 pub mod qrun_v05_checkpoint_candidate;
 pub mod qrun_v05_genesis_candidate;
+/// Candidate-only, QRun-domain-separated Noise XX transport; not yet wired into the node or approved for public value-bearing traffic.
+pub mod qrun_v05_noise_transport_candidate;
 /// Candidate adapter joining QRun Genesis to persistent PoW fork choice; not a public node yet.
 pub mod qrun_v05_pow_fork_runtime_candidate;
 /// QRun v0.5 Genesis-bound transfer execution and snapshot candidate; not yet node/P2P wired.
