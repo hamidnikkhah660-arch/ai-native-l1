@@ -700,6 +700,66 @@ mod tests {
     }
 
     #[test]
+    fn runtime_reads_legacy_v2_store_and_rewrites_as_v3_on_next_commit() {
+        let path = store_path();
+        let mut runtime =
+            QRunV05ExecutionRuntime::open_or_create(NETWORK, OWNER, TestAuthenticator, &path)
+                .unwrap();
+        let block = runtime
+            .build_next_block(1, vec![transfer(vec![0x5a])])
+            .unwrap();
+        runtime.import_block(&block).unwrap();
+        drop(runtime);
+
+        // Convert the valid v3 plain-block history into the exact prior v2 layout (length + BLK2).
+        let mut bytes = fs::read(&path).unwrap();
+        assert_eq!(
+            u16::from_be_bytes(bytes[4..6].try_into().unwrap()),
+            STORE_VERSION
+        );
+        let snapshot_len = u32::from_be_bytes(bytes[102..106].try_into().unwrap()) as usize;
+        let first_entry = STORE_HEADER_LEN + snapshot_len;
+        let kind_offset = first_entry + 4;
+        assert_eq!(bytes[kind_offset], 0);
+        bytes.remove(kind_offset);
+        bytes[4..6].copy_from_slice(&2u16.to_be_bytes());
+        let checksum_offset = bytes.len() - STORE_CHECKSUM_LEN;
+        let checksum = store_checksum(&bytes[..checksum_offset]);
+        bytes[checksum_offset..].copy_from_slice(&checksum);
+        fs::write(&path, bytes).unwrap();
+
+        let mut restored =
+            QRunV05ExecutionRuntime::open_or_create(NETWORK, OWNER, TestAuthenticator, &path)
+                .unwrap();
+        assert_eq!(restored.height(), 1);
+        assert_eq!(restored.balance_atoms(&RECIPIENT), 12_345);
+        assert_eq!(
+            restored.total_supply_atoms().unwrap(),
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
+
+        let next = restored.build_next_block(2, Vec::new()).unwrap();
+        restored.import_block(&next).unwrap();
+        drop(restored);
+
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(
+            u16::from_be_bytes(bytes[4..6].try_into().unwrap()),
+            STORE_VERSION
+        );
+        let reopened =
+            QRunV05ExecutionRuntime::open_or_create(NETWORK, OWNER, TestAuthenticator, &path)
+                .unwrap();
+        assert_eq!(reopened.height(), 2);
+        assert_eq!(
+            reopened.total_supply_atoms().unwrap(),
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
+        drop(reopened);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn runtime_executes_real_ed25519_signed_transfer() {
         use crate::transaction_auth::{
             AccountPublicKey, Ed25519TransactionAuthenticator, Ed25519TransactionSigner,
