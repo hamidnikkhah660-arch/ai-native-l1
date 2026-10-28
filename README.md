@@ -113,6 +113,7 @@ The latest direction (CP-0437, 28 October 2026) targets an independent **QRun** 
 - **CP-0455 QRun PFS2 external-CAS protocol candidate:** every wrapped QFP5 commit is staged in a bounded QAP1 pending record, requires a pinned signed ML-DSA-65 CAS receipt before manifest publication, and recovers exact pre/post-CAS crash windows without guessing. Local mock-provider tests cover CAS rejection, lost response and restart after remote commit. A real independent provider, off-machine record custody, production node integration, and independent review remain required (docs/CP-0455_QRUN_V05_PFS2_EXTERNAL_CAS_COMMIT_PROTOCOL_2026-10-28.md).
 - **Windows wallet app:** run tools/QZXB-Wallet.cmd to open QZXB Wallet ? QRun. The 12-word recovery phrase is shown once and must be backed up offline.
 - **Production gate status:** Mainnet is not launched; Gate 2/Gate 8 runtime and external review remain open.
+- **Latest QRun/QZXB release audit (2026-10-29):** [CP-0463 repository audit and release decision](docs/CP-0463_QRUN_REPOSITORY_AUDIT_AND_RELEASE_DECISION_2026-10-29.md).
 
 <details>
 <summary>Historic v0.4 allocation proposal ? superseded for the QRun Mainnet target</summary>

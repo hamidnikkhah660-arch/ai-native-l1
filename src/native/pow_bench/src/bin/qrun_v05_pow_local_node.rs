@@ -221,6 +221,54 @@ fn validate_mainnet_p2p_requirements(
     Ok(())
 }
 
+/// Keep administrative interfaces on loopback while allowing explicit public P2P in either
+/// public-alpha or a Mainnet configuration. Mainnet's seed/sync/pin requirements are enforced
+/// separately by validate_mainnet_p2p_requirements before runtime startup.
+fn validate_listener_bind_policy(
+    public_alpha: bool,
+    mainnet: bool,
+    rpc_listen: SocketAddr,
+    tx_listen: SocketAddr,
+    block_listen: SocketAddr,
+    peers: &[SocketAddr],
+) -> Result<(), String> {
+    if !rpc_listen.ip().is_loopback() || !tx_listen.ip().is_loopback() {
+        return Err("RPC/transaction interfaces stay loopback-only".into());
+    }
+    let public_p2p_enabled = public_alpha || mainnet;
+    if !public_p2p_enabled
+        && (!block_listen.ip().is_loopback() || peers.iter().any(|peer| !peer.ip().is_loopback()))
+    {
+        return Err("non-loopback P2P requires explicit --public-alpha or --mainnet".into());
+    }
+    Ok(())
+}
+
+fn consensus_parameters_for_mode(
+    public_alpha: bool,
+    mainnet: bool,
+    qrun_v05_identity: bool,
+) -> Result<ConsensusParameters, String> {
+    // Production-intent modes must use the calibrated candidate profile. Only the explicit
+    // loopback smoke-test mode gets maximum-target PoW and reduced Argon2 memory.
+    if public_alpha || mainnet {
+        return ConsensusParameters::qrun_v05_calibrated_candidate()
+            .map_err(|error| format!("load calibrated QRun v0.5 consensus candidate: {error:?}"));
+    }
+
+    let mut local = ConsensusParameters::candidate_testnet()
+        .map_err(|error| format!("load local smoke PoW profile: {error:?}"))?;
+    if qrun_v05_identity {
+        local.protocol_version = 5;
+    }
+    local.initial_target = Uint256::MAX;
+    local.pow_limit = Uint256::MAX;
+    local.pow.memory_kib = 8 * 1024;
+    local.pow.iterations = 1;
+    local.pow.lanes = 1;
+    Ok(local)
+}
+
 fn validate_frozen_mainnet_genesis(
     enabled: bool,
     genesis_id: &[u8; 32],
@@ -1594,13 +1642,14 @@ fn poll_transaction_listener(
 }
 
 fn run(config: Config) -> Result<(), String> {
-    if !config.rpc_listen.ip().is_loopback()
-        || !config.tx_listen.ip().is_loopback()
-        || (!config.public_alpha && !config.block_listen.ip().is_loopback())
-        || (!config.public_alpha && config.peers.iter().any(|peer| !peer.ip().is_loopback()))
-    {
-        return Err("RPC/transaction interfaces stay loopback-only; non-loopback P2P requires explicit --public-alpha".into());
-    }
+    validate_listener_bind_policy(
+        config.public_alpha,
+        config.mainnet,
+        config.rpc_listen,
+        config.tx_listen,
+        config.block_listen,
+        &config.peers,
+    )?;
     fs::create_dir_all(&config.data_dir)
         .map_err(|error| format!("create data directory: {error}"))?;
     let authenticator = Ed25519TransactionAuthenticator::select(
@@ -1613,7 +1662,7 @@ fn run(config: Config) -> Result<(), String> {
     .map_err(|error| format!("configure Ed25519 authenticator: {error:?}"))?;
 
     // Local-testnet keeps its trivial target and reduced memory for fast smoke tests. Public-alpha
-    // always uses the calibrated QRun v0.5 consensus profile. A wallet-bound Genesis may use a
+    // and Mainnet use the calibrated QRun v0.5 consensus profile. A wallet-bound Genesis may use a
     // custom network ID and owner account; those inputs deterministically change the Genesis and
     // profile IDs, so every peer must be configured with the same values to join the same chain.
     let qrun_v05_identity = config.network_id
@@ -1623,22 +1672,8 @@ fn run(config: Config) -> Result<(), String> {
     if config.public_alpha && config.noise_private_key_file.is_none() {
         return Err("--public-alpha requires the network-bound Noise static key".into());
     }
-    let params = if config.public_alpha {
-        ConsensusParameters::qrun_v05_calibrated_candidate()
-            .map_err(|error| format!("load calibrated QRun v0.5 consensus candidate: {error:?}"))?
-    } else {
-        let mut local = ConsensusParameters::candidate_testnet()
-            .map_err(|error| format!("load local smoke PoW profile: {error:?}"))?;
-        if qrun_v05_identity {
-            local.protocol_version = 5;
-        }
-        local.initial_target = Uint256::MAX;
-        local.pow_limit = Uint256::MAX;
-        local.pow.memory_kib = 8 * 1024;
-        local.pow.iterations = 1;
-        local.pow.lanes = 1;
-        local
-    };
+    let params =
+        consensus_parameters_for_mode(config.public_alpha, config.mainnet, qrun_v05_identity)?;
     let profile_params = params.clone();
     if !config.peers.is_empty() && config.noise_private_key_file.is_none() {
         return Err(
@@ -1928,6 +1963,65 @@ mod tests {
             validate_mainnet_p2p_requirements(true, true, &[peer], 1, loopback_listener).is_err()
         );
         assert!(validate_mainnet_p2p_requirements(true, true, &[peer], 1, public_listener).is_ok());
+    }
+
+    #[test]
+    fn listener_policy_allows_public_p2p_for_mainnet_but_keeps_rpc_and_tx_loopback() {
+        let rpc: SocketAddr = "127.0.0.1:49339".parse().unwrap();
+        let tx: SocketAddr = "127.0.0.1:49340".parse().unwrap();
+        let public_listener: SocketAddr = "0.0.0.0:49341".parse().unwrap();
+        let peer: SocketAddr = "198.51.100.10:49341".parse().unwrap();
+        let loopback_listener: SocketAddr = "127.0.0.1:49341".parse().unwrap();
+        let public_rpc: SocketAddr = "0.0.0.0:49339".parse().unwrap();
+
+        assert!(
+            validate_listener_bind_policy(false, true, rpc, tx, public_listener, &[peer]).is_ok()
+        );
+        assert!(validate_listener_bind_policy(true, false, rpc, tx, public_listener, &[]).is_ok());
+        assert!(
+            validate_listener_bind_policy(false, false, rpc, tx, loopback_listener, &[]).is_ok()
+        );
+        assert!(
+            validate_listener_bind_policy(false, false, rpc, tx, public_listener, &[]).is_err()
+        );
+        assert!(
+            validate_listener_bind_policy(false, false, rpc, tx, loopback_listener, &[peer])
+                .is_err()
+        );
+        assert!(validate_listener_bind_policy(
+            false,
+            true,
+            public_rpc,
+            tx,
+            public_listener,
+            &[peer]
+        )
+        .is_err());
+        assert!(validate_listener_bind_policy(
+            false,
+            true,
+            rpc,
+            public_rpc,
+            public_listener,
+            &[peer]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn mainnet_uses_same_calibrated_candidate_profile_as_public_alpha() {
+        let genesis = parse_hex32(QZXB_MAINNET_GENESIS_ID_HEX, "genesis").unwrap();
+        let public_alpha = consensus_parameters_for_mode(true, false, false).unwrap();
+        let mainnet = consensus_parameters_for_mode(false, true, false).unwrap();
+        let local_smoke = consensus_parameters_for_mode(false, false, false).unwrap();
+
+        let public_profile = profile_id(&QZXB_MAINNET_NETWORK_ID, &public_alpha, &genesis);
+        let mainnet_profile = profile_id(&QZXB_MAINNET_NETWORK_ID, &mainnet, &genesis);
+        let local_profile = profile_id(&QZXB_MAINNET_NETWORK_ID, &local_smoke, &genesis);
+
+        assert_eq!(hex(&public_profile), QZXB_MAINNET_PROFILE_ID_HEX);
+        assert_eq!(public_profile, mainnet_profile);
+        assert_ne!(public_profile, local_profile);
     }
 
     #[test]
