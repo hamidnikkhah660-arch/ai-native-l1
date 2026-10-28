@@ -38,6 +38,7 @@ pub enum QRunCheckpointError {
     ChecksumMismatch,
     CommitmentMismatch,
     HeightRollback,
+    ParentCheckpointCommitmentMismatch,
     MissingParentCheckpoint,
     StateSnapshot(String),
     StateMetadataMismatch,
@@ -70,6 +71,9 @@ impl std::fmt::Display for QRunCheckpointError {
             Self::HeightRollback => {
                 f.write_str("QRCP checkpoint height is below the trusted monotonic floor")
             }
+            Self::ParentCheckpointCommitmentMismatch => f.write_str(
+                "QRCP checkpoint does not link to the independently trusted parent commitment",
+            ),
             Self::MissingParentCheckpoint => {
                 f.write_str("non-Genesis QRCP checkpoint requires a parent checkpoint commitment")
             }
@@ -432,6 +436,32 @@ impl QRunV05PowCheckpoint {
         )?;
         if record.height < minimum_height {
             return Err(QRunCheckpointError::HeightRollback);
+        }
+        Ok(record)
+    }
+
+    /// Decode a checkpoint only when both its own commitment and its predecessor link are
+    /// independently trusted. This is the strict API for checkpoint rollover: trusting the latest
+    /// checkpoint bytes alone does not prove that the caller intended this particular parent.
+    pub fn decode_anchored_with_parent(
+        bytes: &[u8],
+        expected_network_id: &NetworkId,
+        expected_genesis_commitment: &[u8; 32],
+        params: &ConsensusParameters,
+        expected_commitment: [u8; 32],
+        minimum_height: u64,
+        expected_parent_checkpoint_commitment: [u8; 32],
+    ) -> Result<Self, QRunCheckpointError> {
+        let record = Self::decode_anchored(
+            bytes,
+            expected_network_id,
+            expected_genesis_commitment,
+            params,
+            expected_commitment,
+            minimum_height,
+        )?;
+        if record.parent_checkpoint_commitment != expected_parent_checkpoint_commitment {
+            return Err(QRunCheckpointError::ParentCheckpointCommitmentMismatch);
         }
         Ok(record)
     }

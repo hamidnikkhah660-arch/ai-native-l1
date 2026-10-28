@@ -826,10 +826,56 @@ where
         })
     }
 
+    /// Strict checkpoint rollover entry point. Validate the exact parent link before touching
+    /// local files or consulting the provider, then apply the normal signed-CAS-anchored open.
+    /// The caller must independently retain both this checkpoint commitment and its expected
+    /// predecessor commitment. The provider pin and bootstrap record remain out-of-band.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_from_checkpoint_with_parent<A: TransactionAuthenticator>(
+        directory: impl AsRef<Path>,
+        genesis: LedgerState,
+        params: ConsensusParameters,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+        checkpoint_bytes: &[u8],
+        expected_checkpoint_commitment: [u8; 32],
+        minimum_checkpoint_height: u64,
+        expected_parent_checkpoint_commitment: [u8; 32],
+        pin: ExternalCasPin,
+        client: VerifiedExternalCasClient<P, V>,
+        trusted_record: ExternalCasRecord,
+        minimum_object_generation: u64,
+    ) -> Result<Self, ForkStoreError> {
+        crate::qrun_v05_checkpoint_candidate::QRunV05PowCheckpoint::decode_anchored_with_parent(
+            checkpoint_bytes,
+            &genesis.network_id(),
+            &crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT,
+            &params,
+            expected_checkpoint_commitment,
+            minimum_checkpoint_height,
+            expected_parent_checkpoint_commitment,
+        )
+        .map_err(|_| ForkStoreError::ManifestAnchorMismatch)?;
+        Self::open_from_checkpoint(
+            directory,
+            genesis,
+            params,
+            authenticator,
+            clock,
+            checkpoint_bytes,
+            expected_checkpoint_commitment,
+            minimum_checkpoint_height,
+            pin,
+            client,
+            trusted_record,
+            minimum_object_generation,
+        )
+    }
+
     /// Open a checkpoint-rooted QFP5 suffix only when the externally retained signed-CAS
     /// record anchors this exact checkpoint-profile manifest. The provider pin and bootstrap
     /// record must already be provisioned out-of-band; this method never initializes or advances
-    /// an external provider implicitly.
+    /// an external provider implicitly. For rollover, prefer open_from_checkpoint_with_parent.
     #[allow(clippy::too_many_arguments)]
     pub fn open_from_checkpoint<A: TransactionAuthenticator>(
         directory: impl AsRef<Path>,
@@ -2565,6 +2611,16 @@ mod tests {
         let mut archive =
             PrivateTestnetForkChoice::new_qrun_v05_fee_only(genesis.clone(), params.clone())
                 .unwrap();
+        let genesis_checkpoint =
+            crate::qrun_v05_checkpoint_candidate::QRunV05PowCheckpoint::capture(
+                genesis.network_id(),
+                crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT,
+                &params,
+                archive.canonical_chain(),
+                [0; 32],
+            )
+            .unwrap();
+        let genesis_checkpoint_commitment = genesis_checkpoint.commitment(&params).unwrap();
         let first = qrun_fee_envelope(&genesis, &params);
         archive
             .insert_encoded(&first, &EmptyAuthenticator, &FixedClock)
@@ -2575,7 +2631,7 @@ mod tests {
             crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT,
             &params,
             archive.canonical_chain(),
-            [0x91; 32],
+            genesis_checkpoint_commitment,
         )
         .unwrap();
         let checkpoint_bytes = checkpoint.encode(&params).unwrap();
@@ -2640,7 +2696,41 @@ mod tests {
             VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
                 .unwrap();
 
-        let mut store = QRunV05ExternalCasForkStore::open_from_checkpoint(
+        // A wrong predecessor link must fail before local storage is opened or provider state is
+        // read/advanced. This guards the rollover boundary, not just the QRCP decoder in isolation.
+        let rejected_dir = TestDir::new();
+        let sign_key = signing_key.clone();
+        let provider = make_memory_cas_provider(pin.clone(), shared.clone(), move |mut receipt| {
+            let digest = receipt.signing_digest().unwrap();
+            receipt.signature = *portable::sign(&sign_key, &digest, &[], [0x72u8; 32])
+                .unwrap()
+                .as_ref();
+            receipt
+        });
+        let rejected_client =
+            VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
+                .unwrap();
+        assert!(matches!(
+            QRunV05ExternalCasForkStore::open_from_checkpoint_with_parent(
+                &rejected_dir.0,
+                genesis.clone(),
+                params.clone(),
+                &EmptyAuthenticator,
+                &FixedClock,
+                &checkpoint_bytes,
+                checkpoint_commitment,
+                1,
+                [0x91; 32],
+                pin.clone(),
+                rejected_client,
+                bootstrap.clone(),
+                1,
+            ),
+            Err(ForkStoreError::ManifestAnchorMismatch)
+        ));
+        assert!(!rejected_dir.0.join(MANIFEST_NAME).exists());
+
+        let mut store = QRunV05ExternalCasForkStore::open_from_checkpoint_with_parent(
             &dir.0,
             genesis.clone(),
             params.clone(),
@@ -2649,6 +2739,7 @@ mod tests {
             &checkpoint_bytes,
             checkpoint_commitment,
             1,
+            genesis_checkpoint_commitment,
             pin.clone(),
             client,
             bootstrap,
@@ -2701,7 +2792,7 @@ mod tests {
         let client =
             VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
                 .unwrap();
-        let reopened = QRunV05ExternalCasForkStore::open_from_checkpoint(
+        let reopened = QRunV05ExternalCasForkStore::open_from_checkpoint_with_parent(
             &dir.0,
             genesis,
             params,
@@ -2710,6 +2801,7 @@ mod tests {
             &checkpoint_bytes,
             checkpoint_commitment,
             1,
+            genesis_checkpoint_commitment,
             pin,
             client,
             trusted_record,

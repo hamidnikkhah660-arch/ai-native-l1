@@ -110,6 +110,47 @@ impl QRunV05PowForkRuntime {
         )
     }
 
+    /// Open a new durable suffix only when both the checkpoint's own bytes and its predecessor
+    /// commitment match independently supplied trust values. Prefer this entry point for rolling
+    /// a checkpoint chain forward; the basic API remains for callers that pin only the latest QRCP.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_from_checkpoint_with_parent<A: TransactionAuthenticator>(
+        directory: impl AsRef<Path>,
+        network_id: NetworkId,
+        owner_account: AccountId,
+        params: ConsensusParameters,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+        checkpoint_bytes: &[u8],
+        checkpoint_commitment: [u8; 32],
+        minimum_checkpoint_height: u64,
+        expected_parent_checkpoint_commitment: [u8; 32],
+        expected_manifest_anchor: Option<[u8; 32]>,
+    ) -> Result<Self, QRunV05PowRuntimeError> {
+        let genesis = QRunGenesisV05::new(network_id, owner_account)?;
+        QRunV05PowCheckpoint::decode_anchored_with_parent(
+            checkpoint_bytes,
+            &network_id,
+            &genesis.commitment(),
+            &params,
+            checkpoint_commitment,
+            minimum_checkpoint_height,
+            expected_parent_checkpoint_commitment,
+        )?;
+        Self::open_from_checkpoint(
+            directory,
+            network_id,
+            owner_account,
+            params,
+            authenticator,
+            clock,
+            checkpoint_bytes,
+            checkpoint_commitment,
+            minimum_checkpoint_height,
+            expected_manifest_anchor,
+        )
+    }
+
     /// Open a new durable suffix store from an independently anchored QRCP checkpoint.
     /// The caller must retain checkpoint bytes and its commitment outside the mutable store.
     pub fn open_from_checkpoint<A: TransactionAuthenticator>(
@@ -1145,6 +1186,11 @@ mod tests {
             runtime.canonical_state().total_value().unwrap(),
             MAX_TOTAL_SUPPLY_ATOMS
         );
+        // Create a trusted Genesis-height checkpoint to model a real parent commitment rather
+        // than attaching a non-Genesis checkpoint to an arbitrary test constant.
+        let genesis_checkpoint_bytes = runtime.export_checkpoint([0; 32]).unwrap();
+        let genesis_checkpoint_commitment =
+            QRunV05PowCheckpoint::commitment_for_bytes(&genesis_checkpoint_bytes);
 
         let envelope = runtime
             .mine_candidate(100, Vec::new(), &EmptyAuthenticator, 1)
@@ -1157,8 +1203,33 @@ mod tests {
             runtime.canonical_state().total_value().unwrap(),
             MAX_TOTAL_SUPPLY_ATOMS
         );
-        let checkpoint_bytes = runtime.export_checkpoint([0x91; 32]).unwrap();
+        let checkpoint_bytes = runtime
+            .export_checkpoint(genesis_checkpoint_commitment)
+            .unwrap();
         let checkpoint_commitment = QRunV05PowCheckpoint::commitment_for_bytes(&checkpoint_bytes);
+        let linked_checkpoint = QRunV05PowCheckpoint::decode_anchored_with_parent(
+            &checkpoint_bytes,
+            &network,
+            &runtime.genesis_commitment(),
+            &params,
+            checkpoint_commitment,
+            1,
+            genesis_checkpoint_commitment,
+        )
+        .unwrap();
+        assert_eq!(linked_checkpoint.height, 1);
+        assert_eq!(
+            QRunV05PowCheckpoint::decode_anchored_with_parent(
+                &checkpoint_bytes,
+                &network,
+                &runtime.genesis_commitment(),
+                &params,
+                checkpoint_commitment,
+                1,
+                [0x91; 32],
+            ),
+            Err(QRunCheckpointError::ParentCheckpointCommitmentMismatch)
+        );
         let restored_checkpoint = QRunV05PowCheckpoint::decode_anchored(
             &checkpoint_bytes,
             &network,
@@ -1205,7 +1276,7 @@ mod tests {
         );
         // Exercise checkpoint-rooted durable suffix storage, not only checkpoint decoding.
         let suffix_dir = TestDir::new();
-        let mut segmented = QRunV05PowForkRuntime::open_from_checkpoint(
+        let mut segmented = QRunV05PowForkRuntime::open_from_checkpoint_with_parent(
             &suffix_dir.0,
             network,
             owner,
@@ -1215,6 +1286,7 @@ mod tests {
             &checkpoint_bytes,
             checkpoint_commitment,
             1,
+            genesis_checkpoint_commitment,
             None,
         )
         .unwrap();
@@ -1273,6 +1345,117 @@ mod tests {
         .unwrap();
         assert_eq!(segmented_reopened.canonical_height(), 2);
         assert_eq!(segmented_reopened.canonical_state_root(), suffix_root);
+
+        // Roll the checkpoint forward using the actual previous checkpoint commitment. The
+        // strict verifier rejects a checkpoint whose parent link is spliced to another history.
+        let rolling_checkpoint_bytes = segmented_reopened
+            .export_checkpoint(checkpoint_commitment)
+            .unwrap();
+        let rolling_checkpoint_commitment =
+            QRunV05PowCheckpoint::commitment_for_bytes(&rolling_checkpoint_bytes);
+        let rolling_checkpoint = QRunV05PowCheckpoint::decode_anchored_with_parent(
+            &rolling_checkpoint_bytes,
+            &network,
+            &runtime.genesis_commitment(),
+            &params,
+            rolling_checkpoint_commitment,
+            2,
+            checkpoint_commitment,
+        )
+        .unwrap();
+        assert_eq!(rolling_checkpoint.height, 2);
+        assert_eq!(rolling_checkpoint.state_root, suffix_root);
+        assert_eq!(
+            QRunV05PowCheckpoint::decode_anchored_with_parent(
+                &rolling_checkpoint_bytes,
+                &network,
+                &runtime.genesis_commitment(),
+                &params,
+                rolling_checkpoint_commitment,
+                2,
+                genesis_checkpoint_commitment,
+            ),
+            Err(QRunCheckpointError::ParentCheckpointCommitmentMismatch)
+        );
+        let rejected_rollover_dir = TestDir::new();
+        assert!(matches!(
+            QRunV05PowForkRuntime::open_from_checkpoint_with_parent(
+                &rejected_rollover_dir.0,
+                network,
+                owner,
+                params.clone(),
+                &EmptyAuthenticator,
+                &FixedClock,
+                &rolling_checkpoint_bytes,
+                rolling_checkpoint_commitment,
+                2,
+                genesis_checkpoint_commitment,
+                None,
+            ),
+            Err(QRunV05PowRuntimeError::Checkpoint(
+                QRunCheckpointError::ParentCheckpointCommitmentMismatch
+            ))
+        ));
+        assert!(!rejected_rollover_dir.0.join("forkstore.manifest").exists());
+
+        // Start a second durable suffix from the rolled checkpoint, produce one more block, and
+        // verify its externally supplied manifest anchor is required for restart.
+        let rolling_suffix_dir = TestDir::new();
+        let mut rolling_suffix = QRunV05PowForkRuntime::open_from_checkpoint_with_parent(
+            &rolling_suffix_dir.0,
+            network,
+            owner,
+            params.clone(),
+            &EmptyAuthenticator,
+            &FixedClock,
+            &rolling_checkpoint_bytes,
+            rolling_checkpoint_commitment,
+            2,
+            checkpoint_commitment,
+            None,
+        )
+        .unwrap();
+        assert_eq!(rolling_suffix.canonical_height(), 2);
+        let final_envelope = rolling_suffix
+            .mine_candidate(102, Vec::new(), &EmptyAuthenticator, 1)
+            .unwrap();
+        rolling_suffix
+            .submit_block(&final_envelope, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+        assert_eq!(rolling_suffix.canonical_height(), 3);
+        assert_eq!(
+            rolling_suffix.canonical_state().total_value().unwrap(),
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
+        let rolling_final_root = rolling_suffix.canonical_state_root();
+        let rolling_final_anchor = rolling_suffix.manifest_anchor().unwrap();
+        drop(rolling_suffix);
+        let rolling_suffix_reopened = QRunV05PowForkRuntime::open_from_checkpoint_with_parent(
+            &rolling_suffix_dir.0,
+            network,
+            owner,
+            params.clone(),
+            &EmptyAuthenticator,
+            &FixedClock,
+            &rolling_checkpoint_bytes,
+            rolling_checkpoint_commitment,
+            2,
+            checkpoint_commitment,
+            Some(rolling_final_anchor),
+        )
+        .unwrap();
+        assert_eq!(rolling_suffix_reopened.canonical_height(), 3);
+        assert_eq!(
+            rolling_suffix_reopened.canonical_state_root(),
+            rolling_final_root
+        );
+        assert_eq!(
+            rolling_suffix_reopened
+                .canonical_state()
+                .total_value()
+                .unwrap(),
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
 
         let root = runtime.canonical_state_root();
         let commitment = runtime.genesis_commitment();
