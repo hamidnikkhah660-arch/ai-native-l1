@@ -116,9 +116,13 @@ Do not submit this automatically, do not solicit votes, and do not claim product
 
 ## Platform execution status
 
-- Website/social preview/SEO: prepared in source for publication.
+- **Website/social preview/SEO:** merged to `main` and live-verified on 2026-10-29. The English-only homepage, share composer links, Open Graph/Twitter preview, 1200x630 social card, `robots.txt`, and `sitemap.xml` are published.
+- **GitHub Announcement:** published at https://github.com/hamidnikkhah660-arch/ai-native-l1/discussions/77.
+- **SilentStars directory:** submitted for editorial/community review at https://github.com/capuz/silentstars/issues/36. The issue remains open; listing and its possible Bluesky cross-post are not yet confirmed.
+- **OpenSrc directory:** submitted for manual maintainer review at https://github.com/AaryanPuri/OpenSrc/issues/10. The repository has fewer than 30 stars, so inclusion requires the maintainer's hand-add exception; listing is not yet confirmed.
+- **LinkedIn, Reddit, X and Bluesky:** share links are published on the website, but they only open authenticated post composers. No standalone post has been published from these accounts.
+- **FindOpenSource.dev:** a form attempt did not return a success confirmation, so it is not counted as a completed submission.
 - GitHub source, issues and public contributor calls: published.
-- LinkedIn, Reddit, X and Bluesky: share links on the website; each post still requires an authenticated account.
 - DEV Community: draft included above; publish via an account that controls the publication.
 - Product Hunt: not submitted. Its current guidelines emphasize usable digital products, while QRun is still experimental public-alpha and not a general end-user product. Reassess after a self-serve runnable demo exists.
 - Hacker News: draft only, because its guidelines require authentic human posting and discussion; do not automate it.
