@@ -75,6 +75,29 @@ jobs:
         # and must not race with other lock probes on constrained hosted runners.
         run: cargo +stable test --all-targets --locked -- --test-threads=1
 
+  qrun-pow-benchmark-matrix:
+    name: QRun PoW benchmark (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        working-directory: src/native/pow_bench
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+
+      - name: Measure Argon2id PoW throughput on this independent runner
+        run: cargo run --release --locked --bin cpw_argon2id_pow_benchmark
+
   windows-pmt4-loopback:
     name: Windows PMT4 TXN4 two-node loopback
     runs-on: windows-latest
