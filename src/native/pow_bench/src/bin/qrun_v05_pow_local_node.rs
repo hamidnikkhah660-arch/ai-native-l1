@@ -201,20 +201,25 @@ fn validate_mainnet_p2p_requirements(
     if !enabled {
         return Ok(());
     }
-    if !sync_on_start {
-        return Err("--mainnet requires --sync-on-start true".into());
-    }
-    if peers.is_empty() {
-        return Err("--mainnet requires at least one independently configured seed peer".into());
-    }
-    if peers.iter().any(|peer| peer.ip().is_loopback()) {
-        return Err("--mainnet seed peers must be non-loopback addresses".into());
-    }
-    if pinned_peer_count != peers.len() {
-        return Err("--mainnet requires a static-key pin for every configured seed peer".into());
-    }
     if block_listener.ip().is_loopback() {
         return Err("--mainnet requires a non-loopback P2P block listener".into());
+    }
+    // First boot can create the deterministic frozen Genesis without any existing peers.
+    // Independent peer sync is optional at bootstrap, but when requested it must be pinned.
+    if sync_on_start {
+        if peers.is_empty() {
+            return Err(
+                "--sync-on-start requires at least one independently configured seed peer".into(),
+            );
+        }
+        if peers.iter().any(|peer| peer.ip().is_loopback()) {
+            return Err("--mainnet seed peers must be non-loopback addresses".into());
+        }
+        if pinned_peer_count != peers.len() {
+            return Err(
+                "--mainnet requires a static-key pin for every configured seed peer".into(),
+            );
+        }
     }
     Ok(())
 }
@@ -268,8 +273,8 @@ fn parse_config() -> Result<Config, String> {
             "QRun v0.5 node modes\n\
 Local test: qrun_v05_pow_local_node --local-testnet --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH\n\
 Public alpha: qrun_v05_pow_local_node --public-alpha --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH --noise-private-key-file NPK1\n\
-Mainnet: qrun_v05_pow_local_node --mainnet --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH --noise-private-key-file NPK1\n\
-Mainnet activation is refused unless frozen Genesis/profile/state root and 10B single-account supply match exactly, and a non-loopback pinned peer completes sync before Mainnet is reported. RPC and transaction ingress stay loopback-only."
+Mainnet: qrun_v05_pow_local_node --mainnet --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH --noise-private-key-file NPK1 --peer IP:PORT --peer-static-public-key-hex HEX64 --sync-on-start true\n\
+Mainnet requires --sync-on-start true, at least one non-loopback --peer, a matching --peer-static-public-key-hex pin for every peer, and frozen Genesis/profile/state-root/supply checks before the node reports Mainnet. RPC and transaction ingress stay loopback-only."
         );
         return Err("__help__".into());
     }
@@ -432,20 +437,19 @@ Mainnet activation is refused unless frozen Genesis/profile/state root and 10B s
         "false" => false,
         _ => return Err("--sync-on-start must be exactly true or false".into()),
     };
-    // A new chain can start from its frozen, deterministic Genesis without an existing peer,
-    // as Bitcoin's first node did. Operators can opt into pinned startup sync with --sync-on-start.
     validate_sync_start_config(
         sync_on_start,
         noise_private_key_file.is_some(),
         peers.len(),
         peer_static_public_keys.len(),
     )?;
-    if mainnet && peers.iter().any(|peer| peer.ip().is_loopback()) {
-        return Err("--mainnet seed peers must be non-loopback addresses".into());
-    }
-    if mainnet && block_listen.ip().is_loopback() {
-        return Err("--mainnet requires a non-loopback P2P block listener".into());
-    }
+    validate_mainnet_p2p_requirements(
+        mainnet,
+        sync_on_start,
+        &peers,
+        peer_static_public_keys.len(),
+        block_listen,
+    )?;
     if public_network && noise_private_key_file.is_none() {
         return Err(
             "--public-alpha requires --noise-private-key-file; plaintext public peer transport is forbidden".into(),
@@ -1903,39 +1907,36 @@ mod tests {
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(1);
 
     #[test]
-    fn mainnet_p2p_gate_requires_sync_pins_and_non_loopback_addresses() {
+    fn mainnet_bootstrap_needs_no_existing_peer_but_optional_sync_requires_pins() {
         let peer: SocketAddr = "198.51.100.10:49341".parse().unwrap();
         let loopback_peer: SocketAddr = "127.0.0.1:49341".parse().unwrap();
         let public_listener: SocketAddr = "0.0.0.0:49341".parse().unwrap();
         let loopback_listener: SocketAddr = "127.0.0.1:49341".parse().unwrap();
+
+        // Like a first Bitcoin node, Mainnet can start from the frozen Genesis on an empty network.
+        assert!(validate_mainnet_p2p_requirements(true, false, &[], 0, public_listener).is_ok());
+        assert!(
+            validate_mainnet_p2p_requirements(true, false, &[peer], 0, public_listener).is_ok()
+        );
+        assert!(validate_mainnet_p2p_requirements(false, false, &[], 0, loopback_listener).is_ok());
+
+        // If the operator explicitly requests sync, an external, pinned seed is mandatory.
+        assert!(validate_mainnet_p2p_requirements(true, true, &[], 0, public_listener).is_err());
         assert!(validate_mainnet_p2p_requirements(
-            false, false, &[], 0, loopback_listener
-        )
-        .is_ok());
-        assert!(validate_mainnet_p2p_requirements(
-            true, false, &[peer], 1, public_listener
-        )
-        .is_err());
-        assert!(validate_mainnet_p2p_requirements(
-            true, true, &[], 0, public_listener
-        )
-        .is_err());
-        assert!(validate_mainnet_p2p_requirements(
-            true, true, &[loopback_peer], 1, public_listener
-        )
-        .is_err());
-        assert!(validate_mainnet_p2p_requirements(
-            true, true, &[peer], 0, public_listener
+            true,
+            true,
+            &[loopback_peer],
+            1,
+            public_listener
         )
         .is_err());
-        assert!(validate_mainnet_p2p_requirements(
-            true, true, &[peer], 1, loopback_listener
-        )
-        .is_err());
-        assert!(validate_mainnet_p2p_requirements(
-            true, true, &[peer], 1, public_listener
-        )
-        .is_ok());
+        assert!(
+            validate_mainnet_p2p_requirements(true, true, &[peer], 0, public_listener).is_err()
+        );
+        assert!(
+            validate_mainnet_p2p_requirements(true, true, &[peer], 1, loopback_listener).is_err()
+        );
+        assert!(validate_mainnet_p2p_requirements(true, true, &[peer], 1, public_listener).is_ok());
     }
 
     #[test]
