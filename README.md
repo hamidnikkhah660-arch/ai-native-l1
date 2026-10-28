@@ -1,9 +1,20 @@
-# QuantumZXB - AI-Native Layer-1 Engineering Project
+# QRun - QZXB Native Layer-1 & Open Ecosystem
 
-**QuantumZXB** is the public working identity of an independently developed native Layer-1 and programmable-ecosystem project. The source combines a Rust-native ledger research programme, deterministic state/recovery candidates, ML-DSA-65 and hybrid-identity research, an isolated EVM/revm smart-contract laboratory, and a roadmap toward an AI-native developer ecosystem.
+**QRun** is the public brand of an independently developed native Layer-1 project; **QZXB** is the selected native-coin ticker and **QRun Blockchain** is the network name. The source contains a Rust-native ledger research programme, deterministic state/recovery candidates, ML-DSA-65 and hybrid-identity research, an isolated EVM/revm smart-contract laboratory, and an AI-native ecosystem roadmap.
 
+
+## Public ecosystem status (2026-10-29)
+
+The source repository and project website are public, and we are actively inviting independent node operators, code contributors, security reviewers, AI/ML researchers, application developers and milestone sponsors. **The running node remains experimental public-alpha; value-bearing native Mainnet and a genuine QZXB/USDT market are not live.** A public source tree is open for review/contribution; it is not a claim that candidate balances are publicly spendable.
+
+- **Join the ecosystem:** [operator onboarding issue #72](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/72), [independent protocol review #73](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/73), [sponsors/contributors #1](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/1), and [CONTRIBUTING.md](CONTRIBUTING.md).
+- **Current identity:** [QRun/QZXB brand decision](docs/CP-0464_QRUN_QZXB_BRAND_IDENTITY_2026-10-29.md).
+- **Mainnet and market release decision:** [CP-0465](docs/CP-0465_QRUN_MAINNET_PUBLIC_TRADING_NO_GO_2026-10-29.md).
+- **Zero-budget liquidity routes:** [CP-0466](docs/CP-0466_QRUN_ZERO_BUDGET_REAL_LIQUIDITY_PATH_2026-10-29.md).
+- **Independent zero-value Devnet onboarding:** [operator packet](docs/QZXB_ZERO_VALUE_DEVNET_OPERATOR_ONBOARDING_V01_2026-10-27.md).
 - **Global project site:** https://hamidnikkhah660-arch.github.io/ai-native-l1/
 - **Source and contribution issues:** https://github.com/hamidnikkhah660-arch/ai-native-l1
+- **Latest experimental QRun source (not a production release):** [work branch](https://github.com/hamidnikkhah660-arch/ai-native-l1/tree/work/qzbe-v04-persistent-mining-20261026).
 - **Engineering white paper:** [QuantumZXB Native Coin White Paper v0.3](docs/QUANTUMZXB_NATIVE_COIN_WHITEPAPER_V03.md)
 - **Master roadmap:** [QuantumZXB Engineering & Ecosystem Roadmap v0.3](docs/QUANTUMZXB_MASTER_ROADMAP_V03.md)
 - **Technical review and test evidence:** [CP-0343 report](docs/CP_0343_TECHNICAL_REVIEW_AND_TEST_RESULTS.md)
@@ -63,7 +74,17 @@ An isolated EVM lab pins revm and explores call/create, storage, gas, rollback a
 
 The codebase covers bounded wire parsing and ingress/worker queues, authenticated peer-session research, state-commitment candidates, fork/reorg history replay, archive paging, snapshot/store recovery models and process-crash tests. The next qualification stage adds an independently administered monotonic trust provider and tests across independently operated hosts and storage-failure conditions.
 
-## Native coin design and tokenomics (owner-directed policy v0.4)
+## Current native QZXB direction (CP-0437, 2026-10-28)
+
+The current owner-directed candidate targets a fixed Genesis supply of **10,000,000,000 QZXB**, all allocated to the owner at Genesis, with **zero post-Genesis minting and zero block subsidy**. This is the selected design direction; it is not evidence that value-bearing Mainnet has launched, that the local candidate balance is publicly spendable, or that any market price/liquidity exists. Fee-only block production, canonical issuance, recovery, independent operators and production review remain release gates.
+
+- **Current direction:** [CP-0437 - Full-supply Genesis direction](docs/CP-0437_QRUN_FULL_SUPPLY_GENESIS_DIRECTION_2026-10-28.md).
+- **Genesis/profile context:** [CP-0436](docs/CP-0436_MAINNET_GENESIS_PROFILE_FREEZE_PACKET_2026-10-27.md) and [CP-0447](docs/CP-0447_QRUN_MAINNET_10B_RELEASE_GATE_2026-10-28.md).
+- **Production gate:** [CP-0465 - Mainnet / public trading decision](docs/CP-0465_QRUN_MAINNET_PUBLIC_TRADING_NO_GO_2026-10-29.md).
+<details>
+<summary>Historical v0.4 allocation proposal - superseded for the current QRun Genesis direction</summary>
+
+## Historical native coin design and tokenomics (owner-directed policy v0.4)
 
 The planned maximum native QZXB supply is **10,000,000,000 coins**: **30% mining/network-security rewards (3B); 10% community airdrop (1B); 10% exchange, market-integration and liquidity partnerships (1B); 10% major marketing partners (1B); 10% developers/security contributors (1B); 10% financial/strategic supporters (1B); 10% protocol burn reserve (1B); and 10% owner allocation (1B)**. The eight buckets total exactly 100%.
 
@@ -75,6 +96,9 @@ These are planned allocations, not active Genesis issuance, circulating supply, 
 - **Production gate status:** Gate 2 and Gate 8 remain open; native QZXB mainnet and a liquid native-coin market are not launched.
 
 The former 4B founder / 3B mining / 3B public-goods proposal is preserved in versioned historical documents and superseded for current allocation planning by policy v0.4. The separate QX ERC-20 deployment on Ethereum Sepolia is a test asset, not the native QZXB coin or a production market.
+
+
+</details>
 
 ## Current engineering validation
 
