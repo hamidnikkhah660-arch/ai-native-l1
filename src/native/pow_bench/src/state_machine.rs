@@ -445,6 +445,95 @@ pub fn block_id(block: &Block) -> Result<[u8; 32], StateError> {
     Ok(hash_domain(b"AIN1-BLOCK-ID-V2\0", &[&canonical]))
 }
 
+/// QRun v0.5 fee-only block envelope. The producer is canonical block data, and the state root
+/// commits to the account credit funded solely by fees collected in this block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QRunV05FeeBlock {
+    pub body: Block,
+    pub producer: AccountId,
+}
+
+const QRUN_V05_FEE_BLOCK_MAGIC: [u8; 4] = *b"QFB5";
+const QRUN_V05_FEE_BLOCK_VERSION: u16 = 1;
+const QRUN_V05_FEE_BLOCK_FIXED_OVERHEAD: usize = 4 + 2 + 4 + 32;
+const QRUN_V05_FEE_BLOCK_ID_DOMAIN: &[u8] = b"QUANTUMZXB-QRUN-FEE-BLOCK-ID-V05\0";
+
+/// Canonical QFB5 encoding: magic, version, exact BLK2 body length/body, and producer account.
+/// No subsidy or claimed fee amount is accepted from the block; the payout is derived by replay.
+pub fn encode_qrun_v05_fee_block(block: &QRunV05FeeBlock) -> Result<Vec<u8>, StateError> {
+    if is_zero_account(&block.producer) {
+        return Err(StateError::InvalidAccountId);
+    }
+    let body = encode_block(&block.body)?;
+    if body.len() > u32::MAX as usize {
+        return Err(StateError::Oversize {
+            actual: body.len(),
+            limit: MAX_ENCODED_BLOCK_BYTES,
+        });
+    }
+    let mut out = Vec::with_capacity(QRUN_V05_FEE_BLOCK_FIXED_OVERHEAD + body.len());
+    out.extend_from_slice(&QRUN_V05_FEE_BLOCK_MAGIC);
+    out.extend_from_slice(&QRUN_V05_FEE_BLOCK_VERSION.to_be_bytes());
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&block.producer);
+    if out.len() > MAX_ENCODED_BLOCK_BYTES + QRUN_V05_FEE_BLOCK_FIXED_OVERHEAD {
+        return Err(StateError::Oversize {
+            actual: out.len(),
+            limit: MAX_ENCODED_BLOCK_BYTES + QRUN_V05_FEE_BLOCK_FIXED_OVERHEAD,
+        });
+    }
+    Ok(out)
+}
+
+pub fn decode_qrun_v05_fee_block(bytes: &[u8]) -> Result<QRunV05FeeBlock, StateError> {
+    let max_len = MAX_ENCODED_BLOCK_BYTES + QRUN_V05_FEE_BLOCK_FIXED_OVERHEAD;
+    if bytes.len() > max_len {
+        return Err(StateError::Oversize {
+            actual: bytes.len(),
+            limit: max_len,
+        });
+    }
+    if bytes.len() < QRUN_V05_FEE_BLOCK_FIXED_OVERHEAD + BLOCK_HEADER_LEN {
+        return Err(StateError::Malformed);
+    }
+    if bytes[..4] != QRUN_V05_FEE_BLOCK_MAGIC {
+        return Err(StateError::BadMagic);
+    }
+    let version = u16::from_be_bytes([bytes[4], bytes[5]]);
+    if version != QRUN_V05_FEE_BLOCK_VERSION {
+        return Err(StateError::UnsupportedVersion(version));
+    }
+    let body_len = u32::from_be_bytes(bytes[6..10].try_into().expect("fixed body length")) as usize;
+    if !(BLOCK_HEADER_LEN..=MAX_ENCODED_BLOCK_BYTES).contains(&body_len) {
+        return Err(StateError::Malformed);
+    }
+    let expected_len = 10usize
+        .checked_add(body_len)
+        .and_then(|len| len.checked_add(32))
+        .ok_or(StateError::Malformed)?;
+    if bytes.len() != expected_len {
+        return Err(StateError::Malformed);
+    }
+    let body_end = 10 + body_len;
+    let body = decode_block(&bytes[10..body_end])?;
+    let producer: AccountId = bytes[body_end..expected_len]
+        .try_into()
+        .expect("fixed producer ID");
+    if is_zero_account(&producer) {
+        return Err(StateError::InvalidAccountId);
+    }
+    let block = QRunV05FeeBlock { body, producer };
+    if encode_qrun_v05_fee_block(&block)? != bytes {
+        return Err(StateError::Malformed);
+    }
+    Ok(block)
+}
+
+pub fn qrun_v05_fee_block_id(block: &QRunV05FeeBlock) -> Result<[u8; 32], StateError> {
+    let canonical = encode_qrun_v05_fee_block(block)?;
+    Ok(hash_domain(QRUN_V05_FEE_BLOCK_ID_DOMAIN, &[&canonical]))
+}
 impl LedgerState {
     pub fn genesis(
         network_id: NetworkId,
@@ -625,6 +714,86 @@ impl LedgerState {
         Ok(())
     }
 
+    /// Build the post-state candidate for a QRun v0.5 fee-only block. Prior accumulated fees are
+    /// forbidden: every accepted QFB5 block must pay exactly its own fees and leave fee_pool zero.
+    fn prepare_qrun_v05_fee_candidate<A: TransactionAuthenticator>(
+        &self,
+        block: &QRunV05FeeBlock,
+        authenticator: &A,
+    ) -> Result<(Self, u64), StateError> {
+        encode_qrun_v05_fee_block(block)?;
+        if is_zero_account(&block.producer) {
+            return Err(StateError::InvalidAccountId);
+        }
+        if self.fee_pool != 0 {
+            return Err(StateError::InvariantViolation);
+        }
+        let total_before = self.total_value()?;
+        let (mut next, fees_collected) = self.prepare_candidate(&block.body, authenticator)?;
+        if next.fee_pool != fees_collected {
+            return Err(StateError::InvariantViolation);
+        }
+        if fees_collected != 0 {
+            let old = next.accounts.get(&block.producer).copied();
+            if old.is_none() && next.accounts.len() >= MAX_ACCOUNTS {
+                return Err(StateError::TooManyAccounts);
+            }
+            let balance = old
+                .map_or(0, |account| account.balance)
+                .checked_add(fees_collected)
+                .ok_or(StateError::BalanceOverflow)?;
+            next.accounts.insert(
+                block.producer,
+                AccountState {
+                    balance,
+                    nonce: old.map_or(0, |account| account.nonce),
+                },
+            );
+            next.fee_pool = 0;
+        }
+        if next.fee_pool != 0 || next.total_value()? != total_before {
+            return Err(StateError::InvariantViolation);
+        }
+        Ok((next, fees_collected))
+    }
+
+    /// State root after the deterministic fee-only payout. No new supply is created.
+    pub fn preview_qrun_v05_fee_state_root_after<A: TransactionAuthenticator>(
+        &self,
+        block: &QRunV05FeeBlock,
+        authenticator: &A,
+    ) -> Result<[u8; 32], StateError> {
+        let (candidate, _) = self.prepare_qrun_v05_fee_candidate(block, authenticator)?;
+        Ok(candidate.state_root())
+    }
+
+    /// Atomically execute a QFB5 block, pay only fees collected in this block, and derive the tip
+    /// hash from canonical body+producer bytes. Failures leave every field unchanged.
+    pub fn apply_qrun_v05_fee_block<A: TransactionAuthenticator>(
+        &mut self,
+        block: &QRunV05FeeBlock,
+        authenticator: &A,
+    ) -> Result<BlockApplySummary, StateError> {
+        let canonical = encode_qrun_v05_fee_block(block)?;
+        let (mut next, fees_collected) =
+            self.prepare_qrun_v05_fee_candidate(block, authenticator)?;
+        let computed_state_root = next.state_root();
+        if computed_state_root != block.body.state_root {
+            return Err(StateError::StateRootMismatch);
+        }
+        let block_hash = hash_domain(QRUN_V05_FEE_BLOCK_ID_DOMAIN, &[&canonical]);
+        next.tip_hash = block_hash;
+        let summary = BlockApplySummary {
+            height: next.height,
+            block_hash,
+            state_root: computed_state_root,
+            transactions_applied: block.body.transactions.len(),
+            fees_collected,
+            account_count: next.account_count(),
+        };
+        *self = next;
+        Ok(summary)
+    }
     pub fn fee_pool(&self) -> u64 {
         self.fee_pool
     }
@@ -2525,6 +2694,97 @@ mod tests {
         assert_eq!(state.total_value().unwrap(), total);
     }
 
+    #[test]
+    fn qrun_v05_fee_block_pays_only_same_block_fees_without_minting() {
+        let mut state = alice_bob_state();
+        let initial_total = state.total_value().unwrap();
+        let tx = signed_tx(account(1), account(2), 1, 100, 2);
+        let mut fee_block = QRunV05FeeBlock {
+            body: block(1, state.tip_hash(), vec![tx]),
+            producer: account(3),
+        };
+        fee_block.body.state_root = state
+            .preview_qrun_v05_fee_state_root_after(&fee_block, &TestOnlyAuthenticator)
+            .unwrap();
+
+        let encoded = encode_qrun_v05_fee_block(&fee_block).unwrap();
+        assert_eq!(&encoded[..4], b"QFB5");
+        assert_eq!(decode_qrun_v05_fee_block(&encoded).unwrap(), fee_block);
+        let summary = state
+            .apply_qrun_v05_fee_block(&fee_block, &TestOnlyAuthenticator)
+            .unwrap();
+
+        assert_eq!(summary.fees_collected, 2);
+        assert_eq!(
+            summary.block_hash,
+            qrun_v05_fee_block_id(&fee_block).unwrap()
+        );
+        assert_eq!(state.account(&account(1)).unwrap().balance, 898);
+        assert_eq!(state.account(&account(2)).unwrap().balance, 105);
+        assert_eq!(state.account(&account(3)).unwrap().balance, 2);
+        assert_eq!(state.fee_pool(), 0);
+        assert_eq!(state.total_value().unwrap(), initial_total);
+    }
+
+    #[test]
+    fn qrun_v05_fee_block_binds_producer_and_rejects_noncanonical_or_stale_fee_state() {
+        let mut state = alice_bob_state();
+        let initial_snapshot = state.encode_snapshot().unwrap();
+        let tx = signed_tx(account(1), account(2), 1, 100, 2);
+        let mut fee_block = QRunV05FeeBlock {
+            body: block(1, state.tip_hash(), vec![tx]),
+            producer: account(3),
+        };
+        fee_block.body.state_root = state
+            .preview_qrun_v05_fee_state_root_after(&fee_block, &TestOnlyAuthenticator)
+            .unwrap();
+        let canonical_id = qrun_v05_fee_block_id(&fee_block).unwrap();
+
+        let mut altered_producer = fee_block.clone();
+        altered_producer.producer = account(4);
+        assert_ne!(
+            canonical_id,
+            qrun_v05_fee_block_id(&altered_producer).unwrap()
+        );
+        assert_eq!(
+            state.apply_qrun_v05_fee_block(&altered_producer, &TestOnlyAuthenticator),
+            Err(StateError::StateRootMismatch)
+        );
+        assert_eq!(state.encode_snapshot().unwrap(), initial_snapshot);
+
+        let mut with_pending_pool = alice_bob_state();
+        let legacy = committed_block(
+            &with_pending_pool,
+            vec![signed_tx(account(1), account(2), 1, 100, 2)],
+        );
+        with_pending_pool
+            .apply_block(&legacy, &TestOnlyAuthenticator)
+            .unwrap();
+        let mut stale = QRunV05FeeBlock {
+            body: block(2, with_pending_pool.tip_hash(), Vec::new()),
+            producer: account(3),
+        };
+        stale.body.state_root = with_pending_pool
+            .preview_qrun_v05_fee_state_root_after(&stale, &TestOnlyAuthenticator)
+            .unwrap_or([0; 32]);
+        assert_eq!(
+            with_pending_pool.apply_qrun_v05_fee_block(&stale, &TestOnlyAuthenticator),
+            Err(StateError::InvariantViolation)
+        );
+
+        let mut bad_magic = encode_qrun_v05_fee_block(&fee_block).unwrap();
+        bad_magic[0] ^= 0x01;
+        assert_eq!(
+            decode_qrun_v05_fee_block(&bad_magic),
+            Err(StateError::BadMagic)
+        );
+        let mut trailing = encode_qrun_v05_fee_block(&fee_block).unwrap();
+        trailing.push(0);
+        assert_eq!(
+            decode_qrun_v05_fee_block(&trailing),
+            Err(StateError::Malformed)
+        );
+    }
     #[test]
     fn fee_overflow_fixture_is_rejected_by_genesis_cap() {
         // Sum-of-fees overflow requires a starting supply above the agreed hard cap here;

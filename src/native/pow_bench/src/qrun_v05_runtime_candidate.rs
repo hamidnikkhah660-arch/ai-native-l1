@@ -6,8 +6,9 @@
 //! Store checksums detect accidental corruption, not a malicious operator rewriting history.
 use crate::qrun_v05_genesis_candidate::{QRunGenesisError, QRunGenesisV05};
 use crate::state_machine::{
-    decode_block, encode_block, AccountId, Block, BlockApplySummary, LedgerState, NetworkId,
-    StateError, Transaction, TransactionAuthenticator, MAX_TOTAL_SUPPLY_ATOMS,
+    decode_block, decode_qrun_v05_fee_block, encode_block, encode_qrun_v05_fee_block, AccountId,
+    Block, BlockApplySummary, LedgerState, NetworkId, QRunV05FeeBlock, StateError, Transaction,
+    TransactionAuthenticator, MAX_TOTAL_SUPPLY_ATOMS,
 };
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
@@ -15,12 +16,18 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const STORE_MAGIC: [u8; 4] = *b"QRS5";
-const STORE_VERSION: u16 = 2;
+const STORE_VERSION: u16 = 3;
 const STORE_DOMAIN: &[u8] = b"QUANTUMZXB-QRUN-RUNTIME-STORE-V05\0";
 const STORE_CHECKSUM_LEN: usize = 32;
 const STORE_HEADER_V1_LEN: usize = 4 + 2 + 32 + 32 + 32 + 4;
 const STORE_HEADER_LEN: usize = 4 + 2 + 32 + 32 + 32 + 4 + 4;
 const MAX_STORE_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QRunV05HistoryBlock {
+    Plain(Block),
+    Fee(QRunV05FeeBlock),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QRunV05RuntimeError {
@@ -35,6 +42,7 @@ pub enum QRunV05RuntimeError {
     WrongGenesisIdentity,
     SupplyInvariant { expected: u128, actual: u128 },
     TimestampNotIncreasing { previous: u64, actual: u64 },
+    WrongExecutionMode,
 }
 
 impl From<StateError> for QRunV05RuntimeError {
@@ -57,7 +65,7 @@ pub struct QRunV05ExecutionRuntime<A: TransactionAuthenticator> {
     owner_account: AccountId,
     genesis_commitment: [u8; 32],
     state: LedgerState,
-    history: Vec<Block>,
+    history: Vec<QRunV05HistoryBlock>,
     authenticator: A,
     store_path: PathBuf,
 }
@@ -100,8 +108,15 @@ impl<A: TransactionAuthenticator> QRunV05ExecutionRuntime<A> {
                     return Err(QRunV05RuntimeError::StoreHistoryMismatch);
                 }
                 let mut replayed = genesis.ledger().clone();
-                for block in &history {
-                    replayed.apply_block(block, &authenticator)?;
+                for entry in &history {
+                    match entry {
+                        QRunV05HistoryBlock::Plain(block) => {
+                            replayed.apply_block(block, &authenticator)?;
+                        }
+                        QRunV05HistoryBlock::Fee(block) => {
+                            replayed.apply_qrun_v05_fee_block(block, &authenticator)?;
+                        }
+                    }
                     Self::check_full_supply(&replayed)?;
                 }
                 let replayed_snapshot = replayed.encode_snapshot()?;
@@ -201,6 +216,13 @@ impl<A: TransactionAuthenticator> QRunV05ExecutionRuntime<A> {
         timestamp: u64,
         transactions: Vec<Transaction>,
     ) -> Result<Block, QRunV05RuntimeError> {
+        if self
+            .history
+            .iter()
+            .any(|entry| matches!(entry, QRunV05HistoryBlock::Fee(_)))
+        {
+            return Err(QRunV05RuntimeError::WrongExecutionMode);
+        }
         if timestamp <= self.state.last_timestamp() {
             return Err(QRunV05RuntimeError::TimestampNotIncreasing {
                 previous: self.state.last_timestamp(),
@@ -231,13 +253,89 @@ impl<A: TransactionAuthenticator> QRunV05ExecutionRuntime<A> {
         &mut self,
         block: &Block,
     ) -> Result<BlockApplySummary, QRunV05RuntimeError> {
+        if self
+            .history
+            .iter()
+            .any(|entry| matches!(entry, QRunV05HistoryBlock::Fee(_)))
+        {
+            return Err(QRunV05RuntimeError::WrongExecutionMode);
+        }
         // Stage the complete state transition before altering the published runtime state.
         let mut candidate = self.state.clone();
         let summary = candidate.apply_block(block, &self.authenticator)?;
         Self::check_full_supply(&candidate)?;
 
         let previous = std::mem::replace(&mut self.state, candidate);
-        self.history.push(block.clone());
+        self.history.push(QRunV05HistoryBlock::Plain(block.clone()));
+        if let Err(error) = self.persist() {
+            self.history.pop();
+            self.state = previous;
+            return Err(error);
+        }
+        Ok(summary)
+    }
+
+    /// Build a QFB5 block whose producer receives only the valid fees collected in that block.
+    /// This candidate state-execution path is separate from the legacy loopback-only BLK2 path.
+    pub fn build_next_fee_block(
+        &self,
+        timestamp: u64,
+        transactions: Vec<Transaction>,
+        producer: AccountId,
+    ) -> Result<QRunV05FeeBlock, QRunV05RuntimeError> {
+        if self
+            .history
+            .iter()
+            .any(|entry| matches!(entry, QRunV05HistoryBlock::Plain(_)))
+        {
+            return Err(QRunV05RuntimeError::WrongExecutionMode);
+        }
+        if timestamp <= self.state.last_timestamp() {
+            return Err(QRunV05RuntimeError::TimestampNotIncreasing {
+                previous: self.state.last_timestamp(),
+                actual: timestamp,
+            });
+        }
+        let height = self
+            .state
+            .height()
+            .checked_add(1)
+            .ok_or(StateError::InvalidHeight)?;
+        let mut fee_block = QRunV05FeeBlock {
+            body: Block {
+                height,
+                timestamp,
+                parent_hash: self.state.tip_hash(),
+                state_root: [0; 32],
+                transactions,
+            },
+            producer,
+        };
+        fee_block.body.state_root = self
+            .state
+            .preview_qrun_v05_fee_state_root_after(&fee_block, &self.authenticator)?;
+        Ok(fee_block)
+    }
+
+    /// Validate, replay and durably commit a fee-only QFB5 block. The state is rolled back if
+    /// the atomic store write fails; ordered QFB5 history is replayed on reopen.
+    pub fn import_fee_block(
+        &mut self,
+        block: &QRunV05FeeBlock,
+    ) -> Result<BlockApplySummary, QRunV05RuntimeError> {
+        if self
+            .history
+            .iter()
+            .any(|entry| matches!(entry, QRunV05HistoryBlock::Plain(_)))
+        {
+            return Err(QRunV05RuntimeError::WrongExecutionMode);
+        }
+        let mut candidate = self.state.clone();
+        let summary = candidate.apply_qrun_v05_fee_block(block, &self.authenticator)?;
+        Self::check_full_supply(&candidate)?;
+
+        let previous = std::mem::replace(&mut self.state, candidate);
+        self.history.push(QRunV05HistoryBlock::Fee(block.clone()));
         if let Err(error) = self.persist() {
             self.history.pop();
             self.state = previous;
@@ -258,7 +356,7 @@ fn encode_store(
     owner_account: AccountId,
     genesis_commitment: [u8; 32],
     snapshot: &[u8],
-    history: &[Block],
+    history: &[QRunV05HistoryBlock],
 ) -> Result<Vec<u8>, QRunV05RuntimeError> {
     if snapshot.len() > u32::MAX as usize || history.len() > u32::MAX as usize {
         return Err(QRunV05RuntimeError::StoreTooLarge);
@@ -274,14 +372,23 @@ fn encode_store(
     bytes.extend_from_slice(&(snapshot.len() as u32).to_be_bytes());
     bytes.extend_from_slice(&(history.len() as u32).to_be_bytes());
     bytes.extend_from_slice(snapshot);
-    for block in history {
-        let encoded = encode_block(block).map_err(|_| QRunV05RuntimeError::InvalidStore)?;
+    for entry in history {
+        let (kind, encoded) = match entry {
+            QRunV05HistoryBlock::Plain(block) => (
+                0u8,
+                encode_block(block).map_err(|_| QRunV05RuntimeError::InvalidStore)?,
+            ),
+            QRunV05HistoryBlock::Fee(block) => (
+                1u8,
+                encode_qrun_v05_fee_block(block).map_err(|_| QRunV05RuntimeError::InvalidStore)?,
+            ),
+        };
         if encoded.is_empty() || encoded.len() > u32::MAX as usize {
             return Err(QRunV05RuntimeError::StoreTooLarge);
         }
         let needed = bytes
             .len()
-            .checked_add(4)
+            .checked_add(5)
             .and_then(|len| len.checked_add(encoded.len()))
             .and_then(|len| len.checked_add(STORE_CHECKSUM_LEN))
             .ok_or(QRunV05RuntimeError::StoreTooLarge)?;
@@ -289,6 +396,7 @@ fn encode_store(
             return Err(QRunV05RuntimeError::StoreTooLarge);
         }
         bytes.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+        bytes.push(kind);
         bytes.extend_from_slice(&encoded);
     }
     if bytes.len().saturating_add(STORE_CHECKSUM_LEN) > MAX_STORE_BYTES {
@@ -299,11 +407,21 @@ fn encode_store(
     Ok(bytes)
 }
 
-/// Version 1 is accepted only for an untouched Genesis and is immediately upgraded.
-/// Version 2 binds the ordered block history into the same checksummed atomic store.
+/// Version 1 is accepted only for an untouched Genesis; v2 contains legacy BLK2 history.
+/// Version 3 adds a canonical kind byte to each entry for BLK2 or fee-only QFB5 blocks.
 fn decode_store(
     bytes: &[u8],
-) -> Result<(NetworkId, AccountId, [u8; 32], &[u8], Vec<Block>, u16), QRunV05RuntimeError> {
+) -> Result<
+    (
+        NetworkId,
+        AccountId,
+        [u8; 32],
+        &[u8],
+        Vec<QRunV05HistoryBlock>,
+        u16,
+    ),
+    QRunV05RuntimeError,
+> {
     if bytes.len() > MAX_STORE_BYTES || bytes.len() < STORE_HEADER_V1_LEN + STORE_CHECKSUM_LEN {
         return Err(if bytes.len() > MAX_STORE_BYTES {
             QRunV05RuntimeError::StoreTooLarge
@@ -315,7 +433,7 @@ fn decode_store(
         return Err(QRunV05RuntimeError::InvalidStore);
     }
     let version = u16::from_be_bytes([bytes[4], bytes[5]]);
-    if version != 1 && version != STORE_VERSION {
+    if version != 1 && version != 2 && version != STORE_VERSION {
         return Err(QRunV05RuntimeError::InvalidStore);
     }
     let payload_len = bytes.len() - STORE_CHECKSUM_LEN;
@@ -360,15 +478,35 @@ fn decode_store(
         if block_len == 0 || block_len > MAX_STORE_BYTES {
             return Err(QRunV05RuntimeError::InvalidStore);
         }
-        let block_end = len_end
+        let (kind, encoded_start) = if version >= 3 {
+            let encoded_start = len_end
+                .checked_add(1)
+                .ok_or(QRunV05RuntimeError::InvalidStore)?;
+            if encoded_start > payload_len {
+                return Err(QRunV05RuntimeError::InvalidStore);
+            }
+            (bytes[len_end], encoded_start)
+        } else {
+            (0u8, len_end)
+        };
+        let block_end = encoded_start
             .checked_add(block_len)
             .ok_or(QRunV05RuntimeError::InvalidStore)?;
         if block_end > payload_len {
             return Err(QRunV05RuntimeError::InvalidStore);
         }
-        let block = decode_block(&bytes[len_end..block_end])
-            .map_err(|_| QRunV05RuntimeError::InvalidStore)?;
-        history.push(block);
+        let encoded = &bytes[encoded_start..block_end];
+        let entry = match (version, kind) {
+            (3, 0) | (1, 0) | (2, 0) => QRunV05HistoryBlock::Plain(
+                decode_block(encoded).map_err(|_| QRunV05RuntimeError::InvalidStore)?,
+            ),
+            (3, 1) => QRunV05HistoryBlock::Fee(
+                decode_qrun_v05_fee_block(encoded)
+                    .map_err(|_| QRunV05RuntimeError::InvalidStore)?,
+            ),
+            _ => return Err(QRunV05RuntimeError::InvalidStore),
+        };
+        history.push(entry);
         cursor = block_end;
     }
     if cursor != payload_len {
@@ -495,6 +633,69 @@ mod tests {
             reopened.total_supply_atoms().unwrap(),
             MAX_TOTAL_SUPPLY_ATOMS
         );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn qrun_v05_fee_runtime_pays_same_block_fees_and_replays_after_restart() {
+        let path = store_path();
+        let producer: AccountId = [0x77; 32];
+        let mut runtime =
+            QRunV05ExecutionRuntime::open_or_create(NETWORK, OWNER, TestAuthenticator, &path)
+                .unwrap();
+        let block = runtime
+            .build_next_fee_block(1, vec![transfer(vec![0x5a])], producer)
+            .unwrap();
+        let summary = runtime.import_fee_block(&block).unwrap();
+
+        assert_eq!(summary.fees_collected, 67);
+        assert_eq!(runtime.height(), 1);
+        assert_eq!(runtime.state().fee_pool(), 0);
+        assert_eq!(runtime.balance_atoms(&producer), 67);
+        assert_eq!(runtime.balance_atoms(&RECIPIENT), 12_345);
+        assert_eq!(
+            runtime.owner_balance_atoms(),
+            MAX_TOTAL_SUPPLY_ATOMS as u64 - 12_345 - 67
+        );
+        assert_eq!(
+            runtime.total_supply_atoms().unwrap(),
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
+        drop(runtime);
+
+        let reopened =
+            QRunV05ExecutionRuntime::open_or_create(NETWORK, OWNER, TestAuthenticator, &path)
+                .unwrap();
+        assert_eq!(reopened.height(), 1);
+        assert_eq!(reopened.retained_block_count(), 1);
+        assert_eq!(reopened.state().fee_pool(), 0);
+        assert_eq!(reopened.balance_atoms(&producer), 67);
+        assert_eq!(reopened.balance_atoms(&RECIPIENT), 12_345);
+        assert_eq!(
+            reopened.total_supply_atoms().unwrap(),
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
+        assert!(matches!(
+            reopened.build_next_block(2, Vec::new()),
+            Err(QRunV05RuntimeError::WrongExecutionMode)
+        ));
+        drop(reopened);
+
+        // Even with a recomputed local checksum, an unknown QRS5 v3 history-kind tag must fail closed.
+        let mut bytes = fs::read(&path).unwrap();
+        let snapshot_len = u32::from_be_bytes(bytes[102..106].try_into().unwrap()) as usize;
+        let first_entry = STORE_HEADER_LEN + snapshot_len;
+        let kind_offset = first_entry + 4;
+        assert_eq!(bytes[kind_offset], 1);
+        bytes[kind_offset] = 0xff;
+        let checksum_offset = bytes.len() - STORE_CHECKSUM_LEN;
+        let checksum = store_checksum(&bytes[..checksum_offset]);
+        bytes[checksum_offset..].copy_from_slice(&checksum);
+        fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            QRunV05ExecutionRuntime::open_or_create(NETWORK, OWNER, TestAuthenticator, &path),
+            Err(QRunV05RuntimeError::InvalidStore)
+        ));
         let _ = fs::remove_file(path);
     }
 

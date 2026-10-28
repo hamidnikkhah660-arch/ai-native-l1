@@ -1,6 +1,6 @@
 # CP-0450 — QRun v0.5 identity and Genesis commitment candidate
 
-**Date:** 2026-10-28  
+**Date:** 2026-10-28
 **Status:** Proposed identity and Genesis commitment are pinned for continued engineering; Mainnet remains **not activated**.
 
 ## Fixed candidate values
