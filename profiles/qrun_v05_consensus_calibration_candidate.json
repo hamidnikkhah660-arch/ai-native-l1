@@ -1,0 +1,56 @@
+{
+  "profile_status": "candidate_single_host_calibrated_not_frozen",
+  "network_profile": "QRun v0.5 / QZXB; candidate identity only",
+  "mainnet_activated": false,
+  "production_consensus_profile_frozen": false,
+  "pow": {
+    "algorithm": "Argon2id-v1.3",
+    "memory_kib": 65536,
+    "iterations": 1,
+    "lanes": 1,
+    "output_bytes": 32
+  },
+  "difficulty": {
+    "target_block_time_seconds": 30,
+    "window_blocks": 2016,
+    "minimum_adjustment_ratio_divisor": 4,
+    "maximum_adjustment_ratio": 4,
+    "pow_limit_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "initial_target_hex": "00c34aaf0f8c0ba80ec4d914373b1f1bff34e587607897b79eb865eaf9c2837c",
+    "initial_target_derivation": "floor((2^256-1)*1000/(median_hashes_per_second_milli*target_block_time_seconds))"
+  },
+  "calibration_evidence": {
+    "bench_command": "cargo run --release --bin cpw_argon2id_pow_benchmark",
+    "scope": "one local Windows development host; seven trials per memory case; eight hashes per trial; warm-up two hashes",
+    "samples": [
+      {
+        "memory_mib": 16,
+        "median_seconds_per_8_hashes": 0.116017,
+        "median_hashes_per_second": 68.955,
+        "hps_mad": 2.245
+      },
+      {
+        "memory_mib": 32,
+        "median_seconds_per_8_hashes": 0.270532,
+        "median_hashes_per_second": 29.571,
+        "hps_mad": 2.363
+      },
+      {
+        "memory_mib": 64,
+        "median_seconds_per_8_hashes": 0.715189,
+        "median_hashes_per_second": 11.186,
+        "hps_mad": 1.105
+      }
+    ],
+    "selected_memory_mib": 64,
+    "selected_median_hashes_per_second_milli": 11186,
+    "selected_hps_mad_milli": 1105,
+    "expected_attempts_at_30_seconds": 335.58,
+    "independent_host_count": 1,
+    "required_independent_host_count": 3,
+    "power_watts_measured": false
+  },
+  "launch_note": "This profile is calibrated against a single host only. Do not use it as a frozen Mainnet consensus profile until at least three independently operated hardware classes are benchmarked, the rule is simulated under rate changes and timestamp attacks, and all runtime producers/importers/replayers enforce the exact same profile.",
+  "post_genesis_minting_enabled": false,
+  "miner_subsidy_atoms_per_block": "0"
+}

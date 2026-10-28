@@ -1295,4 +1295,69 @@ mod tests {
             MAX_TOTAL_SUPPLY_ATOMS
         );
     }
+
+    #[test]
+    fn qrun_v05_full_genesis_history_replays_32_blocks_after_restart() {
+        let dir = TestDir::new();
+        let network = PROPOSED_QRUN_V05_NETWORK_ID;
+        let owner = PROPOSED_OWNER_ACCOUNT_ID;
+        let mut params = params();
+        params.protocol_version = 5;
+        // The minimum legal memory is used only to make the history/restart invariant test fast;
+        // this test is not evidence for mining economics or the production PoW memory profile.
+        params.pow.memory_kib = 8;
+        let clock = FixedClock;
+
+        let mut runtime = QRunV05PowForkRuntime::open(
+            &dir.0,
+            network,
+            owner,
+            params.clone(),
+            &EmptyAuthenticator,
+            &clock,
+        )
+        .unwrap();
+        assert!(runtime.is_qrun_v05_fee_only());
+
+        // Keep a Genesis-rooted archive (rather than relying on a checkpoint) and exercise the
+        // same QFP5 producer/importer path that the full-history restart must replay.
+        for height in 1..=32u64 {
+            let envelope = runtime
+                .mine_candidate(100_000 + height, Vec::new(), &EmptyAuthenticator, 1)
+                .unwrap();
+            runtime
+                .submit_block(&envelope, &EmptyAuthenticator, &clock)
+                .unwrap();
+            assert_eq!(runtime.canonical_height(), height);
+            assert_eq!(
+                runtime.canonical_state().total_value().unwrap(),
+                MAX_TOTAL_SUPPLY_ATOMS
+            );
+        }
+
+        let expected_root = runtime.canonical_state_root();
+        let expected_tip = runtime.canonical_tip();
+        let expected_genesis = runtime.genesis_commitment();
+        assert_eq!(runtime.canonical_height(), 32);
+        drop(runtime);
+
+        let reopened = QRunV05PowForkRuntime::open(
+            &dir.0,
+            network,
+            owner,
+            params,
+            &EmptyAuthenticator,
+            &clock,
+        )
+        .unwrap();
+        assert!(reopened.is_qrun_v05_fee_only());
+        assert_eq!(reopened.canonical_height(), 32);
+        assert_eq!(reopened.canonical_state_root(), expected_root);
+        assert_eq!(reopened.canonical_tip(), expected_tip);
+        assert_eq!(reopened.genesis_commitment(), expected_genesis);
+        assert_eq!(
+            reopened.canonical_state().total_value().unwrap(),
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
+    }
 }
