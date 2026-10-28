@@ -150,7 +150,7 @@ fn parse_config() -> Result<Config, String> {
 Local test: qrun_v05_pow_local_node --local-testnet --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH\n\
 Public alpha: qrun_v05_pow_local_node --public-alpha --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH --noise-private-key-file NPK1\n\
 P2P uses --block-listen 0.0.0.0:49341 in public-alpha mode; RPC and transaction ingress remain loopback-only. Optional outbound peers use repeated --peer IP:PORT; optionally provide one --peer-static-public-key-hex HEX64 per configured peer to pin them.\n\
-Public alpha uses the measured QRun v0.5 candidate profile, accepts encrypted Noise sessions from inbound peers without requiring identity pins, validates every block using the shared network/profile and consensus rules, and keeps CAS optional. Unpinned Noise peers are not independently identity-authenticated; use optional seed pins for that property. It is experimental and is not a claim of production readiness."
+Public alpha uses the measured QRun v0.5 candidate profile. Its 10B Genesis supply is credited to --owner-account-id-hex; custom wallet Genesis uses a distinct network ID and produces distinct Genesis/profile IDs. Every peer must use the same network ID, owner account/public key, Genesis and profile. Inbound Noise sessions are encrypted but unpinned peers are not independently identity-authenticated; use seed pins for that property. CAS remains optional. Experimental only; not Mainnet."
         );
         return Err("__help__".into());
     }
@@ -1454,19 +1454,14 @@ fn run(config: Config) -> Result<(), String> {
     )
     .map_err(|error| format!("configure Ed25519 authenticator: {error:?}"))?;
 
-    // The local-testnet mode deliberately keeps its trivial target and reduced memory for fast
-    // smoke tests. Public-alpha must use the separate measured QRun v0.5 candidate profile and
-    // may only run with the exact committed network and Genesis owner identity.
+    // Local-testnet keeps its trivial target and reduced memory for fast smoke tests. Public-alpha
+    // always uses the calibrated QRun v0.5 consensus profile. A wallet-bound Genesis may use a
+    // custom network ID and owner account; those inputs deterministically change the Genesis and
+    // profile IDs, so every peer must be configured with the same values to join the same chain.
     let qrun_v05_identity = config.network_id
         == ai_native_l1_pow_bench::qrun_v05_profile_identity_candidate::PROPOSED_QRUN_V05_NETWORK_ID
         && config.owner_account
             == ai_native_l1_pow_bench::qrun_v05_profile_identity_candidate::PROPOSED_OWNER_ACCOUNT_ID;
-    if config.public_alpha && !qrun_v05_identity {
-        return Err(
-            "--public-alpha only supports the exact proposed QRun v0.5 network and Genesis owner"
-                .into(),
-        );
-    }
     if config.public_alpha && config.noise_private_key_file.is_none() {
         return Err("--public-alpha requires the network-bound Noise static key".into());
     }
