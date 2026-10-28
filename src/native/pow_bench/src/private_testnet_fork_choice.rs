@@ -99,6 +99,7 @@ struct StoredBranch {
 enum ForkChoiceExecutionMode {
     LegacyPtb2,
     QRunV05FeeOnly,
+    QRunV05FeeCheckpoint([u8; 32]),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,8 +131,7 @@ impl PrivateTestnetForkChoice {
         })
     }
 
-    /// Genesis-rooted QRun profile: QFP5/QFB5 only. Checkpoint import is intentionally not
-    /// exposed for this profile until profile-bound QFP5 checkpoint/replay support is complete.
+    /// Genesis-rooted QRun profile: QFP5/QFB5 only. The exact 10B Genesis is frozen.
     pub fn new_qrun_v05_fee_only(
         genesis: LedgerState,
         params: ConsensusParameters,
@@ -176,6 +176,43 @@ impl PrivateTestnetForkChoice {
             reorg_count: 0,
             execution_mode: ForkChoiceExecutionMode::LegacyPtb2,
         })
+    }
+
+    /// Restore a QFP5 suffix only from a previously decoded QRCP checkpoint. The caller must
+    /// authenticate the QRCP bytes/commitment against an independent anchor before using this API.
+    pub fn new_qrun_v05_fee_only_from_checkpoint(
+        base_state: LedgerState,
+        params: ConsensusParameters,
+        base_chain: PrivateTestnetChain,
+        checkpoint_commitment: [u8; 32],
+    ) -> Result<Self, ForkChoiceError> {
+        if params.protocol_version != 5 {
+            return Err(ForkChoiceError::ConsensusProfileMismatch);
+        }
+        if checkpoint_commitment == [0; 32]
+            || base_state.network_id()
+                != crate::qrun_v05_profile_identity_candidate::PROPOSED_QRUN_V05_NETWORK_ID
+            || base_chain.state() != &base_state
+            || base_state.height() == 0
+            || base_state.total_value().ok() != Some(crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS)
+            || !base_chain.uses_qrun_v05_fee_only_execution()
+            || crate::qrun_v05_checkpoint_candidate::qrun_consensus_profile_fingerprint(&params)
+                .is_err()
+        {
+            return Err(ForkChoiceError::GenesisProfileMismatch);
+        }
+        let frozen = crate::qrun_v05_profile_identity_candidate::build_candidate_genesis()
+            .map_err(|_| ForkChoiceError::GenesisProfileMismatch)?;
+        if frozen.commitment()
+            != crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT
+        {
+            return Err(ForkChoiceError::GenesisProfileMismatch);
+        }
+        let mut choice = Self::from_base_chain(base_state, params, base_chain)
+            .map_err(ForkChoiceError::InvalidPow)?;
+        choice.execution_mode =
+            ForkChoiceExecutionMode::QRunV05FeeCheckpoint(checkpoint_commitment);
+        Ok(choice)
     }
 
     pub fn canonical_chain(&self) -> &PrivateTestnetChain {
@@ -348,9 +385,12 @@ impl PrivateTestnetForkChoice {
         historical_replay: bool,
     ) -> Result<ForkChoiceOutcome, ForkChoiceError> {
         let candidate = decode_candidate_network_block(envelope).map_err(ForkChoiceError::Wire)?;
-        if (candidate.fee_block.is_some())
-            != (self.execution_mode == ForkChoiceExecutionMode::QRunV05FeeOnly)
-        {
+        let qrun_mode = matches!(
+            self.execution_mode,
+            ForkChoiceExecutionMode::QRunV05FeeOnly
+                | ForkChoiceExecutionMode::QRunV05FeeCheckpoint(_)
+        );
+        if candidate.fee_block.is_some() != qrun_mode {
             return Err(ForkChoiceError::ExecutionModeMismatch);
         }
         let maximum_segment_height = self
@@ -393,7 +433,8 @@ impl PrivateTestnetForkChoice {
         };
 
         match (&candidate.fee_block, self.execution_mode, historical_replay) {
-            (Some(fee_block), ForkChoiceExecutionMode::QRunV05FeeOnly, true) => {
+            (Some(fee_block), ForkChoiceExecutionMode::QRunV05FeeOnly, true)
+            | (Some(fee_block), ForkChoiceExecutionMode::QRunV05FeeCheckpoint(_), true) => {
                 parent_chain
                     .append_qrun_v05_fee_historical(
                         fee_block,
@@ -403,7 +444,8 @@ impl PrivateTestnetForkChoice {
                     )
                     .map_err(ForkChoiceError::Consensus)?;
             }
-            (Some(fee_block), ForkChoiceExecutionMode::QRunV05FeeOnly, false) => {
+            (Some(fee_block), ForkChoiceExecutionMode::QRunV05FeeOnly, false)
+            | (Some(fee_block), ForkChoiceExecutionMode::QRunV05FeeCheckpoint(_), false) => {
                 parent_chain
                     .append_qrun_v05_fee_live(
                         fee_block,
@@ -551,6 +593,44 @@ impl PrivateTestnetForkChoice {
         ordered.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
         let expected_count = ordered.len();
         let mut archive = Self::new_qrun_v05_fee_only(genesis, params)?;
+        for (_, _, envelope) in ordered {
+            archive.insert_encoded_internal(&envelope, authenticator, clock, true)?;
+        }
+        if archive.archive_len() != expected_count {
+            return Err(ForkChoiceError::ReplayIncomplete);
+        }
+        Ok(archive)
+    }
+
+    /// Rebuild an externally anchored QRun QRCP checkpoint suffix with QFP5 fee-only replay.
+    pub fn rebuild_qrun_v05_fee_from_checkpoint<A: TransactionAuthenticator>(
+        base_state: LedgerState,
+        params: ConsensusParameters,
+        base_chain: PrivateTestnetChain,
+        checkpoint_commitment: [u8; 32],
+        envelopes: impl IntoIterator<Item = Vec<u8>>,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+    ) -> Result<Self, ForkChoiceError> {
+        let mut ordered = Vec::new();
+        for envelope in envelopes {
+            let decoded =
+                decode_candidate_network_block(&envelope).map_err(ForkChoiceError::Wire)?;
+            if decoded.fee_block.is_none() || decoded.header.height <= base_state.height() {
+                return Err(ForkChoiceError::ExecutionModeMismatch);
+            }
+            let digest =
+                pow_digest(&decoded.header, params.pow).map_err(ForkChoiceError::InvalidPow)?;
+            ordered.push((decoded.header.height, digest, envelope));
+        }
+        ordered.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        let expected_count = ordered.len();
+        let mut archive = Self::new_qrun_v05_fee_only_from_checkpoint(
+            base_state,
+            params,
+            base_chain,
+            checkpoint_commitment,
+        )?;
         for (_, _, envelope) in ordered {
             archive.insert_encoded_internal(&envelope, authenticator, clock, true)?;
         }

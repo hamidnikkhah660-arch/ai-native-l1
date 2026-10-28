@@ -43,6 +43,7 @@ const MAX_MANIFEST_BYTES: usize =
     MANIFEST_FIXED_PREFIX + MAX_FORK_ARCHIVE_BLOCKS * 32 + MANIFEST_CHECKSUM_BYTES;
 const PROFILE_DOMAIN: &[u8] = b"AIN1-PTB2-STORE-PROFILE-V1\0";
 const QRUN_V05_FEE_PROFILE_DOMAIN: &[u8] = b"QRUN-V05-FEE-ONLY-STORE-PROFILE-V1\0";
+const QRUN_V05_FEE_CHECKPOINT_PROFILE_DOMAIN: &[u8] = b"QRUN-V05-FEE-CHECKPOINT-STORE-PROFILE-V1\0";
 const MANIFEST_NAME: &str = "forkstore.manifest";
 const QRUN_PENDING_NAME: &str = "qrun-v05-external-cas.pending";
 const QRUN_PENDING_MAGIC: &[u8; 4] = b"QAP1";
@@ -224,6 +225,13 @@ pub struct QRunV05ExternalCasForkStore<P, V> {
 enum ForkStoreProfile {
     LegacyPtb2,
     QRunV05FeeOnly,
+    QRunV05FeeCheckpoint([u8; 32]),
+}
+
+impl ForkStoreProfile {
+    fn is_qrun_fee_only(self) -> bool {
+        matches!(self, Self::QRunV05FeeOnly | Self::QRunV05FeeCheckpoint(_))
+    }
 }
 
 pub struct PrivateTestnetForkStore {
@@ -323,6 +331,62 @@ impl PrivateTestnetForkStore {
         )
     }
 
+    /// Open a QRun QFP5 PFS2 suffix store rooted at a QRCP checkpoint whose exact commitment and
+    /// monotonic height floor are supplied independently on every open. This constructor does not
+    /// contact the external CAS provider; use the CAS wrapper for value-bearing production work.
+    pub fn open_qrun_v05_fee_only_from_checkpoint<A: TransactionAuthenticator>(
+        directory: impl AsRef<Path>,
+        genesis: LedgerState,
+        params: ConsensusParameters,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+        checkpoint_bytes: &[u8],
+        expected_checkpoint_commitment: [u8; 32],
+        minimum_checkpoint_height: u64,
+        expected_manifest_anchor: Option<[u8; 32]>,
+    ) -> Result<Self, ForkStoreError> {
+        if genesis.network_id()
+            != crate::qrun_v05_profile_identity_candidate::PROPOSED_QRUN_V05_NETWORK_ID
+            || genesis.state_root()
+                != crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_STATE_ROOT
+            || expected_checkpoint_commitment == [0; 32]
+        {
+            return Err(ForkStoreError::ManifestProfileMismatch);
+        }
+        let frozen = crate::qrun_v05_profile_identity_candidate::build_candidate_genesis()
+            .map_err(|_| ForkStoreError::ManifestProfileMismatch)?;
+        if frozen.commitment()
+            != crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT
+        {
+            return Err(ForkStoreError::ManifestProfileMismatch);
+        }
+        let mut base_chain =
+            crate::qrun_v05_checkpoint_candidate::QRunV05PowCheckpoint::restore_chain_anchored(
+                checkpoint_bytes,
+                &genesis.network_id(),
+                &crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT,
+                &params,
+                expected_checkpoint_commitment,
+                minimum_checkpoint_height,
+            )
+            .map_err(|_| ForkStoreError::ManifestAnchorMismatch)?;
+        base_chain
+            .enable_qrun_v05_fee_only_execution()
+            .map_err(|_| ForkStoreError::ManifestProfileMismatch)?;
+        let checkpoint_commitment = expected_checkpoint_commitment;
+        let base_state = base_chain.state().clone();
+        Self::open_inner(
+            directory,
+            base_state,
+            params,
+            authenticator,
+            clock,
+            expected_manifest_anchor,
+            Some(base_chain),
+            ForkStoreProfile::QRunV05FeeCheckpoint(checkpoint_commitment),
+        )
+    }
+
     /// Open a bounded suffix store rooted at a previously authenticated checkpoint chain.
     /// Persist the checkpoint record/commitment separately and supply it again on every restart.
     pub fn open_from_base_chain<A: TransactionAuthenticator>(
@@ -381,8 +445,14 @@ impl PrivateTestnetForkStore {
         mut preopen_recovery: Option<&mut dyn FnMut(&Path) -> Result<(), ForkStoreError>>,
     ) -> Result<Self, ForkStoreError> {
         params.validate()?;
-        if profile == ForkStoreProfile::QRunV05FeeOnly && base_chain.is_some() {
-            return Err(ForkStoreError::ManifestProfileMismatch);
+        match profile {
+            ForkStoreProfile::QRunV05FeeOnly if base_chain.is_some() => {
+                return Err(ForkStoreError::ManifestProfileMismatch);
+            }
+            ForkStoreProfile::QRunV05FeeCheckpoint(_) if base_chain.is_none() => {
+                return Err(ForkStoreError::ManifestProfileMismatch);
+            }
+            _ => {}
         }
         let directory = directory.as_ref().to_path_buf();
         fs::create_dir_all(&directory)?;
@@ -396,18 +466,33 @@ impl PrivateTestnetForkStore {
             ForkStoreProfile::QRunV05FeeOnly => {
                 qrun_v05_fee_profile_fingerprint(&genesis, &params)?
             }
+            ForkStoreProfile::QRunV05FeeCheckpoint(commitment) => {
+                qrun_v05_fee_checkpoint_profile_fingerprint(&genesis, &params, commitment)?
+            }
         };
-        let empty = if profile == ForkStoreProfile::QRunV05FeeOnly {
-            PrivateTestnetForkChoice::new_qrun_v05_fee_only(genesis.clone(), params.clone())?
-        } else {
-            match base_chain.as_ref() {
+        let empty = match profile {
+            ForkStoreProfile::QRunV05FeeOnly => {
+                PrivateTestnetForkChoice::new_qrun_v05_fee_only(genesis.clone(), params.clone())?
+            }
+            ForkStoreProfile::QRunV05FeeCheckpoint(commitment) => {
+                let base = base_chain
+                    .as_ref()
+                    .ok_or(ForkStoreError::ManifestProfileMismatch)?;
+                PrivateTestnetForkChoice::new_qrun_v05_fee_only_from_checkpoint(
+                    genesis.clone(),
+                    params.clone(),
+                    base.clone(),
+                    commitment,
+                )?
+            }
+            ForkStoreProfile::LegacyPtb2 => match base_chain.as_ref() {
                 Some(base) => PrivateTestnetForkChoice::from_base_chain(
                     genesis.clone(),
                     params.clone(),
                     base.clone(),
                 )?,
                 None => PrivateTestnetForkChoice::new(genesis.clone(), params.clone())?,
-            }
+            },
         };
         let genesis_tip = empty.canonical_chain().chain_tip().tip_hash;
         let manifest_path = directory.join(MANIFEST_NAME);
@@ -452,7 +537,7 @@ impl PrivateTestnetForkStore {
                     })?;
                 let decoded =
                     decode_candidate_network_block(&bytes).map_err(ForkStoreError::from_wire)?;
-                if decoded.fee_block.is_some() != (profile == ForkStoreProfile::QRunV05FeeOnly) {
+                if decoded.fee_block.is_some() != profile.is_qrun_fee_only() {
                     return Err(ForkStoreError::ManifestProfileMismatch);
                 }
                 if decoded.header.network_id != genesis.network_id()
@@ -462,16 +547,31 @@ impl PrivateTestnetForkStore {
                 }
                 envelopes.push(bytes);
             }
-            let archive = if profile == ForkStoreProfile::QRunV05FeeOnly {
-                PrivateTestnetForkChoice::rebuild_qrun_v05_fee_from_envelopes(
-                    genesis.clone(),
-                    params.clone(),
-                    envelopes,
-                    authenticator,
-                    clock,
-                )?
-            } else {
-                match base_chain.as_ref() {
+            let archive = match profile {
+                ForkStoreProfile::QRunV05FeeOnly => {
+                    PrivateTestnetForkChoice::rebuild_qrun_v05_fee_from_envelopes(
+                        genesis.clone(),
+                        params.clone(),
+                        envelopes,
+                        authenticator,
+                        clock,
+                    )?
+                }
+                ForkStoreProfile::QRunV05FeeCheckpoint(commitment) => {
+                    let base = base_chain
+                        .as_ref()
+                        .ok_or(ForkStoreError::ManifestProfileMismatch)?;
+                    PrivateTestnetForkChoice::rebuild_qrun_v05_fee_from_checkpoint(
+                        genesis.clone(),
+                        params.clone(),
+                        base.clone(),
+                        commitment,
+                        envelopes,
+                        authenticator,
+                        clock,
+                    )?
+                }
+                ForkStoreProfile::LegacyPtb2 => match base_chain.as_ref() {
                     Some(base) => PrivateTestnetForkChoice::rebuild_from_base_chain(
                         genesis.clone(),
                         params.clone(),
@@ -487,7 +587,7 @@ impl PrivateTestnetForkStore {
                         authenticator,
                         clock,
                     )?,
-                }
+                },
             };
             let replayed_tip = archive.canonical_chain().chain_tip().tip_hash;
             if replayed_tip != manifest.canonical_tip {
@@ -581,7 +681,7 @@ impl PrivateTestnetForkStore {
         clock: &dyn ReferenceTimeProvider,
     ) -> Result<ForkChoiceOutcome, ForkStoreError> {
         let is_qfp5 = envelope.starts_with(b"QFP5");
-        if is_qfp5 != (self.profile == ForkStoreProfile::QRunV05FeeOnly) {
+        if is_qfp5 != self.profile.is_qrun_fee_only() {
             return Err(ForkStoreError::Fork(ForkChoiceError::ExecutionModeMismatch));
         }
         // Validate into an isolated clone first. No durable bytes or visible in-memory state
@@ -986,6 +1086,27 @@ fn qrun_v05_fee_profile_fingerprint(
     let mut canonical = Vec::with_capacity(QRUN_V05_FEE_PROFILE_DOMAIN.len() + 32);
     canonical.extend_from_slice(QRUN_V05_FEE_PROFILE_DOMAIN);
     canonical.extend_from_slice(&legacy_fingerprint);
+    Ok(Sha256::digest(&canonical).into())
+}
+
+fn qrun_v05_fee_checkpoint_profile_fingerprint(
+    base_state: &LedgerState,
+    params: &ConsensusParameters,
+    checkpoint_commitment: [u8; 32],
+) -> Result<[u8; 32], ForkStoreError> {
+    if checkpoint_commitment == [0; 32]
+        || base_state.network_id()
+            != crate::qrun_v05_profile_identity_candidate::PROPOSED_QRUN_V05_NETWORK_ID
+        || base_state.height() == 0
+        || base_state.total_value().ok() != Some(crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS)
+    {
+        return Err(ForkStoreError::ManifestProfileMismatch);
+    }
+    let base_fingerprint = qrun_v05_fee_profile_fingerprint(base_state, params)?;
+    let mut canonical = Vec::with_capacity(QRUN_V05_FEE_CHECKPOINT_PROFILE_DOMAIN.len() + 64);
+    canonical.extend_from_slice(QRUN_V05_FEE_CHECKPOINT_PROFILE_DOMAIN);
+    canonical.extend_from_slice(&checkpoint_commitment);
+    canonical.extend_from_slice(&base_fingerprint);
     Ok(Sha256::digest(&canonical).into())
 }
 
@@ -1788,6 +1909,44 @@ mod tests {
         envelope(parent, params, timestamp, nonce)
     }
 
+    fn qrun_fee_envelope_from_chain(
+        chain: &crate::private_testnet_driver::PrivateTestnetChain,
+        params: &ConsensusParameters,
+        producer: [u8; 32],
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let mut fee_block = crate::state_machine::QRunV05FeeBlock {
+            body: Block {
+                height: chain.state().height() + 1,
+                timestamp,
+                parent_hash: chain.state().tip_hash(),
+                state_root: [0; 32],
+                transactions: Vec::new(),
+            },
+            producer,
+        };
+        fee_block.body.state_root = chain
+            .state()
+            .preview_qrun_v05_fee_state_root_after(&fee_block, &EmptyAuthenticator)
+            .unwrap();
+        let header = PowHeader {
+            protocol_version: params.protocol_version,
+            network_id: chain.state().network_id(),
+            height: fee_block.body.height,
+            timestamp: fee_block.body.timestamp,
+            parent_hash: fee_block.body.parent_hash,
+            previous_consensus_hash: chain.chain_tip().tip_hash,
+            state_root: crate::qrun_v05_fee_pow_wire_candidate::qrun_v05_fee_pow_state_commitment(
+                &fee_block,
+            )
+            .unwrap(),
+            target: chain.expected_target(None).unwrap(),
+            nonce: 0,
+        };
+        crate::qrun_v05_fee_pow_wire_candidate::encode_qrun_v05_fee_pow_block(&header, &fee_block)
+            .unwrap()
+    }
+
     fn qrun_fee_envelope(genesis: &LedgerState, params: &ConsensusParameters) -> Vec<u8> {
         let chain = crate::private_testnet_driver::PrivateTestnetChain::new(
             genesis.clone(),
@@ -1823,6 +1982,156 @@ mod tests {
         };
         crate::qrun_v05_fee_pow_wire_candidate::encode_qrun_v05_fee_pow_block(&header, &fee_block)
             .unwrap()
+    }
+
+    #[test]
+    fn qrun_checkpoint_pfs2_reopens_only_from_exact_external_commitment_and_replays_qfp5_suffix() {
+        let dir = TestDir::new();
+        let genesis_candidate =
+            crate::qrun_v05_profile_identity_candidate::build_candidate_genesis().unwrap();
+        let genesis = genesis_candidate.ledger().clone();
+        let mut params = params();
+        params.protocol_version = 5;
+        params.target_block_time_secs = 1;
+        params.initial_target = Uint256::MAX;
+        params.pow_limit = Uint256::MAX;
+
+        let first = qrun_fee_envelope(&genesis, &params);
+        let mut genesis_archive =
+            PrivateTestnetForkChoice::new_qrun_v05_fee_only(genesis.clone(), params.clone())
+                .unwrap();
+        genesis_archive
+            .insert_encoded(&first, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+        let checkpoint_chain = genesis_archive.canonical_chain().clone();
+        assert_eq!(checkpoint_chain.state().height(), 1);
+        assert_eq!(
+            checkpoint_chain.state().total_value().unwrap(),
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+        );
+
+        let checkpoint = crate::qrun_v05_checkpoint_candidate::QRunV05PowCheckpoint::capture(
+            genesis.network_id(),
+            crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT,
+            &params,
+            &checkpoint_chain,
+            [0xC7; 32],
+        )
+        .unwrap();
+        let checkpoint_bytes = checkpoint.encode(&params).unwrap();
+        let checkpoint_commitment = checkpoint.commitment(&params).unwrap();
+        assert_ne!(checkpoint_commitment, [0; 32]);
+
+        let restored_chain =
+            crate::qrun_v05_checkpoint_candidate::QRunV05PowCheckpoint::restore_chain_anchored(
+                &checkpoint_bytes,
+                &genesis.network_id(),
+                &crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT,
+                &params,
+                checkpoint_commitment,
+                1,
+            )
+            .unwrap();
+        assert_eq!(restored_chain.state(), checkpoint_chain.state());
+        assert!(!restored_chain.uses_qrun_v05_fee_only_execution());
+
+        let mut store = PrivateTestnetForkStore::open_qrun_v05_fee_only_from_checkpoint(
+            &dir.0,
+            genesis.clone(),
+            params.clone(),
+            &EmptyAuthenticator,
+            &FixedClock,
+            &checkpoint_bytes,
+            checkpoint_commitment,
+            1,
+            None,
+        )
+        .unwrap();
+        assert_eq!(store.canonical_height(), 1);
+        let next = qrun_fee_envelope_from_chain(
+            store.archive().canonical_chain(),
+            &params,
+            [0x78; 32],
+            101,
+        );
+        store
+            .submit(&next, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+        assert_eq!(store.canonical_height(), 2);
+        assert_eq!(
+            store
+                .archive()
+                .canonical_chain()
+                .state()
+                .total_value()
+                .unwrap(),
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+        );
+        let anchor = store.manifest_anchor().unwrap();
+        drop(store);
+
+        let reopened = PrivateTestnetForkStore::open_qrun_v05_fee_only_from_checkpoint(
+            &dir.0,
+            genesis.clone(),
+            params.clone(),
+            &EmptyAuthenticator,
+            &FixedClock,
+            &checkpoint_bytes,
+            checkpoint_commitment,
+            1,
+            Some(anchor),
+        )
+        .unwrap();
+        assert_eq!(reopened.canonical_height(), 2);
+        assert_eq!(
+            reopened
+                .archive()
+                .canonical_chain()
+                .state()
+                .total_value()
+                .unwrap(),
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+        );
+        assert_eq!(
+            reopened
+                .archive()
+                .canonical_chain()
+                .state()
+                .account(&crate::qrun_v05_profile_identity_candidate::PROPOSED_OWNER_ACCOUNT_ID)
+                .unwrap()
+                .balance,
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS as u64
+        );
+
+        let mut wrong_commitment = checkpoint_commitment;
+        wrong_commitment[0] ^= 1;
+        let wrong_dir = TestDir::new();
+        assert!(matches!(
+            PrivateTestnetForkStore::open_qrun_v05_fee_only_from_checkpoint(
+                &wrong_dir.0,
+                genesis.clone(),
+                params.clone(),
+                &EmptyAuthenticator,
+                &FixedClock,
+                &checkpoint_bytes,
+                wrong_commitment,
+                1,
+                None,
+            ),
+            Err(ForkStoreError::ManifestAnchorMismatch)
+        ));
+
+        drop(reopened);
+        assert!(matches!(
+            PrivateTestnetForkStore::open(
+                &dir.0,
+                genesis,
+                params,
+                &EmptyAuthenticator,
+                &FixedClock,
+            ),
+            Err(ForkStoreError::ManifestProfileMismatch)
+        ));
     }
 
     #[test]

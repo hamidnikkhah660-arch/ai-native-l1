@@ -636,6 +636,23 @@ impl PrivateTestnetChain {
         self.monetary_state.as_ref()
     }
 
+    pub(crate) fn uses_qrun_v05_fee_only_execution(&self) -> bool {
+        matches!(self.execution_mode, ChainExecutionMode::QRunV05FeeOnly)
+    }
+    pub(crate) fn enable_qrun_v05_fee_only_execution(&mut self) -> Result<(), String> {
+        if self.execution_mode != ChainExecutionMode::Legacy
+            || self.monetary_state.is_some()
+            || self.state.height() == 0
+            || self.state.network_id()
+                != crate::qrun_v05_profile_identity_candidate::PROPOSED_QRUN_V05_NETWORK_ID
+            || self.state.total_value().ok() != Some(crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS)
+        {
+            return Err("checkpoint chain does not match the QRun v0.5 fee-only profile".into());
+        }
+        self.execution_mode = ChainExecutionMode::QRunV05FeeOnly;
+        Ok(())
+    }
+
     pub fn state(&self) -> &LedgerState {
         &self.state
     }
