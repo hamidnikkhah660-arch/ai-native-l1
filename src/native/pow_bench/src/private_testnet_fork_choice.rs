@@ -62,7 +62,7 @@ impl std::fmt::Display for ForkChoiceError {
             ),
             Self::GenesisProfileMismatch => write!(
                 f,
-                "QRun fee-only mode requires the exact frozen 10B Genesis identity and state root"
+                "QRun fee-only mode requires a height-zero single-account Genesis with the fixed 10B supply"
             ),
             Self::ConsensusProfileMismatch => write!(
                 f,
@@ -131,7 +131,8 @@ impl PrivateTestnetForkChoice {
         })
     }
 
-    /// Genesis-rooted QRun profile: QFP5/QFB5 only. The exact 10B Genesis is frozen.
+    /// Genesis-rooted QRun profile: QFP5/QFB5 only. Network and owner are bound by the
+    /// supplied Genesis ledger; the selected consensus profile fixes the 10B cap and rules.
     pub fn new_qrun_v05_fee_only(
         genesis: LedgerState,
         params: ConsensusParameters,
@@ -139,16 +140,9 @@ impl PrivateTestnetForkChoice {
         if params.protocol_version != 5 {
             return Err(ForkChoiceError::ConsensusProfileMismatch);
         }
-        let frozen = crate::qrun_v05_profile_identity_candidate::build_candidate_genesis()
-            .map_err(|_| ForkChoiceError::GenesisProfileMismatch)?;
         if genesis.height() != 0
-            || genesis.network_id()
-                != crate::qrun_v05_profile_identity_candidate::PROPOSED_QRUN_V05_NETWORK_ID
-            || genesis.state_root()
-                != crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_STATE_ROOT
-            || frozen.state_root() != genesis.state_root()
-            || frozen.commitment()
-                != crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT
+            || genesis.account_count() != 1
+            || genesis.total_value().ok() != Some(crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS)
         {
             return Err(ForkChoiceError::GenesisProfileMismatch);
         }

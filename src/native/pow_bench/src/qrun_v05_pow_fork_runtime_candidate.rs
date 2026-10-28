@@ -269,12 +269,10 @@ impl QRunV05PowForkRuntime {
             });
         }
         let genesis_commitment = genesis.commitment();
-        let proposed_qrun_identity = network_id == PROPOSED_QRUN_V05_NETWORK_ID
-            && owner_account == PROPOSED_OWNER_ACCOUNT_ID;
-        if params.protocol_version == 5 && !proposed_qrun_identity {
-            return Err(QRunV05PowRuntimeError::WrongNetwork);
-        }
-        let fee_only = params.protocol_version == 5 && proposed_qrun_identity;
+        // Protocol v5 is the QFP5 fee-only execution profile for the supplied Genesis. The
+        // network ID and owner are committed by Genesis and must match across peers, but they
+        // are not hard-coded to the earlier proposed owner account.
+        let fee_only = params.protocol_version == 5;
         if fee_only && base_chain.is_some() {
             return Err(QRunV05PowRuntimeError::InvalidCandidate(
                 "QRun checkpoint-rooted startup must use the QFP5 checkpoint-store API".into(),
@@ -794,6 +792,34 @@ mod tests {
         encode_candidate_network_block(&header, &block).unwrap()
     }
 
+    #[test]
+    fn wallet_bound_genesis_is_accepted_and_credits_full_supply() {
+        let dir = TestDir::new();
+        let network = [0x8b; 32];
+        let owner = [0xa1; 32];
+        let mut params = params();
+        params.protocol_version = 5;
+        let runtime = QRunV05PowForkRuntime::open(
+            &dir.0,
+            network,
+            owner,
+            params,
+            &EmptyAuthenticator,
+            &FixedClock,
+        )
+        .expect("a custom wallet-bound Genesis is valid under the configured QFP5 profile");
+        assert!(runtime.is_qrun_v05_fee_only());
+        assert_eq!(runtime.canonical_height(), 0);
+        assert_eq!(runtime.canonical_state().account_count(), 1);
+        assert_eq!(
+            runtime.canonical_state().account(&owner).unwrap().balance as u128,
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
+        assert_eq!(
+            runtime.canonical_state().total_value().unwrap(),
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
+    }
     #[test]
     fn qrun_fee_only_runtime_mines_submits_and_replays_qfp5_blocks() {
         let dir = TestDir::new();

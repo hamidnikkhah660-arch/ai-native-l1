@@ -2,7 +2,7 @@
 
 ## Status
 
-The QZXB wallet file was created locally and the node binary was rebuilt with support for a wallet-specific public-alpha Genesis owner. The node binary build succeeded and the `qrun_v05_pow_local_node` test target passed 11/11 tests. Runtime startup against this newly generated wallet and its balance query remain unverified in this run; do not describe this wallet balance as independently verified yet. Mainnet remains disabled.
+The QZXB wallet file was created locally and the node binary was rebuilt with support for a wallet-specific public-alpha Genesis owner. The node binary build succeeded and the `qrun_v05_pow_local_node` test target passed 11/11 tests. Runtime startup and the balance query were subsequently verified against the wallet-specific network identity. The wallet CLI reported `wallet_rpc_balance_status=ok`, `balance_atoms=1000000000000000000`, `height=0`, and `network_class=candidate_not_mainnet`. This verifies the local node genesis state and read-only balance path; it does not verify an Internet-connected peer or activate Mainnet. Mainnet remains disabled.
 
 ## Local wallet identity
 
@@ -28,8 +28,8 @@ Because the owner/network values differ, this wallet-bound network has a differe
 
 The QRun v0.5 Genesis runtime credits the fixed total supply of `1,000,000,000,000,000,000` atoms (10 billion QZXB at 8 decimals) to the configured Genesis owner. There is no subsequent issuance and the block subsidy is zero. This is an owner pre-allocation model, not Bitcoin's miner-reward issuance schedule. Even after local balance verification, this is experimental public-alpha state, not a live Mainnet or a claim of market value.
 
-## Verification still required
+## Local verification completed
 
-1. Launch the rebuilt public-alpha node with the wallet-derived account/public key, this wallet-bound network ID, and a fresh data directory.
-2. Verify the emitted Genesis owner and total supply, then run `qzxb_wallet balance` against `127.0.0.1:49339` for the wallet account ID.
-3. Keep RPC (`49339`) and transaction ingress (`49340`) on loopback. Only P2P (`49341`) may be exposed.
+1. A rebuilt public-alpha node was launched with the wallet-derived account/public key, this wallet-bound network ID, a matching DPAPI-protected Noise key, and fresh data directory `C:\QRun\wallet-bound-genesis-data-v3`.
+2. Verified from the node startup output: Genesis owner equals the wallet account, owner balance and total supply are `1000000000000000000` atoms, and height is zero. The `qzxb_wallet balance` command against `127.0.0.1:49339` returned the same balance, account ID, and state root.
+3. Observed listeners: RPC `127.0.0.1:49339`, transaction ingress `127.0.0.1:49340`, and P2P `0.0.0.0:49341`. No independent peer is connected (`block_peer_count=0`); inbound Internet reachability remains unverified. Keep RPC and transaction ingress loopback-only.
