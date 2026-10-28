@@ -3,6 +3,7 @@
 **QRun** is the brand and public-facing name of the native Layer-1 project; the native coin ticker is **QZXB**, and the network name is **QRun Blockchain**. QZXB expands to **Quantum Zeta eXecution Blockchain** (Q = Quantum, Z = Zeta, X = eXecution, B = Blockchain). The Persian brand reading is «کیوران». The source combines a Rust-native ledger research programme, deterministic state/recovery candidates, ML-DSA-65 and hybrid-identity research, an isolated EVM/revm smart-contract laboratory, and a roadmap toward an AI-native developer ecosystem.
 
 - **Official naming and brand usage:** [CP-0464 QRun / QZXB Brand Identity](docs/CP-0464_QRUN_QZXB_BRAND_IDENTITY_2026-10-29.md)
+- **Mainnet/public-trading release decision:** [CP-0465 QRun Mainnet and QZXB/USDT Go/No-Go](docs/CP-0465_QRUN_MAINNET_PUBLIC_TRADING_NO_GO_2026-10-29.md) — current candidate is not released as public Mainnet and no QZXB/USDT market is verified.
 
 - **Global project site:** https://hamidnikkhah660-arch.github.io/ai-native-l1/
 - **Source and contribution issues:** https://github.com/hamidnikkhah660-arch/ai-native-l1

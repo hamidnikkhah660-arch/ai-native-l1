@@ -1,9 +1,11 @@
-//! QRun v0.5 local-loopback PoW integration node.
+//! QRun v0.5 candidate PoW integration node for local-testnet and experimental public-alpha.
 //!
-//! This is an executable integration harness for the QRun v0.5 Genesis-bound runtime and the
-//! existing QZXB wallet TXN2/QZTS/1 + read-only HTTP RPC protocols. It is deliberately restricted
-//! to loopback, labelled test-only, and cannot claim Mainnet status. It uses persistent PoW fork choice with a deliberately trivial local-only smoke target.
-//! It is not a public-network consensus profile.
+//! This executable integrates the Genesis-bound candidate runtime with QZXB wallet TXN2/QZTS/1
+//! and read-only HTTP RPC. Local-testnet uses a deliberately trivial smoke target and is loopback-only.
+//! Public-alpha permits a public P2P listener, but is experimental and is not Mainnet. The `--mainnet`
+//! path has additional P2P/identity guards and a source-level release gate that MUST remain closed
+//! until production consensus, full-history recovery, independent-operator validation and review pass.
+//! This binary is not a production-certified public-network release.
 use ai_native_l1_pow_bench::chain_admission::SystemClockReferenceTime;
 use ai_native_l1_pow_bench::consensus::{ConsensusParameters, PowAlgorithm, Uint256};
 use ai_native_l1_pow_bench::noise_key_provisioning::load_protected_noise_private_key;
@@ -70,6 +72,17 @@ const QZXB_MAINNET_PROFILE_ID_HEX: &str =
     "75596fa188dc308088efc6b138e9fcd50be6de82ec2bc117c13e81d7eebfdb09";
 const QZXB_MAINNET_STATE_ROOT_HEX: &str =
     "a44e545c2cd8fa4e56e228f4f242cbf5445b1cc983c7b1f8fe89c5b42aef88d7";
+
+// Keep production activation disabled until each independent release gate has evidence. This is
+// intentionally not a CLI flag: an operator must not be able to bypass unimplemented protocol
+// guarantees by adding an argument or pointing at a convenient peer.
+const QRUN_MAINNET_RELEASE_APPROVED: bool = false;
+const QRUN_MAINNET_RELEASE_BLOCKERS: &[&str] = &[
+    "production consensus profile is not frozen and proven by at least three independent operators",
+    "full-history validation/recovery and independently verifiable checkpoint rollover are not integrated",
+    "adversarial multi-host restart/reorg/partition/transaction-relay tests and independent security review are incomplete",
+    "the exhaustive locked all-target test suite has not completed successfully for this release candidate",
+];
 
 #[derive(Clone)]
 struct Receipt {
@@ -189,6 +202,16 @@ fn validate_sync_start_config(
         );
     }
     Ok(())
+}
+
+fn validate_mainnet_release_gate(enabled: bool) -> Result<(), String> {
+    if !enabled || QRUN_MAINNET_RELEASE_APPROVED {
+        return Ok(());
+    }
+    Err(format!(
+        "--mainnet is disabled by the QRun production release gate; do not bypass it. Unresolved: {}",
+        QRUN_MAINNET_RELEASE_BLOCKERS.join("; ")
+    ))
 }
 
 fn validate_mainnet_p2p_requirements(
@@ -319,7 +342,7 @@ fn parse_config() -> Result<Config, String> {
 Local test: qrun_v05_pow_local_node --local-testnet --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH\n\
 Public alpha: qrun_v05_pow_local_node --public-alpha --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH --noise-private-key-file NPK1\n\
 Mainnet: qrun_v05_pow_local_node --mainnet --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH --noise-private-key-file NPK1 --peer IP:PORT --peer-static-public-key-hex HEX64 --sync-on-start true\n\
-Mainnet requires --sync-on-start true, at least one non-loopback --peer, a matching --peer-static-public-key-hex pin for every peer, and frozen Genesis/profile/state-root/supply checks before the node reports Mainnet. RPC and transaction ingress stay loopback-only."
+Mainnet also requires --sync-on-start true, non-loopback pinned peers, and frozen identity checks. RPC/transaction ingress stay loopback-only. IMPORTANT: this candidate build keeps --mainnet blocked until production consensus, full-history recovery, independent-operator validation, and security/release tests are complete."
         );
         return Err("__help__".into());
     }
@@ -332,6 +355,8 @@ Mainnet requires --sync-on-start true, at least one non-loopback --peer, a match
             "choose exactly one mode: --local-testnet, --public-alpha, or --mainnet".into(),
         );
     }
+    // Run before parsing paths, reading protected keys, creating data directories, or binding sockets.
+    validate_mainnet_release_gate(mainnet)?;
     let public_network = public_alpha_mode || mainnet;
     if args
         .iter()
@@ -1937,6 +1962,15 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn mainnet_release_gate_fails_closed_without_source_approval() {
+        assert!(validate_mainnet_release_gate(false).is_ok());
+        let error = validate_mainnet_release_gate(true).unwrap_err();
+        assert!(error.contains("--mainnet is disabled by the QRun production release gate"));
+        assert!(error.contains("full-history validation/recovery"));
+        assert!(error.contains("three independent operators"));
+    }
 
     #[test]
     fn mainnet_requires_pinned_external_seed_before_activation() {
