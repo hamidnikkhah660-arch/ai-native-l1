@@ -118,14 +118,49 @@ impl QRunV05NoiseSession {
         network_id: &[u8; 32],
         profile_id: &[u8; 32],
     ) -> Result<Self, QRunV05NoiseError> {
-        validate_private_and_network(local_static_private_key, network_id)?;
-        validate_profile_id(profile_id)?;
         if trusted_remote_static_public_key
             .iter()
             .all(|byte| *byte == 0)
         {
             return Err(QRunV05NoiseError::UntrustedPeer);
         }
+        Self::connect_with_policy(
+            stream,
+            local_static_private_key,
+            Some(trusted_remote_static_public_key),
+            network_id,
+            profile_id,
+        )
+    }
+
+    /// Bitcoin-style public-P2P initiator: establishes an encrypted Noise session bound to the
+    /// exact network and consensus profile without requiring a preconfigured remote-key pin.
+    /// The remote key is learned from the authenticated Noise transcript; all received blocks
+    /// must still pass normal consensus validation. Do not use this for RPC or CAS receipts.
+    pub fn connect_public(
+        stream: &mut TcpStream,
+        local_static_private_key: &[u8; 32],
+        network_id: &[u8; 32],
+        profile_id: &[u8; 32],
+    ) -> Result<Self, QRunV05NoiseError> {
+        Self::connect_with_policy(
+            stream,
+            local_static_private_key,
+            None,
+            network_id,
+            profile_id,
+        )
+    }
+
+    fn connect_with_policy(
+        stream: &mut TcpStream,
+        local_static_private_key: &[u8; 32],
+        expected_remote_static_public_key: Option<&[u8; 32]>,
+        network_id: &[u8; 32],
+        profile_id: &[u8; 32],
+    ) -> Result<Self, QRunV05NoiseError> {
+        validate_private_and_network(local_static_private_key, network_id)?;
+        validate_profile_id(profile_id)?;
         let deadline = Instant::now() + HANDSHAKE_BUDGET;
         apply_timeouts(stream, deadline).map_err(io_error)?;
         let params = noise_params()?;
@@ -154,8 +189,13 @@ impl QRunV05NoiseSession {
         let remote = handshake
             .get_remote_static()
             .ok_or(QRunV05NoiseError::MalformedHandshake)?;
-        if remote != trusted_remote_static_public_key {
-            return Err(QRunV05NoiseError::UntrustedPeer);
+        if let Some(expected) = expected_remote_static_public_key {
+            if remote != expected {
+                return Err(QRunV05NoiseError::UntrustedPeer);
+            }
+        }
+        if remote.iter().all(|byte| *byte == 0) {
+            return Err(QRunV05NoiseError::MalformedHandshake);
         }
         let mut remote_static_public_key = [0u8; 32];
         remote_static_public_key.copy_from_slice(remote);
@@ -182,9 +222,51 @@ impl QRunV05NoiseSession {
         network_id: &[u8; 32],
         profile_id: &[u8; 32],
     ) -> Result<Self, QRunV05NoiseError> {
+        Self::accept_with_policy(
+            stream,
+            local_static_private_key,
+            trusted_remote_static_public_keys,
+            network_id,
+            profile_id,
+            true,
+        )
+    }
+
+    /// Bitcoin-style inbound peer mode: authenticate the Noise transcript, network ID and profile,
+    /// but do not require an out-of-band identity pin for the remote node. This is appropriate
+    /// only for a public PoW P2P listener whose blocks are fully validated by consensus; it must
+    /// never be used for RPC authorization or trusted checkpoint/CAS receipt signatures.
+    pub fn accept_public(
+        stream: &mut TcpStream,
+        local_static_private_key: &[u8; 32],
+        network_id: &[u8; 32],
+        profile_id: &[u8; 32],
+    ) -> Result<Self, QRunV05NoiseError> {
+        Self::accept_with_policy(
+            stream,
+            local_static_private_key,
+            &[],
+            network_id,
+            profile_id,
+            false,
+        )
+    }
+
+    fn accept_with_policy(
+        stream: &mut TcpStream,
+        local_static_private_key: &[u8; 32],
+        trusted_remote_static_public_keys: &[[u8; 32]],
+        network_id: &[u8; 32],
+        profile_id: &[u8; 32],
+        require_trusted_key: bool,
+    ) -> Result<Self, QRunV05NoiseError> {
         validate_private_and_network(local_static_private_key, network_id)?;
         validate_profile_id(profile_id)?;
-        validate_trust_set(trusted_remote_static_public_keys)?;
+        if require_trusted_key {
+            validate_trust_set(trusted_remote_static_public_keys)?;
+        } else if trusted_remote_static_public_keys.len() > MAX_TRUSTED_PEERS {
+            return Err(QRunV05NoiseError::OversizedTrustSet);
+        }
         let deadline = Instant::now() + HANDSHAKE_BUDGET;
         apply_timeouts(stream, deadline).map_err(io_error)?;
         let params = noise_params()?;
@@ -220,11 +302,15 @@ impl QRunV05NoiseSession {
         let remote = handshake
             .get_remote_static()
             .ok_or(QRunV05NoiseError::MalformedHandshake)?;
-        if !trusted_remote_static_public_keys
-            .iter()
-            .any(|key| key.as_slice() == remote)
+        if require_trusted_key
+            && !trusted_remote_static_public_keys
+                .iter()
+                .any(|key| key.as_slice() == remote)
         {
             return Err(QRunV05NoiseError::UntrustedPeer);
+        }
+        if remote.iter().all(|byte| *byte == 0) {
+            return Err(QRunV05NoiseError::MalformedHandshake);
         }
         let mut remote_static_public_key = [0u8; 32];
         remote_static_public_key.copy_from_slice(remote);
@@ -711,6 +797,45 @@ mod tests {
             .write_record(&mut stream, b"PTB2-PFS2-TEST-ENVELOPE")
             .unwrap();
         assert_eq!(session.read_record(&mut stream).unwrap(), b"PTA2-ACK");
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn public_inbound_noise_accepts_unpinned_peer_but_binds_network_and_profile() {
+        let network = [0x62; 32];
+        let profile = [0x72; 32];
+        let (server_private, _server_public) = keypair(31);
+        let (client_private, client_public) = keypair(32);
+        let (listener, address) = listener();
+        let server_thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut session = QRunV05NoiseSession::accept_public(
+                &mut stream,
+                &server_private,
+                &network,
+                &profile,
+            )
+            .unwrap();
+            assert_eq!(session.remote_static_public_key(), &client_public);
+            let request = session.read_record(&mut stream).unwrap();
+            assert_eq!(request, b"public-alpha-block-frame");
+            session
+                .write_record(&mut stream, b"public-alpha-ack")
+                .unwrap();
+        });
+        // Public P2P learns a peer's static key from the Noise transcript rather than needing
+        // an operator to provision every remote public key in advance.
+        let mut stream = TcpStream::connect(address).unwrap();
+        let mut session =
+            QRunV05NoiseSession::connect_public(&mut stream, &client_private, &network, &profile)
+                .unwrap();
+        session
+            .write_record(&mut stream, b"public-alpha-block-frame")
+            .unwrap();
+        assert_eq!(
+            session.read_record(&mut stream).unwrap(),
+            b"public-alpha-ack"
+        );
         server_thread.join().unwrap();
     }
 

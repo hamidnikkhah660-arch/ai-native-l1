@@ -37,7 +37,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_HTTP_REQUEST: usize = 4096;
 const MAX_HTTP_RESPONSE: usize = 16 * 1024;
-const LOCAL_PROFILE_DOMAIN: &[u8] = b"QUANTUMZXB-QRUN-V05-LOCAL-LOOPBACK-TESTNET\0";
+const PROFILE_DOMAIN: &[u8] = b"QUANTUMZXB-QRUN-V05-CONSENSUS-PROFILE\0";
 const BLOCK_MAGIC: &[u8; 4] = b"QRB5";
 const BLOCK_ACK_MAGIC: &[u8; 4] = b"QRA5";
 const BLOCK_PROTOCOL_VERSION: u16 = 2;
@@ -58,6 +58,7 @@ struct Receipt {
 
 struct NodeState {
     runtime: QRunV05PowForkRuntime,
+    public_alpha: bool,
     authenticator: Ed25519TransactionAuthenticator,
     clock: SystemClockReferenceTime,
     receipts: BTreeMap<[u8; 32], Receipt>,
@@ -92,6 +93,7 @@ impl NodeState {
 
 #[derive(Clone)]
 struct Config {
+    public_alpha: bool,
     network_id: NetworkId,
     owner_account: AccountId,
     producer_account: AccountId,
@@ -128,13 +130,13 @@ fn hex(bytes: &[u8]) -> String {
     result
 }
 
-fn parse_socket(value: &str, name: &str) -> Result<SocketAddr, String> {
+fn parse_socket(value: &str, name: &str, allow_public: bool) -> Result<SocketAddr, String> {
     let address = value
         .parse::<SocketAddr>()
         .map_err(|_| format!("{name} must be a numeric IP:PORT socket address"))?;
-    if !address.ip().is_loopback() {
+    if !allow_public && !address.ip().is_loopback() {
         return Err(format!(
-            "{name} must be loopback-only; public binds are forbidden"
+            "{name} must be loopback-only outside explicit public-alpha mode"
         ));
     }
     Ok(address)
@@ -144,23 +146,22 @@ fn parse_config() -> Result<Config, String> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "QRun v0.5 local-loopback PoW integration node (test-only; never Mainnet)\n\
-Usage: qrun_v05_pow_local_node --local-testnet --network-id-hex HEX64 \
---owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH \
-[--rpc-listen 127.0.0.1:49339] [--tx-listen 127.0.0.1:49340]\n\
-Authenticated candidate peers: --noise-private-key-file NPK1 --peer 127.0.0.1:PORT --peer-static-public-key-hex HEX64 (repeat peer and pin together).\n\
-Optional --sync-on-start true requests bounded authenticated catch-up from pinned peers before listeners bind. The binary remains loopback-only and uses an insecure smoke target; it is not Mainnet."
+            "QRun v0.5 node modes (neither mode activates Mainnet)\n\
+Local test: qrun_v05_pow_local_node --local-testnet --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH\n\
+Public alpha: qrun_v05_pow_local_node --public-alpha --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH --noise-private-key-file NPK1\n\
+P2P uses --block-listen 0.0.0.0:49341 in public-alpha mode; RPC and transaction ingress remain loopback-only. Optional outbound peers use repeated --peer IP:PORT; optionally provide one --peer-static-public-key-hex HEX64 per configured peer to pin them.\n\
+Public alpha uses the measured QRun v0.5 candidate profile, accepts authenticated Noise inbound peers without identity pins, validates every block using the shared network/profile and consensus rules, and keeps CAS optional. It is experimental and is not a claim of production readiness."
         );
         return Err("__help__".into());
     }
-    if !args.iter().any(|arg| arg == "--local-testnet") {
-        return Err(
-            "explicit --local-testnet flag is required; this binary never launches Mainnet".into(),
-        );
+    let local_testnet = args.iter().any(|arg| arg == "--local-testnet");
+    let public_alpha = args.iter().any(|arg| arg == "--public-alpha");
+    if local_testnet == public_alpha {
+        return Err("choose exactly one mode: --local-testnet or --public-alpha".into());
     }
     if args
         .iter()
-        .filter(|arg| arg.as_str() != "--local-testnet")
+        .filter(|arg| arg.as_str() != "--local-testnet" && arg.as_str() != "--public-alpha")
         .count()
         % 2
         != 0
@@ -173,7 +174,7 @@ Optional --sync-on-start true requests bounded authenticated catch-up from pinne
     let mut index = 0;
     while index < args.len() {
         let key = &args[index];
-        if key == "--local-testnet" {
+        if key == "--local-testnet" || key == "--public-alpha" {
             index += 1;
             continue;
         }
@@ -187,7 +188,7 @@ Optional --sync-on-start true requests bounded authenticated catch-up from pinne
             return Err(format!("missing value for {key}"));
         }
         if key == "--peer" {
-            peers.push(parse_socket(value, "--peer")?);
+            peers.push(parse_socket(value, "--peer", public_alpha)?);
         } else if key == "--peer-static-public-key-hex" {
             peer_static_public_keys.push(parse_hex32(value, "peer static public key")?);
         } else if values.insert(key.clone(), value.clone()).is_some() {
@@ -246,6 +247,7 @@ Optional --sync-on-start true requests bounded authenticated catch-up from pinne
             .map(String::as_str)
             .unwrap_or("127.0.0.1:49339"),
         "--rpc-listen",
+        false,
     )?;
     let tx_listen = parse_socket(
         values
@@ -253,13 +255,20 @@ Optional --sync-on-start true requests bounded authenticated catch-up from pinne
             .map(String::as_str)
             .unwrap_or("127.0.0.1:49340"),
         "--tx-listen",
+        false,
     )?;
+    let default_block_listen = if public_alpha {
+        "0.0.0.0:49341"
+    } else {
+        "127.0.0.1:49341"
+    };
     let block_listen = parse_socket(
         values
             .get("--block-listen")
             .map(String::as_str)
-            .unwrap_or("127.0.0.1:49341"),
+            .unwrap_or(default_block_listen),
         "--block-listen",
+        public_alpha,
     )?;
     if rpc_listen == tx_listen || rpc_listen == block_listen || tx_listen == block_listen {
         return Err(
@@ -289,9 +298,19 @@ Optional --sync-on-start true requests bounded authenticated catch-up from pinne
             "--sync-on-start requires --noise-private-key-file and pinned peer keys".into(),
         );
     }
+    if public_alpha && noise_private_key_file.is_none() {
+        return Err(
+            "--public-alpha requires --noise-private-key-file; plaintext public peer transport is forbidden".into(),
+        );
+    }
     if noise_private_key_file.is_some() {
-        if peer_static_public_keys.len() != peers.len() || peers.is_empty() {
-            return Err("authenticated peer mode requires exactly one --peer-static-public-key-hex for each --peer, with at least one pinned peer".into());
+        let pin_count_mismatch = if public_alpha {
+            !peer_static_public_keys.is_empty() && peer_static_public_keys.len() != peers.len()
+        } else {
+            peer_static_public_keys.len() != peers.len() || peers.is_empty()
+        };
+        if pin_count_mismatch {
+            return Err("local-testnet requires one static-key pin for every configured peer; public-alpha may omit all outbound pins or provide one for every peer".into());
         }
         if peer_static_public_keys
             .iter()
@@ -312,6 +331,7 @@ Optional --sync-on-start true requests bounded authenticated catch-up from pinne
         return Err("--peer-static-public-key-hex requires --noise-private-key-file".into());
     }
     Ok(Config {
+        public_alpha,
         network_id,
         owner_account,
         producer_account,
@@ -333,7 +353,7 @@ fn profile_id(
     genesis_commitment: &[u8; 32],
 ) -> [u8; 32] {
     let mut hash = Sha256::new();
-    hash.update(LOCAL_PROFILE_DOMAIN);
+    hash.update(PROFILE_DOMAIN);
     hash.update(network_id);
     hash.update(genesis_commitment);
     hash.update(params.protocol_version.to_be_bytes());
@@ -807,11 +827,12 @@ fn send_block_to_peer_authenticated(
     network_id: &[u8; 32],
     profile_id: &[u8; 32],
     local_private_key: [u8; 32],
-    remote_static_public_key: &[u8; 32],
+    remote_static_public_key: Option<&[u8; 32]>,
+    allow_public_peer: bool,
 ) -> Result<(), String> {
     let local_private_key = EphemeralNoisePrivateKey(local_private_key);
-    if !peer.ip().is_loopback() {
-        return Err("peer must be loopback in the local PoW integration profile".into());
+    if !allow_public_peer && !peer.ip().is_loopback() {
+        return Err("non-loopback peers require explicit public-alpha mode".into());
     }
     let candidate = decode_candidate_network_block(envelope)
         .map_err(|error| format!("decode PTB2 envelope: {error:?}"))?;
@@ -827,19 +848,32 @@ fn send_block_to_peer_authenticated(
     stream
         .set_write_timeout(Some(Duration::from_secs(6)))
         .map_err(|error| error.to_string())?;
-    let established = QRunV05NoiseSession::connect(
-        &mut stream,
-        &local_private_key.0,
-        remote_static_public_key,
-        network_id,
-        profile_id,
-    );
+    let established = match remote_static_public_key {
+        Some(expected_key) => QRunV05NoiseSession::connect(
+            &mut stream,
+            &local_private_key.0,
+            expected_key,
+            network_id,
+            profile_id,
+        ),
+        None if allow_public_peer => QRunV05NoiseSession::connect_public(
+            &mut stream,
+            &local_private_key.0,
+            network_id,
+            profile_id,
+        ),
+        None => {
+            return Err("outbound peer requires a static-key pin outside public-alpha mode".into())
+        }
+    };
     let mut session =
         established.map_err(|error| format!("Noise XX peer authentication failed: {error}"))?;
-    if session.remote_static_public_key() != remote_static_public_key {
-        return Err(format!(
-            "peer {peer} Noise static key differs from the configured pin"
-        ));
+    if let Some(expected_key) = remote_static_public_key {
+        if session.remote_static_public_key() != expected_key {
+            return Err(format!(
+                "peer {peer} Noise static key differs from the configured pin"
+            ));
+        }
     }
     session
         .write_record(&mut stream, &frame)
@@ -855,7 +889,7 @@ fn send_block_to_peer(
     envelope: &[u8],
     state: &Arc<Mutex<NodeState>>,
 ) -> Result<(), String> {
-    let (network_id, profile_id, local_private_key, remote_static_public_key) = {
+    let (network_id, profile_id, local_private_key, remote_static_public_key, public_alpha) = {
         let locked = state
             .lock()
             .map_err(|_| "node state lock poisoned".to_string())?;
@@ -864,18 +898,20 @@ fn send_block_to_peer(
             locked.profile_id,
             locked.noise_private_key,
             locked.peer_static_keys_by_addr.get(&peer).copied(),
+            locked.public_alpha,
         )
     };
     match (local_private_key, remote_static_public_key) {
         (None, None) => send_block_to_peer_plain(peer, envelope),
-        (Some(mut private_key), Some(public_key)) => {
+        (Some(mut private_key), remote_key) if public_alpha || remote_key.is_some() => {
             let result = send_block_to_peer_authenticated(
                 peer,
                 envelope,
                 &network_id,
                 &profile_id,
                 private_key,
-                &public_key,
+                remote_key.as_ref(),
+                public_alpha,
             );
             private_key.fill(0);
             result
@@ -894,8 +930,12 @@ fn request_sync_page_authenticated(
     max_blocks: usize,
     max_bytes: usize,
 ) -> Result<(u64, u64), String> {
-    if !peer.ip().is_loopback() {
-        return Err("peer must be loopback in the local PoW integration profile".into());
+    let public_alpha = state
+        .lock()
+        .map_err(|_| "node state lock poisoned".to_string())?
+        .public_alpha;
+    if !public_alpha && !peer.ip().is_loopback() {
+        return Err("non-loopback peers require explicit public-alpha mode".into());
     }
     let (
         network_id,
@@ -910,16 +950,19 @@ fn request_sync_page_authenticated(
             .lock()
             .map_err(|_| "node state lock poisoned".to_string())?;
         let local_height = locked.runtime.canonical_height();
+        let remote_static_key = locked.peer_static_keys_by_addr.get(&peer).copied();
+        if remote_static_key.is_none() && !locked.public_alpha {
+            return Err(
+                "authenticated sync requires a pinned peer key outside public-alpha mode".into(),
+            );
+        }
         (
             locked.runtime.network_id(),
             locked.profile_id,
             locked
                 .noise_private_key
                 .ok_or("authenticated sync requires a local Noise key")?,
-            *locked
-                .peer_static_keys_by_addr
-                .get(&peer)
-                .ok_or("authenticated sync requires a pinned key for the peer")?,
+            remote_static_key,
             local_height
                 .checked_add(1)
                 .ok_or("local chain height overflow")?,
@@ -937,16 +980,28 @@ fn request_sync_page_authenticated(
     stream
         .set_write_timeout(Some(Duration::from_secs(6)))
         .map_err(|error| error.to_string())?;
-    let mut session = QRunV05NoiseSession::connect(
-        &mut stream,
-        &local_private_key.0,
-        &remote_static_public_key,
-        &network_id,
-        &profile_id,
-    )
-    .map_err(|error| format!("Noise XX sync authentication failed: {error}"))?;
-    if session.remote_static_public_key() != &remote_static_public_key {
-        return Err("sync peer static key differs from the configured pin".into());
+    let established = match remote_static_public_key.as_ref() {
+        Some(expected_key) => QRunV05NoiseSession::connect(
+            &mut stream,
+            &local_private_key.0,
+            expected_key,
+            &network_id,
+            &profile_id,
+        ),
+        None if public_alpha => QRunV05NoiseSession::connect_public(
+            &mut stream,
+            &local_private_key.0,
+            &network_id,
+            &profile_id,
+        ),
+        None => return Err("sync peer needs a static-key pin outside public-alpha mode".into()),
+    };
+    let mut session =
+        established.map_err(|error| format!("Noise XX sync authentication failed: {error}"))?;
+    if let Some(expected_key) = remote_static_public_key.as_ref() {
+        if session.remote_static_public_key() != expected_key {
+            return Err("sync peer static key differs from the configured pin".into());
+        }
     }
     session
         .write_record(&mut stream, &request)
@@ -1080,7 +1135,7 @@ fn handle_block(stream: &mut TcpStream, state: &Arc<Mutex<NodeState>>) -> Result
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|error| error.to_string())?;
-    let (network_id, profile_id, local_private_key, trusted_peer_static_keys) = {
+    let (network_id, profile_id, local_private_key, trusted_peer_static_keys, public_alpha) = {
         let locked = state
             .lock()
             .map_err(|_| "node state lock poisoned".to_string())?;
@@ -1089,16 +1144,21 @@ fn handle_block(stream: &mut TcpStream, state: &Arc<Mutex<NodeState>>) -> Result
             locked.profile_id,
             locked.noise_private_key,
             locked.trusted_peer_static_keys.clone(),
+            locked.public_alpha,
         )
     };
     let mut noise_session = if let Some(mut private_key) = local_private_key {
-        let result = QRunV05NoiseSession::accept(
-            stream,
-            &private_key,
-            &trusted_peer_static_keys,
-            &network_id,
-            &profile_id,
-        );
+        let result = if public_alpha {
+            QRunV05NoiseSession::accept_public(stream, &private_key, &network_id, &profile_id)
+        } else {
+            QRunV05NoiseSession::accept(
+                stream,
+                &private_key,
+                &trusted_peer_static_keys,
+                &network_id,
+                &profile_id,
+            )
+        };
         private_key.fill(0);
         Some(
             result
@@ -1284,11 +1344,14 @@ fn handle_transaction(stream: &mut TcpStream, state: &Arc<Mutex<NodeState>>) -> 
                     .last_timestamp()
                     .saturating_add(1),
             );
+            // Public-alpha uses the calibrated target, so it must allow enough nonce attempts
+            // for expected block production. Local-loopback tests keep the single-attempt smoke path.
+            let max_nonce_attempts = if locked.public_alpha { 10_000 } else { 1 };
             let envelope_result = {
                 let auth = &locked.authenticator;
                 locked
                     .runtime
-                    .mine_candidate(timestamp, vec![tx.clone()], auth, 1)
+                    .mine_candidate(timestamp, vec![tx.clone()], auth, max_nonce_attempts)
             };
             match envelope_result {
                 Ok(envelope) => {
@@ -1375,10 +1438,10 @@ fn poll_transaction_listener(
 fn run(config: Config) -> Result<(), String> {
     if !config.rpc_listen.ip().is_loopback()
         || !config.tx_listen.ip().is_loopback()
-        || !config.block_listen.ip().is_loopback()
-        || config.peers.iter().any(|peer| !peer.ip().is_loopback())
+        || (!config.public_alpha && !config.block_listen.ip().is_loopback())
+        || (!config.public_alpha && config.peers.iter().any(|peer| !peer.ip().is_loopback()))
     {
-        return Err("refusing non-loopback listener or peer".into());
+        return Err("RPC/transaction interfaces stay loopback-only; non-loopback P2P requires explicit --public-alpha".into());
     }
     fs::create_dir_all(&config.data_dir)
         .map_err(|error| format!("create data directory: {error}"))?;
@@ -1391,23 +1454,38 @@ fn run(config: Config) -> Result<(), String> {
     )
     .map_err(|error| format!("configure Ed25519 authenticator: {error:?}"))?;
 
-    // This explicitly local-only smoke profile has an easy target. It verifies the QFP5
-    // fee-only producer commitment and fork-selection path, but is not secure and must not be
-    // reused for public consensus. Protocol version 5 is pinned to the exact candidate identity.
+    // The local-testnet mode deliberately keeps its trivial target and reduced memory for fast
+    // smoke tests. Public-alpha must use the separate measured QRun v0.5 candidate profile and
+    // may only run with the exact committed network and Genesis owner identity.
     let qrun_v05_identity = config.network_id
         == ai_native_l1_pow_bench::qrun_v05_profile_identity_candidate::PROPOSED_QRUN_V05_NETWORK_ID
         && config.owner_account
             == ai_native_l1_pow_bench::qrun_v05_profile_identity_candidate::PROPOSED_OWNER_ACCOUNT_ID;
-    let mut params = ConsensusParameters::candidate_testnet()
-        .map_err(|error| format!("load candidate PoW profile: {error:?}"))?;
-    if qrun_v05_identity {
-        params.protocol_version = 5;
+    if config.public_alpha && !qrun_v05_identity {
+        return Err(
+            "--public-alpha only supports the exact proposed QRun v0.5 network and Genesis owner"
+                .into(),
+        );
     }
-    params.initial_target = Uint256::MAX;
-    params.pow_limit = Uint256::MAX;
-    params.pow.memory_kib = 8 * 1024;
-    params.pow.iterations = 1;
-    params.pow.lanes = 1;
+    if config.public_alpha && config.noise_private_key_file.is_none() {
+        return Err("--public-alpha requires the network-bound Noise static key".into());
+    }
+    let params = if config.public_alpha {
+        ConsensusParameters::qrun_v05_calibrated_candidate()
+            .map_err(|error| format!("load calibrated QRun v0.5 consensus candidate: {error:?}"))?
+    } else {
+        let mut local = ConsensusParameters::candidate_testnet()
+            .map_err(|error| format!("load local smoke PoW profile: {error:?}"))?;
+        if qrun_v05_identity {
+            local.protocol_version = 5;
+        }
+        local.initial_target = Uint256::MAX;
+        local.pow_limit = Uint256::MAX;
+        local.pow.memory_kib = 8 * 1024;
+        local.pow.iterations = 1;
+        local.pow.lanes = 1;
+        local
+    };
     let profile_params = params.clone();
     if !config.peers.is_empty() && config.noise_private_key_file.is_none() {
         return Err(
@@ -1447,9 +1525,23 @@ fn run(config: Config) -> Result<(), String> {
         .total_value()
         .map_err(|error| format!("{error:?}"))?;
 
-    println!("QRUN_V05_LOCAL_POW_LOOPBACK_TESTNET_READY");
+    println!(
+        "{}",
+        if config.public_alpha {
+            "QRUN_V05_PUBLIC_ALPHA_CANDIDATE_READY"
+        } else {
+            "QRUN_V05_LOCAL_POW_LOOPBACK_TESTNET_READY"
+        }
+    );
     println!("mainnet=false");
-    println!("network_class=local_loopback_pow_testnet_not_public");
+    println!(
+        "network_class={}",
+        if config.public_alpha {
+            "public_alpha_experimental_not_mainnet"
+        } else {
+            "local_loopback_pow_testnet_not_public"
+        }
+    );
     println!("network_id_hex={}", hex(&network_id));
     println!("genesis_id_hex={}", hex(&genesis_id));
     println!("profile_id_hex={}", hex(&profile_id));
@@ -1469,17 +1561,27 @@ fn run(config: Config) -> Result<(), String> {
     println!("block_peer_count={}", config.peers.len());
     println!(
         "peer_transport={}",
-        if config.noise_private_key_file.is_some() {
+        if config.public_alpha {
+            "qrun_v05_noise_xx_open_inbound_pinned_outbound"
+        } else if config.noise_private_key_file.is_some() {
             "qrun_v05_noise_xx_pinned_candidate"
         } else {
             "plaintext_loopback_smoke_only"
         }
     );
     println!("consensus=PoW_fork_choice_persistent_PFS2");
-    println!("security_note=loopback_only_max_target_smoke_profile_not_public_consensus");
+    println!(
+        "security_note={}",
+        if config.public_alpha {
+            "experimental_public_alpha; calibrated_argon2id_pow; fixed_genesis_supply; zero_block_subsidy; CAS_optional; mainnet_disabled"
+        } else {
+            "loopback_only_max_target_smoke_profile_not_public_consensus"
+        }
+    );
 
     let state = Arc::new(Mutex::new(NodeState {
         runtime,
+        public_alpha: config.public_alpha,
         authenticator,
         clock,
         receipts: BTreeMap::new(),
@@ -1561,8 +1663,8 @@ fn run(config: Config) -> Result<(), String> {
         config.tx_listen
     );
     println!(
-        "qrun_pow_local_block_ready address={} protocol=QRB5/2 loopback_only=true",
-        config.block_listen
+        "qrun_pow_local_block_ready address={} protocol=QRB5/2 loopback_only={}",
+        config.block_listen, !config.public_alpha
     );
 
     loop {
@@ -1668,6 +1770,7 @@ mod tests {
         let profile_id = profile_id(&network, &profile_params, &runtime.genesis_commitment());
         let mut state = NodeState {
             runtime,
+            public_alpha: false,
             authenticator,
             clock,
             receipts: BTreeMap::new(),
@@ -1708,6 +1811,7 @@ mod tests {
         let profile_id = profile_id(&network, &profile_params, &runtime.genesis_commitment());
         let mut state = NodeState {
             runtime,
+            public_alpha: false,
             authenticator,
             clock,
             receipts: BTreeMap::new(),
@@ -1790,7 +1894,8 @@ mod tests {
                 &network_id,
                 &profile_id,
                 local_private_key,
-                &remote_static_public_key,
+                Some(&remote_static_public_key),
+                false,
             );
             local_private_key.fill(0);
             result.unwrap();
@@ -1878,10 +1983,15 @@ mod tests {
     }
 
     #[test]
-    fn smoke_node_public_listener_guard_remains_fail_closed() {
-        assert!(parse_socket("0.0.0.0:49341", "--block-listen").is_err());
-        assert!(parse_socket("192.0.2.10:49341", "--block-listen").is_err());
-        assert!(parse_socket("127.0.0.1:49341", "--block-listen").is_ok());
+    fn listener_bind_policy_separates_loopback_and_public_alpha_modes() {
+        assert!(parse_socket("0.0.0.0:49341", "--block-listen", false).is_err());
+        assert!(parse_socket("192.0.2.10:49341", "--peer", false).is_err());
+        assert!(parse_socket("127.0.0.1:49341", "--block-listen", false).is_ok());
+        assert!(parse_socket("0.0.0.0:49341", "--block-listen", true).is_ok());
+        assert!(parse_socket("192.0.2.10:49341", "--peer", true).is_ok());
+        // Public-alpha still cannot expose the unauthenticated RPC or transaction ingress.
+        assert!(parse_socket("0.0.0.0:49339", "--rpc-listen", false).is_err());
+        assert!(parse_socket("0.0.0.0:49340", "--tx-listen", false).is_err());
     }
 
     #[test]
@@ -2520,6 +2630,109 @@ mod tests {
     }
 
     #[test]
+    fn public_alpha_nodes_gossip_unpinned_qfp5_blocks_and_converge() {
+        use ai_native_l1_pow_bench::state_machine::MAX_TOTAL_SUPPLY_ATOMS;
+
+        let source_dir = TestDir::new();
+        let receiver_dir = TestDir::new();
+        let source_signer = Ed25519TransactionSigner::from_seed([0x41; 32]);
+        let receiver_signer = Ed25519TransactionSigner::from_seed([0x42; 32]);
+        let source = Arc::new(Mutex::new(qrun_v05_node_state(
+            &source_dir.0,
+            &source_signer,
+        )));
+        let receiver = Arc::new(Mutex::new(qrun_v05_node_state(
+            &receiver_dir.0,
+            &receiver_signer,
+        )));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap();
+        let (mut source_private, _) = test_noise_keypair();
+        let (mut receiver_private, _) = test_noise_keypair();
+        {
+            let mut node = source.lock().unwrap();
+            node.public_alpha = true;
+            node.noise_private_key = Some(source_private);
+            node.block_peers = vec![peer];
+            // Public-alpha does not require the remote static key to be pre-pinned.
+            node.peer_static_keys_by_addr.clear();
+            node.trusted_peer_static_keys.clear();
+            source_private.fill(0);
+        }
+        {
+            let mut node = receiver.lock().unwrap();
+            node.public_alpha = true;
+            node.noise_private_key = Some(receiver_private);
+            node.peer_static_keys_by_addr.clear();
+            node.trusted_peer_static_keys.clear();
+            receiver_private.fill(0);
+        }
+
+        let envelope = {
+            let mut node = source.lock().unwrap();
+            let auth = &node.authenticator;
+            let envelope = node
+                .runtime
+                .mine_candidate(100, Vec::new(), auth, 1)
+                .unwrap();
+            let NodeState {
+                runtime,
+                authenticator,
+                clock,
+                ..
+            } = &mut *node;
+            runtime
+                .submit_block(&envelope, authenticator, clock)
+                .unwrap();
+            envelope
+        };
+        assert!(envelope.starts_with(b"QFP5"));
+
+        let (network_id, profile_id, mut local_private_key) = {
+            let node = source.lock().unwrap();
+            (
+                node.runtime.network_id(),
+                node.profile_id,
+                node.noise_private_key.unwrap(),
+            )
+        };
+        let outbound = envelope.clone();
+        let client = std::thread::spawn(move || {
+            let result = send_block_to_peer_authenticated(
+                peer,
+                &outbound,
+                &network_id,
+                &profile_id,
+                local_private_key,
+                None,
+                true,
+            );
+            local_private_key.fill(0);
+            result.unwrap();
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        handle_block(&mut stream, &receiver).unwrap();
+        client.join().unwrap();
+
+        let source = source.lock().unwrap();
+        let receiver = receiver.lock().unwrap();
+        assert_eq!(source.runtime.canonical_height(), 1);
+        assert_eq!(receiver.runtime.canonical_height(), 1);
+        assert_eq!(
+            source.runtime.canonical_tip(),
+            receiver.runtime.canonical_tip()
+        );
+        assert_eq!(
+            source.runtime.canonical_state_root(),
+            receiver.runtime.canonical_state_root()
+        );
+        assert_eq!(
+            receiver.runtime.canonical_state().total_value().unwrap(),
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
+    }
+
+    #[test]
     fn two_qrun_nodes_sync_signed_transfer_over_authenticated_noise_xx() {
         let first_dir = TestDir::new();
         let second_dir = TestDir::new();
@@ -2702,6 +2915,7 @@ mod tx_ingress_tests {
         let profile_id = profile_id(&network, &profile_params, &runtime.genesis_commitment());
         let mut state = NodeState {
             runtime,
+            public_alpha: false,
             authenticator,
             clock,
             receipts: BTreeMap::new(),
