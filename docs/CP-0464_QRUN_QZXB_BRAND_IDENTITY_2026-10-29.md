@@ -5,25 +5,25 @@ Status: **Founder-selected naming direction recorded.** This is a project naming
 
 ## 1. Canonical public identity
 
-- **Brand / spoken coin name:** QRun — Persian reading: «کیوران».
+- **Brand / spoken coin name:** QRun.
 - **Native coin ticker:** QZXB.
 - **Network name:** QRun Blockchain.
 - **Acronym expansion:** Quantum Zeta eXecution Blockchain.
 - **Letter mapping:** Q = Quantum; Z = Zeta; X = eXecution; B = Blockchain.
-- **Ticker pronunciation in Persian:** «کیو ـ زد ـ ایکس ـ بی» (read the four letters, not as a word).
+- **Ticker pronunciation:** Q-Z-X-B (read the four letters, not as a word).
 - **Short public usage:** “I bought QRun”; “QRun price”; “QRun Blockchain”; symbol/code shown as QZXB.
 
 QRun is the short name people should remember and say. QZXB is the ticker/technical symbol used in wallets, node outputs, source code, transaction/accounting data, and any future market-data integration. The network name is QRun Blockchain. The expanded phrase explains the symbol; it does not replace the short brand in everyday speech.
 
 ## 2. Consistent writing
 
-Use **QRun** for the brand, **QZXB** for the native coin ticker, and **QRun Blockchain** for the network. Use the Persian display **کیوران** when writing in Persian. Spell the acronym expansion exactly as **Quantum Zeta eXecution Blockchain** when the expanded phrase is needed.
+Use **QRun** for the brand, **QZXB** for the native coin ticker, and **QRun Blockchain** for the network. Spell the acronym expansion exactly as **Quantum Zeta eXecution Blockchain** when the expanded phrase is needed.
 
 Examples:
 - “QRun is building an independent Layer-1 blockchain.”
 - “QRun Blockchain is the native network.”
 - “QZXB is the native coin ticker.”
-- “کیوران (QRun) با نماد QZXB.”
+- “QRun, native coin ticker QZXB.”
 
 Do not call the native coin “Qanvoryx” or “QX”: those labels belong to a separate historical EVM test-asset experiment and must not be confused with the native coin. Do not describe QZXB as a listed ticker until a real listing has been verified.
 

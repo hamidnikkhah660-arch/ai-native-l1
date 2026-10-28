@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://hamidnikkhah660-arch.github.io/ai-native-l1/sitemap.xml

@@ -11,6 +11,8 @@ The source repository and project website are public, and we are actively inviti
 - **Current identity:** [QRun/QZXB brand decision](docs/CP-0464_QRUN_QZXB_BRAND_IDENTITY_2026-10-29.md).
 - **Mainnet and market release decision:** [CP-0465](docs/CP-0465_QRUN_MAINNET_PUBLIC_TRADING_NO_GO_2026-10-29.md).
 - **Zero-budget liquidity routes:** [CP-0466](docs/CP-0466_QRUN_ZERO_BUDGET_REAL_LIQUIDITY_PATH_2026-10-29.md).
+- **Public outreach kit:** [English-only project description and platform-specific drafts](docs/QRUN_PUBLIC_OUTREACH_KIT_2026-10-29.md).
+- **Public community announcement:** [QRun contributor discussion](https://github.com/hamidnikkhah660-arch/ai-native-l1/discussions/77).
 - **Independent zero-value Devnet onboarding:** [operator packet](docs/QZXB_ZERO_VALUE_DEVNET_OPERATOR_ONBOARDING_V01_2026-10-27.md).
 - **Global project site:** https://hamidnikkhah660-arch.github.io/ai-native-l1/
 - **Source and contribution issues:** https://github.com/hamidnikkhah660-arch/ai-native-l1
