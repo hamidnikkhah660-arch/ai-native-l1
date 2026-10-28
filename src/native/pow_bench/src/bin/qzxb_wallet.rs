@@ -172,11 +172,15 @@ mod windows_wallet {
         let value: serde_json::Value = serde_json::from_slice(&bytes[body_start..])
             .map_err(|_| "read-only RPC response contains invalid JSON".to_string())?;
         if value.get("ok") != Some(&serde_json::Value::Bool(true))
-            || value.get("mainnet") != Some(&serde_json::Value::Bool(false))
+            || value
+                .get("mainnet")
+                .and_then(serde_json::Value::as_bool)
+                .is_none()
             || value.get("read_only") != Some(&serde_json::Value::Bool(true))
         {
             return Err(
-                "RPC response is not explicitly an OK, read-only candidate response".into(),
+                "RPC response is not explicitly an OK, read-only response with a network mode"
+                    .into(),
             );
         }
         Ok(value)
@@ -255,7 +259,7 @@ mod windows_wallet {
         println!("tip_hex={}", json_string(&value, "tip")?);
         println!("state_root_hex={}", json_string(&value, "state_root")?);
         println!("generation={}", json_u64(&value, "generation")?);
-        println!("network_class=candidate_not_mainnet");
+        println!("network_class={}", json_string(&value, "network_class")?);
         Ok(())
     }
 
@@ -270,7 +274,7 @@ mod windows_wallet {
         println!("height={}", json_u64(&value, "height")?);
         println!("tip_hex={}", json_string(&value, "tip")?);
         println!("state_root_hex={}", json_string(&value, "state_root")?);
-        println!("network_class=candidate_not_mainnet");
+        println!("network_class={}", json_string(&value, "network_class")?);
         Ok(())
     }
 
@@ -307,7 +311,7 @@ mod windows_wallet {
         println!("tip_hex={}", json_string(&value, "tip")?);
         println!("state_root_hex={}", json_string(&value, "state_root")?);
         println!("finality=probabilistic_candidate_chain_reorg_possible");
-        println!("network_class=candidate_not_mainnet");
+        println!("network_class={}", json_string(&value, "network_class")?);
         Ok(())
     }
 
@@ -983,7 +987,7 @@ Usage:\n\
   qzxb_wallet address --wallet ABSOLUTE_PATH\n\
   qzxb_wallet sign-transfer --wallet ABSOLUTE_PATH --network-id-hex HEX64 --recipient-id-hex HEX64 --nonce U64 --amount-atoms U64 --fee-atoms U64 --expires-at UNIX_SECONDS [--signature-mode self-contained|registered] [--submit-to IP:PORT]\n\
 Default signature mode embeds the public key with its Ed25519 signature so the sender account can be derived and checked by any validating node. `--signature-mode registered` is for legacy fixtures. `--submit-to` sends signed TXN2 using QZTS/1 and waits for the node's admission ACK; this does not imply Mainnet status or that the transaction was mined.");
-                println!("Read-only candidate RPC: rpc-status --rpc 127.0.0.1:PORT; balance --rpc 127.0.0.1:PORT --account-id-hex HEX64; tx-status --rpc 127.0.0.1:PORT --txid-hex HEX64. These queries are restricted to loopback and refuse responses not marked mainnet=false/read_only=true.");
+                println!("Read-only local RPC: rpc-status --rpc 127.0.0.1:PORT; balance --rpc 127.0.0.1:PORT --account-id-hex HEX64; tx-status --rpc 127.0.0.1:PORT --txid-hex HEX64. These queries are restricted to loopback and require an explicitly read-only RPC response.");
                 Ok(())
             }
             Ok(Command::Create { output }) => create_wallet(&output),
@@ -1045,12 +1049,13 @@ Default signature mode embeds the public key with its Ed25519 signature so the s
             assert_eq!(value["height"].as_u64(), Some(2));
 
             let mainnet = r#"{"ok":true,"mainnet":true,"read_only":true}"#;
-            let false_mainnet = format!(
+            let mainnet_response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 mainnet.len(),
                 mainnet
             );
-            assert!(parse_rpc_http_response(false_mainnet.as_bytes()).is_err());
+            let parsed_mainnet = parse_rpc_http_response(mainnet_response.as_bytes()).unwrap();
+            assert_eq!(parsed_mainnet["mainnet"].as_bool(), Some(true));
 
             let too_short = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 99\r\n\r\n{}";
             assert!(parse_rpc_http_response(too_short).is_err());

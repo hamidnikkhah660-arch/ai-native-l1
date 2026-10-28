@@ -2,7 +2,7 @@
 
 ## Status
 
-The QZXB wallet file was created locally and the node binary was rebuilt with support for a wallet-specific public-alpha Genesis owner. The node binary build succeeded and the `qrun_v05_pow_local_node` test target passed 11/11 tests. Runtime startup and the balance query were subsequently verified against the wallet-specific network identity. The wallet CLI reported `wallet_rpc_balance_status=ok`, `balance_atoms=1000000000000000000`, `height=0`, and `network_class=candidate_not_mainnet`. This verifies the local node genesis state and read-only balance path; it does not verify an Internet-connected peer or activate Mainnet. Mainnet remains disabled.
+A wallet-bound QZXB Genesis and wallet-specific node were verified locally. The fixed total supply is credited to the wallet account in the deterministic Genesis state. A distinct --mainnet mode is now implemented and running on the same network ID, Genesis, profile, and data directory. The node emits mainnet=true and network_class=qzxb_mainnet; the wallet CLI independently reads the same mode and 10B balance from read-only local RPC. This confirms local Mainnet-mode operation and balance, but does not by itself prove Internet reachability or independent peer replication. The current node reports block_peer_count=0; an inbound Windows Firewall rule requires elevated PowerShell and any router NAT must forward TCP 49341 to this host.
 
 ## Local wallet identity
 
@@ -33,3 +33,17 @@ The QRun v0.5 Genesis runtime credits the fixed total supply of `1,000,000,000,0
 1. A rebuilt public-alpha node was launched with the wallet-derived account/public key, this wallet-bound network ID, a matching DPAPI-protected Noise key, and fresh data directory `C:\QRun\wallet-bound-genesis-data-v3`.
 2. Verified from the node startup output: Genesis owner equals the wallet account, owner balance and total supply are `1000000000000000000` atoms, and height is zero. The `qzxb_wallet balance` command against `127.0.0.1:49339` returned the same balance, account ID, and state root.
 3. Observed listeners: RPC `127.0.0.1:49339`, transaction ingress `127.0.0.1:49340`, and P2P `0.0.0.0:49341`. No independent peer is connected (`block_peer_count=0`); inbound Internet reachability remains unverified. Keep RPC and transaction ingress loopback-only.
+
+## Mainnet-mode launch verification
+
+- Release node supports --mainnet, locked to the wallet-bound network ID, owner account ID, and owner public key recorded above.
+- Mainnet-mode startup banner: QRUN_V05_MAINNET_NODE_READY.
+- mainnet=true; network_class=qzxb_mainnet.
+- Genesis ID: 91229b7d21b23cee83f00cec53a566ef1b30db70c644c1e9d05a431c1acf4dbc.
+- Profile ID: 75596fa188dc308088efc6b138e9fcd50be6de82ec2bc117c13e81d7eebfdb09.
+- State root at height zero: a44e545c2cd8fa4e56e228f4f242cbf5445b1cc983c7b1f8fe89c5b42aef88d7.
+- Node startup reports owner_balance_atoms=1000000000000000000 and total_supply_atoms=1000000000000000000.
+- The rebuilt qzxb_wallet.exe rpc-status and qzxb_wallet.exe balance both succeed. Wallet RPC reports network_class=qzxb_mainnet and balance 1000000000000000000 atoms for the owner account.
+- Listeners: RPC 127.0.0.1:49339, transaction ingress 127.0.0.1:49340, P2P 0.0.0.0:49341. RPC and transaction ingress remain loopback-only.
+- No independent peer is currently connected and public Internet reachability has not been verified. The PowerShell process is not elevated, so it cannot install the inbound firewall rule.
+- Supply policy remains a one-time 10B Genesis preallocation to the owner with zero subsequent issuance and zero block subsidy. This is not Bitcoin's miner-reward issuance schedule.

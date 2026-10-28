@@ -51,6 +51,26 @@ const SYNC_REQUEST_BYTES: usize = 20;
 const SYNC_RESPONSE_HEADER_BYTES: usize = 120;
 const MAX_SYNC_PAGE_BLOCKS: usize = 16;
 
+// Fixed wallet-bound Genesis identity for the first QZXB Mainnet.
+const QZXB_MAINNET_NETWORK_ID: NetworkId = [
+    0x8b, 0x5d, 0x16, 0x92, 0x05, 0xac, 0x49, 0xcb, 0x98, 0x66, 0xa9, 0xd2, 0x7f, 0xf1, 0xa6, 0xc3,
+    0xc2, 0x57, 0x1f, 0xca, 0x65, 0xf6, 0x34, 0x85, 0x4c, 0x41, 0xc1, 0x12, 0xe5, 0x06, 0xae, 0xbb,
+];
+const QZXB_MAINNET_OWNER_ACCOUNT_ID: AccountId = [
+    0xa1, 0x4d, 0x67, 0xbd, 0x19, 0x5c, 0x6a, 0x00, 0x44, 0xbe, 0xda, 0xc8, 0x53, 0x2e, 0x74, 0x28,
+    0x11, 0xf9, 0x25, 0x01, 0x63, 0x07, 0x64, 0xd7, 0x3a, 0x98, 0xb2, 0xf0, 0xcc, 0x33, 0x5f, 0xdd,
+];
+const QZXB_MAINNET_OWNER_PUBLIC_KEY: [u8; 32] = [
+    0xfc, 0xa6, 0x5e, 0x26, 0xf5, 0x96, 0xfa, 0x60, 0x67, 0x4f, 0x5e, 0xc3, 0x58, 0x08, 0xec, 0x80,
+    0xb3, 0x17, 0xa7, 0x01, 0xe9, 0x7f, 0xee, 0xe3, 0x43, 0xd8, 0x50, 0x07, 0x71, 0x3b, 0xd9, 0x3f,
+];
+const QZXB_MAINNET_GENESIS_ID_HEX: &str =
+    "91229b7d21b23cee83f00cec53a566ef1b30db70c644c1e9d05a431c1acf4dbc";
+const QZXB_MAINNET_PROFILE_ID_HEX: &str =
+    "75596fa188dc308088efc6b138e9fcd50be6de82ec2bc117c13e81d7eebfdb09";
+const QZXB_MAINNET_STATE_ROOT_HEX: &str =
+    "a44e545c2cd8fa4e56e228f4f242cbf5445b1cc983c7b1f8fe89c5b42aef88d7";
+
 #[derive(Clone)]
 struct Receipt {
     height: u64,
@@ -59,6 +79,7 @@ struct Receipt {
 struct NodeState {
     runtime: QRunV05PowForkRuntime,
     public_alpha: bool,
+    mainnet: bool,
     authenticator: Ed25519TransactionAuthenticator,
     clock: SystemClockReferenceTime,
     receipts: BTreeMap<[u8; 32], Receipt>,
@@ -94,6 +115,7 @@ impl NodeState {
 #[derive(Clone)]
 struct Config {
     public_alpha: bool,
+    mainnet: bool,
     network_id: NetworkId,
     owner_account: AccountId,
     producer_account: AccountId,
@@ -142,26 +164,95 @@ fn parse_socket(value: &str, name: &str, allow_public: bool) -> Result<SocketAdd
     Ok(address)
 }
 
+/// Startup synchronization is security-sensitive: never accept a seed's chain response unless
+/// its Noise static key is pinned. Public-alpha may use unpinned peers for block gossip, but not
+/// for deciding the chain tip during startup.
+fn validate_sync_start_config(
+    sync_on_start: bool,
+    has_noise_private_key: bool,
+    peer_count: usize,
+    pinned_peer_count: usize,
+) -> Result<(), String> {
+    if !sync_on_start {
+        return Ok(());
+    }
+    if !has_noise_private_key {
+        return Err("--sync-on-start requires --noise-private-key-file".into());
+    }
+    if peer_count == 0 {
+        return Err("--sync-on-start requires at least one --peer".into());
+    }
+    if pinned_peer_count != peer_count {
+        return Err(
+            "--sync-on-start requires exactly one --peer-static-public-key-hex pin for every --peer"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_frozen_mainnet_genesis(
+    enabled: bool,
+    genesis_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    state_root: &[u8; 32],
+    owner_balance: u128,
+    total_supply: u128,
+    account_count: usize,
+) -> Result<(), String> {
+    if !enabled {
+        return Ok(());
+    }
+    if hex(genesis_id) != QZXB_MAINNET_GENESIS_ID_HEX
+        || hex(profile_id) != QZXB_MAINNET_PROFILE_ID_HEX
+        || hex(state_root) != QZXB_MAINNET_STATE_ROOT_HEX
+    {
+        return Err(
+            "--mainnet refuses to start: computed Genesis ID, profile ID, or state root differs from the frozen QZXB identity"
+                .into(),
+        );
+    }
+    let expected_supply =
+        ai_native_l1_pow_bench::state_machine::MAX_TOTAL_SUPPLY_ATOMS;
+    if account_count != 1 || owner_balance != expected_supply || total_supply != expected_supply {
+        return Err(
+            "--mainnet refuses to start: Genesis must credit the full fixed supply to exactly one owner account"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn parse_config() -> Result<Config, String> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "QRun v0.5 node modes (neither mode activates Mainnet)\n\
+            "QRun v0.5 node modes\n\
 Local test: qrun_v05_pow_local_node --local-testnet --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH\n\
 Public alpha: qrun_v05_pow_local_node --public-alpha --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH --noise-private-key-file NPK1\n\
-P2P uses --block-listen 0.0.0.0:49341 in public-alpha mode; RPC and transaction ingress remain loopback-only. Optional outbound peers use repeated --peer IP:PORT; optionally provide one --peer-static-public-key-hex HEX64 per configured peer to pin them.\n\
-Public alpha uses the measured QRun v0.5 candidate profile. Its 10B Genesis supply is credited to --owner-account-id-hex; custom wallet Genesis uses a distinct network ID and produces distinct Genesis/profile IDs. Every peer must use the same network ID, owner account/public key, Genesis and profile. Inbound Noise sessions are encrypted but unpinned peers are not independently identity-authenticated; use seed pins for that property. CAS remains optional. Experimental only; not Mainnet."
+Mainnet: qrun_v05_pow_local_node --mainnet --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH --noise-private-key-file NPK1\n\
+Mainnet is locked to the frozen wallet-bound QZXB Genesis identity in this binary. P2P uses 0.0.0.0:49341; RPC and transaction ingress stay loopback-only. Peer nodes must use the same network ID, owner, Genesis and consensus profile."
         );
         return Err("__help__".into());
     }
     let local_testnet = args.iter().any(|arg| arg == "--local-testnet");
-    let public_alpha = args.iter().any(|arg| arg == "--public-alpha");
-    if local_testnet == public_alpha {
-        return Err("choose exactly one mode: --local-testnet or --public-alpha".into());
+    let public_alpha_mode = args.iter().any(|arg| arg == "--public-alpha");
+    let mainnet = args.iter().any(|arg| arg == "--mainnet");
+    let mode_count = u8::from(local_testnet) + u8::from(public_alpha_mode) + u8::from(mainnet);
+    if mode_count != 1 {
+        return Err(
+            "choose exactly one mode: --local-testnet, --public-alpha, or --mainnet".into(),
+        );
     }
+    let public_network = public_alpha_mode || mainnet;
     if args
         .iter()
-        .filter(|arg| arg.as_str() != "--local-testnet" && arg.as_str() != "--public-alpha")
+        .filter(|arg| {
+            !matches!(
+                arg.as_str(),
+                "--local-testnet" | "--public-alpha" | "--mainnet"
+            )
+        })
         .count()
         % 2
         != 0
@@ -174,7 +265,7 @@ Public alpha uses the measured QRun v0.5 candidate profile. Its 10B Genesis supp
     let mut index = 0;
     while index < args.len() {
         let key = &args[index];
-        if key == "--local-testnet" || key == "--public-alpha" {
+        if key == "--local-testnet" || key == "--public-alpha" || key == "--mainnet" {
             index += 1;
             continue;
         }
@@ -188,7 +279,7 @@ Public alpha uses the measured QRun v0.5 candidate profile. Its 10B Genesis supp
             return Err(format!("missing value for {key}"));
         }
         if key == "--peer" {
-            peers.push(parse_socket(value, "--peer", public_alpha)?);
+            peers.push(parse_socket(value, "--peer", public_network)?);
         } else if key == "--peer-static-public-key-hex" {
             peer_static_public_keys.push(parse_hex32(value, "peer static public key")?);
         } else if values.insert(key.clone(), value.clone()).is_some() {
@@ -237,6 +328,16 @@ Public alpha uses the measured QRun v0.5 candidate profile. Its 10B Genesis supp
     }
     VerifyingKey::from_bytes(&owner_public_key)
         .map_err(|_| "owner public key is invalid".to_string())?;
+    if mainnet
+        && (network_id != QZXB_MAINNET_NETWORK_ID
+            || owner_account != QZXB_MAINNET_OWNER_ACCOUNT_ID
+            || owner_public_key != QZXB_MAINNET_OWNER_PUBLIC_KEY)
+    {
+        return Err(
+            "--mainnet requires the frozen wallet-bound QZXB network ID, owner account and public key"
+                .into(),
+        );
+    }
     let data_dir = PathBuf::from(required("--data-dir")?);
     if !data_dir.is_absolute() || data_dir.file_name().is_none() {
         return Err("--data-dir must be an absolute path with a final directory name".into());
@@ -257,7 +358,7 @@ Public alpha uses the measured QRun v0.5 candidate profile. Its 10B Genesis supp
         "--tx-listen",
         false,
     )?;
-    let default_block_listen = if public_alpha {
+    let default_block_listen = if public_network {
         "0.0.0.0:49341"
     } else {
         "127.0.0.1:49341"
@@ -268,7 +369,7 @@ Public alpha uses the measured QRun v0.5 candidate profile. Its 10B Genesis supp
             .map(String::as_str)
             .unwrap_or(default_block_listen),
         "--block-listen",
-        public_alpha,
+        public_network,
     )?;
     if rpc_listen == tx_listen || rpc_listen == block_listen || tx_listen == block_listen {
         return Err(
@@ -293,18 +394,31 @@ Public alpha uses the measured QRun v0.5 candidate profile. Its 10B Genesis supp
         "false" => false,
         _ => return Err("--sync-on-start must be exactly true or false".into()),
     };
-    if sync_on_start && noise_private_key_file.is_none() {
+    if mainnet && !sync_on_start {
         return Err(
-            "--sync-on-start requires --noise-private-key-file and pinned peer keys".into(),
+            "--mainnet requires --sync-on-start true so a pinned independent peer verifies the chain before activation"
+                .into(),
         );
     }
-    if public_alpha && noise_private_key_file.is_none() {
+    validate_sync_start_config(
+        sync_on_start,
+        noise_private_key_file.is_some(),
+        peers.len(),
+        peer_static_public_keys.len(),
+    )?;
+    if mainnet && peers.iter().any(|peer| peer.ip().is_loopback()) {
+        return Err("--mainnet seed peers must be non-loopback addresses".into());
+    }
+    if mainnet && block_listen.ip().is_loopback() {
+        return Err("--mainnet requires a non-loopback P2P block listener".into());
+    }
+    if public_network && noise_private_key_file.is_none() {
         return Err(
             "--public-alpha requires --noise-private-key-file; plaintext public peer transport is forbidden".into(),
         );
     }
     if noise_private_key_file.is_some() {
-        let pin_count_mismatch = if public_alpha {
+        let pin_count_mismatch = if public_network {
             !peer_static_public_keys.is_empty() && peer_static_public_keys.len() != peers.len()
         } else {
             peer_static_public_keys.len() != peers.len() || peers.is_empty()
@@ -331,7 +445,8 @@ Public alpha uses the measured QRun v0.5 candidate profile. Its 10B Genesis supp
         return Err("--peer-static-public-key-hex requires --noise-private-key-file".into());
     }
     Ok(Config {
-        public_alpha,
+        public_alpha: public_network,
+        mainnet,
         network_id,
         owner_account,
         producer_account,
@@ -430,27 +545,35 @@ fn handle_rpc(stream: &mut TcpStream, state: &Arc<Mutex<NodeState>>) -> Result<(
     let network = hex(&locked.runtime.network_id());
     let genesis = hex(&locked.runtime.genesis_commitment());
     let profile = hex(&locked.profile_id);
+    let mainnet = locked.mainnet;
+    let network_class = if mainnet {
+        "qzxb_mainnet"
+    } else if locked.public_alpha {
+        "public_alpha_experimental_not_mainnet"
+    } else {
+        "local_loopback_pow_testnet_not_public"
+    };
     let value = if path == "/v1/status" {
         json!({
-            "ok": true, "mainnet": false, "read_only": true,
+            "ok": true, "mainnet": mainnet, "read_only": true,
             "network_id": network, "genesis_id": genesis, "profile_id": profile,
             "height": height, "tip": tip, "state_root": root, "generation": 0,
-            "network_class": "local_loopback_pow_testnet_not_mainnet",
+            "network_class": network_class,
             "consensus": "candidate_argon2id_pow_pfs2_persistent_fork_choice"
         })
     } else if let Some(account_text) = path.strip_prefix("/v1/balance/") {
         match parse_hex32(account_text, "account ID") {
             Ok(account) => json!({
-                "ok": true, "mainnet": false, "read_only": true,
+                "ok": true, "mainnet": mainnet, "read_only": true,
                 "account_id": hex(&account),
                 "balance_atoms": locked.runtime.canonical_state().account(&account).map_or(0, |a| a.balance),
                 "nonce": locked.runtime.canonical_state().account(&account).map_or(0, |a| a.nonce),
                 "height": height, "tip": tip, "state_root": root,
                 "network_id": network, "genesis_id": genesis,
-                "network_class": "local_loopback_pow_testnet_not_mainnet"
+                "network_class": network_class
             }),
             Err(_) => {
-                json!({"ok": false, "mainnet": false, "read_only": true, "error": "invalid account ID"})
+                json!({"ok": false, "mainnet": mainnet, "read_only": true, "error": "invalid account ID"})
             }
         }
     } else if let Some(txid_text) = path.strip_prefix("/v1/transaction/") {
@@ -458,26 +581,26 @@ fn handle_rpc(stream: &mut TcpStream, state: &Arc<Mutex<NodeState>>) -> Result<(
             Ok(txid) => {
                 if let Some(receipt) = locked.receipts.get(&txid) {
                     json!({
-                        "ok": true, "mainnet": false, "read_only": true, "txid": hex(&txid),
+                        "ok": true, "mainnet": mainnet, "read_only": true, "txid": hex(&txid),
                         "status": "confirmed", "confirmations": height.saturating_sub(receipt.height) + 1,
                         "block_height": receipt.height, "search_floor_height": 0,
-                        "height": height, "tip": tip, "state_root": root
+                        "height": height, "tip": tip, "state_root": root, "network_class": network_class
                     })
                 } else {
                     json!({
-                        "ok": true, "mainnet": false, "read_only": true, "txid": hex(&txid),
+                        "ok": true, "mainnet": mainnet, "read_only": true, "txid": hex(&txid),
                         "status": "not_found_in_canonical_chain", "confirmations": 0,
                         "block_height": Value::Null, "search_floor_height": 0,
-                        "height": height, "tip": tip, "state_root": root
+                        "height": height, "tip": tip, "state_root": root, "network_class": network_class
                     })
                 }
             }
             Err(_) => {
-                json!({"ok": false, "mainnet": false, "read_only": true, "error": "invalid transaction ID"})
+                json!({"ok": false, "mainnet": mainnet, "read_only": true, "error": "invalid transaction ID"})
             }
         }
     } else {
-        json!({"ok": false, "mainnet": false, "read_only": true, "error": "unsupported endpoint"})
+        json!({"ok": false, "mainnet": mainnet, "read_only": true, "error": "unsupported endpoint"})
     };
     if serde_json::to_vec(&value).map_or(MAX_HTTP_RESPONSE + 1, |bytes| bytes.len())
         > MAX_HTTP_RESPONSE
@@ -1519,19 +1642,32 @@ fn run(config: Config) -> Result<(), String> {
         .canonical_state()
         .total_value()
         .map_err(|error| format!("{error:?}"))?;
+    validate_frozen_mainnet_genesis(
+        config.mainnet,
+        &genesis_id,
+        &profile_id,
+        &root,
+        owner_balance as u128,
+        total_supply,
+        runtime.canonical_state().account_count(),
+    )?;
 
     println!(
         "{}",
-        if config.public_alpha {
+        if config.mainnet {
+            "QRUN_V05_MAINNET_NODE_READY"
+        } else if config.public_alpha {
             "QRUN_V05_PUBLIC_ALPHA_CANDIDATE_READY"
         } else {
             "QRUN_V05_LOCAL_POW_LOOPBACK_TESTNET_READY"
         }
     );
-    println!("mainnet=false");
+    println!("mainnet={}", config.mainnet);
     println!(
         "network_class={}",
-        if config.public_alpha {
+        if config.mainnet {
+            "qzxb_mainnet"
+        } else if config.public_alpha {
             "public_alpha_experimental_not_mainnet"
         } else {
             "local_loopback_pow_testnet_not_public"
@@ -1556,7 +1692,9 @@ fn run(config: Config) -> Result<(), String> {
     println!("block_peer_count={}", config.peers.len());
     println!(
         "peer_transport={}",
-        if config.public_alpha {
+        if config.mainnet {
+            "qrun_v05_mainnet_noise_xx_public_peers_optional_seed_pins"
+        } else if config.public_alpha {
             "qrun_v05_noise_xx_open_public_peers_optional_seed_pins"
         } else if config.noise_private_key_file.is_some() {
             "qrun_v05_noise_xx_pinned_candidate"
@@ -1567,7 +1705,9 @@ fn run(config: Config) -> Result<(), String> {
     println!("consensus=PoW_fork_choice_persistent_PFS2");
     println!(
         "security_note={}",
-        if config.public_alpha {
+        if config.mainnet {
+            "qzxb_mainnet; calibrated_argon2id_pow; fixed_wallet_genesis; fixed_10b_supply; zero_block_subsidy; CAS_optional"
+        } else if config.public_alpha {
             "experimental_public_alpha; calibrated_argon2id_pow; fixed_genesis_supply; zero_block_subsidy; CAS_optional; mainnet_disabled"
         } else {
             "loopback_only_max_target_smoke_profile_not_public_consensus"
@@ -1577,6 +1717,7 @@ fn run(config: Config) -> Result<(), String> {
     let state = Arc::new(Mutex::new(NodeState {
         runtime,
         public_alpha: config.public_alpha,
+        mainnet: config.mainnet,
         authenticator,
         clock,
         receipts: BTreeMap::new(),
@@ -1650,12 +1791,12 @@ fn run(config: Config) -> Result<(), String> {
         .set_nonblocking(true)
         .map_err(|error| error.to_string())?;
     println!(
-        "qrun_pow_local_rpc_ready address={} read_only=true mainnet=false",
-        config.rpc_listen
+        "qrun_pow_local_rpc_ready address={} read_only=true mainnet={}",
+        config.rpc_listen, config.mainnet
     );
     println!(
-        "qrun_pow_local_tx_ready address={} protocol=QZTS/1 mainnet=false",
-        config.tx_listen
+        "qrun_pow_local_tx_ready address={} protocol=QZTS/1 mainnet={}",
+        config.tx_listen, config.mainnet
     );
     println!(
         "qrun_pow_local_block_ready address={} protocol=QRB5/2 loopback_only={}",
@@ -1705,6 +1846,22 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn startup_sync_requires_noise_key_and_a_pinned_seed_for_every_peer() {
+        assert!(validate_sync_start_config(false, false, 0, 0).is_ok());
+        assert!(validate_sync_start_config(true, false, 1, 1)
+            .unwrap_err()
+            .contains("--noise-private-key-file"));
+        assert!(validate_sync_start_config(true, true, 0, 0)
+            .unwrap_err()
+            .contains("at least one --peer"));
+        assert!(validate_sync_start_config(true, true, 1, 0)
+            .unwrap_err()
+            .contains("one --peer-static-public-key-hex pin"));
+        assert!(validate_sync_start_config(true, true, 2, 1).is_err());
+        assert!(validate_sync_start_config(true, true, 2, 2).is_ok());
+    }
 
     struct TestDir(PathBuf);
     impl TestDir {
@@ -1766,6 +1923,7 @@ mod tests {
         let mut state = NodeState {
             runtime,
             public_alpha: false,
+            mainnet: false,
             authenticator,
             clock,
             receipts: BTreeMap::new(),
@@ -1807,6 +1965,7 @@ mod tests {
         let mut state = NodeState {
             runtime,
             public_alpha: false,
+            mainnet: false,
             authenticator,
             clock,
             receipts: BTreeMap::new(),
@@ -2911,6 +3070,7 @@ mod tx_ingress_tests {
         let mut state = NodeState {
             runtime,
             public_alpha: false,
+            mainnet: false,
             authenticator,
             clock,
             receipts: BTreeMap::new(),
