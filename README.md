@@ -15,6 +15,11 @@ The source repository and project website are public, and we are actively inviti
 - **Public community announcement:** [QRun contributor discussion](https://github.com/hamidnikkhah660-arch/ai-native-l1/discussions/77).
 - **Independent zero-value Devnet onboarding:** [operator packet](docs/QZXB_ZERO_VALUE_DEVNET_OPERATOR_ONBOARDING_V01_2026-10-27.md).
 - **Global project site:** https://hamidnikkhah660-arch.github.io/ai-native-l1/
+- **Technology guide:** [Rust Layer-1 architecture and implementation boundaries](technology.html).
+- **Cryptography guide:** [ML-DSA-65, the selected 53-case fixture, hybrid-signature limits](cryptography.html).
+- **Current economics:** [10B Genesis direction and superseded emission model](economics.html).
+- **Release status:** [Current source branch, test inventory, production blockers](status.html).
+- **Contributions and sponsorship:** [How to submit a review, work plan or funding proposal](contribute.html).
 - **Source and contribution issues:** https://github.com/hamidnikkhah660-arch/ai-native-l1
 - **Latest experimental QRun source (not a production release):** [work branch](https://github.com/hamidnikkhah660-arch/ai-native-l1/tree/work/qzbe-v04-persistent-mining-20261026).
 - **Engineering white paper:** [QuantumZXB Native Coin White Paper v0.3](docs/QUANTUMZXB_NATIVE_COIN_WHITEPAPER_V03.md)
@@ -32,7 +37,7 @@ The source repository and project website are public, and we are actively inviti
 - **PFM5 full-archive replay-binding candidate (CP-0388):** [Genesis checkpoint and replay binding](docs/CP_0388_PFM5_FULL_ARCHIVE_REPLAY_BINDING_CANDIDATE_2026-10-23.md) ? recomputes every PMT4 envelope digest and checks the branch set and selected canonical tip against a replayed archive; rejects pruned non-Genesis checkpoints. Not wired into durable-store commit/startup or external anti-rollback.
 - **PFM5 externally anchored checkpoint-restore candidate (CP-0389):** [Restore checks and trust limitations](docs/CP_0389_PFM5_CHECKPOINT_BASELINE_RESTORE_CANDIDATE_2026-10-23.md) ? restores only after an exact external manifest commitment and monotonic floors match; rejects manifests that still need post-checkpoint archive replay. Not yet wired into the live PFM4 store/runtime.
 - **Publication checkpoint:** [CP-0344](docs/CP_0344_PUBLIC_DOCUMENTATION_REFRESH_2026-10-20.md)
-- **Founder/sponsor/contributor economics:** [Current tokenomics policy v0.4](docs/FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V04_2026-10-24.md)
+- **Historical allocation proposal (superseded by CP-0437):** [Tokenomics policy v0.4](\1)
 - **Current curated source baseline:** [v0.1.1-source](https://github.com/hamidnikkhah660-arch/ai-native-l1/releases/tag/v0.1.1-source)
 - **Founder profile and collaboration contact:** [Founder / AI research profile](docs/FOUNDER_PROFILE_AND_COLLABORATION.md) - email: [hamidnikkhah660@gmail.com](mailto:hamidnikkhah660@gmail.com?subject=QuantumZXB%20collaboration)
 - **Fixed-scope paid engineering offer (G1):** [Rust/protocol reproducibility and AI/ML sprint, deliverables, acceptance criteria, and payment terms](docs/ENGINEERING_SERVICE_OFFER_V01.md)
@@ -92,26 +97,23 @@ The planned maximum native QZXB supply is **10,000,000,000 coins**: **30% mining
 
 These are planned allocations, not active Genesis issuance, circulating supply, cash raised, signed awards, a completed airdrop or an actual burn. Exchange listing is not guaranteed; the exchange reserve is conditional on documented services/milestones, not a promise to buy a listing. Sponsor, marketing and contributor awards must be documented. The burn reserve is not burned until a verifiable burn occurs and carries no price-support promise. The owner allocation is explicitly 1B / 10%; control does not authorize hidden issuance or bypassing published consensus rules.
 
-- **Current allocation policy:** [Tokenomics and Distribution Policy v0.4](docs/FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V04_2026-10-24.md)
-- **Current white paper:** [QuantumZXB Native Coin White Paper v0.3](docs/QUANTUMZXB_NATIVE_COIN_WHITEPAPER_V03.md)
+- **Historical allocation proposal, superseded by CP-0437:** [Tokenomics and Distribution Policy v0.4](docs/FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V04_2026-10-24.md)
+- **Historical white paper:** [QuantumZXB Native Coin White Paper v0.3](docs/QUANTUMZXB_NATIVE_COIN_WHITEPAPER_V03.md) (read alongside the later CP-0437 and CP-0465 release decisions)
 - **Current engineering roadmap:** [QuantumZXB Engineering & Ecosystem Roadmap v0.3](docs/QUANTUMZXB_MASTER_ROADMAP_V03.md)
 - **Production gate status:** Gate 2 and Gate 8 remain open; native QZXB mainnet and a liquid native-coin market are not launched.
 
-The former 4B founder / 3B mining / 3B public-goods proposal is preserved in versioned historical documents and superseded for current allocation planning by policy v0.4. The separate QX ERC-20 deployment on Ethereum Sepolia is a test asset, not the native QZXB coin or a production market.
+Both the former 4B founder / 3B mining / 3B public-goods proposal and the later v0.4 percentage-bucket proposal are historical. CP-0437 is the latest owner-directed Genesis target: 10B QZXB to one owner account at Genesis, with zero later minting and zero block subsidy. The separate QX ERC-20 deployment on Ethereum Sepolia is a test asset, not the native QZXB coin or a production market.
 
 
 </details>
 
-## Current engineering validation
+## Experimental branch test inventory and recorded validation (2026-10-29)
 
-On the maintainer's complete working checkout at review time:
+The active experimental source branch is work/qzbe-v04-persistent-mining-20261026; its source lives under src/native/pow_bench. The branch is not a production release and is separate from the smaller public curated baseline described below.
 
-- cargo fmt --all -- --check - PASS.
-- cargo check --all-targets --locked --offline - PASS.
-- cargo test --all-targets --locked --offline - PASS, 736/736 library tests and no failures across remaining test targets.
-- npm test in contracts/launch-asset - PASS for the fixed-supply local EVM, wallet-console and loopback server suites.
-
-The complete maintainer checkout is larger than this curated public release tree; these counts describe the working checkout used for the review, not a claim that every internal historical fixture is included here. They are engineering regression evidence, not an independent security audit or a TPS/latency benchmark. The separate contracts/vm-lab Rust 1.99 toolchain test suite was not rerun in the current review environment.
+- cargo test --all-targets --locked --offline -- --list enumerated 1,187 test cases across 74 Cargo test targets, including 931 tests in src/lib.rs. This command lists test cases; it does not execute them.
+- The dated [CP-0465 release-gate report](docs/CP-0465_QRUN_MAINNET_PUBLIC_TRADING_NO_GO_2026-10-29.md) records a full local cargo test --all-targets --locked run with exit code 0, plus focused QRun node and wallet tests. These are local regression results, not an independent security review, third-party build attestation or multi-host production qualification.
+- The current active checkout audit did not rerun npm test for contracts/launch-asset because node_modules was absent; no fresh pass is claimed for that step here. The QX Sepolia asset remains separate from native QZXB.
 
 ## Latest curated public checkout validation (2026-10-21)
 
@@ -131,8 +133,10 @@ The public curated tree at source commit c3a5474aea60d3925f45ccc5f964f1229e4565e
 
 The founder profile now reflects the founder-confirmed **Ph.D. in Artificial Intelligence (completed 2024; institution omitted by request)** and summarises the AI, quantum-machine-learning, fuzzy/evolutionary optimisation, and post-quantum blockchain research described in the supplied CV and the engineering demonstrated in this repository. Sponsors, Rust/protocol engineers, cryptography reviewers, EVM developers, AI/LLM researchers, academic groups, grant programmes, infrastructure providers, exchanges and market-data platforms can send a concrete proposal to [hamidnikkhah660@gmail.com](mailto:hamidnikkhah660@gmail.com?subject=QuantumZXB%20collaboration). Exchange or data-platform contact is for technical diligence/readiness discussion only; no listing or market is represented as live. See the [liquidity and public-launch readiness plan](docs/LIQUIDITY_MARKET_DATA_AND_PUBLIC_LAUNCH_READINESS_V01.md).
 
-## Mining and performance status
+## Historical mining/emission candidate (superseded for the current Genesis direction)
 
-The current 10B design cap assigns 3B to the mining/network-security envelope. A shared research candidate uses 8 decimal places, a 30-second target, 2,016-block difficulty window, Argon2id v1.3 (64 MiB, one iteration, one lane), and a 4,204,800-block halving interval with a 356.73515981-coin initial subsidy. These are candidate arithmetic values, not frozen production rules; Gate 2 remains open and the reward path is not yet integrated through canonical block production/import, Genesis, reorganisation, snapshots and state roots. The project has no validated end-to-end native TPS or public-network latency benchmark. See the mining/performance report for the single-host candidate screens, their limitations, and the exact benchmark plan.
+Older research records modelled a 3B mining/security envelope with a candidate 30-second target, 2,016-block difficulty window, Argon2id parameters and a halving/subsidy schedule. Those numbers remain in dated historical simulation reports only. They are not the current supply policy after CP-0437 and must not be promoted as a live emission plan.
+
+The current owner-directed target assigns all 10,000,000,000 QZXB at Genesis to one owner account, with zero post-Genesis minting and zero block subsidy. Any block production would therefore be fee-only. Canonical consensus, Genesis, issuance invariants, recovery and fee-only security economics remain release gates; no production mining payout, live supply or native TPS benchmark is claimed. See [CP-0437](docs/CP-0437_QRUN_FULL_SUPPLY_GENESIS_DIRECTION_2026-10-28.md) and [CP-0465](docs/CP-0465_QRUN_MAINNET_PUBLIC_TRADING_NO_GO_2026-10-29.md).
 
 The source tree is a curated public selection. Review specific files, reproduce commands in the relevant package, and use the [current public release manifest](docs/PUBLIC_RELEASE_MANIFEST_V18_2026-10-22.md) to identify the versioned public baseline. The public white paper and roadmap describe the engineering plan; they do not assert that future integrations are already operating on native Mainnet.
