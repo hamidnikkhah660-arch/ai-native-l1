@@ -6,19 +6,21 @@ Status: implemented and locally tested as a candidate transport integration. Not
 
 ## Changes
 
-- Added `qrun_v05_noise_transport_candidate.rs`, a QRun-specific Noise XX domain separated from the zero-value Devnet transport. It pins the remote static key, binds the handshake to the configured network ID, encrypts bounded records and fails closed on wrong-network, unknown-key, malformed or tampered records.
+- Added `qrun_v05_noise_transport_candidate.rs`, a QRun-specific Noise XX domain separated from the zero-value Devnet transport. It pins the remote static key and binds the handshake to the configured network ID, a fingerprint of all consensus parameters, and the Genesis commitment; it encrypts bounded records and fails closed on wrong-network, unknown-key, malformed or tampered records.
 - Wired optional authenticated peer sessions into `qrun_v05_pow_local_node` block exchange. A node configured with an NPK1 protected private key requires the configured pinned-key trust set on inbound connections and refuses plaintext fallback if an outbound peer's key pin is missing. Block acknowledgments use the same encrypted session.
 - Added `qrun_v05_noise_keygen`, which creates a Noise static keypair, stores the private key using Windows CurrentUser DPAPI bound to the supplied network ID, and prints only the public key. The utility refuses to overwrite an existing key file.
 - In-memory node and ephemeral copies of Noise private keys are explicitly zeroed on drop/after use where the code controls their lifecycle.
-- Added an authenticated two-node integration test that propagates an empty block and a signed transfer and verifies matching canonical tip/state root, recipient balance and receipt. Added a regression test proving an authenticated outbound peer with a missing pin fails without sending plaintext, and a separate test confirming non-loopback binds remain rejected; the parser also rejects duplicate peer sockets.
+- Added an authenticated two-node integration test that propagates an empty block and a signed transfer and verifies matching canonical tip/state root, recipient balance and receipt. A canonical consensus-profile fingerprint covers all parameters plus the Genesis commitment, with a regression test that changing PoW parameters or Genesis changes the fingerprint. Added a regression test proving an authenticated outbound peer with a missing pin fails without sending plaintext, and a separate test confirming non-loopback binds remain rejected; the parser also rejects duplicate peer sockets.
 
 ## Validation
 
 The following passed on Windows stable Rust with locked dependencies:
 
 - `cargo +stable fmt --all -- --check`
-- Seven unit tests for the QRun-domain Noise transport: network binding, mutual static-key pinning, unknown-key rejection, trust-set bounds, tamper rejection and record-size limits.
+- Eight unit tests for the QRun-domain Noise transport, including wrong-network and wrong-profile handshake rejection, mutual static-key pinning, unknown-key rejection, trust-set bounds, tamper rejection and record-size limits.
+- `tests::consensus_profile_fingerprint_changes_when_pow_parameters_change`
 - `tests::two_qrun_nodes_sync_signed_transfer_over_authenticated_noise_xx`
+- `tests::authenticated_mode_refuses_unpinned_peer_instead_of_plaintext_fallback`
 - `tests::smoke_node_public_listener_guard_remains_fail_closed`
 - `tests::two_pow_nodes_sync_signed_transfer_over_real_loopback_socket`
 - `tx_ingress_tests::qzts_signed_wallet_request_executes_and_persists_canonical_receipt`

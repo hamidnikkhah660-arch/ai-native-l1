@@ -104,15 +104,17 @@ impl QRunV05NoiseSession {
         &self.remote_static_public_key
     }
 
-    /// Initiator: verifies the responder static key against an out-of-band pin before application
-    /// data is sent. The Network ID is bound into the Noise prologue (no cross-network fallback).
+    /// Initiator: verifies the responder static key and binds both network and consensus profile
+    /// into the Noise prologue before application data is sent.
     pub fn connect(
         stream: &mut TcpStream,
         local_static_private_key: &[u8; 32],
         trusted_remote_static_public_key: &[u8; 32],
         network_id: &[u8; 32],
+        profile_id: &[u8; 32],
     ) -> Result<Self, QRunV05NoiseError> {
         validate_private_and_network(local_static_private_key, network_id)?;
+        validate_profile_id(profile_id)?;
         if trusted_remote_static_public_key
             .iter()
             .all(|byte| *byte == 0)
@@ -122,7 +124,7 @@ impl QRunV05NoiseSession {
         let deadline = Instant::now() + HANDSHAKE_BUDGET;
         apply_timeouts(stream, deadline).map_err(io_error)?;
         let params = noise_params()?;
-        let prologue = prologue(network_id);
+        let prologue = prologue(network_id, profile_id);
         let builder = Builder::new(params)
             .prologue(&prologue)
             .local_private_key(local_static_private_key);
@@ -166,20 +168,22 @@ impl QRunV05NoiseSession {
         })
     }
 
-    /// Responder: completes XX and checks the initiator's static key against the entire explicitly
-    /// configured trust set. No frame is handed to PTB2 decoding until this function succeeds.
+    /// Responder: completes XX and checks the initiator's static key and profile against explicit
+    /// operator pins. No block frame is decoded until authentication succeeds.
     pub fn accept(
         stream: &mut TcpStream,
         local_static_private_key: &[u8; 32],
         trusted_remote_static_public_keys: &[[u8; 32]],
         network_id: &[u8; 32],
+        profile_id: &[u8; 32],
     ) -> Result<Self, QRunV05NoiseError> {
         validate_private_and_network(local_static_private_key, network_id)?;
+        validate_profile_id(profile_id)?;
         validate_trust_set(trusted_remote_static_public_keys)?;
         let deadline = Instant::now() + HANDSHAKE_BUDGET;
         apply_timeouts(stream, deadline).map_err(io_error)?;
         let params = noise_params()?;
-        let prologue = prologue(network_id);
+        let prologue = prologue(network_id, profile_id);
         let builder = Builder::new(params)
             .prologue(&prologue)
             .local_private_key(local_static_private_key);
@@ -283,11 +287,19 @@ fn noise_params() -> Result<NoiseParams, QRunV05NoiseError> {
         .parse()
         .map_err(|error: snow::Error| QRunV05NoiseError::Handshake(error.to_string()))
 }
-fn prologue(network_id: &[u8; 32]) -> Vec<u8> {
-    let mut value = Vec::with_capacity(PROLOGUE_DOMAIN.len() + network_id.len());
+fn prologue(network_id: &[u8; 32], profile_id: &[u8; 32]) -> Vec<u8> {
+    let mut value = Vec::with_capacity(PROLOGUE_DOMAIN.len() + network_id.len() + profile_id.len());
     value.extend_from_slice(PROLOGUE_DOMAIN);
     value.extend_from_slice(network_id);
+    value.extend_from_slice(profile_id);
     value
+}
+
+fn validate_profile_id(profile_id: &[u8; 32]) -> Result<(), QRunV05NoiseError> {
+    if profile_id.iter().all(|byte| *byte == 0) {
+        return Err(QRunV05NoiseError::InvalidNetworkId);
+    }
+    Ok(())
 }
 fn validate_private_and_network(
     private_key: &[u8; 32],
@@ -468,11 +480,12 @@ mod tests {
     }
 
     #[test]
-    fn prologue_domain_is_qrun_specific_and_binds_the_network_id() {
+    fn prologue_domain_is_qrun_specific_and_binds_network_and_profile_fingerprint() {
         let network = [0x52; 32];
-        let actual = prologue(&network);
+        let profile = [0x72; 32];
+        let actual = prologue(&network, &profile);
         assert!(actual.starts_with(b"QRUN-V05-VALUE-BEARING-CANDIDATE-NOISE-XX-V1\0"));
-        assert!(actual.ends_with(&network));
+        assert!(actual.ends_with(&[network.as_slice(), profile.as_slice()].concat()));
         assert_ne!(
             actual,
             [
@@ -495,6 +508,7 @@ mod tests {
     #[test]
     fn noise_xx_binds_network_and_pins_both_sides_then_encrypts_ptb2_payload_and_ack() {
         let network = [0x61; 32];
+        let profile = [0x71; 32];
         let (server_private, server_public) = keypair(1);
         let (client_private, client_public) = keypair(2);
         let (listener, address) = listener();
@@ -505,6 +519,7 @@ mod tests {
                 &server_private,
                 &[client_public],
                 &network,
+                &profile,
             )
             .unwrap();
             assert_eq!(session.remote_static_public_key(), &client_public);
@@ -513,9 +528,14 @@ mod tests {
             session.write_record(&mut stream, b"PTA2-ACK").unwrap();
         });
         let mut stream = TcpStream::connect(address).unwrap();
-        let mut session =
-            QRunV05NoiseSession::connect(&mut stream, &client_private, &server_public, &network)
-                .unwrap();
+        let mut session = QRunV05NoiseSession::connect(
+            &mut stream,
+            &client_private,
+            &server_public,
+            &network,
+            &profile,
+        )
+        .unwrap();
         assert_eq!(session.remote_static_public_key(), &server_public);
         session
             .write_record(&mut stream, b"PTB2-PFS2-TEST-ENVELOPE")
@@ -528,17 +548,60 @@ mod tests {
     fn wrong_network_prologue_rejects_without_plaintext_fallback() {
         let network_a = [0x62; 32];
         let network_b = [0x63; 32];
+        let profile = [0x73; 32];
         let (server_private, server_public) = keypair(3);
         let (client_private, client_public) = keypair(4);
         let (listener, address) = listener();
         let server_thread = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            QRunV05NoiseSession::accept(&mut stream, &server_private, &[client_public], &network_a)
-                .map(|_| ())
+            QRunV05NoiseSession::accept(
+                &mut stream,
+                &server_private,
+                &[client_public],
+                &network_a,
+                &profile,
+            )
+            .map(|_| ())
         });
         let mut stream = TcpStream::connect(address).unwrap();
-        let client =
-            QRunV05NoiseSession::connect(&mut stream, &client_private, &server_public, &network_b);
+        let client = QRunV05NoiseSession::connect(
+            &mut stream,
+            &client_private,
+            &server_public,
+            &network_b,
+            &profile,
+        );
+        assert!(client.is_err());
+        assert!(server_thread.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn wrong_profile_fingerprint_rejects_without_plaintext_fallback() {
+        let network = [0x68; 32];
+        let profile_a = [0x78; 32];
+        let profile_b = [0x79; 32];
+        let (server_private, server_public) = keypair(9);
+        let (client_private, client_public) = keypair(10);
+        let (listener, address) = listener();
+        let server_thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            QRunV05NoiseSession::accept(
+                &mut stream,
+                &server_private,
+                &[client_public],
+                &network,
+                &profile_a,
+            )
+            .map(|_| ())
+        });
+        let mut stream = TcpStream::connect(address).unwrap();
+        let client = QRunV05NoiseSession::connect(
+            &mut stream,
+            &client_private,
+            &server_public,
+            &network,
+            &profile_b,
+        );
         assert!(client.is_err());
         assert!(server_thread.join().unwrap().is_err());
     }
@@ -546,16 +609,28 @@ mod tests {
     #[test]
     fn unknown_remote_static_key_is_rejected() {
         let network = [0x64; 32];
+        let profile = [0x74; 32];
         let (server_private, _server_public) = keypair(5);
         let (client_private, client_public) = keypair(6);
         let (listener, address) = listener();
         let server_thread = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            QRunV05NoiseSession::accept(&mut stream, &server_private, &[[0x99; 32]], &network)
+            QRunV05NoiseSession::accept(
+                &mut stream,
+                &server_private,
+                &[[0x99; 32]],
+                &network,
+                &profile,
+            )
         });
         let mut stream = TcpStream::connect(address).unwrap();
-        let client =
-            QRunV05NoiseSession::connect(&mut stream, &client_private, &[0x98; 32], &network);
+        let client = QRunV05NoiseSession::connect(
+            &mut stream,
+            &client_private,
+            &[0x98; 32],
+            &network,
+            &profile,
+        );
         assert!(client.is_err());
         assert!(server_thread.join().unwrap().is_err());
         assert_ne!(client_public, [0; 32]);
@@ -584,11 +659,16 @@ mod tests {
             validate_private_and_network(&[1; 32], &[0; 32]),
             Err(QRunV05NoiseError::InvalidNetworkId)
         );
+        assert_eq!(
+            validate_profile_id(&[0; 32]),
+            Err(QRunV05NoiseError::InvalidNetworkId)
+        );
     }
 
     #[test]
     fn encrypted_record_rejects_tampered_or_oversized_input() {
         let network = [0x65; 32];
+        let profile = [0x75; 32];
         let (server_private, server_public) = keypair(7);
         let (client_private, client_public) = keypair(8);
         let (listener, address) = listener();
@@ -599,15 +679,21 @@ mod tests {
                 &server_private,
                 &[client_public],
                 &network,
+                &profile,
             )
             .unwrap();
             let result = session.read_record(&mut stream);
             assert!(result.is_err());
         });
         let mut stream = TcpStream::connect(address).unwrap();
-        let mut session =
-            QRunV05NoiseSession::connect(&mut stream, &client_private, &server_public, &network)
-                .unwrap();
+        let mut session = QRunV05NoiseSession::connect(
+            &mut stream,
+            &client_private,
+            &server_public,
+            &network,
+            &profile,
+        )
+        .unwrap();
         let mut ciphertext = vec![0u8; b"corrupt me".len() + 128];
         let length = session
             .transport

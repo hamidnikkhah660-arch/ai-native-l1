@@ -5,7 +5,7 @@
 //! to loopback, labelled test-only, and cannot claim Mainnet status. It uses persistent PoW fork choice with a deliberately trivial local-only smoke target.
 //! It is not a public-network consensus profile.
 use ai_native_l1_pow_bench::chain_admission::SystemClockReferenceTime;
-use ai_native_l1_pow_bench::consensus::{ConsensusParameters, Uint256};
+use ai_native_l1_pow_bench::consensus::{ConsensusParameters, PowAlgorithm, Uint256};
 use ai_native_l1_pow_bench::noise_key_provisioning::load_protected_noise_private_key;
 use ai_native_l1_pow_bench::private_testnet_wire::decode_candidate_network_block;
 use ai_native_l1_pow_bench::qrun_v05_noise_transport_candidate::QRunV05NoiseSession;
@@ -292,10 +292,32 @@ Initializes the full 10B candidate Genesis in a test-only local store. All liste
     })
 }
 
-fn profile_id(network_id: &NetworkId) -> [u8; 32] {
+fn profile_id(
+    network_id: &NetworkId,
+    params: &ConsensusParameters,
+    genesis_commitment: &[u8; 32],
+) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(LOCAL_PROFILE_DOMAIN);
     hash.update(network_id);
+    hash.update(genesis_commitment);
+    hash.update(params.protocol_version.to_be_bytes());
+    hash.update(params.target_block_time_secs.to_be_bytes());
+    hash.update(params.difficulty_window_blocks.to_be_bytes());
+    hash.update(params.difficulty_min_ratio_divisor.to_be_bytes());
+    hash.update(params.difficulty_max_ratio.to_be_bytes());
+    hash.update(params.pow_limit.to_be_bytes());
+    hash.update(params.initial_target.to_be_bytes());
+    hash.update(match params.pow.algorithm {
+        PowAlgorithm::Argon2id => [1u8],
+    });
+    hash.update(params.pow.memory_kib.to_be_bytes());
+    hash.update(params.pow.iterations.to_be_bytes());
+    hash.update(params.pow.lanes.to_be_bytes());
+    hash.update([params.pow.output_bytes]);
+    hash.update(params.issuance.maximum_supply().to_be_bytes());
+    hash.update(params.issuance.initial_subsidy().to_be_bytes());
+    hash.update(params.issuance.blocks_per_halving().to_be_bytes());
     hash.finalize().into()
 }
 
@@ -545,6 +567,7 @@ fn send_block_to_peer_authenticated(
     peer: SocketAddr,
     envelope: &[u8],
     network_id: &[u8; 32],
+    profile_id: &[u8; 32],
     local_private_key: [u8; 32],
     remote_static_public_key: &[u8; 32],
 ) -> Result<(), String> {
@@ -570,6 +593,7 @@ fn send_block_to_peer_authenticated(
         &local_private_key.0,
         remote_static_public_key,
         network_id,
+        profile_id,
     );
     let mut session =
         established.map_err(|error| format!("Noise XX peer authentication failed: {error}"))?;
@@ -592,12 +616,13 @@ fn send_block_to_peer(
     envelope: &[u8],
     state: &Arc<Mutex<NodeState>>,
 ) -> Result<(), String> {
-    let (network_id, local_private_key, remote_static_public_key) = {
+    let (network_id, profile_id, local_private_key, remote_static_public_key) = {
         let locked = state
             .lock()
             .map_err(|_| "node state lock poisoned".to_string())?;
         (
             locked.runtime.network_id(),
+            locked.profile_id,
             locked.noise_private_key,
             locked.peer_static_keys_by_addr.get(&peer).copied(),
         )
@@ -609,6 +634,7 @@ fn send_block_to_peer(
                 peer,
                 envelope,
                 &network_id,
+                &profile_id,
                 private_key,
                 &public_key,
             );
@@ -628,12 +654,13 @@ fn handle_block(stream: &mut TcpStream, state: &Arc<Mutex<NodeState>>) -> Result
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|error| error.to_string())?;
-    let (network_id, local_private_key, trusted_peer_static_keys) = {
+    let (network_id, profile_id, local_private_key, trusted_peer_static_keys) = {
         let locked = state
             .lock()
             .map_err(|_| "node state lock poisoned".to_string())?;
         (
             locked.runtime.network_id(),
+            locked.profile_id,
             locked.noise_private_key,
             locked.trusted_peer_static_keys.clone(),
         )
@@ -644,6 +671,7 @@ fn handle_block(stream: &mut TcpStream, state: &Arc<Mutex<NodeState>>) -> Result
             &private_key,
             &trusted_peer_static_keys,
             &network_id,
+            &profile_id,
         );
         private_key.fill(0);
         Some(
@@ -933,6 +961,7 @@ fn run(config: Config) -> Result<(), String> {
     params.pow.memory_kib = 8 * 1024;
     params.pow.iterations = 1;
     params.pow.lanes = 1;
+    let profile_params = params.clone();
     let clock = SystemClockReferenceTime;
     let store_dir = config.data_dir.join("qrun-v05-pow-fork-store");
     let runtime = QRunV05PowForkRuntime::open(
@@ -946,8 +975,8 @@ fn run(config: Config) -> Result<(), String> {
     .map_err(|error| format!("open QRun PoW fork runtime: {error:?}"))?;
     let network_id = runtime.network_id();
     let genesis_id = runtime.genesis_commitment();
+    let profile_id = profile_id(&network_id, &profile_params, &genesis_id);
     let root = runtime.canonical_state_root();
-    let profile_id = profile_id(&network_id);
     let owner_balance = runtime
         .canonical_state()
         .account(&config.owner_account)
@@ -1132,21 +1161,18 @@ mod tests {
         )
         .unwrap();
         let clock = SystemClockReferenceTime;
-        let runtime = QRunV05PowForkRuntime::open(
-            directory,
-            network,
-            owner,
-            smoke_params(),
-            &authenticator,
-            &clock,
-        )
-        .unwrap();
+        let params = smoke_params();
+        let profile_params = params.clone();
+        let runtime =
+            QRunV05PowForkRuntime::open(directory, network, owner, params, &authenticator, &clock)
+                .unwrap();
+        let profile_id = profile_id(&network, &profile_params, &runtime.genesis_commitment());
         let mut state = NodeState {
             runtime,
             authenticator,
             clock,
             receipts: BTreeMap::new(),
-            profile_id: profile_id(&network),
+            profile_id,
             block_peers: Vec::new(),
             noise_private_key: None,
             trusted_peer_static_keys: Vec::new(),
@@ -1208,10 +1234,11 @@ mod tests {
         envelope: &[u8],
     ) {
         let peer = listener.local_addr().unwrap();
-        let (network_id, mut local_private_key, remote_static_public_key) = {
+        let (network_id, profile_id, mut local_private_key, remote_static_public_key) = {
             let locked = sender.lock().unwrap();
             (
                 locked.runtime.network_id(),
+                locked.profile_id,
                 locked.noise_private_key.unwrap(),
                 *locked.peer_static_keys_by_addr.get(&peer).unwrap(),
             )
@@ -1222,6 +1249,7 @@ mod tests {
                 peer,
                 &envelope,
                 &network_id,
+                &profile_id,
                 local_private_key,
                 &remote_static_public_key,
             );
@@ -1231,6 +1259,29 @@ mod tests {
         let (mut stream, _) = listener.accept().unwrap();
         handle_block(&mut stream, receiver).unwrap();
         client.join().unwrap();
+    }
+
+    #[test]
+    fn consensus_profile_fingerprint_changes_when_pow_parameters_change() {
+        let network = [0x54; 32];
+        let baseline = smoke_params();
+        let mut modified = baseline.clone();
+        modified.pow.memory_kib += 1;
+        let genesis = [0x64; 32];
+        let genesis_other = [0x65; 32];
+        let baseline_fingerprint = profile_id(&network, &baseline, &genesis);
+        assert_eq!(
+            baseline_fingerprint,
+            profile_id(&network, &smoke_params(), &genesis)
+        );
+        assert_ne!(
+            baseline_fingerprint,
+            profile_id(&network, &modified, &genesis)
+        );
+        assert_ne!(
+            baseline_fingerprint,
+            profile_id(&network, &baseline, &genesis_other)
+        );
     }
 
     #[test]
@@ -1527,21 +1578,24 @@ mod tx_ingress_tests {
         )
         .unwrap();
         let clock = SystemClockReferenceTime;
+        let params = test_params();
+        let profile_params = params.clone();
         let runtime = QRunV05PowForkRuntime::open(
             directory,
             network,
             account,
-            test_params(),
+            params,
             &authenticator,
             &clock,
         )
         .unwrap();
+        let profile_id = profile_id(&network, &profile_params, &runtime.genesis_commitment());
         let mut state = NodeState {
             runtime,
             authenticator,
             clock,
             receipts: BTreeMap::new(),
-            profile_id: profile_id(&network),
+            profile_id,
             block_peers: Vec::new(),
             noise_private_key: None,
             trusted_peer_static_keys: Vec::new(),
