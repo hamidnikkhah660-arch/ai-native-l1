@@ -259,6 +259,12 @@ impl PrivateTestnetForkStore {
                         BoundedReadError::Io(error) => ForkStoreError::Io(error),
                         BoundedReadError::TooLarge => ForkStoreError::ManifestTooLarge,
                     })?;
+                // A checkpoint-rooted segment must not silently reopen an existing suffix
+                // without an anchor retained outside the mutable archive directory. Otherwise a
+                // self-consistent rollback of its manifest can discard already-committed blocks.
+                if base_chain.is_some() && expected_manifest_anchor.is_none() {
+                    return Err(ForkStoreError::ManifestAnchorMismatch);
+                }
                 if expected_manifest_anchor
                     .is_some_and(|expected| manifest_anchor_commitment(&manifest_bytes) != expected)
                 {

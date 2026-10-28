@@ -777,6 +777,23 @@ mod tests {
         let suffix_root = segmented.canonical_state_root();
         let suffix_manifest_anchor = segmented.manifest_anchor().unwrap();
         drop(segmented);
+
+        // Reopening an existing checkpoint-rooted segment without the out-of-band manifest
+        // anchor must fail closed instead of accepting a local-only rollback of its suffix.
+        assert!(QRunV05PowForkRuntime::open_from_checkpoint(
+            &suffix_dir.0,
+            network,
+            owner,
+            params.clone(),
+            &EmptyAuthenticator,
+            &FixedClock,
+            &checkpoint_bytes,
+            checkpoint_commitment,
+            1,
+            None,
+        )
+        .is_err());
+
         let segmented_reopened = QRunV05PowForkRuntime::open_from_checkpoint(
             &suffix_dir.0,
             network,
