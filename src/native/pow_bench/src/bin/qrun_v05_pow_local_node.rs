@@ -1394,9 +1394,15 @@ fn run(config: Config) -> Result<(), String> {
     // This explicitly local-only smoke profile has an easy target. It verifies the QFP5
     // fee-only producer commitment and fork-selection path, but is not secure and must not be
     // reused for public consensus. Protocol version 5 is pinned to the exact candidate identity.
+    let qrun_v05_identity = config.network_id
+        == ai_native_l1_pow_bench::qrun_v05_profile_identity_candidate::PROPOSED_QRUN_V05_NETWORK_ID
+        && config.owner_account
+            == ai_native_l1_pow_bench::qrun_v05_profile_identity_candidate::PROPOSED_OWNER_ACCOUNT_ID;
     let mut params = ConsensusParameters::candidate_testnet()
         .map_err(|error| format!("load candidate PoW profile: {error:?}"))?;
-    params.protocol_version = 5;
+    if qrun_v05_identity {
+        params.protocol_version = 5;
+    }
     params.initial_target = Uint256::MAX;
     params.pow_limit = Uint256::MAX;
     params.pow.memory_kib = 8 * 1024;
@@ -1409,7 +1415,13 @@ fn run(config: Config) -> Result<(), String> {
         );
     }
     let clock = SystemClockReferenceTime;
-    let store_dir = config.data_dir.join("qrun-v05-qfp5-store");
+    let store_dir = if qrun_v05_identity {
+        config.data_dir.join("qrun-v05-qfp5-store")
+    } else {
+        // Preserve isolated PTB2 fixtures for startup-sync compatibility tests; QRun v0.5 uses
+        // its profile-specific directory so the two modes cannot share a manifest accidentally.
+        config.data_dir.join("qrun-v05-pow-fork-store")
+    };
     let mut runtime = QRunV05PowForkRuntime::open(
         &store_dir,
         config.network_id,

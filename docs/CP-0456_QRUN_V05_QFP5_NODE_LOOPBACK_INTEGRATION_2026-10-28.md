@@ -45,3 +45,16 @@ Targeted validation after this follow-up:
 - Formatting and whitespace/diff checks: passed.
 
 The added checkpoint test creates a QFP5 block, exports and restores QRCP state, extends the suffix with another QFP5 block, and verifies reopening requires the externally retained PFS2 manifest anchor while preserving the exact total supply and state root. Public listeners remain loopback-restricted; this follow-up does not activate Mainnet.
+
+## Follow-up: select QFP5 only for the frozen QRun identity
+
+The executable now enables protocol version 5 and chooses the dedicated QFP5 store directory only when both the configured network ID and Genesis owner account equal the exact proposed QRun v0.5 identity. Isolated historical PTB2 startup-sync fixtures keep their legacy profile and separate directory; they cannot cause the production candidate identity to accept PTB2 or cause random test identities to impersonate QRun v0.5.
+
+Validation after this compatibility correction:
+
+- cargo test --bin qrun_v05_pow_local_node ? 10 passed.
+- simulations/cp0449_qrun_authenticated_startup_sync_loopback.ps1 ? passed authenticated startup sync before listener bind, explicit mainnet=false, and fail-closed listener guard.
+- cargo fmt --all -- --check ? passed.
+- git diff --check ? passed.
+
+The CP-0449 executable scenario remains loopback-only and is not public Mainnet validation.
