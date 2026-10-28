@@ -125,6 +125,38 @@ impl QRunV05PowForkRuntime {
         expected_manifest_anchor: Option<[u8; 32]>,
     ) -> Result<Self, QRunV05PowRuntimeError> {
         let genesis = QRunGenesisV05::new(network_id, owner_account)?;
+        let proposed_qrun_identity = network_id == PROPOSED_QRUN_V05_NETWORK_ID
+            && owner_account == PROPOSED_OWNER_ACCOUNT_ID;
+        if params.protocol_version == 5 && !proposed_qrun_identity {
+            return Err(QRunV05PowRuntimeError::WrongNetwork);
+        }
+        if params.protocol_version == 5 {
+            let store = PrivateTestnetForkStore::open_qrun_v05_fee_only_from_checkpoint(
+                directory,
+                genesis.ledger().clone(),
+                params.clone(),
+                authenticator,
+                clock,
+                checkpoint_bytes,
+                checkpoint_commitment,
+                minimum_checkpoint_height,
+                expected_manifest_anchor,
+            )?;
+            let runtime = Self {
+                network_id,
+                owner_account,
+                genesis_commitment: genesis.commitment(),
+                params,
+                store,
+                fee_only: true,
+                producer_account: owner_account,
+            };
+            runtime.validate_all_branch_supplies()?;
+            return Ok(runtime);
+        }
+
+        // Legacy fixture profiles retain their historical checkpoint path. QRun v0.5 above uses
+        // the profile-locked QRCP-to-QFP5 PFS2 store so the execution mode cannot downgrade.
         let base_chain = QRunV05PowCheckpoint::restore_chain_anchored(
             checkpoint_bytes,
             &network_id,
@@ -961,6 +993,105 @@ mod tests {
             MAX_TOTAL_SUPPLY_ATOMS
         );
         assert_ne!(winner_txid, loser_txid);
+    }
+
+    #[test]
+    fn qrun_fee_only_runtime_resumes_from_checkpoint_and_reopens_qfp5_suffix() {
+        let base_dir = TestDir::new();
+        let suffix_dir = TestDir::new();
+        let network = PROPOSED_QRUN_V05_NETWORK_ID;
+        let owner = PROPOSED_OWNER_ACCOUNT_ID;
+        let mut params = params();
+        params.protocol_version = 5;
+
+        let mut base = QRunV05PowForkRuntime::open(
+            &base_dir.0,
+            network,
+            owner,
+            params.clone(),
+            &EmptyAuthenticator,
+            &FixedClock,
+        )
+        .unwrap();
+        assert!(base.is_qrun_v05_fee_only());
+        let first = base
+            .mine_candidate(100, Vec::new(), &EmptyAuthenticator, 1)
+            .unwrap();
+        assert!(first.starts_with(b"QFP5"));
+        base.submit_block(&first, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+        assert_eq!(base.canonical_height(), 1);
+        let base_root = base.canonical_state_root();
+        let checkpoint_bytes = base.export_checkpoint([0x91; 32]).unwrap();
+        let checkpoint_commitment = QRunV05PowCheckpoint::commitment_for_bytes(&checkpoint_bytes);
+
+        let mut suffix = QRunV05PowForkRuntime::open_from_checkpoint(
+            &suffix_dir.0,
+            network,
+            owner,
+            params.clone(),
+            &EmptyAuthenticator,
+            &FixedClock,
+            &checkpoint_bytes,
+            checkpoint_commitment,
+            1,
+            None,
+        )
+        .unwrap();
+        assert!(suffix.is_qrun_v05_fee_only());
+        assert_eq!(suffix.canonical_height(), 1);
+        assert_eq!(suffix.canonical_state_root(), base_root);
+        assert_eq!(
+            suffix.canonical_state().total_value().unwrap(),
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
+
+        let continuation = suffix
+            .mine_candidate(101, Vec::new(), &EmptyAuthenticator, 1)
+            .unwrap();
+        assert!(continuation.starts_with(b"QFP5"));
+        suffix
+            .submit_block(&continuation, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+        assert_eq!(suffix.canonical_height(), 2);
+        let suffix_root = suffix.canonical_state_root();
+        let manifest_anchor = suffix.manifest_anchor().unwrap();
+        drop(suffix);
+
+        assert!(QRunV05PowForkRuntime::open_from_checkpoint(
+            &suffix_dir.0,
+            network,
+            owner,
+            params.clone(),
+            &EmptyAuthenticator,
+            &FixedClock,
+            &checkpoint_bytes,
+            checkpoint_commitment,
+            1,
+            None,
+        )
+        .is_err());
+
+        let reopened = QRunV05PowForkRuntime::open_from_checkpoint(
+            &suffix_dir.0,
+            network,
+            owner,
+            params,
+            &EmptyAuthenticator,
+            &FixedClock,
+            &checkpoint_bytes,
+            checkpoint_commitment,
+            1,
+            Some(manifest_anchor),
+        )
+        .unwrap();
+        assert!(reopened.is_qrun_v05_fee_only());
+        assert_eq!(reopened.canonical_height(), 2);
+        assert_eq!(reopened.canonical_state_root(), suffix_root);
+        assert_eq!(
+            reopened.canonical_state().total_value().unwrap(),
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
     }
 
     #[test]

@@ -32,3 +32,16 @@ The executable is still qrun_v05_pow_local_node, explicitly requires --local-tes
 The integration does not close the remaining production engineering gates: a calibrated/frozen production difficulty and timestamp profile, full-history verification or a verifiable automatic checkpoint rollover beyond the bounded 1,024-block catch-up path, a genuinely independent and monotonic external CAS anchor, public peer bootstrap/reconnect/churn, end-to-end permissionless wallet submission on the fixed profile, independently operated multi-host recovery, and a release built from a single finalized production configuration. The external CAS provider in tests is not a deployed independent service. No public QRun Mainnet endpoint or live trade is asserted here.
 
 The owner-directed candidate Genesis still specifies 10,000,000,000 QZXB at Genesis, with zero post-Genesis minting and zero block subsidy. That fixed-supply candidate is not evidence that 10B QZXB are already spendable on a public Mainnet or have market value. Exchange listing and legal approval are not treated as protocol software prerequisites.
+
+## Follow-up: checkpoint-rooted QFP5 runtime path
+
+The runtime checkpoint entry point now routes protocol-version 5 with the exact candidate QRun identity directly through the QFP5 PFS2 checkpoint-store constructor. This avoids accidentally entering the legacy suffix path or rejecting a valid QRun checkpoint. The branch-profile check remains fail-closed if version 5 is supplied with a different network or owner identity.
+
+Targeted validation after this follow-up:
+
+- QRun runtime tests: 5 passed.
+- QRun local-node tests: 10 passed.
+- All-target compilation check: passed.
+- Formatting and whitespace/diff checks: passed.
+
+The added checkpoint test creates a QFP5 block, exports and restores QRCP state, extends the suffix with another QFP5 block, and verifies reopening requires the externally retained PFS2 manifest anchor while preserving the exact total supply and state root. Public listeners remain loopback-restricted; this follow-up does not activate Mainnet.
