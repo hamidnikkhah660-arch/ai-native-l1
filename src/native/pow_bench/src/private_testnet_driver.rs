@@ -1,4 +1,4 @@
-﻿//! Private-testnet consensus chain driver for CP-W.
+//! Private-testnet consensus chain driver for CP-W.
 //!
 //! This driver keeps target history, cumulative work, and canonical state together without
 //! changing the legacy BLK2 body encoding. It is deliberately small and explicit so a later
@@ -476,6 +476,45 @@ impl PrivateTestnetChain {
             monetary_state: None,
             target_history: TargetHistory::new(params)?,
             cumulative_work: Uint256::ZERO,
+            tip_consensus_hash,
+        })
+    }
+
+    /// Restore the QRun ledger/consensus baseline after its checkpoint has been validated against
+    /// an independently protected commitment and monotonic height floor. This constructor checks
+    /// local snapshot/history consistency; it does not authenticate the checkpoint on its own.
+    pub(crate) fn from_qrun_checkpoint(
+        state: LedgerState,
+        params: ConsensusParameters,
+        target_history_checkpoint: &TargetHistoryCheckpoint,
+        cumulative_work: Uint256,
+        tip_consensus_hash: [u8; 32],
+    ) -> Result<Self, String> {
+        state
+            .total_value()
+            .map_err(|error| format!("checkpoint state invariant: {error:?}"))?;
+        let target_history =
+            TargetHistory::from_checkpoint_snapshot(params, target_history_checkpoint)
+                .map_err(|error| format!("checkpoint target history: {error}"))?;
+        if target_history.height() != state.height() {
+            return Err("checkpoint target history height differs from ledger height".into());
+        }
+        if state.height() == 0 {
+            if tip_consensus_hash != state.tip_hash() || cumulative_work != Uint256::ZERO {
+                return Err(
+                    "Genesis checkpoint must have zero chainwork and the Genesis ledger tip".into(),
+                );
+            }
+        } else if tip_consensus_hash == [0; 32] || cumulative_work == Uint256::ZERO {
+            return Err(
+                "non-Genesis checkpoint must have a nonzero consensus tip and chainwork".into(),
+            );
+        }
+        Ok(Self {
+            state,
+            monetary_state: None,
+            target_history,
+            cumulative_work,
             tip_consensus_hash,
         })
     }

@@ -436,6 +436,36 @@ impl QRunV05PowCheckpoint {
         Ok(record)
     }
 
+    /// Restore a chain baseline only after the record passes the external-anchor and rollback
+    /// checks. The caller still has to integrate this baseline with a durable branch store.
+    pub fn restore_chain_anchored(
+        bytes: &[u8],
+        expected_network_id: &NetworkId,
+        expected_genesis_commitment: &[u8; 32],
+        params: &ConsensusParameters,
+        expected_commitment: [u8; 32],
+        minimum_height: u64,
+    ) -> Result<PrivateTestnetChain, QRunCheckpointError> {
+        let record = Self::decode_anchored(
+            bytes,
+            expected_network_id,
+            expected_genesis_commitment,
+            params,
+            expected_commitment,
+            minimum_height,
+        )?;
+        let state = LedgerState::decode_snapshot(&record.state_snapshot, expected_network_id)
+            .map_err(|error| QRunCheckpointError::StateSnapshot(format!("{error:?}")))?;
+        PrivateTestnetChain::from_qrun_checkpoint(
+            state,
+            params.clone(),
+            &record.target_history,
+            record.cumulative_work,
+            record.consensus_tip_digest,
+        )
+        .map_err(QRunCheckpointError::TargetHistory)
+    }
+
     pub fn commitment(
         &self,
         params: &ConsensusParameters,

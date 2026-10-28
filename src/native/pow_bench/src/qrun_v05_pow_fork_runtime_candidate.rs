@@ -659,6 +659,32 @@ mod tests {
             restored_checkpoint.cumulative_work,
             runtime.store.archive().canonical_chain().cumulative_work()
         );
+        let restored_chain = QRunV05PowCheckpoint::restore_chain_anchored(
+            &checkpoint_bytes,
+            &network,
+            &runtime.genesis_commitment(),
+            &params,
+            checkpoint_commitment,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            restored_chain.chain_tip().height,
+            runtime.canonical_height()
+        );
+        assert_eq!(restored_chain.chain_tip().tip_hash, runtime.canonical_tip());
+        assert_eq!(
+            restored_chain.chain_tip().cumulative_work,
+            runtime.store.archive().canonical_chain().cumulative_work()
+        );
+        assert_eq!(
+            restored_chain.state().state_root(),
+            runtime.canonical_state_root()
+        );
+        assert_eq!(
+            restored_chain.state().total_value().unwrap(),
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
         let root = runtime.canonical_state_root();
         let commitment = runtime.genesis_commitment();
         drop(runtime);
