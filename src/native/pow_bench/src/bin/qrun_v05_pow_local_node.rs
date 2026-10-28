@@ -94,6 +94,7 @@ impl NodeState {
 struct Config {
     network_id: NetworkId,
     owner_account: AccountId,
+    producer_account: AccountId,
     owner_public_key: [u8; 32],
     data_dir: PathBuf,
     rpc_listen: SocketAddr,
@@ -197,6 +198,7 @@ Optional --sync-on-start true requests bounded authenticated catch-up from pinne
     let allowed = [
         "--network-id-hex",
         "--owner-account-id-hex",
+        "--producer-account-id-hex",
         "--owner-public-key-hex",
         "--data-dir",
         "--rpc-listen",
@@ -216,12 +218,18 @@ Optional --sync-on-start true requests bounded authenticated catch-up from pinne
     };
     let network_id = parse_hex32(required("--network-id-hex")?, "network ID")?;
     let owner_account = parse_hex32(required("--owner-account-id-hex")?, "owner account ID")?;
+    let producer_account = values
+        .get("--producer-account-id-hex")
+        .map(|value| parse_hex32(value, "producer account ID"))
+        .transpose()?
+        .unwrap_or(owner_account);
     let owner_public_key = parse_hex32(required("--owner-public-key-hex")?, "owner public key")?;
     if network_id.iter().all(|byte| *byte == 0)
         || owner_account.iter().all(|byte| *byte == 0)
+        || producer_account.iter().all(|byte| *byte == 0)
         || owner_public_key.iter().all(|byte| *byte == 0)
     {
-        return Err("network and owner identifiers must be nonzero".into());
+        return Err("network, owner, and producer identifiers must be nonzero".into());
     }
     if account_id_from_public_key(&owner_public_key) != owner_account {
         return Err("owner account ID does not match owner public key".into());
@@ -306,6 +314,7 @@ Optional --sync-on-start true requests bounded authenticated catch-up from pinne
     Ok(Config {
         network_id,
         owner_account,
+        producer_account,
         owner_public_key,
         data_dir,
         rpc_listen,
@@ -806,11 +815,7 @@ fn send_block_to_peer_authenticated(
     }
     let candidate = decode_candidate_network_block(envelope)
         .map_err(|error| format!("decode PTB2 envelope: {error:?}"))?;
-    if candidate.fee_block.is_some() {
-        return Err(
-            "local loopback PTB2 node refuses QFP5; use the profile-locked QRun path".into(),
-        );
-    }
+    // QFP5 relay is permitted only through this authenticated, profile-bound session.
     let height = candidate.block.height;
     let expected_hash = block_id(envelope);
     let frame = encode_block_frame(envelope)?;
@@ -972,12 +977,12 @@ fn request_sync_page_authenticated(
     for envelope in &response.envelopes {
         let candidate = decode_candidate_network_block(envelope)
             .map_err(|error| format!("decode synced PTB2 block: {error:?}"))?;
-        if candidate.fee_block.is_some() {
-            return Err("legacy PTB2 sync refuses QFP5; use the profile-locked QRun path".into());
-        }
         let mut locked = state
             .lock()
             .map_err(|_| "node state lock poisoned".to_string())?;
+        if candidate.fee_block.is_some() != locked.runtime.is_qrun_v05_fee_only() {
+            return Err("sync envelope execution mode differs from the local QRun profile".into());
+        }
         let expected_height = locked
             .runtime
             .canonical_height()
@@ -1135,17 +1140,15 @@ fn handle_block(stream: &mut TcpStream, state: &Arc<Mutex<NodeState>>) -> Result
     };
     let candidate = decode_candidate_network_block(&payload)
         .map_err(|error| format!("decode PTB2 envelope: {error:?}"))?;
-    if candidate.fee_block.is_some() {
-        return Err(
-            "local loopback PTB2 node refuses QFP5; use the profile-locked QRun path".into(),
-        );
-    }
     let height = candidate.block.height;
     let id = block_id(&payload);
     let (status, forward_peers, log) = {
         let mut locked = state
             .lock()
             .map_err(|_| "node state lock poisoned".to_string())?;
+        if candidate.fee_block.is_some() != locked.runtime.is_qrun_v05_fee_only() {
+            return Err("incoming block execution mode differs from the local QRun profile".into());
+        }
         let previous_count = locked.runtime.retained_branch_count();
         let submit_result = {
             let NodeState {
@@ -1290,9 +1293,12 @@ fn handle_transaction(stream: &mut TcpStream, state: &Arc<Mutex<NodeState>>) -> 
             match envelope_result {
                 Ok(envelope) => {
                     let candidate = decode_candidate_network_block(&envelope)
-                        .map_err(|error| format!("decode newly mined PTB2 envelope: {error:?}"))?;
-                    if candidate.fee_block.is_some() {
-                        return Err("local PTB2 miner produced unsupported QFP5 envelope".into());
+                        .map_err(|error| format!("decode newly mined QFP5 envelope: {error:?}"))?;
+                    if candidate.fee_block.is_some() != locked.runtime.is_qrun_v05_fee_only() {
+                        return Err(
+                            "mined envelope execution mode differs from the local QRun profile"
+                                .into(),
+                        );
                     }
                     let candidate_height = candidate.block.height;
                     let submit_result = {
@@ -1385,19 +1391,26 @@ fn run(config: Config) -> Result<(), String> {
     )
     .map_err(|error| format!("configure Ed25519 authenticator: {error:?}"))?;
 
-    // This explicitly local-only smoke profile has an easy target. It verifies code paths for
-    // mining and fork selection, but is not secure and must not be reused for public consensus.
+    // This explicitly local-only smoke profile has an easy target. It verifies the QFP5
+    // fee-only producer commitment and fork-selection path, but is not secure and must not be
+    // reused for public consensus. Protocol version 5 is pinned to the exact candidate identity.
     let mut params = ConsensusParameters::candidate_testnet()
         .map_err(|error| format!("load candidate PoW profile: {error:?}"))?;
+    params.protocol_version = 5;
     params.initial_target = Uint256::MAX;
     params.pow_limit = Uint256::MAX;
     params.pow.memory_kib = 8 * 1024;
     params.pow.iterations = 1;
     params.pow.lanes = 1;
     let profile_params = params.clone();
+    if !config.peers.is_empty() && config.noise_private_key_file.is_none() {
+        return Err(
+            "QFP5 peer operation requires the authenticated, pinned Noise transport".into(),
+        );
+    }
     let clock = SystemClockReferenceTime;
-    let store_dir = config.data_dir.join("qrun-v05-pow-fork-store");
-    let runtime = QRunV05PowForkRuntime::open(
+    let store_dir = config.data_dir.join("qrun-v05-qfp5-store");
+    let mut runtime = QRunV05PowForkRuntime::open(
         &store_dir,
         config.network_id,
         config.owner_account,
@@ -1405,7 +1418,10 @@ fn run(config: Config) -> Result<(), String> {
         &authenticator,
         &clock,
     )
-    .map_err(|error| format!("open QRun PoW fork runtime: {error:?}"))?;
+    .map_err(|error| format!("open QRun QFP5 fee-only runtime: {error:?}"))?;
+    runtime
+        .set_producer_account(config.producer_account)
+        .map_err(|error| format!("configure fee-only producer: {error:?}"))?;
     let network_id = runtime.network_id();
     let genesis_id = runtime.genesis_commitment();
     let profile_id = profile_id(&network_id, &profile_params, &genesis_id);
@@ -1426,6 +1442,7 @@ fn run(config: Config) -> Result<(), String> {
     println!("genesis_id_hex={}", hex(&genesis_id));
     println!("profile_id_hex={}", hex(&profile_id));
     println!("owner_account_id_hex={}", hex(&config.owner_account));
+    println!("producer_account_id_hex={}", hex(&config.producer_account));
     println!("owner_balance_atoms={owner_balance}");
     println!(
         "owner_balance_qzxb={:.8}",
@@ -1636,6 +1653,46 @@ mod tests {
         let runtime =
             QRunV05PowForkRuntime::open(directory, network, owner, params, &authenticator, &clock)
                 .unwrap();
+        let profile_id = profile_id(&network, &profile_params, &runtime.genesis_commitment());
+        let mut state = NodeState {
+            runtime,
+            authenticator,
+            clock,
+            receipts: BTreeMap::new(),
+            profile_id,
+            block_peers: Vec::new(),
+            noise_private_key: None,
+            trusted_peer_static_keys: Vec::new(),
+            peer_static_keys_by_addr: BTreeMap::new(),
+        };
+        state.refresh_receipts().unwrap();
+        state
+    }
+
+    fn qrun_v05_node_state(directory: &Path, signer: &Ed25519TransactionSigner) -> NodeState {
+        use ai_native_l1_pow_bench::qrun_v05_profile_identity_candidate::{
+            PROPOSED_OWNER_ACCOUNT_ID, PROPOSED_QRUN_V05_NETWORK_ID,
+        };
+
+        let network = PROPOSED_QRUN_V05_NETWORK_ID;
+        let owner = PROPOSED_OWNER_ACCOUNT_ID;
+        let authenticator = Ed25519TransactionAuthenticator::select(
+            TransactionAuthenticatorKind::Ed25519V1,
+            [AccountPublicKey {
+                account_id: signer.account_id(),
+                public_key: signer.public_key(),
+            }],
+        )
+        .unwrap();
+        let clock = SystemClockReferenceTime;
+        let mut params = smoke_params();
+        params.protocol_version = 5;
+        let profile_params = params.clone();
+        let mut runtime =
+            QRunV05PowForkRuntime::open(directory, network, owner, params, &authenticator, &clock)
+                .unwrap();
+        runtime.set_producer_account(owner).unwrap();
+        assert!(runtime.is_qrun_v05_fee_only());
         let profile_id = profile_id(&network, &profile_params, &runtime.genesis_commitment());
         let mut state = NodeState {
             runtime,
@@ -2273,6 +2330,181 @@ mod tests {
             Some(2)
         );
         assert_eq!(source_receipt, Some(2));
+    }
+
+    #[test]
+    fn qrun_fee_only_qfp5_authenticated_gossip_and_sync_converge() {
+        use ai_native_l1_pow_bench::{
+            qrun_v05_profile_identity_candidate::PROPOSED_OWNER_ACCOUNT_ID,
+            state_machine::MAX_TOTAL_SUPPLY_ATOMS,
+        };
+
+        let source_dir = TestDir::new();
+        let receiver_dir = TestDir::new();
+        let fresh_dir = TestDir::new();
+        let source_signer = Ed25519TransactionSigner::from_seed([0x31; 32]);
+        let receiver_signer = Ed25519TransactionSigner::from_seed([0x32; 32]);
+        let fresh_signer = Ed25519TransactionSigner::from_seed([0x33; 32]);
+        let source = Arc::new(Mutex::new(qrun_v05_node_state(
+            &source_dir.0,
+            &source_signer,
+        )));
+        let receiver = Arc::new(Mutex::new(qrun_v05_node_state(
+            &receiver_dir.0,
+            &receiver_signer,
+        )));
+        let gossip_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let gossip_peer = gossip_listener.local_addr().unwrap();
+        let (mut source_private, source_public) = test_noise_keypair();
+        let (mut receiver_private, receiver_public) = test_noise_keypair();
+        {
+            let mut node = source.lock().unwrap();
+            node.noise_private_key = Some(source_private);
+            node.trusted_peer_static_keys = vec![receiver_public];
+            node.peer_static_keys_by_addr
+                .insert(gossip_peer, receiver_public);
+            node.block_peers = vec![gossip_peer];
+            source_private.fill(0);
+        }
+        {
+            let mut node = receiver.lock().unwrap();
+            node.noise_private_key = Some(receiver_private);
+            node.trusted_peer_static_keys = vec![source_public];
+            receiver_private.fill(0);
+        }
+
+        let timestamp = now_unix().unwrap();
+        let envelope = {
+            let mut node = source.lock().unwrap();
+            let auth = &node.authenticator;
+            node.runtime
+                .mine_candidate(timestamp, Vec::new(), auth, 1)
+                .unwrap()
+        };
+        assert!(envelope.starts_with(b"QFP5"));
+        {
+            let mut node = source.lock().unwrap();
+            let NodeState {
+                runtime,
+                authenticator,
+                clock,
+                ..
+            } = &mut *node;
+            runtime
+                .submit_block(&envelope, authenticator, clock)
+                .unwrap();
+        }
+        deliver_authenticated_block(&gossip_listener, &receiver, &source, &envelope);
+
+        let sync_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let sync_peer = sync_listener.local_addr().unwrap();
+        let (mut fresh_private, fresh_public) = test_noise_keypair();
+        {
+            let mut node = source.lock().unwrap();
+            node.trusted_peer_static_keys.push(fresh_public);
+        }
+        let fresh = Arc::new(Mutex::new(qrun_v05_node_state(&fresh_dir.0, &fresh_signer)));
+        {
+            let mut node = fresh.lock().unwrap();
+            node.noise_private_key = Some(fresh_private);
+            node.trusted_peer_static_keys = vec![source_public];
+            node.peer_static_keys_by_addr
+                .insert(sync_peer, source_public);
+            fresh_private.fill(0);
+        }
+
+        // The store lock is deliberately not Send on Windows, so the source node remains on the
+        // test thread. The client worker carries only the network identity, Noise key and wire bytes.
+        let (network, profile, client_private) = {
+            let node = fresh.lock().unwrap();
+            (
+                node.runtime.network_id(),
+                node.profile_id,
+                node.noise_private_key.unwrap(),
+            )
+        };
+        let page_bytes = max_sync_response_block_bytes(MAX_SYNC_PAGE_BLOCKS).unwrap();
+        let request = encode_sync_request(1, MAX_SYNC_PAGE_BLOCKS, page_bytes).unwrap();
+        let client = std::thread::spawn(move || {
+            let private_key = EphemeralNoisePrivateKey(client_private);
+            let mut stream =
+                TcpStream::connect_timeout(&sync_peer, Duration::from_secs(2)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(6)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(6)))
+                .unwrap();
+            let mut session = QRunV05NoiseSession::connect(
+                &mut stream,
+                &private_key.0,
+                &source_public,
+                &network,
+                &profile,
+            )
+            .unwrap();
+            session.write_record(&mut stream, &request).unwrap();
+            session.read_record(&mut stream).unwrap()
+        });
+        let (mut stream, _) = sync_listener.accept().unwrap();
+        handle_block(&mut stream, &source).unwrap();
+        let response_bytes = client.join().unwrap();
+        let response =
+            decode_sync_response(&response_bytes, MAX_SYNC_PAGE_BLOCKS, page_bytes).unwrap();
+        assert_eq!(response.height, 1);
+        assert_eq!(response.envelopes.len(), 1);
+        assert!(response.envelopes[0].starts_with(b"QFP5"));
+        for envelope in &response.envelopes {
+            let candidate = decode_candidate_network_block(envelope).unwrap();
+            assert!(candidate.fee_block.is_some());
+            let mut node = fresh.lock().unwrap();
+            let NodeState {
+                runtime,
+                authenticator,
+                clock,
+                ..
+            } = &mut *node;
+            runtime
+                .submit_block(envelope, authenticator, clock)
+                .unwrap();
+            node.refresh_receipts().unwrap();
+        }
+
+        let source = source.lock().unwrap();
+        let receiver = receiver.lock().unwrap();
+        let fresh = fresh.lock().unwrap();
+        assert_eq!(receiver.runtime.canonical_height(), 1);
+        assert_eq!(fresh.runtime.canonical_height(), 1);
+        assert_eq!(
+            source.runtime.canonical_tip(),
+            receiver.runtime.canonical_tip()
+        );
+        assert_eq!(
+            source.runtime.canonical_tip(),
+            fresh.runtime.canonical_tip()
+        );
+        assert_eq!(
+            source.runtime.canonical_state_root(),
+            receiver.runtime.canonical_state_root()
+        );
+        assert_eq!(
+            source.runtime.canonical_state_root(),
+            fresh.runtime.canonical_state_root()
+        );
+        for node in [&*source, &*receiver, &*fresh] {
+            assert_eq!(
+                node.runtime.canonical_state().total_value().unwrap(),
+                MAX_TOTAL_SUPPLY_ATOMS
+            );
+            assert_eq!(
+                node.runtime
+                    .canonical_state()
+                    .account(&PROPOSED_OWNER_ACCOUNT_ID)
+                    .unwrap()
+                    .balance as u128,
+                MAX_TOTAL_SUPPLY_ATOMS
+            );
+        }
     }
 
     #[test]

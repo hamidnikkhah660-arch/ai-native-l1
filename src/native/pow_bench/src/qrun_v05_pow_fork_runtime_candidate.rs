@@ -15,10 +15,16 @@ use crate::{
         decode_candidate_network_block, encode_candidate_network_block, PrivateTestnetWireError,
     },
     qrun_v05_checkpoint_candidate::{QRunCheckpointError, QRunV05PowCheckpoint},
+    qrun_v05_fee_pow_wire_candidate::{
+        encode_qrun_v05_fee_pow_block, qrun_v05_fee_pow_state_commitment,
+    },
     qrun_v05_genesis_candidate::{QRunGenesisError, QRunGenesisV05},
+    qrun_v05_profile_identity_candidate::{
+        PROPOSED_OWNER_ACCOUNT_ID, PROPOSED_QRUN_V05_NETWORK_ID,
+    },
     state_machine::{
-        transaction_id, AccountId, Block, LedgerState, NetworkId, StateError, Transaction,
-        TransactionAuthenticator, MAX_TOTAL_SUPPLY_ATOMS,
+        transaction_id, AccountId, Block, LedgerState, NetworkId, QRunV05FeeBlock, StateError,
+        Transaction, TransactionAuthenticator, MAX_TOTAL_SUPPLY_ATOMS,
     },
 };
 use std::path::Path;
@@ -79,6 +85,8 @@ pub struct QRunV05PowForkRuntime {
     genesis_commitment: [u8; 32],
     params: ConsensusParameters,
     store: PrivateTestnetForkStore,
+    fee_only: bool,
+    producer_account: AccountId,
 }
 
 impl QRunV05PowForkRuntime {
@@ -188,17 +196,20 @@ impl QRunV05PowForkRuntime {
             });
         }
         let genesis_commitment = genesis.commitment();
-        let store = match base_chain {
-            Some(base) => PrivateTestnetForkStore::open_from_base_chain(
-                directory,
-                base,
-                params.clone(),
-                authenticator,
-                clock,
-                anchor,
-            )?,
-            None => match anchor {
-                Some(expected) => PrivateTestnetForkStore::open_anchored(
+        let proposed_qrun_identity = network_id == PROPOSED_QRUN_V05_NETWORK_ID
+            && owner_account == PROPOSED_OWNER_ACCOUNT_ID;
+        if params.protocol_version == 5 && !proposed_qrun_identity {
+            return Err(QRunV05PowRuntimeError::WrongNetwork);
+        }
+        let fee_only = params.protocol_version == 5 && proposed_qrun_identity;
+        if fee_only && base_chain.is_some() {
+            return Err(QRunV05PowRuntimeError::InvalidCandidate(
+                "QRun checkpoint-rooted startup must use the QFP5 checkpoint-store API".into(),
+            ));
+        }
+        let store = if fee_only {
+            match anchor {
+                Some(expected) => PrivateTestnetForkStore::open_qrun_v05_fee_only_anchored(
                     directory,
                     genesis.ledger().clone(),
                     params.clone(),
@@ -206,14 +217,42 @@ impl QRunV05PowForkRuntime {
                     clock,
                     expected,
                 )?,
-                None => PrivateTestnetForkStore::open(
+                None => PrivateTestnetForkStore::open_qrun_v05_fee_only(
                     directory,
                     genesis.ledger().clone(),
                     params.clone(),
                     authenticator,
                     clock,
                 )?,
-            },
+            }
+        } else {
+            match base_chain {
+                Some(base) => PrivateTestnetForkStore::open_from_base_chain(
+                    directory,
+                    base,
+                    params.clone(),
+                    authenticator,
+                    clock,
+                    anchor,
+                )?,
+                None => match anchor {
+                    Some(expected) => PrivateTestnetForkStore::open_anchored(
+                        directory,
+                        genesis.ledger().clone(),
+                        params.clone(),
+                        authenticator,
+                        clock,
+                        expected,
+                    )?,
+                    None => PrivateTestnetForkStore::open(
+                        directory,
+                        genesis.ledger().clone(),
+                        params.clone(),
+                        authenticator,
+                        clock,
+                    )?,
+                },
+            }
         };
         let runtime = Self {
             network_id,
@@ -221,14 +260,71 @@ impl QRunV05PowForkRuntime {
             genesis_commitment,
             params,
             store,
+            fee_only,
+            producer_account: owner_account,
         };
         runtime.validate_all_branch_supplies()?;
         Ok(runtime)
     }
 
-    /// Mine a PTB2 envelope on the selected branch. The attempt count is explicitly bounded.
-    /// This method uses candidate consensus parameters, not an approved Mainnet mining profile.
+    /// Mine a block on the selected branch. QRun v0.5 uses the producer-bound QFP5 fee-only
+    /// envelope; legacy fixture profiles retain PTB2 solely for compatibility tests.
     pub fn mine_candidate<A: TransactionAuthenticator>(
+        &self,
+        timestamp: u64,
+        transactions: Vec<Transaction>,
+        authenticator: &A,
+        max_attempts: u64,
+    ) -> Result<Vec<u8>, QRunV05PowRuntimeError> {
+        self.mine_candidate_for_producer(
+            timestamp,
+            transactions,
+            self.producer_account,
+            authenticator,
+            max_attempts,
+        )
+    }
+
+    /// Set the fee beneficiary used by this process's miner. A producer receives only the fees
+    /// actually paid by included transactions; QRun v0.5 never creates a block subsidy.
+    pub fn set_producer_account(
+        &mut self,
+        producer: AccountId,
+    ) -> Result<(), QRunV05PowRuntimeError> {
+        if producer == [0; 32] {
+            return Err(QRunV05PowRuntimeError::InvalidCandidate(
+                "producer account must be nonzero".into(),
+            ));
+        }
+        self.producer_account = producer;
+        Ok(())
+    }
+
+    pub fn is_qrun_v05_fee_only(&self) -> bool {
+        self.fee_only
+    }
+
+    pub fn mine_candidate_for_producer<A: TransactionAuthenticator>(
+        &self,
+        timestamp: u64,
+        transactions: Vec<Transaction>,
+        producer: AccountId,
+        authenticator: &A,
+        max_attempts: u64,
+    ) -> Result<Vec<u8>, QRunV05PowRuntimeError> {
+        if self.fee_only {
+            return self.mine_fee_candidate(
+                timestamp,
+                transactions,
+                producer,
+                authenticator,
+                max_attempts,
+            );
+        }
+        self.mine_legacy_candidate(timestamp, transactions, authenticator, max_attempts)
+    }
+
+    fn mine_legacy_candidate<A: TransactionAuthenticator>(
         &self,
         timestamp: u64,
         transactions: Vec<Transaction>,
@@ -282,6 +378,76 @@ impl QRunV05PowForkRuntime {
         })
     }
 
+    fn mine_fee_candidate<A: TransactionAuthenticator>(
+        &self,
+        timestamp: u64,
+        transactions: Vec<Transaction>,
+        producer: AccountId,
+        authenticator: &A,
+        max_attempts: u64,
+    ) -> Result<Vec<u8>, QRunV05PowRuntimeError> {
+        if max_attempts == 0 {
+            return Err(QRunV05PowRuntimeError::MiningExhausted { attempts: 0 });
+        }
+        if producer == [0; 32] {
+            return Err(QRunV05PowRuntimeError::InvalidCandidate(
+                "producer account must be nonzero".into(),
+            ));
+        }
+        let chain: PrivateTestnetChain = self.store.archive().canonical_chain().clone();
+        if timestamp <= chain.state().last_timestamp() {
+            return Err(QRunV05PowRuntimeError::InvalidCandidate(
+                "candidate timestamp must exceed parent timestamp".into(),
+            ));
+        }
+        let height =
+            chain.state().height().checked_add(1).ok_or_else(|| {
+                QRunV05PowRuntimeError::InvalidCandidate("height overflow".into())
+            })?;
+        let mut fee_block = QRunV05FeeBlock {
+            body: Block {
+                height,
+                timestamp,
+                parent_hash: chain.state().tip_hash(),
+                state_root: [0; 32],
+                transactions,
+            },
+            producer,
+        };
+        fee_block.body.state_root = chain
+            .state()
+            .preview_qrun_v05_fee_state_root_after(&fee_block, authenticator)?;
+        let commitment = qrun_v05_fee_pow_state_commitment(&fee_block).map_err(|error| {
+            QRunV05PowRuntimeError::InvalidCandidate(format!("QFP5 commitment: {error:?}"))
+        })?;
+        let target = chain
+            .expected_target(None)
+            .map_err(|error| QRunV05PowRuntimeError::InvalidCandidate(error.to_string()))?;
+        let mut header = PowHeader {
+            protocol_version: self.params.protocol_version,
+            network_id: self.network_id,
+            height,
+            timestamp,
+            parent_hash: fee_block.body.parent_hash,
+            previous_consensus_hash: chain.chain_tip().tip_hash,
+            state_root: commitment,
+            target,
+            nonce: 0,
+        };
+        for nonce in 0..max_attempts {
+            header.nonce = nonce;
+            let digest = pow_digest(&header, self.params.pow)?;
+            if Uint256::from_be_bytes(digest) <= target {
+                return encode_qrun_v05_fee_pow_block(&header, &fee_block).map_err(|error| {
+                    QRunV05PowRuntimeError::InvalidCandidate(format!("encode QFP5: {error:?}"))
+                });
+            }
+        }
+        Err(QRunV05PowRuntimeError::MiningExhausted {
+            attempts: max_attempts,
+        })
+    }
+
     /// Validate and persist a candidate branch. Reorganizations use shared PoW fork choice.
     pub fn submit_block<A: TransactionAuthenticator>(
         &mut self,
@@ -290,7 +456,7 @@ impl QRunV05PowForkRuntime {
         clock: &dyn ReferenceTimeProvider,
     ) -> Result<[u8; 32], QRunV05PowRuntimeError> {
         let candidate = decode_candidate_network_block(envelope)?;
-        if candidate.fee_block.is_some() {
+        if candidate.fee_block.is_some() != self.fee_only {
             return Err(QRunV05PowRuntimeError::UnsupportedEnvelopeMode);
         }
         if candidate.header.network_id != self.network_id {
@@ -553,6 +719,74 @@ mod tests {
             nonce,
         };
         encode_candidate_network_block(&header, &block).unwrap()
+    }
+
+    #[test]
+    fn qrun_fee_only_runtime_mines_submits_and_replays_qfp5_blocks() {
+        let dir = TestDir::new();
+        let network = PROPOSED_QRUN_V05_NETWORK_ID;
+        let owner = PROPOSED_OWNER_ACCOUNT_ID;
+        let mut params = params();
+        params.protocol_version = 5;
+        let clock = FixedClock;
+
+        let mut runtime = QRunV05PowForkRuntime::open(
+            &dir.0,
+            network,
+            owner,
+            params.clone(),
+            &EmptyAuthenticator,
+            &clock,
+        )
+        .unwrap();
+        assert!(runtime.is_qrun_v05_fee_only());
+        assert_eq!(runtime.canonical_height(), 0);
+        assert_eq!(
+            runtime.canonical_state().total_value().unwrap(),
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
+        assert_eq!(
+            runtime.canonical_state().account(&owner).unwrap().balance as u128,
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
+
+        let envelope = runtime
+            .mine_candidate(1, Vec::new(), &EmptyAuthenticator, 1)
+            .unwrap();
+        assert!(envelope.starts_with(b"QFP5"));
+        runtime
+            .submit_block(&envelope, &EmptyAuthenticator, &clock)
+            .unwrap();
+        assert_eq!(runtime.canonical_height(), 1);
+        assert_eq!(
+            runtime.canonical_state().total_value().unwrap(),
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
+        let committed_root = runtime.canonical_state_root();
+        let committed_tip = runtime.canonical_tip();
+        drop(runtime);
+
+        let reopened = QRunV05PowForkRuntime::open(
+            &dir.0,
+            network,
+            owner,
+            params,
+            &EmptyAuthenticator,
+            &clock,
+        )
+        .unwrap();
+        assert!(reopened.is_qrun_v05_fee_only());
+        assert_eq!(reopened.canonical_height(), 1);
+        assert_eq!(reopened.canonical_tip(), committed_tip);
+        assert_eq!(reopened.canonical_state_root(), committed_root);
+        assert_eq!(
+            reopened.canonical_state().total_value().unwrap(),
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
+        assert_eq!(
+            reopened.canonical_state().account(&owner).unwrap().balance as u128,
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
     }
 
     #[test]
