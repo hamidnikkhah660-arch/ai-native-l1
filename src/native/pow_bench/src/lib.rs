@@ -426,6 +426,8 @@ pub mod token_forge;
 
 /// QRun canonical checkpoint codec with profile binding and external anti-rollback anchor checks.
 pub mod qrun_v05_checkpoint_candidate;
+/// Candidate QRun fee-only PoW envelope; payload commitment is not yet wired into fork choice.
+pub mod qrun_v05_fee_pow_wire_candidate;
 pub mod qrun_v05_genesis_candidate;
 /// Candidate-only, QRun-domain-separated Noise XX transport; not yet wired into the node or approved for public value-bearing traffic.
 pub mod qrun_v05_noise_transport_candidate;
