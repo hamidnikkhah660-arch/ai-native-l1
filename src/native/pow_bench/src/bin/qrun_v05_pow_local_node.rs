@@ -201,25 +201,22 @@ fn validate_mainnet_p2p_requirements(
     if !enabled {
         return Ok(());
     }
+    // Do not claim Mainnet from a local Genesis alone: require an independently operated,
+    // non-loopback seed whose identity is pinned and whose chain successfully syncs at startup.
+    if !sync_on_start {
+        return Err("--mainnet requires --sync-on-start true".into());
+    }
+    if peers.is_empty() {
+        return Err("--mainnet requires at least one independently configured seed peer".into());
+    }
+    if peers.iter().any(|peer| peer.ip().is_loopback()) {
+        return Err("--mainnet seed peers must be non-loopback addresses".into());
+    }
+    if pinned_peer_count != peers.len() {
+        return Err("--mainnet requires a static-key pin for every configured seed peer".into());
+    }
     if block_listener.ip().is_loopback() {
         return Err("--mainnet requires a non-loopback P2P block listener".into());
-    }
-    // First boot can create the deterministic frozen Genesis without any existing peers.
-    // Independent peer sync is optional at bootstrap, but when requested it must be pinned.
-    if sync_on_start {
-        if peers.is_empty() {
-            return Err(
-                "--sync-on-start requires at least one independently configured seed peer".into(),
-            );
-        }
-        if peers.iter().any(|peer| peer.ip().is_loopback()) {
-            return Err("--mainnet seed peers must be non-loopback addresses".into());
-        }
-        if pinned_peer_count != peers.len() {
-            return Err(
-                "--mainnet requires a static-key pin for every configured seed peer".into(),
-            );
-        }
     }
     Ok(())
 }
@@ -1907,20 +1904,14 @@ mod tests {
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(1);
 
     #[test]
-    fn mainnet_bootstrap_needs_no_existing_peer_but_optional_sync_requires_pins() {
+    fn mainnet_requires_pinned_external_seed_before_activation() {
         let peer: SocketAddr = "198.51.100.10:49341".parse().unwrap();
         let loopback_peer: SocketAddr = "127.0.0.1:49341".parse().unwrap();
         let public_listener: SocketAddr = "0.0.0.0:49341".parse().unwrap();
         let loopback_listener: SocketAddr = "127.0.0.1:49341".parse().unwrap();
 
-        // Like a first Bitcoin node, Mainnet can start from the frozen Genesis on an empty network.
-        assert!(validate_mainnet_p2p_requirements(true, false, &[], 0, public_listener).is_ok());
-        assert!(
-            validate_mainnet_p2p_requirements(true, false, &[peer], 0, public_listener).is_ok()
-        );
         assert!(validate_mainnet_p2p_requirements(false, false, &[], 0, loopback_listener).is_ok());
-
-        // If the operator explicitly requests sync, an external, pinned seed is mandatory.
+        assert!(validate_mainnet_p2p_requirements(true, false, &[], 0, public_listener).is_err());
         assert!(validate_mainnet_p2p_requirements(true, true, &[], 0, public_listener).is_err());
         assert!(validate_mainnet_p2p_requirements(
             true,

@@ -2,11 +2,11 @@
 
 ## Current status
 
-The wallet-bound QZXB node is running with the explicit --mainnet mode and has the fixed Genesis identity below. The node reached QRUN_V05_MAINNET_NODE_READY after validating the frozen height-zero Genesis, profile, state root and exact 10B supply. The rebuilt wallet CLI independently confirmed mainnet=true through read-only local RPC and returned the complete 10 billion QZXB balance for the owner's wallet account.
+Current state (2026-10-29): the node is running in `public-alpha` candidate mode. The prior `--mainnet` startup was found to report `mainnet=true` even when no remote peer or startup sync was configured; that behavior contradicted the launch criteria and is now blocked in source. The fixed wallet-bound Genesis and 10B supply remain intact; current read-only RPC confirms the owner's 10B balance while correctly reporting `mainnet=false`.
 
-This is a one-node Mainnet bootstrap: canonical height is 0 and no independent peer is connected yet. The TCP P2P listener is bound to 0.0.0.0:49341, but inbound Internet reachability has not been verified because this PowerShell is not elevated and the inbound firewall rule is not installed. Router/NAT forwarding may also be required. RPC (49339) and transaction ingress (49340) remain loopback-only. Do not treat the Mainnet mode flag as proof of external peer connectivity.
+This is a one-node experimental public-alpha candidate: canonical height is 0 and no independent peer is configured. The TCP P2P listener is bound to 0.0.0.0:49341, but inbound Internet reachability has not been verified; Windows Firewall is enabled and no matching inbound rule was found, and no local Windows NAT mapping was detected. Router/NAT forwarding may also be required. RPC (49339) and transaction ingress (49340) remain loopback-only. Do not treat a mode flag, listener bind, or successful local balance query as proof of public Mainnet connectivity.
 
-A new node can bootstrap from the deterministic frozen Genesis without an already-existing peer, as the first Bitcoin node did. If an operator explicitly requests --sync-on-start true, the node requires a non-loopback, statically pinned seed and refuses activation if startup sync fails. Without that option the node reports startup_mode=genesis_bootstrap_or_validated_local_store and does not claim pinned_peer_sync_verified.
+A candidate node can initialize the deterministic Genesis without an existing peer, but this project must not call that state Mainnet. The `--mainnet` mode now requires `--sync-on-start true`, at least one non-loopback seed, and a static Noise-key pin for every configured seed. Startup must authenticate and successfully sync with that seed before the process sets its RPC `mainnet` status to true. Genesis/profile identity and the height-zero state root/single-owner allocation are checked, and the total supply must remain at the fixed cap.
 
 ## Local wallet identity
 
@@ -30,7 +30,7 @@ Because the owner/network values differ, this wallet-bound network has a differe
 
 ## Monetary state
 
-The QRun v0.5 Genesis runtime credits the fixed total supply of 1,000,000,000,000,000,000 atoms (10 billion QZXB at 8 decimals) to the configured Genesis owner. There is no subsequent issuance and the block subsidy is zero. This is an owner pre-allocation model, not Bitcoin's miner-reward issuance schedule. The local node currently runs in Mainnet mode, but external reachability and independent peer replication are not yet verified.
+The QRun v0.5 Genesis runtime credits the fixed total supply of 1,000,000,000,000,000,000 atoms (10 billion QZXB at 8 decimals) to the configured Genesis owner. There is no subsequent issuance and the block subsidy is zero. This is an owner pre-allocation model, not Bitcoin's miner-reward issuance schedule. The local node currently runs in `public-alpha` candidate mode (`mainnet=false`); external reachability and independent peer replication are not yet verified.
 
 ## Local verification completed
 
@@ -38,7 +38,9 @@ The QRun v0.5 Genesis runtime credits the fixed total supply of 1,000,000,000,00
 2. Verified from the node startup output: Genesis owner equals the wallet account, owner balance and total supply are `1000000000000000000` atoms, and height is zero. The `qzxb_wallet balance` command against `127.0.0.1:49339` returned the same balance, account ID, and state root.
 3. Observed listeners: RPC `127.0.0.1:49339`, transaction ingress `127.0.0.1:49340`, and P2P `0.0.0.0:49341`. No independent peer is connected (`block_peer_count=0`); inbound Internet reachability remains unverified. Keep RPC and transaction ingress loopback-only.
 
-## Mainnet-mode launch verification
+## Historical one-node Mainnet-flag launch (superseded; not proof of public Mainnet)
+
+This section records an earlier flag-only/Genesis-bootstrap run for traceability. It had no configured peers, so the observed `mainnet=true` response did not establish a public Mainnet. The current source and verified Release build reject the same no-peer/no-sync configuration.
 
 - Release node supports --mainnet, locked to the wallet-bound network ID, owner account ID, and owner public key recorded above.
 - Mainnet-mode startup banners: QRUN_V05_MAINNET_GENESIS_BOOTSTRAP followed by QRUN_V05_MAINNET_NODE_READY after listener binding.
@@ -55,8 +57,20 @@ The QRun v0.5 Genesis runtime credits the fixed total supply of 1,000,000,000,00
 
 ## Public P2P firewall step
 
-Run PowerShell as Administrator on the node host to open only the P2P listener. Keep RPC and transaction ingress restricted to loopback. Use the correct executable path for the firewall program filter; the current Cargo output is C:\QRun\qrun-verification-target\release\qrun_v05_pow_local_node.exe.
+Run PowerShell as Administrator on the node host to open only the P2P listener. Keep RPC and transaction ingress restricted to loopback. Use the correct executable path for the firewall program filter; the latest verified Release build is C:\QRun\qrun-mainnet-verified-target-20261029a\release\qrun_v05_pow_local_node.exe.
 
-New-NetFirewallRule -DisplayName "QZXB Mainnet P2P 49341" -Direction Inbound -Action Allow -Enabled True -Profile Any -Program "C:\QRun\qrun-verification-target\release\qrun_v05_pow_local_node.exe" -Protocol TCP -LocalPort 49341 -EdgeTraversalPolicy Block
+New-NetFirewallRule -DisplayName "QZXB P2P 49341" -Direction Inbound -Action Allow -Enabled True -Profile Any -Program "C:\QRun\qrun-mainnet-verified-target-20261029a\release\qrun_v05_pow_local_node.exe" -Protocol TCP -LocalPort 49341 -EdgeTraversalPolicy Block
 
 If this machine is behind NAT, forward TCP 49341 on the router to the host LAN IPv4 address. No Internet peer has yet been observed, so external reachability must not be claimed until an outside peer can connect.
+## Current engineering verification — 2026-10-29
+
+- The currently running node was relaunched using the latest isolated Release build in `public-alpha` mode against the existing `C:\QRun\wallet-bound-genesis-data-v3` directory. No wallet, Noise-key, or chain data files were deleted or reset.
+- Current RPC `/v1/status`: `mainnet=false`, `network_class=public_alpha_experimental_not_mainnet`, `height=0`. Network ID, Genesis ID and Profile ID match the wallet-bound identity above. State root remains `a44e545c2cd8fa4e56e228f4f242cbf5445b1cc983c7b1f8fe89c5b42aef88d7`.
+- Current RPC balance for the owner account is `1000000000000000000` atoms (`10000000000.00000000` QZXB); total supply is the same amount. This verifies the persistent local Genesis state, not public replication.
+- Current listeners: RPC `127.0.0.1:49339`, transaction ingress `127.0.0.1:49340`, P2P `0.0.0.0:49341`. `configured_peer_count=0`.
+- Source now refuses `--mainnet` unless `--sync-on-start true`, at least one non-loopback seed, one static-key pin for each seed, and a non-loopback P2P listener are configured. After the authenticated seed sync succeeds and listeners bind, the frozen Genesis/Profile and the fixed 10B supply are checked before Mainnet status can be enabled.
+- Integration gate check: invoking the latest Release binary with the correct wallet/network identity but no `--peer` or startup-sync option returned `QRUN_V05_LOCAL_NODE_ERROR: --mainnet requires --sync-on-start true` (exit code 2). The designated smoke-test data directory was not created.
+- Validation passed: `cargo fmt --all -- --check`; node binary tests `14 passed, 0 failed`; wallet binary tests `6 passed, 0 failed`; wallet-bound Genesis regression `1 passed, 0 failed`; Release build of `qrun_v05_pow_local_node` and `qzxb_wallet` succeeded in `C:\QRun\qrun-mainnet-verified-target-20261029a`. Existing unrelated warnings about unused imports/helpers and `unused_mut` remain.
+- Windows Firewall profiles are enabled; no inbound rule for TCP 49341 was found, and no local Windows NAT mapping was found. Outbound public-IPv4 detection worked, but inbound Internet reachability remains unverified. RPC/transaction ingress remain loopback-only. No remote peer address or Noise static-key pin is presently configured, so this remains a candidate and must not be advertised as public Mainnet.
+
+The earlier one-node process that reported `mainnet=true` without a seed was stopped after verification, because that status contradicted the launch criteria. Its data directory was retained and the same persistent store was reopened in candidate mode.
