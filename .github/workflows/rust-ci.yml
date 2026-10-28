@@ -70,3 +70,27 @@ jobs:
       - name: Run PFM4 paged archive sync with inter-page reorg and stale-cursor rejection
         shell: pwsh
         run: ./simulations/cp0362_pfm4_page2_cursor_reorg.ps1
+
+  evm-launch-asset:
+    name: EVM contract, wallet console and dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: contracts/launch-asset
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install pinned Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install the exact locked dependency tree
+        run: npm ci
+      - name: Compile the fixed-supply EVM candidate
+        run: npm run compile
+      - name: Test local contract, wallet console and loopback server
+        run: npm test
+      - name: Fail on any known dependency vulnerability
+        run: npm audit

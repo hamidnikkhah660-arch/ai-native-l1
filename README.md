@@ -20,6 +20,7 @@ The source repository and project website are public, and we are actively inviti
 - **Current economics:** [10B Genesis direction and superseded emission model](economics.html).
 - **Release status:** [Current source branch, test inventory, production blockers](status.html).
 - **Contributions and sponsorship:** [How to submit a review, work plan or funding proposal](contribute.html).
+- **EVM toolchain security follow-up:** [Hardhat/EDR validation, clean dependency audit and CI coverage](docs/CP-0467_QRUN_EVM_TOOLCHAIN_DEPENDENCY_HARDENING_2026-10-29.md).
 - **Technical readiness and sponsorship milestones:** [M0–M6 deliverables, evidence gates, proposal format and zero-budget fallback](docs/QRUN_TECHNICAL_READINESS_AND_SPONSORSHIP_PLAN_V1_2026-10-29.md).
 - **Source and contribution issues:** https://github.com/hamidnikkhah660-arch/ai-native-l1
 - **Latest experimental QRun source (not a production release):** [work branch](https://github.com/hamidnikkhah660-arch/ai-native-l1/tree/work/qzbe-v04-persistent-mining-20261026).
@@ -114,7 +115,7 @@ The active experimental source branch is work/qzbe-v04-persistent-mining-2026102
 
 - cargo test --all-targets --locked --offline -- --list enumerated 1,187 test cases across 74 Cargo test targets, including 931 tests in src/lib.rs. This command lists test cases; it does not execute them.
 - The dated [CP-0465 release-gate report](docs/CP-0465_QRUN_MAINNET_PUBLIC_TRADING_NO_GO_2026-10-29.md) records a full local cargo test --all-targets --locked run with exit code 0, plus focused QRun node and wallet tests. These are local regression results, not an independent security review, third-party build attestation or multi-host production qualification.
-- The current active checkout audit did not rerun npm test for contracts/launch-asset because node_modules was absent; no fresh pass is claimed for that step here. The QX Sepolia asset remains separate from native QZXB.
+- Follow-up EVM validation on 2026-10-29: clean npm ci, npm run compile, all three npm test suites and npm audit passed (zero reported vulnerabilities) using Hardhat 3.21.1 and patched Zod/Undici resolutions. These tests use only an ephemeral loopback EVM; QX on Sepolia remains a separate test asset, not native QZXB. See [CP-0467](docs/CP-0467_QRUN_EVM_TOOLCHAIN_DEPENDENCY_HARDENING_2026-10-29.md).
 
 ## Latest curated public checkout validation (2026-10-21)
 

@@ -29,7 +29,7 @@ npm run compile
 npm test
 ```
 
-The test starts an ephemeral Hardhat 3/EDR local JSON-RPC node bound only to 127.0.0.1 (chain ID 31337; no public network) and uses its unlocked development accounts. It verifies exact fixed supply, all three initial balances, 40/30/30 arithmetic, ERC-20 transfer and allowance flow, constant supply after transfers, absence of privileged mint/admin functions, and rejection of zero or duplicate allocation addresses. The final locked npm dependency audit reports zero vulnerabilities at all severities.
+The test starts an ephemeral Hardhat 3/EDR local JSON-RPC node bound only to 127.0.0.1 (chain ID 31337; no public network) and uses its unlocked development accounts. It verifies exact fixed supply, all three initial balances, 40/30/30 arithmetic, ERC-20 transfer and allowance flow, constant supply after transfers, absence of privileged mint/admin functions, and rejection of zero or duplicate allocation addresses. On 2026-10-29, a clean locked install, compilation, all three test suites and npm audit passed with zero reported vulnerabilities using Hardhat 3.21.1, Zod 4.6.7 and Undici 7.30.1. The explicit Zod/Undici resolutions address the current npm advisories; re-run npm audit on every dependency refresh and review these overrides when upstream peer requirements change.
 
 ## Browser wallet and testnet deployment console (CP-0253)
 
