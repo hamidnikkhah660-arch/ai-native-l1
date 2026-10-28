@@ -1,0 +1,29 @@
+{
+  "profile_status": "candidate_identity_frozen_not_activated",
+  "mainnet_activated": false,
+  "network_name": "QRun",
+  "protocol_profile": "QRun v0.5 candidate",
+  "native_asset": "QZXB",
+  "decimals": 8,
+  "network_id_derivation": "SHA-256(QUANTUMZXB-QRUN-MAINNET-NETWORK-ID-V05\\0)",
+  "network_id_hex": "70fdcdbe6f0afa1edb0c4fb4a85252831376f7b9ecf2a13a86dcf61979cdcad7",
+  "owner_account_id_hex": "0f521debfc16bd0fa2cbe44be396875702750fb3baed3720f18bd0ad8bc74c88",
+  "maximum_supply_coins": "10000000000",
+  "atoms_per_coin": "100000000",
+  "maximum_supply_atoms": "1000000000000000000",
+  "genesis_owner_balance_atoms": "1000000000000000000",
+  "genesis_state_root_hex": "9d8ab7e2c415e83990a63274e7851e6ebd891868a74422a6e6ed418895f27887",
+  "genesis_commitment_hex": "0815c01a85373caf7f50b53aaeb7a269ef4a151f2a3ba3171acc8ee2b52f8908",
+  "post_genesis_minting_enabled": false,
+  "miner_subsidy_atoms_per_block": "0",
+  "release_gates": {
+    "production_consensus_profile_frozen": false,
+    "canonical_producer_importer_replay_wired": false,
+    "fee_only_producer_payout_committed_in_block": false,
+    "full_history_or_verified_checkpoint_rollover": false,
+    "external_anti_rollback_anchor_provider": false,
+    "production_peer_bootstrap_and_churn_tests": false,
+    "independent_multi_host_security_review": false,
+    "public_mainnet_activation": false
+  }
+}

@@ -431,5 +431,7 @@ pub mod qrun_v05_genesis_candidate;
 pub mod qrun_v05_noise_transport_candidate;
 /// Candidate adapter joining QRun Genesis to persistent PoW fork choice; not a public node yet.
 pub mod qrun_v05_pow_fork_runtime_candidate;
+/// Candidate immutable QRun v0.5 network/owner identity; not Mainnet activation.
+pub mod qrun_v05_profile_identity_candidate;
 /// QRun v0.5 Genesis-bound transfer execution and snapshot candidate; not yet node/P2P wired.
 pub mod qrun_v05_runtime_candidate;

@@ -105,6 +105,7 @@ The latest direction (CP-0437, 28 October 2026) targets an independent **QRun** 
 **Important:** CP-0437 is not a Mainnet launch claim. The new code currently builds and tests an in-memory Genesis candidate only; the canonical node runtime, persistent consensus/reorg path and production activation are not yet integrated. Do not treat any candidate balance as real or spendable until the independent QRun network is launched and the balance is verified on multiple nodes.
 
 - **Latest owner direction:** CP-0437 ? QRun full-supply Genesis direction (docs/CP-0437_QRUN_FULL_SUPPLY_GENESIS_DIRECTION_2026-10-28.md)
+- **CP-0450 identity candidate:** [machine-readable candidate manifest](profiles/qrun_v05_mainnet_identity_candidate.json) with independently verified network ID, one-owner 10B Genesis state root and commitment. This is not Mainnet activation; production consensus, fee-only producer payout, history recovery, external anti-rollback and independent review remain open (docs/CP-0450_QRUN_V05_IDENTITY_CANDIDATE_2026-10-28.md).
 - **Windows wallet app:** run tools/QZXB-Wallet.cmd to open QZXB Wallet ? QRun. The 12-word recovery phrase is shown once and must be backed up offline.
 - **Production gate status:** Mainnet is not launched; Gate 2/Gate 8 runtime and external review remain open.
 
