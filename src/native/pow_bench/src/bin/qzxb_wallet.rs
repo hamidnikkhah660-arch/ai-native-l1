@@ -242,6 +242,20 @@ mod windows_wallet {
             .ok_or_else(|| format!("candidate RPC omitted string field {key}"))
     }
 
+    fn rpc_network_class(value: &serde_json::Value) -> String {
+        if let Some(class) = value
+            .get("network_class")
+            .and_then(serde_json::Value::as_str)
+        {
+            return class.to_string();
+        }
+        if value.get("mainnet").and_then(serde_json::Value::as_bool) == Some(true) {
+            "qzxb_mainnet".to_string()
+        } else {
+            "candidate_not_mainnet".to_string()
+        }
+    }
+
     fn json_u64(value: &serde_json::Value, key: &str) -> Result<u64, String> {
         value
             .get(key)
@@ -259,7 +273,7 @@ mod windows_wallet {
         println!("tip_hex={}", json_string(&value, "tip")?);
         println!("state_root_hex={}", json_string(&value, "state_root")?);
         println!("generation={}", json_u64(&value, "generation")?);
-        println!("network_class={}", json_string(&value, "network_class")?);
+        println!("network_class={}", rpc_network_class(&value));
         Ok(())
     }
 
@@ -274,7 +288,7 @@ mod windows_wallet {
         println!("height={}", json_u64(&value, "height")?);
         println!("tip_hex={}", json_string(&value, "tip")?);
         println!("state_root_hex={}", json_string(&value, "state_root")?);
-        println!("network_class={}", json_string(&value, "network_class")?);
+        println!("network_class={}", rpc_network_class(&value));
         Ok(())
     }
 
@@ -311,7 +325,7 @@ mod windows_wallet {
         println!("tip_hex={}", json_string(&value, "tip")?);
         println!("state_root_hex={}", json_string(&value, "state_root")?);
         println!("finality=probabilistic_candidate_chain_reorg_possible");
-        println!("network_class={}", json_string(&value, "network_class")?);
+        println!("network_class={}", rpc_network_class(&value));
         Ok(())
     }
 
