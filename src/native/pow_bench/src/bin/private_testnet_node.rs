@@ -1467,6 +1467,11 @@ fn import_payload(
 ) -> Result<(u8, u64, [u8; 32]), ImportFailure> {
     let candidate = decode_candidate_network_block(payload)
         .map_err(|error| ImportFailure::Rejected(format!("decode candidate envelope: {error}")))?;
+    if candidate.fee_block.is_some() {
+        return Err(ImportFailure::Rejected(
+            "legacy PTB2 node refuses QFP5; use the profile-locked QRun path".into(),
+        ));
+    }
     let height = candidate.header.height;
     let digest = pow_digest(&candidate.header, params.pow)
         .map_err(|error| ImportFailure::Rejected(format!("calculate candidate digest: {error}")))?;
@@ -2204,6 +2209,9 @@ fn ordered_archive_envelopes(
     for bytes in envelopes {
         let candidate = decode_candidate_network_block(&bytes)
             .map_err(|error| format!("decode archived PTB2 candidate: {error}"))?;
+        if candidate.fee_block.is_some() {
+            return Err("legacy PTB2 archive contains a QFP5 envelope".into());
+        }
         let digest = pow_digest(&candidate.header, params.pow)
             .map_err(|error| format!("hash archived PTB2 candidate: {error}"))?;
         ordered.push((bytes, candidate.header.height, digest));

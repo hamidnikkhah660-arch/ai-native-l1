@@ -32,6 +32,7 @@ pub enum QRunV05PowRuntimeError {
     Ledger(StateError),
     WrongSupplyProfile,
     WrongNetwork,
+    UnsupportedEnvelopeMode,
     SupplyMismatch { expected: u128, actual: u128 },
     InvalidCandidate(String),
     MiningExhausted { attempts: u64 },
@@ -289,6 +290,9 @@ impl QRunV05PowForkRuntime {
         clock: &dyn ReferenceTimeProvider,
     ) -> Result<[u8; 32], QRunV05PowRuntimeError> {
         let candidate = decode_candidate_network_block(envelope)?;
+        if candidate.fee_block.is_some() {
+            return Err(QRunV05PowRuntimeError::UnsupportedEnvelopeMode);
+        }
         if candidate.header.network_id != self.network_id {
             return Err(QRunV05PowRuntimeError::WrongNetwork);
         }
@@ -476,6 +480,46 @@ mod tests {
         params.pow.memory_kib = 8 * 1024;
         params.pow.iterations = 1;
         params
+    }
+
+    fn make_qfp5_fee_envelope(
+        network: NetworkId,
+        owner: AccountId,
+        params: &ConsensusParameters,
+    ) -> Vec<u8> {
+        use crate::{
+            qrun_v05_fee_pow_wire_candidate::{
+                encode_qrun_v05_fee_pow_block, qrun_v05_fee_pow_state_commitment,
+            },
+            state_machine::QRunV05FeeBlock,
+        };
+        let genesis = QRunGenesisV05::new(network, owner).unwrap();
+        let ledger = genesis.ledger().clone();
+        let mut fee_block = QRunV05FeeBlock {
+            body: Block {
+                height: 1,
+                timestamp: 1,
+                parent_hash: ledger.tip_hash(),
+                state_root: [0; 32],
+                transactions: Vec::new(),
+            },
+            producer: [0x77; 32],
+        };
+        fee_block.body.state_root = ledger
+            .preview_qrun_v05_fee_state_root_after(&fee_block, &EmptyAuthenticator)
+            .unwrap();
+        let header = PowHeader {
+            protocol_version: params.protocol_version,
+            network_id: network,
+            height: 1,
+            timestamp: 1,
+            parent_hash: fee_block.body.parent_hash,
+            previous_consensus_hash: ledger.tip_hash(),
+            state_root: qrun_v05_fee_pow_state_commitment(&fee_block).unwrap(),
+            target: params.initial_target,
+            nonce: 0,
+        };
+        encode_qrun_v05_fee_pow_block(&header, &fee_block).unwrap()
     }
 
     fn make_test_envelope<A: TransactionAuthenticator>(
@@ -683,6 +727,37 @@ mod tests {
             MAX_TOTAL_SUPPLY_ATOMS
         );
         assert_ne!(winner_txid, loser_txid);
+    }
+
+    #[test]
+    fn legacy_pow_runtime_rejects_qfp5_without_publishing_or_mutating_state() {
+        let dir = TestDir::new();
+        let network = [0x51; 32];
+        let owner = [0x62; 32];
+        let params = params();
+        let envelope = make_qfp5_fee_envelope(network, owner, &params);
+        let mut runtime = QRunV05PowForkRuntime::open(
+            &dir.0,
+            network,
+            owner,
+            params,
+            &EmptyAuthenticator,
+            &FixedClock,
+        )
+        .unwrap();
+        let anchor_before = runtime.manifest_anchor().unwrap();
+
+        assert!(matches!(
+            runtime.submit_block(&envelope, &EmptyAuthenticator, &FixedClock),
+            Err(QRunV05PowRuntimeError::UnsupportedEnvelopeMode)
+        ));
+        assert_eq!(runtime.canonical_height(), 0);
+        assert_eq!(runtime.retained_branch_count(), 0);
+        assert_eq!(runtime.manifest_anchor().unwrap(), anchor_before);
+        assert_eq!(
+            runtime.canonical_state().total_value().unwrap(),
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
     }
 
     #[test]

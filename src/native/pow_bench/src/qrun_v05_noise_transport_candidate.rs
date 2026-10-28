@@ -8,15 +8,15 @@
 
 use crate::{
     monetary_pow_v04_candidate::MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES,
-    private_testnet_wire::MAX_PRIVATE_TESTNET_ENVELOPE_BYTES,
+    private_testnet_wire::{decode_candidate_network_block, MAX_CANDIDATE_NETWORK_ENVELOPE_BYTES},
 };
 
 /// Largest bounded application record for a PTB2 frame or a bounded sync response.
 /// The sync response reserves space for metadata and fixed-width per-block length prefixes.
 const QRUN_SYNC_RESPONSE_OVERHEAD_BYTES: usize = 256;
 pub const MAX_NOISE_APPLICATION_RECORD_BYTES: usize =
-    if MAX_PRIVATE_TESTNET_ENVELOPE_BYTES > MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES {
-        MAX_PRIVATE_TESTNET_ENVELOPE_BYTES
+    if MAX_CANDIDATE_NETWORK_ENVELOPE_BYTES > MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES {
+        MAX_CANDIDATE_NETWORK_ENVELOPE_BYTES
     } else {
         MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES
     } + QRUN_SYNC_RESPONSE_OVERHEAD_BYTES;
@@ -50,6 +50,7 @@ pub enum QRunV05NoiseError {
     MalformedRecord,
     RecordTimeout,
     RecordTooLarge(usize),
+    UnsupportedBlockEnvelopeMode,
     RecordAuthentication,
     Io(String),
 }
@@ -79,6 +80,10 @@ impl std::fmt::Display for QRunV05NoiseError {
             Self::RecordTooLarge(length) => {
                 write!(f, "Noise record exceeds the bounded limit ({length} bytes)")
             }
+            Self::UnsupportedBlockEnvelopeMode => write!(
+                f,
+                "Noise QRun block helper requires a canonical QFP5 fee-only envelope"
+            ),
             Self::RecordAuthentication => write!(f, "Noise encrypted record authentication failed"),
             Self::Io(error) => write!(f, "Noise transport I/O failed: {error}"),
         }
@@ -255,6 +260,36 @@ impl QRunV05NoiseSession {
         write_all_until(stream, &(ciphertext.len() as u32).to_be_bytes(), deadline)
             .map_err(io_error)?;
         write_all_until(stream, &ciphertext, deadline).map_err(io_error)
+    }
+
+    /// Send a canonical QFP5/QFB5 block over the authenticated QRun session. This typed helper
+    /// refuses legacy PTB2 envelopes and never downgrades to plaintext.
+    pub fn write_qfp5_block_record(
+        &mut self,
+        stream: &mut TcpStream,
+        envelope: &[u8],
+    ) -> Result<(), QRunV05NoiseError> {
+        let candidate = decode_candidate_network_block(envelope)
+            .map_err(|_| QRunV05NoiseError::UnsupportedBlockEnvelopeMode)?;
+        if candidate.fee_block.is_none() {
+            return Err(QRunV05NoiseError::UnsupportedBlockEnvelopeMode);
+        }
+        self.write_record(stream, envelope)
+    }
+
+    /// Read an authenticated record and require QFP5/QFB5 before returning block bytes.
+    /// Callers should discard the connection on any failure.
+    pub fn read_qfp5_block_record(
+        &mut self,
+        stream: &mut TcpStream,
+    ) -> Result<Vec<u8>, QRunV05NoiseError> {
+        let envelope = self.read_record(stream)?;
+        let candidate = decode_candidate_network_block(&envelope)
+            .map_err(|_| QRunV05NoiseError::UnsupportedBlockEnvelopeMode)?;
+        if candidate.fee_block.is_none() {
+            return Err(QRunV05NoiseError::UnsupportedBlockEnvelopeMode);
+        }
+        Ok(envelope)
     }
 
     /// Read one length-bounded Noise record and authenticate it before returning plaintext.
@@ -479,6 +514,58 @@ mod tests {
         (listener, address)
     }
 
+    fn qfp5_test_envelope() -> ([u8; 32], Vec<u8>) {
+        use crate::{
+            consensus::{PowHeader, Uint256},
+            qrun_v05_fee_pow_wire_candidate::{
+                encode_qrun_v05_fee_pow_block, qrun_v05_fee_pow_state_commitment,
+            },
+            state_machine::{
+                Block, LedgerState, QRunV05FeeBlock, TransactionAuthenticator,
+                MAX_TOTAL_SUPPLY_ATOMS,
+            },
+        };
+        struct EmptyAuth;
+        impl TransactionAuthenticator for EmptyAuth {
+            fn verify(&self, _: &[u8; 32], _: &[u8; 32], _: &[u8]) -> Result<(), ()> {
+                Err(())
+            }
+        }
+
+        let network = [0x61; 32];
+        let owner = [0x42; 32];
+        let genesis =
+            LedgerState::genesis(network, vec![(owner, MAX_TOTAL_SUPPLY_ATOMS as u64)]).unwrap();
+        let mut fee_block = QRunV05FeeBlock {
+            body: Block {
+                height: 1,
+                timestamp: 1,
+                parent_hash: genesis.tip_hash(),
+                state_root: [0; 32],
+                transactions: Vec::new(),
+            },
+            producer: [0x77; 32],
+        };
+        fee_block.body.state_root = genesis
+            .preview_qrun_v05_fee_state_root_after(&fee_block, &EmptyAuth)
+            .unwrap();
+        let header = PowHeader {
+            protocol_version: 5,
+            network_id: network,
+            height: 1,
+            timestamp: 1,
+            parent_hash: fee_block.body.parent_hash,
+            previous_consensus_hash: genesis.tip_hash(),
+            state_root: qrun_v05_fee_pow_state_commitment(&fee_block).unwrap(),
+            target: Uint256::MAX,
+            nonce: 7,
+        };
+        (
+            network,
+            encode_qrun_v05_fee_pow_block(&header, &fee_block).unwrap(),
+        )
+    }
+
     #[test]
     fn prologue_domain_is_qrun_specific_and_binds_network_and_profile_fingerprint() {
         let network = [0x52; 32];
@@ -500,11 +587,94 @@ mod tests {
     fn application_record_budget_covers_the_largest_canonical_candidate_envelope() {
         assert_eq!(
             MAX_NOISE_APPLICATION_RECORD_BYTES,
-            MAX_PRIVATE_TESTNET_ENVELOPE_BYTES.max(MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES)
+            MAX_CANDIDATE_NETWORK_ENVELOPE_BYTES.max(MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES)
                 + QRUN_SYNC_RESPONSE_OVERHEAD_BYTES
         );
         assert!(MAX_NOISE_APPLICATION_RECORD_BYTES >= MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES);
     }
+    #[test]
+    fn noise_qfp5_typed_record_roundtrips_and_refuses_legacy_block_payloads() {
+        let (network, envelope) = qfp5_test_envelope();
+        let profile = [0x71; 32];
+        let (server_private, server_public) = keypair(11);
+        let (client_private, client_public) = keypair(12);
+        let (listener, address) = listener();
+
+        let server_envelope = envelope.clone();
+        let server_thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut session = QRunV05NoiseSession::accept(
+                &mut stream,
+                &server_private,
+                &[client_public],
+                &network,
+                &profile,
+            )
+            .unwrap();
+            let received = session.read_qfp5_block_record(&mut stream).unwrap();
+            assert_eq!(received, server_envelope);
+            session.write_record(&mut stream, b"QFP5-ACK").unwrap();
+        });
+
+        let mut stream = TcpStream::connect(address).unwrap();
+        let mut session = QRunV05NoiseSession::connect(
+            &mut stream,
+            &client_private,
+            &server_public,
+            &network,
+            &profile,
+        )
+        .unwrap();
+        session
+            .write_qfp5_block_record(&mut stream, &envelope)
+            .unwrap();
+        assert_eq!(session.read_record(&mut stream).unwrap(), b"QFP5-ACK");
+        assert_eq!(
+            session.write_qfp5_block_record(&mut stream, b"PTB2-legacy"),
+            Err(QRunV05NoiseError::UnsupportedBlockEnvelopeMode)
+        );
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn noise_qfp5_typed_reader_rejects_a_legacy_payload_after_authentication() {
+        let (network, _) = qfp5_test_envelope();
+        let profile = [0x72; 32];
+        let (server_private, server_public) = keypair(13);
+        let (client_private, client_public) = keypair(14);
+        let (listener, address) = listener();
+
+        let server_thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut session = QRunV05NoiseSession::accept(
+                &mut stream,
+                &server_private,
+                &[client_public],
+                &network,
+                &profile,
+            )
+            .unwrap();
+            session.read_qfp5_block_record(&mut stream)
+        });
+
+        let mut stream = TcpStream::connect(address).unwrap();
+        let mut session = QRunV05NoiseSession::connect(
+            &mut stream,
+            &client_private,
+            &server_public,
+            &network,
+            &profile,
+        )
+        .unwrap();
+        session
+            .write_record(&mut stream, b"PTB2-legacy-only")
+            .unwrap();
+        assert_eq!(
+            server_thread.join().unwrap(),
+            Err(QRunV05NoiseError::UnsupportedBlockEnvelopeMode)
+        );
+    }
+
     #[test]
     fn noise_xx_binds_network_and_pins_both_sides_then_encrypts_ptb2_payload_and_ack() {
         let network = [0x61; 32];

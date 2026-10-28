@@ -735,6 +735,11 @@ fn send_block_to_peer_plain(peer: SocketAddr, envelope: &[u8]) -> Result<(), Str
     }
     let candidate = decode_candidate_network_block(envelope)
         .map_err(|error| format!("decode PTB2 envelope: {error:?}"))?;
+    if candidate.fee_block.is_some() {
+        return Err(
+            "local loopback PTB2 node refuses QFP5; use the profile-locked QRun path".into(),
+        );
+    }
     let height = candidate.block.height;
     let expected_hash = block_id(envelope);
     let frame = encode_block_frame(envelope)?;
@@ -801,6 +806,11 @@ fn send_block_to_peer_authenticated(
     }
     let candidate = decode_candidate_network_block(envelope)
         .map_err(|error| format!("decode PTB2 envelope: {error:?}"))?;
+    if candidate.fee_block.is_some() {
+        return Err(
+            "local loopback PTB2 node refuses QFP5; use the profile-locked QRun path".into(),
+        );
+    }
     let height = candidate.block.height;
     let expected_hash = block_id(envelope);
     let frame = encode_block_frame(envelope)?;
@@ -962,6 +972,9 @@ fn request_sync_page_authenticated(
     for envelope in &response.envelopes {
         let candidate = decode_candidate_network_block(envelope)
             .map_err(|error| format!("decode synced PTB2 block: {error:?}"))?;
+        if candidate.fee_block.is_some() {
+            return Err("legacy PTB2 sync refuses QFP5; use the profile-locked QRun path".into());
+        }
         let mut locked = state
             .lock()
             .map_err(|_| "node state lock poisoned".to_string())?;
@@ -1122,6 +1135,11 @@ fn handle_block(stream: &mut TcpStream, state: &Arc<Mutex<NodeState>>) -> Result
     };
     let candidate = decode_candidate_network_block(&payload)
         .map_err(|error| format!("decode PTB2 envelope: {error:?}"))?;
+    if candidate.fee_block.is_some() {
+        return Err(
+            "local loopback PTB2 node refuses QFP5; use the profile-locked QRun path".into(),
+        );
+    }
     let height = candidate.block.height;
     let id = block_id(&payload);
     let (status, forward_peers, log) = {
@@ -1273,6 +1291,9 @@ fn handle_transaction(stream: &mut TcpStream, state: &Arc<Mutex<NodeState>>) -> 
                 Ok(envelope) => {
                     let candidate = decode_candidate_network_block(&envelope)
                         .map_err(|error| format!("decode newly mined PTB2 envelope: {error:?}"))?;
+                    if candidate.fee_block.is_some() {
+                        return Err("local PTB2 miner produced unsupported QFP5 envelope".into());
+                    }
                     let candidate_height = candidate.block.height;
                     let submit_result = {
                         let NodeState {
