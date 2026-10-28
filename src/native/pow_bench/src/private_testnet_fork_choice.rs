@@ -31,6 +31,9 @@ pub enum ForkChoiceError {
     BranchHeightExceeded,
     ReplayIncomplete,
     CanonicalRangeBeforeBase,
+    ExecutionModeMismatch,
+    GenesisProfileMismatch,
+    ConsensusProfileMismatch,
 }
 
 impl std::fmt::Display for ForkChoiceError {
@@ -52,6 +55,18 @@ impl std::fmt::Display for ForkChoiceError {
             Self::CanonicalRangeBeforeBase => write!(
                 f,
                 "requested canonical range predates this checkpoint-rooted archive segment"
+            ),
+            Self::ExecutionModeMismatch => write!(
+                f,
+                "candidate envelope execution mode does not match the chain's frozen profile"
+            ),
+            Self::GenesisProfileMismatch => write!(
+                f,
+                "QRun fee-only mode requires the exact frozen 10B Genesis identity and state root"
+            ),
+            Self::ConsensusProfileMismatch => write!(
+                f,
+                "QRun v0.5 fee-only mode requires protocol version 5; production consensus parameters remain a separate release gate"
             ),
         }
     }
@@ -80,6 +95,12 @@ struct StoredBranch {
 /// Every stored node owns the fully validated chain state at that branch tip. A later
 /// persistence layer can store archive_envelopes() and call rebuild_from_envelopes()
 /// before opening the node to peers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForkChoiceExecutionMode {
+    LegacyPtb2,
+    QRunV05FeeOnly,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrivateTestnetForkChoice {
     genesis: LedgerState,
@@ -90,6 +111,7 @@ pub struct PrivateTestnetForkChoice {
     canonical: PrivateTestnetChain,
     branches: BTreeMap<[u8; 32], StoredBranch>,
     reorg_count: u64,
+    execution_mode: ForkChoiceExecutionMode,
 }
 
 impl PrivateTestnetForkChoice {
@@ -104,7 +126,35 @@ impl PrivateTestnetForkChoice {
             canonical,
             branches: BTreeMap::new(),
             reorg_count: 0,
+            execution_mode: ForkChoiceExecutionMode::LegacyPtb2,
         })
+    }
+
+    /// Genesis-rooted QRun profile: QFP5/QFB5 only. Checkpoint import is intentionally not
+    /// exposed for this profile until profile-bound QFP5 checkpoint/replay support is complete.
+    pub fn new_qrun_v05_fee_only(
+        genesis: LedgerState,
+        params: ConsensusParameters,
+    ) -> Result<Self, ForkChoiceError> {
+        if params.protocol_version != 5 {
+            return Err(ForkChoiceError::ConsensusProfileMismatch);
+        }
+        let frozen = crate::qrun_v05_profile_identity_candidate::build_candidate_genesis()
+            .map_err(|_| ForkChoiceError::GenesisProfileMismatch)?;
+        if genesis.height() != 0
+            || genesis.network_id()
+                != crate::qrun_v05_profile_identity_candidate::PROPOSED_QRUN_V05_NETWORK_ID
+            || genesis.state_root()
+                != crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_STATE_ROOT
+            || frozen.state_root() != genesis.state_root()
+            || frozen.commitment()
+                != crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT
+        {
+            return Err(ForkChoiceError::GenesisProfileMismatch);
+        }
+        let mut choice = Self::new(genesis, params).map_err(ForkChoiceError::InvalidPow)?;
+        choice.execution_mode = ForkChoiceExecutionMode::QRunV05FeeOnly;
+        Ok(choice)
     }
 
     /// Start a new bounded fork segment from a previously validated QRun checkpoint chain.
@@ -124,6 +174,7 @@ impl PrivateTestnetForkChoice {
             canonical: base_chain,
             branches: BTreeMap::new(),
             reorg_count: 0,
+            execution_mode: ForkChoiceExecutionMode::LegacyPtb2,
         })
     }
 
@@ -284,7 +335,24 @@ impl PrivateTestnetForkChoice {
         authenticator: &A,
         clock: &dyn ReferenceTimeProvider,
     ) -> Result<ForkChoiceOutcome, ForkChoiceError> {
+        self.insert_encoded_internal(envelope, authenticator, clock, false)
+    }
+
+    /// Historical QFP5 replay does not sample wall-clock time, but still verifies PoW, ancestry,
+    /// difficulty, canonical fee execution and the frozen execution mode.
+    fn insert_encoded_internal<A: TransactionAuthenticator>(
+        &mut self,
+        envelope: &[u8],
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+        historical_replay: bool,
+    ) -> Result<ForkChoiceOutcome, ForkChoiceError> {
         let candidate = decode_candidate_network_block(envelope).map_err(ForkChoiceError::Wire)?;
+        if (candidate.fee_block.is_some())
+            != (self.execution_mode == ForkChoiceExecutionMode::QRunV05FeeOnly)
+        {
+            return Err(ForkChoiceError::ExecutionModeMismatch);
+        }
         let maximum_segment_height = self
             .base_chain
             .state()
@@ -324,15 +392,41 @@ impl PrivateTestnetForkChoice {
                 .ok_or(ForkChoiceError::UnknownParent)?
         };
 
-        parent_chain
-            .append_live(
-                &candidate.block,
-                &candidate.header,
-                None,
-                authenticator,
-                clock,
-            )
-            .map_err(ForkChoiceError::Consensus)?;
+        match (&candidate.fee_block, self.execution_mode, historical_replay) {
+            (Some(fee_block), ForkChoiceExecutionMode::QRunV05FeeOnly, true) => {
+                parent_chain
+                    .append_qrun_v05_fee_historical(
+                        fee_block,
+                        &candidate.header,
+                        None,
+                        authenticator,
+                    )
+                    .map_err(ForkChoiceError::Consensus)?;
+            }
+            (Some(fee_block), ForkChoiceExecutionMode::QRunV05FeeOnly, false) => {
+                parent_chain
+                    .append_qrun_v05_fee_live(
+                        fee_block,
+                        &candidate.header,
+                        None,
+                        authenticator,
+                        clock,
+                    )
+                    .map_err(ForkChoiceError::Consensus)?;
+            }
+            (None, ForkChoiceExecutionMode::LegacyPtb2, _) => {
+                parent_chain
+                    .append_live(
+                        &candidate.block,
+                        &candidate.header,
+                        None,
+                        authenticator,
+                        clock,
+                    )
+                    .map_err(ForkChoiceError::Consensus)?;
+            }
+            _ => return Err(ForkChoiceError::ExecutionModeMismatch),
+        }
         if parent_chain.chain_tip().tip_hash != digest {
             return Err(ForkChoiceError::DigestMismatch);
         }
@@ -427,6 +521,38 @@ impl PrivateTestnetForkChoice {
         let mut archive = Self::new(genesis, params).map_err(ForkChoiceError::InvalidPow)?;
         for (_, _, envelope) in ordered {
             archive.insert_encoded(&envelope, authenticator, clock)?;
+        }
+        if archive.archive_len() != expected_count {
+            return Err(ForkChoiceError::ReplayIncomplete);
+        }
+        Ok(archive)
+    }
+
+    /// Rebuild a Genesis-rooted QRun QFP5 archive using deterministic historical replay.
+    /// QFP5 state-root commitments and fee-only execution are checked through the same chain path.
+    pub fn rebuild_qrun_v05_fee_from_envelopes<A: TransactionAuthenticator>(
+        genesis: LedgerState,
+        params: ConsensusParameters,
+        envelopes: impl IntoIterator<Item = Vec<u8>>,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+    ) -> Result<Self, ForkChoiceError> {
+        let mut ordered = Vec::new();
+        for envelope in envelopes {
+            let decoded =
+                decode_candidate_network_block(&envelope).map_err(ForkChoiceError::Wire)?;
+            if decoded.fee_block.is_none() {
+                return Err(ForkChoiceError::ExecutionModeMismatch);
+            }
+            let digest =
+                pow_digest(&decoded.header, params.pow).map_err(ForkChoiceError::InvalidPow)?;
+            ordered.push((decoded.header.height, digest, envelope));
+        }
+        ordered.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        let expected_count = ordered.len();
+        let mut archive = Self::new_qrun_v05_fee_only(genesis, params)?;
+        for (_, _, envelope) in ordered {
+            archive.insert_encoded_internal(&envelope, authenticator, clock, true)?;
         }
         if archive.archive_len() != expected_count {
             return Err(ForkChoiceError::ReplayIncomplete);
@@ -566,6 +692,134 @@ mod tests {
                 .unwrap()
                 .mul_div_u64(chain.state().height(), 1)
                 .unwrap()
+        );
+    }
+
+    fn qrun_fee_candidate(
+        chain: &PrivateTestnetChain,
+        params: &ConsensusParameters,
+        timestamp: u64,
+        producer: [u8; 32],
+        nonce: u64,
+    ) -> (Vec<u8>, [u8; 32]) {
+        let mut block = crate::state_machine::QRunV05FeeBlock {
+            body: Block {
+                height: chain.state().height() + 1,
+                timestamp,
+                parent_hash: chain.state().tip_hash(),
+                state_root: [0; 32],
+                transactions: Vec::new(),
+            },
+            producer,
+        };
+        block.body.state_root = chain
+            .state()
+            .preview_qrun_v05_fee_state_root_after(&block, &EmptyAuthenticator)
+            .unwrap();
+        let header = PowHeader {
+            protocol_version: params.protocol_version,
+            network_id: chain.state().network_id(),
+            height: block.body.height,
+            timestamp,
+            parent_hash: block.body.parent_hash,
+            previous_consensus_hash: chain.chain_tip().tip_hash,
+            state_root: crate::qrun_v05_fee_pow_wire_candidate::qrun_v05_fee_pow_state_commitment(
+                &block,
+            )
+            .unwrap(),
+            target: chain.expected_target(None).unwrap(),
+            nonce,
+        };
+        let digest = pow_digest(&header, params.pow).unwrap();
+        let envelope =
+            crate::qrun_v05_fee_pow_wire_candidate::encode_qrun_v05_fee_pow_block(&header, &block)
+                .unwrap();
+        (envelope, digest)
+    }
+
+    #[test]
+    fn qrun_fee_only_fork_choice_rejects_noncanonical_genesis_and_protocol_version() {
+        let mut params = params();
+        params.protocol_version = 5;
+        assert_eq!(
+            PrivateTestnetForkChoice::new_qrun_v05_fee_only(genesis(), params.clone()),
+            Err(ForkChoiceError::GenesisProfileMismatch)
+        );
+        let genesis = crate::qrun_v05_profile_identity_candidate::build_candidate_genesis()
+            .unwrap()
+            .ledger()
+            .clone();
+        params.protocol_version = 1;
+        assert_eq!(
+            PrivateTestnetForkChoice::new_qrun_v05_fee_only(genesis, params),
+            Err(ForkChoiceError::ConsensusProfileMismatch)
+        );
+    }
+
+    #[test]
+    fn qfp5_fork_choice_replays_fee_only_blocks_and_rejects_mode_mixing() {
+        let mut params = params();
+        params.protocol_version = 5;
+        params.pow.memory_kib = 8;
+        params.pow.iterations = 1;
+        params.pow.lanes = 1;
+        let genesis = crate::qrun_v05_profile_identity_candidate::build_candidate_genesis()
+            .unwrap()
+            .ledger()
+            .clone();
+        let genesis_chain = PrivateTestnetChain::new(genesis.clone(), params.clone()).unwrap();
+        let (fee_envelope, fee_digest) =
+            qrun_fee_candidate(&genesis_chain, &params, 100, [0x77; 32], 0);
+
+        let mut qrun_archive =
+            PrivateTestnetForkChoice::new_qrun_v05_fee_only(genesis.clone(), params.clone())
+                .unwrap();
+        let outcome = qrun_archive
+            .insert_encoded(&fee_envelope, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+        assert_eq!(outcome.block_digest, fee_digest);
+        assert_eq!(qrun_archive.canonical_chain().state().height(), 1);
+        assert_eq!(
+            qrun_archive
+                .canonical_chain()
+                .state()
+                .total_value()
+                .unwrap(),
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+        );
+
+        let rebuilt = PrivateTestnetForkChoice::rebuild_qrun_v05_fee_from_envelopes(
+            genesis.clone(),
+            params.clone(),
+            vec![fee_envelope.clone()],
+            &EmptyAuthenticator,
+            &FixedClock,
+        )
+        .unwrap();
+        assert_eq!(
+            rebuilt.canonical_chain().chain_tip(),
+            qrun_archive.canonical_chain().chain_tip()
+        );
+        assert_eq!(
+            rebuilt.canonical_chain().state().state_root(),
+            qrun_archive.canonical_chain().state().state_root()
+        );
+
+        let legacy_archive =
+            PrivateTestnetForkChoice::new(genesis.clone(), params.clone()).unwrap();
+        assert_eq!(
+            legacy_archive
+                .clone()
+                .insert_encoded(&fee_envelope, &EmptyAuthenticator, &FixedClock),
+            Err(ForkChoiceError::ExecutionModeMismatch)
+        );
+
+        let (legacy_envelope, _) = candidate(&genesis_chain, &params, 100, 9);
+        assert_eq!(
+            qrun_archive
+                .clone()
+                .insert_encoded(&legacy_envelope, &EmptyAuthenticator, &FixedClock),
+            Err(ForkChoiceError::ExecutionModeMismatch)
         );
     }
 

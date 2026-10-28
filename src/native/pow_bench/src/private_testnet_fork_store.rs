@@ -13,7 +13,8 @@ use crate::{
         ForkChoiceError, ForkChoiceOutcome, PrivateTestnetForkChoice, MAX_FORK_ARCHIVE_BLOCKS,
     },
     private_testnet_wire::{
-        decode_candidate_network_block, PrivateTestnetWireError, MAX_PRIVATE_TESTNET_ENVELOPE_BYTES,
+        decode_candidate_network_block, PrivateTestnetWireError,
+        MAX_CANDIDATE_NETWORK_ENVELOPE_BYTES,
     },
     state_machine::{LedgerState, StateError, TransactionAuthenticator},
     store_writer_lock::StoreWriterLock,
@@ -36,6 +37,7 @@ const MANIFEST_CHECKSUM_BYTES: usize = 32;
 const MAX_MANIFEST_BYTES: usize =
     MANIFEST_FIXED_PREFIX + MAX_FORK_ARCHIVE_BLOCKS * 32 + MANIFEST_CHECKSUM_BYTES;
 const PROFILE_DOMAIN: &[u8] = b"AIN1-PTB2-STORE-PROFILE-V1\0";
+const QRUN_V05_FEE_PROFILE_DOMAIN: &[u8] = b"QRUN-V05-FEE-ONLY-STORE-PROFILE-V1\0";
 const MANIFEST_NAME: &str = "forkstore.manifest";
 const LOCK_NAME: &str = "forkstore.lock";
 const BRANCH_PREFIX: &str = "branch-";
@@ -160,11 +162,18 @@ struct ParsedManifest {
     digests: Vec<[u8; 32]>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForkStoreProfile {
+    LegacyPtb2,
+    QRunV05FeeOnly,
+}
+
 pub struct PrivateTestnetForkStore {
     directory: PathBuf,
     genesis: LedgerState,
     params: ConsensusParameters,
     profile_fingerprint: [u8; 32],
+    profile: ForkStoreProfile,
     genesis_tip: [u8; 32],
     archive: PrivateTestnetForkChoice,
     _writer_lock: StoreWriterLock,
@@ -180,7 +189,16 @@ impl PrivateTestnetForkStore {
         authenticator: &A,
         clock: &dyn ReferenceTimeProvider,
     ) -> Result<Self, ForkStoreError> {
-        Self::open_inner(directory, genesis, params, authenticator, clock, None, None)
+        Self::open_inner(
+            directory,
+            genesis,
+            params,
+            authenticator,
+            clock,
+            None,
+            None,
+            ForkStoreProfile::LegacyPtb2,
+        )
     }
 
     /// Open only when the stored PFS2 manifest matches an anchor provisioned independently
@@ -201,6 +219,49 @@ impl PrivateTestnetForkStore {
             clock,
             Some(expected_manifest_anchor),
             None,
+            ForkStoreProfile::LegacyPtb2,
+        )
+    }
+
+    /// Open a Genesis-rooted QRun QFP5 branch store. The execution profile is domain-separated
+    /// from the legacy PTB2 profile; checkpoint-rooted mode is deliberately not supported yet.
+    pub fn open_qrun_v05_fee_only<A: TransactionAuthenticator>(
+        directory: impl AsRef<Path>,
+        genesis: LedgerState,
+        params: ConsensusParameters,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+    ) -> Result<Self, ForkStoreError> {
+        Self::open_inner(
+            directory,
+            genesis,
+            params,
+            authenticator,
+            clock,
+            None,
+            None,
+            ForkStoreProfile::QRunV05FeeOnly,
+        )
+    }
+
+    /// Reopen the QRun profile only if its PFS2 manifest matches an externally retained anchor.
+    pub fn open_qrun_v05_fee_only_anchored<A: TransactionAuthenticator>(
+        directory: impl AsRef<Path>,
+        genesis: LedgerState,
+        params: ConsensusParameters,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+        expected_manifest_anchor: [u8; 32],
+    ) -> Result<Self, ForkStoreError> {
+        Self::open_inner(
+            directory,
+            genesis,
+            params,
+            authenticator,
+            clock,
+            Some(expected_manifest_anchor),
+            None,
+            ForkStoreProfile::QRunV05FeeOnly,
         )
     }
 
@@ -223,6 +284,7 @@ impl PrivateTestnetForkStore {
             clock,
             expected_manifest_anchor,
             Some(base_chain),
+            ForkStoreProfile::LegacyPtb2,
         )
     }
 
@@ -234,72 +296,97 @@ impl PrivateTestnetForkStore {
         clock: &dyn ReferenceTimeProvider,
         expected_manifest_anchor: Option<[u8; 32]>,
         base_chain: Option<crate::private_testnet_driver::PrivateTestnetChain>,
+        profile: ForkStoreProfile,
     ) -> Result<Self, ForkStoreError> {
         params.validate()?;
+        if profile == ForkStoreProfile::QRunV05FeeOnly && base_chain.is_some() {
+            return Err(ForkStoreError::ManifestProfileMismatch);
+        }
         let directory = directory.as_ref().to_path_buf();
         fs::create_dir_all(&directory)?;
         let writer_lock = acquire_writer_lock(&directory)?;
 
-        let profile_fingerprint = profile_fingerprint(&genesis, &params)?;
-        let empty = match base_chain.as_ref() {
-            Some(base) => PrivateTestnetForkChoice::from_base_chain(
-                genesis.clone(),
-                params.clone(),
-                base.clone(),
-            )?,
-            None => PrivateTestnetForkChoice::new(genesis.clone(), params.clone())?,
+        let profile_fingerprint = match profile {
+            ForkStoreProfile::LegacyPtb2 => profile_fingerprint(&genesis, &params)?,
+            ForkStoreProfile::QRunV05FeeOnly => {
+                qrun_v05_fee_profile_fingerprint(&genesis, &params)?
+            }
+        };
+        let empty = if profile == ForkStoreProfile::QRunV05FeeOnly {
+            PrivateTestnetForkChoice::new_qrun_v05_fee_only(genesis.clone(), params.clone())?
+        } else {
+            match base_chain.as_ref() {
+                Some(base) => PrivateTestnetForkChoice::from_base_chain(
+                    genesis.clone(),
+                    params.clone(),
+                    base.clone(),
+                )?,
+                None => PrivateTestnetForkChoice::new(genesis.clone(), params.clone())?,
+            }
         };
         let genesis_tip = empty.canonical_chain().chain_tip().tip_hash;
         let manifest_path = directory.join(MANIFEST_NAME);
 
-        let (archive, known_digests) =
-            if manifest_path.exists() {
-                let manifest_bytes = read_bounded_file(&manifest_path, MAX_MANIFEST_BYTES)
+        let (archive, known_digests) = if manifest_path.exists() {
+            let manifest_bytes = read_bounded_file(&manifest_path, MAX_MANIFEST_BYTES).map_err(
+                |error| match error {
+                    BoundedReadError::Io(error) => ForkStoreError::Io(error),
+                    BoundedReadError::TooLarge => ForkStoreError::ManifestTooLarge,
+                },
+            )?;
+            // A checkpoint-rooted segment must not silently reopen an existing suffix
+            // without an anchor retained outside the mutable archive directory. Otherwise a
+            // self-consistent rollback of its manifest can discard already-committed blocks.
+            if base_chain.is_some() && expected_manifest_anchor.is_none() {
+                return Err(ForkStoreError::ManifestAnchorMismatch);
+            }
+            if expected_manifest_anchor
+                .is_some_and(|expected| manifest_anchor_commitment(&manifest_bytes) != expected)
+            {
+                return Err(ForkStoreError::ManifestAnchorMismatch);
+            }
+            let manifest = decode_manifest(&manifest_bytes)?;
+            if manifest.network_id != genesis.network_id()
+                || manifest.profile_fingerprint != profile_fingerprint
+                || manifest.genesis_tip != genesis_tip
+            {
+                return Err(ForkStoreError::ManifestProfileMismatch);
+            }
+
+            let mut envelopes = Vec::with_capacity(manifest.digests.len());
+            let known: BTreeSet<[u8; 32]> = manifest.digests.iter().copied().collect();
+            for digest in &manifest.digests {
+                let path = directory.join(branch_file_name(digest));
+                if !path.is_file() {
+                    return Err(ForkStoreError::MissingReferencedBranch);
+                }
+                let bytes = read_bounded_file(&path, MAX_CANDIDATE_NETWORK_ENVELOPE_BYTES)
                     .map_err(|error| match error {
                         BoundedReadError::Io(error) => ForkStoreError::Io(error),
-                        BoundedReadError::TooLarge => ForkStoreError::ManifestTooLarge,
+                        BoundedReadError::TooLarge => ForkStoreError::BranchFileTooLarge,
                     })?;
-                // A checkpoint-rooted segment must not silently reopen an existing suffix
-                // without an anchor retained outside the mutable archive directory. Otherwise a
-                // self-consistent rollback of its manifest can discard already-committed blocks.
-                if base_chain.is_some() && expected_manifest_anchor.is_none() {
-                    return Err(ForkStoreError::ManifestAnchorMismatch);
-                }
-                if expected_manifest_anchor
-                    .is_some_and(|expected| manifest_anchor_commitment(&manifest_bytes) != expected)
-                {
-                    return Err(ForkStoreError::ManifestAnchorMismatch);
-                }
-                let manifest = decode_manifest(&manifest_bytes)?;
-                if manifest.network_id != genesis.network_id()
-                    || manifest.profile_fingerprint != profile_fingerprint
-                    || manifest.genesis_tip != genesis_tip
-                {
+                let decoded =
+                    decode_candidate_network_block(&bytes).map_err(ForkStoreError::from_wire)?;
+                if decoded.fee_block.is_some() != (profile == ForkStoreProfile::QRunV05FeeOnly) {
                     return Err(ForkStoreError::ManifestProfileMismatch);
                 }
-
-                let mut envelopes = Vec::with_capacity(manifest.digests.len());
-                let known: BTreeSet<[u8; 32]> = manifest.digests.iter().copied().collect();
-                for digest in &manifest.digests {
-                    let path = directory.join(branch_file_name(digest));
-                    if !path.is_file() {
-                        return Err(ForkStoreError::MissingReferencedBranch);
-                    }
-                    let bytes = read_bounded_file(&path, MAX_PRIVATE_TESTNET_ENVELOPE_BYTES)
-                        .map_err(|error| match error {
-                            BoundedReadError::Io(error) => ForkStoreError::Io(error),
-                            BoundedReadError::TooLarge => ForkStoreError::BranchFileTooLarge,
-                        })?;
-                    let decoded = decode_candidate_network_block(&bytes)
-                        .map_err(ForkStoreError::from_wire)?;
-                    if decoded.header.network_id != genesis.network_id()
-                        || pow_digest(&decoded.header, params.pow)? != *digest
-                    {
-                        return Err(ForkStoreError::BranchFilenameDigestMismatch);
-                    }
-                    envelopes.push(bytes);
+                if decoded.header.network_id != genesis.network_id()
+                    || pow_digest(&decoded.header, params.pow)? != *digest
+                {
+                    return Err(ForkStoreError::BranchFilenameDigestMismatch);
                 }
-                let archive = match base_chain.as_ref() {
+                envelopes.push(bytes);
+            }
+            let archive = if profile == ForkStoreProfile::QRunV05FeeOnly {
+                PrivateTestnetForkChoice::rebuild_qrun_v05_fee_from_envelopes(
+                    genesis.clone(),
+                    params.clone(),
+                    envelopes,
+                    authenticator,
+                    clock,
+                )?
+            } else {
+                match base_chain.as_ref() {
                     Some(base) => PrivateTestnetForkChoice::rebuild_from_base_chain(
                         genesis.clone(),
                         params.clone(),
@@ -315,32 +402,33 @@ impl PrivateTestnetForkStore {
                         authenticator,
                         clock,
                     )?,
-                };
-                let replayed_tip = archive.canonical_chain().chain_tip().tip_hash;
-                if replayed_tip != manifest.canonical_tip {
-                    return Err(ForkStoreError::CanonicalTipMismatch);
                 }
-                (archive, known)
-            } else {
-                if expected_manifest_anchor.is_some() {
-                    return Err(ForkStoreError::ManifestAnchorMismatch);
-                }
-                if manifest_path.exists() {
-                    return Err(ForkStoreError::ManifestMalformed);
-                }
-                let known = BTreeSet::new();
-                write_manifest_atomic(
-                    &manifest_path,
-                    &encode_manifest(
-                        &genesis.network_id(),
-                        &profile_fingerprint,
-                        &genesis_tip,
-                        &genesis_tip,
-                        &[],
-                    )?,
-                )?;
-                (empty, known)
             };
+            let replayed_tip = archive.canonical_chain().chain_tip().tip_hash;
+            if replayed_tip != manifest.canonical_tip {
+                return Err(ForkStoreError::CanonicalTipMismatch);
+            }
+            (archive, known)
+        } else {
+            if expected_manifest_anchor.is_some() {
+                return Err(ForkStoreError::ManifestAnchorMismatch);
+            }
+            if manifest_path.exists() {
+                return Err(ForkStoreError::ManifestMalformed);
+            }
+            let known = BTreeSet::new();
+            write_manifest_atomic(
+                &manifest_path,
+                &encode_manifest(
+                    &genesis.network_id(),
+                    &profile_fingerprint,
+                    &genesis_tip,
+                    &genesis_tip,
+                    &[],
+                )?,
+            )?;
+            (empty, known)
+        };
 
         cleanup_orphan_branch_files(&directory, &known_digests)?;
         Ok(Self {
@@ -348,6 +436,7 @@ impl PrivateTestnetForkStore {
             genesis,
             params,
             profile_fingerprint,
+            profile,
             genesis_tip,
             archive,
             _writer_lock: writer_lock,
@@ -406,6 +495,10 @@ impl PrivateTestnetForkStore {
         authenticator: &A,
         clock: &dyn ReferenceTimeProvider,
     ) -> Result<ForkChoiceOutcome, ForkStoreError> {
+        let is_qfp5 = envelope.starts_with(b"QFP5");
+        if is_qfp5 != (self.profile == ForkStoreProfile::QRunV05FeeOnly) {
+            return Err(ForkStoreError::Fork(ForkChoiceError::ExecutionModeMismatch));
+        }
         // Validate into an isolated clone first. No durable bytes or visible in-memory state
         // change if consensus/fork-choice validation fails.
         let mut candidate_archive = self.archive.clone();
@@ -414,7 +507,7 @@ impl PrivateTestnetForkStore {
         let branch_path = self.directory.join(branch_file_name(&digest));
 
         if branch_path.exists() {
-            let existing = read_bounded_file(&branch_path, MAX_PRIVATE_TESTNET_ENVELOPE_BYTES)
+            let existing = read_bounded_file(&branch_path, MAX_CANDIDATE_NETWORK_ENVELOPE_BYTES)
                 .map_err(|error| match error {
                     BoundedReadError::Io(error) => ForkStoreError::Io(error),
                     BoundedReadError::TooLarge => ForkStoreError::BranchFileTooLarge,
@@ -518,6 +611,17 @@ fn profile_fingerprint(
     canonical.extend_from_slice(&params.issuance.maximum_supply().to_be_bytes());
     canonical.extend_from_slice(&params.issuance.initial_subsidy().to_be_bytes());
     canonical.extend_from_slice(&params.issuance.blocks_per_halving().to_be_bytes());
+    Ok(Sha256::digest(&canonical).into())
+}
+
+fn qrun_v05_fee_profile_fingerprint(
+    genesis: &LedgerState,
+    params: &ConsensusParameters,
+) -> Result<[u8; 32], ForkStoreError> {
+    let legacy_fingerprint = profile_fingerprint(genesis, params)?;
+    let mut canonical = Vec::with_capacity(QRUN_V05_FEE_PROFILE_DOMAIN.len() + 32);
+    canonical.extend_from_slice(QRUN_V05_FEE_PROFILE_DOMAIN);
+    canonical.extend_from_slice(&legacy_fingerprint);
     Ok(Sha256::digest(&canonical).into())
 }
 
@@ -670,14 +774,14 @@ fn write_synced_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 fn write_branch_create_new(path: &Path, bytes: &[u8]) -> Result<(), ForkStoreError> {
-    if bytes.len() > MAX_PRIVATE_TESTNET_ENVELOPE_BYTES {
+    if bytes.len() > MAX_CANDIDATE_NETWORK_ENVELOPE_BYTES {
         return Err(ForkStoreError::BranchFileTooLarge);
     }
     match write_synced_new(path, bytes) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             let existing =
-                read_bounded_file(path, MAX_PRIVATE_TESTNET_ENVELOPE_BYTES).map_err(|error| {
+                read_bounded_file(path, MAX_CANDIDATE_NETWORK_ENVELOPE_BYTES).map_err(|error| {
                     match error {
                         BoundedReadError::Io(error) => ForkStoreError::Io(error),
                         BoundedReadError::TooLarge => ForkStoreError::BranchFileTooLarge,
@@ -927,6 +1031,253 @@ mod tests {
         nonce: u64,
     ) -> (Vec<u8>, [u8; 32]) {
         envelope(parent, params, timestamp, nonce)
+    }
+
+    fn qrun_fee_envelope(genesis: &LedgerState, params: &ConsensusParameters) -> Vec<u8> {
+        let chain = crate::private_testnet_driver::PrivateTestnetChain::new(
+            genesis.clone(),
+            params.clone(),
+        )
+        .unwrap();
+        let mut fee_block = crate::state_machine::QRunV05FeeBlock {
+            body: Block {
+                height: 1,
+                timestamp: 100,
+                parent_hash: genesis.tip_hash(),
+                state_root: [0; 32],
+                transactions: Vec::new(),
+            },
+            producer: [0x77; 32],
+        };
+        fee_block.body.state_root = genesis
+            .preview_qrun_v05_fee_state_root_after(&fee_block, &EmptyAuthenticator)
+            .unwrap();
+        let header = PowHeader {
+            protocol_version: params.protocol_version,
+            network_id: genesis.network_id(),
+            height: 1,
+            timestamp: 100,
+            parent_hash: genesis.tip_hash(),
+            previous_consensus_hash: chain.chain_tip().tip_hash,
+            state_root: crate::qrun_v05_fee_pow_wire_candidate::qrun_v05_fee_pow_state_commitment(
+                &fee_block,
+            )
+            .unwrap(),
+            target: params.initial_target,
+            nonce: 0,
+        };
+        crate::qrun_v05_fee_pow_wire_candidate::encode_qrun_v05_fee_pow_block(&header, &fee_block)
+            .unwrap()
+    }
+
+    #[test]
+    fn exact_ten_billion_candidate_genesis_persists_through_qfp5_store_restart() {
+        let dir = TestDir::new();
+        let mut params = params();
+        params.protocol_version = 5;
+        params.pow.memory_kib = 8;
+        let genesis_candidate =
+            crate::qrun_v05_profile_identity_candidate::build_candidate_genesis().unwrap();
+        assert_eq!(
+            genesis_candidate.commitment(),
+            crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT
+        );
+        let genesis = genesis_candidate.ledger().clone();
+        assert_eq!(genesis.state_root(), genesis_candidate.state_root());
+        assert_eq!(
+            genesis.total_value().unwrap(),
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+        );
+        assert_eq!(
+            genesis
+                .account(&crate::qrun_v05_profile_identity_candidate::PROPOSED_OWNER_ACCOUNT_ID)
+                .unwrap()
+                .balance,
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS as u64
+        );
+
+        let mut store = PrivateTestnetForkStore::open_qrun_v05_fee_only(
+            &dir.0,
+            genesis.clone(),
+            params.clone(),
+            &EmptyAuthenticator,
+            &FixedClock,
+        )
+        .unwrap();
+        let chain = store.archive().canonical_chain();
+        assert_eq!(
+            chain.state().network_id(),
+            crate::qrun_v05_profile_identity_candidate::PROPOSED_QRUN_V05_NETWORK_ID
+        );
+        let mut fee_block = crate::state_machine::QRunV05FeeBlock {
+            body: Block {
+                height: 1,
+                timestamp: 100,
+                parent_hash: chain.state().tip_hash(),
+                state_root: [0; 32],
+                transactions: Vec::new(),
+            },
+            producer: [0x77; 32],
+        };
+        fee_block.body.state_root = chain
+            .state()
+            .preview_qrun_v05_fee_state_root_after(&fee_block, &EmptyAuthenticator)
+            .unwrap();
+        let header = PowHeader {
+            protocol_version: params.protocol_version,
+            network_id: chain.state().network_id(),
+            height: 1,
+            timestamp: 100,
+            parent_hash: fee_block.body.parent_hash,
+            previous_consensus_hash: chain.chain_tip().tip_hash,
+            state_root: crate::qrun_v05_fee_pow_wire_candidate::qrun_v05_fee_pow_state_commitment(
+                &fee_block,
+            )
+            .unwrap(),
+            target: chain.expected_target(None).unwrap(),
+            nonce: 0,
+        };
+        let envelope = crate::qrun_v05_fee_pow_wire_candidate::encode_qrun_v05_fee_pow_block(
+            &header, &fee_block,
+        )
+        .unwrap();
+        store
+            .submit(&envelope, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+        assert_eq!(store.canonical_height(), 1);
+        assert_eq!(
+            store
+                .archive()
+                .canonical_chain()
+                .state()
+                .total_value()
+                .unwrap(),
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+        );
+        assert_eq!(
+            store
+                .archive()
+                .canonical_chain()
+                .state()
+                .account(&crate::qrun_v05_profile_identity_candidate::PROPOSED_OWNER_ACCOUNT_ID)
+                .unwrap()
+                .balance,
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS as u64
+        );
+        let anchor = store.manifest_anchor().unwrap();
+        drop(store);
+
+        let reopened = PrivateTestnetForkStore::open_qrun_v05_fee_only_anchored(
+            &dir.0,
+            genesis,
+            params,
+            &EmptyAuthenticator,
+            &FixedClock,
+            anchor,
+        )
+        .unwrap();
+        assert_eq!(reopened.canonical_height(), 1);
+        assert_eq!(
+            reopened
+                .archive()
+                .canonical_chain()
+                .state()
+                .total_value()
+                .unwrap(),
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+        );
+        assert_eq!(
+            reopened
+                .archive()
+                .canonical_chain()
+                .state()
+                .account(&crate::qrun_v05_profile_identity_candidate::PROPOSED_OWNER_ACCOUNT_ID)
+                .unwrap()
+                .balance,
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS as u64
+        );
+    }
+
+    #[test]
+    fn qrun_fee_store_reopens_with_profile_and_external_anchor_and_rejects_legacy() {
+        let dir = TestDir::new();
+        let mut params = params();
+        params.protocol_version = 5;
+        params.pow.memory_kib = 8;
+        let genesis = crate::qrun_v05_profile_identity_candidate::build_candidate_genesis()
+            .unwrap()
+            .ledger()
+            .clone();
+        let fee = qrun_fee_envelope(&genesis, &params);
+        let mut store = PrivateTestnetForkStore::open_qrun_v05_fee_only(
+            &dir.0,
+            genesis.clone(),
+            params.clone(),
+            &EmptyAuthenticator,
+            &FixedClock,
+        )
+        .unwrap();
+        store
+            .submit(&fee, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+        assert_eq!(store.canonical_height(), 1);
+        assert_eq!(
+            store
+                .archive()
+                .canonical_chain()
+                .state()
+                .total_value()
+                .unwrap(),
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+        );
+        let anchor = store.manifest_anchor().unwrap();
+        drop(store);
+
+        let reopened = PrivateTestnetForkStore::open_qrun_v05_fee_only_anchored(
+            &dir.0,
+            genesis.clone(),
+            params.clone(),
+            &EmptyAuthenticator,
+            &FixedClock,
+            anchor,
+        )
+        .unwrap();
+        assert_eq!(reopened.canonical_height(), 1);
+        assert_eq!(
+            reopened
+                .archive()
+                .canonical_chain()
+                .state()
+                .total_value()
+                .unwrap(),
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+        );
+        drop(reopened);
+
+        assert!(matches!(
+            PrivateTestnetForkStore::open(
+                &dir.0,
+                genesis.clone(),
+                params.clone(),
+                &EmptyAuthenticator,
+                &FixedClock,
+            ),
+            Err(ForkStoreError::ManifestProfileMismatch)
+        ));
+
+        let legacy_dir = TestDir::new();
+        let mut legacy = PrivateTestnetForkStore::open(
+            &legacy_dir.0,
+            genesis.clone(),
+            params.clone(),
+            &EmptyAuthenticator,
+            &FixedClock,
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy.submit(&fee, &EmptyAuthenticator, &FixedClock),
+            Err(ForkStoreError::Fork(ForkChoiceError::ExecutionModeMismatch))
+        ));
     }
 
     #[test]

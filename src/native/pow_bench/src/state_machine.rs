@@ -1147,6 +1147,47 @@ impl LedgerState {
         self.apply_block(block, authenticator)
     }
 
+    /// Live-admission variant for QFB5. It validates the inner body/time policy before applying
+    /// the fee-only transition, whose committed state root is the post-fee ledger root.
+    pub(crate) fn apply_qrun_v05_fee_block_with_timestamp_policy<A: TransactionAuthenticator>(
+        &mut self,
+        block: &QRunV05FeeBlock,
+        authenticator: &A,
+        reference_time: u64,
+        policy: TimestampPolicy,
+    ) -> Result<BlockApplySummary, StateError> {
+        encode_qrun_v05_fee_block(block)?;
+        let body = &block.body;
+        let expected_height = self
+            .height
+            .checked_add(1)
+            .ok_or(StateError::InvalidHeight)?;
+        if body.height != expected_height {
+            return Err(StateError::HeightMismatch {
+                expected: expected_height,
+                actual: body.height,
+            });
+        }
+        if body.parent_hash != self.tip_hash {
+            return Err(StateError::ParentHashMismatch);
+        }
+        validate_block_timestamp(self.last_timestamp, body.timestamp, reference_time, policy)
+            .map_err(|error| match error {
+                TimestampPolicyError::ZeroTimestamp => StateError::InvalidBlockTimestamp,
+                TimestampPolicyError::NotIncreasing { previous, actual } => {
+                    StateError::TimestampNotIncreasing { previous, actual }
+                }
+                TimestampPolicyError::TooFarInFuture {
+                    latest_allowed,
+                    actual,
+                } => StateError::TimestampTooFarInFuture {
+                    latest_allowed,
+                    actual,
+                },
+            })?;
+        self.apply_qrun_v05_fee_block(block, authenticator)
+    }
+
     /// Atomically execute one block and require its committed state root to match.
     /// Any failure leaves the original state byte-for-byte unchanged.
     pub(crate) fn apply_block<A: TransactionAuthenticator>(

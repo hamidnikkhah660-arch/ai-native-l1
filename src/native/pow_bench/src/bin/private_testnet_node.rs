@@ -2131,7 +2131,11 @@ fn build_next_candidate(
         let digest = pow_digest(&header, params.pow)
             .map_err(|error| format!("calculate candidate PoW digest: {error}"))?;
         if Uint256::from_be_bytes(digest) <= target {
-            return Ok(CandidateNetworkBlock { header, block });
+            return Ok(CandidateNetworkBlock {
+                header,
+                block,
+                fee_block: None,
+            });
         }
     }
     Err("nonce search exhausted".into())
