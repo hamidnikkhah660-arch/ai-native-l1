@@ -18,8 +18,8 @@
   "miner_subsidy_atoms_per_block": "0",
   "release_gates": {
     "production_consensus_profile_frozen": false,
-    "canonical_producer_importer_replay_wired": false,
-    "fee_only_producer_payout_committed_in_block": false,
+    "canonical_producer_importer_replay_wired": true,
+    "fee_only_producer_payout_committed_in_block": true,
     "full_history_or_verified_checkpoint_rollover": false,
     "external_anti_rollback_anchor_provider": false,
     "production_peer_bootstrap_and_churn_tests": false,

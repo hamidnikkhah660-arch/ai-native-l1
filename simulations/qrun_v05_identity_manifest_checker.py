@@ -47,9 +47,20 @@ assert rust_const_hex("PROPOSED_GENESIS_COMMITMENT") == commitment.hex()
 assert manifest["post_genesis_minting_enabled"] is False
 assert manifest["miner_subsidy_atoms_per_block"] == "0"
 assert manifest["mainnet_activated"] is False
-assert all(value is False for value in manifest["release_gates"].values())
+gates = manifest["release_gates"]
+assert gates["canonical_producer_importer_replay_wired"] is True
+assert gates["fee_only_producer_payout_committed_in_block"] is True
+assert all(
+    value is False
+    for key, value in gates.items()
+    if key not in {
+        "canonical_producer_importer_replay_wired",
+        "fee_only_producer_payout_committed_in_block",
+    }
+)
 assert "Mainnet remains **not activated**" in doc
 print("QRUN_V05_IDENTITY_GENESIS_MANIFEST_ORACLE=PASS")
 print(f"network_id={network_id.hex()}; owner={owner.hex()}")
 print(f"supply_atoms={amount}; genesis_state_root={state_root.hex()}; genesis_commitment={commitment.hex()}")
-print("mainnet_activated=false; post_genesis_minting=false; miner_subsidy=0")
+print("candidate_qfp5_producer_importer_replay_wired=true; fee_only_payout_committed=true")
+print("mainnet_activated=false; production_consensus_profile_frozen=false; checkpoint_rollover=false")

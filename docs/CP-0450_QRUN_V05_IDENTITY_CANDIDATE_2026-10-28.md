@@ -18,9 +18,9 @@ Machine-readable values are in `profiles/qrun_v05_mainnet_identity_candidate.jso
 
 ## Explicitly unresolved launch gates
 
-1. The production consensus/difficulty/timestamp/profile fingerprint is not frozen or wired through producer, importer, replay, fork choice, and restart.
-2. The current PoW block envelope does not commit a fee beneficiary. The ledger accumulates fees in `fee_pool` but has no canonical fee-only producer payout. A production block format and replay rule must commit the beneficiary and settle fees without increasing total supply.
-3. Full-history validation or an independently verifiable, automatically rolling checkpoint trust model is not integrated; a caller-supplied local anchor is not an external anti-rollback provider.
+1. The candidate QFP5 producer/importer/replay/fork-choice/restart path is wired, but a production consensus/difficulty/timestamp profile is not frozen or calibrated; the executable smoke profile still has intentionally easy PoW settings.
+2. The QFP5 block now commits its fee beneficiary and deterministically pays only fees from included transactions, with zero subsidy. A production fee policy, fee schedule, and independently tested miner economics remain unfrozen.
+3. Full-history validation or an independently verifiable, automatically rolling checkpoint trust model is not integrated; the checkpoint-rooted CAS API is tested with a mock provider, not a deployed independent provider.
 4. Production peer bootstrap/churn, transaction relay limits and independent multi-host restart/fork testing are unfinished.
 5. Independent security review and owner-side verification of the final manifest remain required before public activation.
 
