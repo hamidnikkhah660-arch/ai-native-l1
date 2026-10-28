@@ -8,6 +8,10 @@ The source repository and website are public. The running node remains **experim
 
 ## What is concrete today
 
+The latest owner-directed supply target in CP-0437 is exactly 10,000,000,000 QZXB at Genesis to one owner account, with zero post-Genesis minting and zero block subsidy. Older v0.4 percentage allocations and the 3B mining/halving model are historical and superseded for this target. Fee-only block-production economics is still an open release gate; this target is not a live or publicly spendable balance.
+
+The active experimental branch is separate from the public curated main baseline. Test counts must always include their branch and date: the older curated baseline recorded 735/735 library tests; the newer working branch lists 1,187 tests across Cargo targets, while test execution results are documented separately in the release-gate record.
+
 - A public source repository with Rust protocol and recovery research.
 - Candidate PoW/fork-choice and a fee-only QRun block/store path, with candidate profile and Genesis commitments documented.
 - Authenticated peer-transport components and local multi-process tests; public-alpha P2P configuration does not itself prove Internet reachability.
@@ -29,6 +33,11 @@ The source repository and website are public. The running node remains **experim
 ## Links
 
 - Project website: https://hamidnikkhah660-arch.github.io/ai-native-l1/
+- Technology guide: https://hamidnikkhah660-arch.github.io/ai-native-l1/technology.html
+- Cryptography guide: https://hamidnikkhah660-arch.github.io/ai-native-l1/cryptography.html
+- Current supply / economics guide: https://hamidnikkhah660-arch.github.io/ai-native-l1/economics.html
+- Current release status: https://hamidnikkhah660-arch.github.io/ai-native-l1/status.html
+- Contributions / sponsorship: https://hamidnikkhah660-arch.github.io/ai-native-l1/contribute.html
 - Public source: https://github.com/hamidnikkhah660-arch/ai-native-l1
 - Latest experimental source branch (not a production release): https://github.com/hamidnikkhah660-arch/ai-native-l1/tree/work/qzbe-v04-persistent-mining-20261026
 - Independent operator call: https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/72
