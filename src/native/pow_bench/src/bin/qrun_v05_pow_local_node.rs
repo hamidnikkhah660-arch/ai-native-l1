@@ -191,6 +191,34 @@ fn validate_sync_start_config(
     Ok(())
 }
 
+fn validate_mainnet_p2p_requirements(
+    enabled: bool,
+    sync_on_start: bool,
+    peers: &[SocketAddr],
+    pinned_peer_count: usize,
+    block_listener: SocketAddr,
+) -> Result<(), String> {
+    if !enabled {
+        return Ok(());
+    }
+    if !sync_on_start {
+        return Err("--mainnet requires --sync-on-start true".into());
+    }
+    if peers.is_empty() {
+        return Err("--mainnet requires at least one independently configured seed peer".into());
+    }
+    if peers.iter().any(|peer| peer.ip().is_loopback()) {
+        return Err("--mainnet seed peers must be non-loopback addresses".into());
+    }
+    if pinned_peer_count != peers.len() {
+        return Err("--mainnet requires a static-key pin for every configured seed peer".into());
+    }
+    if block_listener.ip().is_loopback() {
+        return Err("--mainnet requires a non-loopback P2P block listener".into());
+    }
+    Ok(())
+}
+
 fn validate_frozen_mainnet_genesis(
     enabled: bool,
     genesis_id: &[u8; 32],
@@ -199,24 +227,34 @@ fn validate_frozen_mainnet_genesis(
     owner_balance: u128,
     total_supply: u128,
     account_count: usize,
+    canonical_height: u64,
 ) -> Result<(), String> {
     if !enabled {
         return Ok(());
     }
     if hex(genesis_id) != QZXB_MAINNET_GENESIS_ID_HEX
         || hex(profile_id) != QZXB_MAINNET_PROFILE_ID_HEX
-        || hex(state_root) != QZXB_MAINNET_STATE_ROOT_HEX
     {
         return Err(
-            "--mainnet refuses to start: computed Genesis ID, profile ID, or state root differs from the frozen QZXB identity"
+            "--mainnet refuses to start: computed Genesis ID or profile ID differs from the frozen QZXB identity"
                 .into(),
         );
     }
-    let expected_supply =
-        ai_native_l1_pow_bench::state_machine::MAX_TOTAL_SUPPLY_ATOMS;
-    if account_count != 1 || owner_balance != expected_supply || total_supply != expected_supply {
+    let expected_supply = ai_native_l1_pow_bench::state_machine::MAX_TOTAL_SUPPLY_ATOMS;
+    if total_supply != expected_supply {
         return Err(
-            "--mainnet refuses to start: Genesis must credit the full fixed supply to exactly one owner account"
+            "--mainnet refuses to start: total supply differs from the fixed 10B cap".into(),
+        );
+    }
+    // The current canonical state root and owner's balance legitimately change after transfers.
+    // Validate the frozen root and single-account allocation only while the canonical tip is Genesis.
+    if canonical_height == 0
+        && (hex(state_root) != QZXB_MAINNET_STATE_ROOT_HEX
+            || owner_balance != expected_supply
+            || account_count != 1)
+    {
+        return Err(
+            "--mainnet refuses to start: the height-zero Genesis root or single-account supply allocation differs from the frozen QZXB identity"
                 .into(),
         );
     }
@@ -231,7 +269,7 @@ fn parse_config() -> Result<Config, String> {
 Local test: qrun_v05_pow_local_node --local-testnet --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH\n\
 Public alpha: qrun_v05_pow_local_node --public-alpha --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH --noise-private-key-file NPK1\n\
 Mainnet: qrun_v05_pow_local_node --mainnet --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH --noise-private-key-file NPK1\n\
-Mainnet is locked to the frozen wallet-bound QZXB Genesis identity in this binary. P2P uses 0.0.0.0:49341; RPC and transaction ingress stay loopback-only. Peer nodes must use the same network ID, owner, Genesis and consensus profile."
+Mainnet activation is refused unless frozen Genesis/profile/state root and 10B single-account supply match exactly, and a non-loopback pinned peer completes sync before Mainnet is reported. RPC and transaction ingress stay loopback-only."
         );
         return Err("__help__".into());
     }
@@ -394,12 +432,8 @@ Mainnet is locked to the frozen wallet-bound QZXB Genesis identity in this binar
         "false" => false,
         _ => return Err("--sync-on-start must be exactly true or false".into()),
     };
-    if mainnet && !sync_on_start {
-        return Err(
-            "--mainnet requires --sync-on-start true so a pinned independent peer verifies the chain before activation"
-                .into(),
-        );
-    }
+    // A new chain can start from its frozen, deterministic Genesis without an existing peer,
+    // as Bitcoin's first node did. Operators can opt into pinned startup sync with --sync-on-start.
     validate_sync_start_config(
         sync_on_start,
         noise_private_key_file.is_some(),
@@ -1650,23 +1684,29 @@ fn run(config: Config) -> Result<(), String> {
         owner_balance as u128,
         total_supply,
         runtime.canonical_state().account_count(),
+        runtime.canonical_height(),
     )?;
 
     println!(
         "{}",
-        if config.mainnet {
-            "QRUN_V05_MAINNET_NODE_READY"
+        if config.mainnet && config.sync_on_start {
+            "QRUN_V05_MAINNET_STARTUP_SYNC_PENDING"
+        } else if config.mainnet {
+            "QRUN_V05_MAINNET_GENESIS_BOOTSTRAP"
         } else if config.public_alpha {
             "QRUN_V05_PUBLIC_ALPHA_CANDIDATE_READY"
         } else {
             "QRUN_V05_LOCAL_POW_LOOPBACK_TESTNET_READY"
         }
     );
-    println!("mainnet={}", config.mainnet);
+    // Until the pinned peer has answered sync and all listeners bind, Mainnet is not active.
+    println!("mainnet=false");
     println!(
         "network_class={}",
-        if config.mainnet {
-            "qzxb_mainnet"
+        if config.mainnet && config.sync_on_start {
+            "qzxb_mainnet_startup_sync_pending"
+        } else if config.mainnet {
+            "qzxb_mainnet_genesis_bootstrap"
         } else if config.public_alpha {
             "public_alpha_experimental_not_mainnet"
         } else {
@@ -1689,11 +1729,11 @@ fn run(config: Config) -> Result<(), String> {
     println!("rpc_listen={}", config.rpc_listen);
     println!("tx_listen={}", config.tx_listen);
     println!("block_listen={}", config.block_listen);
-    println!("block_peer_count={}", config.peers.len());
+    println!("configured_peer_count={}", config.peers.len());
     println!(
         "peer_transport={}",
         if config.mainnet {
-            "qrun_v05_mainnet_noise_xx_public_peers_optional_seed_pins"
+            "qrun_v05_mainnet_noise_xx_optional_pinned_startup_sync"
         } else if config.public_alpha {
             "qrun_v05_noise_xx_open_public_peers_optional_seed_pins"
         } else if config.noise_private_key_file.is_some() {
@@ -1706,7 +1746,7 @@ fn run(config: Config) -> Result<(), String> {
     println!(
         "security_note={}",
         if config.mainnet {
-            "qzxb_mainnet; calibrated_argon2id_pow; fixed_wallet_genesis; fixed_10b_supply; zero_block_subsidy; CAS_optional"
+            "qzxb_mainnet; frozen_genesis_and_profile; calibrated_argon2id_pow; fixed_10b_supply; zero_block_subsidy; CAS_optional"
         } else if config.public_alpha {
             "experimental_public_alpha; calibrated_argon2id_pow; fixed_genesis_supply; zero_block_subsidy; CAS_optional; mainnet_disabled"
         } else {
@@ -1717,7 +1757,7 @@ fn run(config: Config) -> Result<(), String> {
     let state = Arc::new(Mutex::new(NodeState {
         runtime,
         public_alpha: config.public_alpha,
-        mainnet: config.mainnet,
+        mainnet: false,
         authenticator,
         clock,
         receipts: BTreeMap::new(),
@@ -1790,6 +1830,21 @@ fn run(config: Config) -> Result<(), String> {
     block_listener
         .set_nonblocking(true)
         .map_err(|error| error.to_string())?;
+    if config.mainnet {
+        state
+            .lock()
+            .map_err(|_| "node state lock poisoned".to_string())?
+            .mainnet = true;
+        println!("QRUN_V05_MAINNET_NODE_READY");
+        println!("mainnet=true");
+        println!("network_class=qzxb_mainnet");
+        println!("frozen_genesis_verified=true");
+        if config.sync_on_start {
+            println!("pinned_peer_sync_verified=true");
+        } else {
+            println!("startup_mode=genesis_bootstrap_or_validated_local_store");
+        }
+    }
     println!(
         "qrun_pow_local_rpc_ready address={} read_only=true mainnet={}",
         config.rpc_listen, config.mainnet
@@ -1846,6 +1901,104 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn mainnet_p2p_gate_requires_sync_pins_and_non_loopback_addresses() {
+        let peer: SocketAddr = "198.51.100.10:49341".parse().unwrap();
+        let loopback_peer: SocketAddr = "127.0.0.1:49341".parse().unwrap();
+        let public_listener: SocketAddr = "0.0.0.0:49341".parse().unwrap();
+        let loopback_listener: SocketAddr = "127.0.0.1:49341".parse().unwrap();
+        assert!(validate_mainnet_p2p_requirements(
+            false, false, &[], 0, loopback_listener
+        )
+        .is_ok());
+        assert!(validate_mainnet_p2p_requirements(
+            true, false, &[peer], 1, public_listener
+        )
+        .is_err());
+        assert!(validate_mainnet_p2p_requirements(
+            true, true, &[], 0, public_listener
+        )
+        .is_err());
+        assert!(validate_mainnet_p2p_requirements(
+            true, true, &[loopback_peer], 1, public_listener
+        )
+        .is_err());
+        assert!(validate_mainnet_p2p_requirements(
+            true, true, &[peer], 0, public_listener
+        )
+        .is_err());
+        assert!(validate_mainnet_p2p_requirements(
+            true, true, &[peer], 1, loopback_listener
+        )
+        .is_err());
+        assert!(validate_mainnet_p2p_requirements(
+            true, true, &[peer], 1, public_listener
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn frozen_mainnet_genesis_gate_checks_frozen_identity_and_genesis_allocation() {
+        let genesis = parse_hex32(QZXB_MAINNET_GENESIS_ID_HEX, "genesis").unwrap();
+        let profile = parse_hex32(QZXB_MAINNET_PROFILE_ID_HEX, "profile").unwrap();
+        let root = parse_hex32(QZXB_MAINNET_STATE_ROOT_HEX, "state root").unwrap();
+        let supply = ai_native_l1_pow_bench::state_machine::MAX_TOTAL_SUPPLY_ATOMS;
+        assert!(validate_frozen_mainnet_genesis(
+            true, &genesis, &profile, &root, supply, supply, 1, 0
+        )
+        .is_ok());
+        assert!(validate_frozen_mainnet_genesis(
+            true,
+            &genesis,
+            &profile,
+            &[0xff; 32],
+            supply,
+            supply,
+            1,
+            0
+        )
+        .is_err());
+        assert!(validate_frozen_mainnet_genesis(
+            true,
+            &genesis,
+            &profile,
+            &root,
+            supply - 1,
+            supply,
+            1,
+            0
+        )
+        .is_err());
+        assert!(validate_frozen_mainnet_genesis(
+            true, &genesis, &profile, &root, supply, supply, 2, 0
+        )
+        .is_err());
+        // The live tip root/balance/account count can change after valid transfers; the frozen
+        // Genesis ID and profile stay constant and the global supply must still match the cap.
+        assert!(validate_frozen_mainnet_genesis(
+            true,
+            &genesis,
+            &profile,
+            &[0xff; 32],
+            supply - 1,
+            supply,
+            2,
+            1
+        )
+        .is_ok());
+        assert!(validate_frozen_mainnet_genesis(
+            true,
+            &genesis,
+            &profile,
+            &[0xff; 32],
+            supply - 1,
+            supply - 1,
+            2,
+            1
+        )
+        .is_err());
+    }
 
     #[test]
     fn startup_sync_requires_noise_key_and_a_pinned_seed_for_every_peer() {
