@@ -37,7 +37,7 @@ The source repository and project website are public, and we are actively inviti
 - **PFM5 full-archive replay-binding candidate (CP-0388):** [Genesis checkpoint and replay binding](docs/CP_0388_PFM5_FULL_ARCHIVE_REPLAY_BINDING_CANDIDATE_2026-10-23.md) ? recomputes every PMT4 envelope digest and checks the branch set and selected canonical tip against a replayed archive; rejects pruned non-Genesis checkpoints. Not wired into durable-store commit/startup or external anti-rollback.
 - **PFM5 externally anchored checkpoint-restore candidate (CP-0389):** [Restore checks and trust limitations](docs/CP_0389_PFM5_CHECKPOINT_BASELINE_RESTORE_CANDIDATE_2026-10-23.md) ? restores only after an exact external manifest commitment and monotonic floors match; rejects manifests that still need post-checkpoint archive replay. Not yet wired into the live PFM4 store/runtime.
 - **Publication checkpoint:** [CP-0344](docs/CP_0344_PUBLIC_DOCUMENTATION_REFRESH_2026-10-20.md)
-- **Historical allocation proposal (superseded by CP-0437):** [Tokenomics policy v0.4](\1)
+- **Historical allocation proposal (superseded by CP-0437):** [Tokenomics policy v0.4](docs/FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V04_2026-10-24.md)
 - **Current curated source baseline:** [v0.1.1-source](https://github.com/hamidnikkhah660-arch/ai-native-l1/releases/tag/v0.1.1-source)
 - **Founder profile and collaboration contact:** [Founder / AI research profile](docs/FOUNDER_PROFILE_AND_COLLABORATION.md) - email: [hamidnikkhah660@gmail.com](mailto:hamidnikkhah660@gmail.com?subject=QuantumZXB%20collaboration)
 - **Fixed-scope paid engineering offer (G1):** [Rust/protocol reproducibility and AI/ML sprint, deliverables, acceptance criteria, and payment terms](docs/ENGINEERING_SERVICE_OFFER_V01.md)
