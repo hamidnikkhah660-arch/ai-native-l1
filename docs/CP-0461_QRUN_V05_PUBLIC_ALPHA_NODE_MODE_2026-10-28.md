@@ -1,7 +1,9 @@
 # CP-0461 — QRun v0.5 Bitcoin-style public-alpha peer mode
 
 **Date:** 2026-10-28
-**Status:** Public-alpha mode implemented and locally tested; a seed process is running on one Windows host. Remote Internet reachability is not yet verified.
+**Status (historical, 2026-10-28):** Public-alpha mode was implemented and locally tested. That earlier seed process used a prior candidate identity; it is not a claim that a node is running now.
+
+> **Supersession and safety warning (2026-10-29):** The launch command below uses the historical `70fd…` network identity and must not be used for the current wallet-bound candidate. The current source identity is documented in [CP-0468](CP-0468_QRUN_WALLET_BOUND_IDENTITY_RECONCILIATION_2026-10-29.md) and the [current candidate manifest](../profiles/qrun_v05_wallet_bound_mainnet_identity_candidate.json) (network `8b5d…`). Keep this runbook's old identity/data directory separate. Do not expose either candidate as a public service until a reviewed current onboarding bundle, independent operator verification, and explicit zero-value configuration are approved. A live host check on 2026-10-29 found no node listening on TCP 49339–49341; external reachability is not verified.
 
 ## Why this mode exists
 
