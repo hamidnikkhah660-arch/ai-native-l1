@@ -473,10 +473,12 @@ impl PrivateTestnetForkStore {
         params: ConsensusParameters,
         authenticator: &A,
         clock: &dyn ReferenceTimeProvider,
-        expected_manifest_anchor: Option<[u8; 32]>,
+        mut expected_manifest_anchor: Option<[u8; 32]>,
         base_chain: Option<crate::private_testnet_driver::PrivateTestnetChain>,
         profile: ForkStoreProfile,
-        mut preopen_recovery: Option<&mut dyn FnMut(&Path) -> Result<(), ForkStoreError>>,
+        mut preopen_recovery: Option<
+            &mut dyn FnMut(&Path) -> Result<Option<[u8; 32]>, ForkStoreError>,
+        >,
     ) -> Result<Self, ForkStoreError> {
         params.validate()?;
         match profile {
@@ -492,7 +494,9 @@ impl PrivateTestnetForkStore {
         fs::create_dir_all(&directory)?;
         let writer_lock = acquire_writer_lock(&directory)?;
         if let Some(recover) = preopen_recovery.as_mut() {
-            recover(&directory)?;
+            if let Some(recovered_anchor) = recover(&directory)? {
+                expected_manifest_anchor = Some(recovered_anchor);
+            }
         }
 
         let profile_fingerprint = match profile {
@@ -889,22 +893,26 @@ where
 
         let recovery_genesis = genesis.clone();
         let recovery_pin = pin.clone();
+        let recovery_expected_record = trusted_record.clone();
         let recovery_profile_fingerprint = qrun_v05_fee_profile_fingerprint(&genesis, &params)?;
         let recovery_genesis_tip =
             PrivateTestnetForkChoice::new_qrun_v05_fee_only(genesis.clone(), params.clone())?
                 .genesis_tip();
-        let mut recovery = |directory: &Path| {
-            recover_pending_external_cas(
-                directory,
-                &recovery_genesis,
-                owner_account,
-                &recovery_pin,
-                &recovery_profile_fingerprint,
-                &recovery_genesis_tip,
-                &mut client,
-                minimum_object_generation,
-            )
-            .map(|_| ())
+        let mut recovery = |directory: &Path| match recover_pending_external_cas(
+            directory,
+            &recovery_genesis,
+            owner_account,
+            &recovery_pin,
+            &recovery_expected_record,
+            &recovery_profile_fingerprint,
+            &recovery_genesis_tip,
+            &mut client,
+            minimum_object_generation,
+        )? {
+            PendingRecoveryOutcome::Committed(record, _) => Ok(Some(record.next_state_digest)),
+            PendingRecoveryOutcome::NotCommitted(_) | PendingRecoveryOutcome::NotPresent => {
+                Ok(None)
+            }
         };
         let store = PrivateTestnetForkStore::open_inner_with_preopen_recovery(
             directory,
@@ -1169,20 +1177,24 @@ where
         let recovery_genesis = genesis.clone();
         let recovery_owner_account = owner_account;
         let recovery_pin = pin.clone();
+        let recovery_expected_record = trusted_record.clone();
         let recovery_profile_fingerprint = profile_fingerprint;
         let recovery_genesis_tip = expected_genesis_tip;
-        let mut recovery = |path: &Path| {
-            recover_pending_external_cas(
-                path,
-                &recovery_genesis,
-                recovery_owner_account,
-                &recovery_pin,
-                &recovery_profile_fingerprint,
-                &recovery_genesis_tip,
-                &mut client,
-                minimum_object_generation,
-            )
-            .map(|_| ())
+        let mut recovery = |path: &Path| match recover_pending_external_cas(
+            path,
+            &recovery_genesis,
+            recovery_owner_account,
+            &recovery_pin,
+            &recovery_expected_record,
+            &recovery_profile_fingerprint,
+            &recovery_genesis_tip,
+            &mut client,
+            minimum_object_generation,
+        )? {
+            PendingRecoveryOutcome::Committed(record, _) => Ok(Some(record.next_state_digest)),
+            PendingRecoveryOutcome::NotCommitted(_) | PendingRecoveryOutcome::NotPresent => {
+                Ok(None)
+            }
         };
         let store = PrivateTestnetForkStore::open_inner_with_preopen_recovery(
             directory,
@@ -1497,6 +1509,7 @@ where
                     &self.genesis_identity,
                     self.owner_account,
                     &self.pin,
+                    &self.trusted_record,
                     &self.store.profile_fingerprint,
                     &self.store.genesis_tip,
                     &mut self.client,
@@ -1780,6 +1793,7 @@ fn recover_pending_external_cas<P, V>(
     genesis: &LedgerState,
     owner_account: AccountId,
     pin: &ExternalCasPin,
+    expected_floor_record: &ExternalCasRecord,
     expected_profile_fingerprint: &[u8; 32],
     expected_genesis_tip: &[u8; 32],
     client: &mut VerifiedExternalCasClient<P, V>,
@@ -1806,6 +1820,12 @@ where
     })?;
     let pending = decode_pending_external_cas_commit(&bytes)?;
     pin.validate()?;
+    expected_floor_record.validate_shape()?;
+    if expected_floor_record != &pending.previous_record
+        && expected_floor_record != &pending.next_record
+    {
+        return Err(ForkStoreError::ExternalAnchorMismatch);
+    }
     let expected_genesis = QRunGenesisV05::new(genesis.network_id(), owner_account)
         .map_err(|_| ForkStoreError::PendingAnchorMalformed)?;
     if pending.previous_record.provider_id != pin.provider_id
@@ -1834,6 +1854,11 @@ where
         read_verified_external_record(client, &pending.previous_record, minimum_object_generation)?;
     let observed_digest = observed.digest()?;
     if observed_digest == pending.previous_record.digest()? {
+        // If the independent floor already names the successor, observing the old provider
+        // record is a rollback, not evidence that this pending operation was never committed.
+        if expected_floor_record != &pending.previous_record {
+            return Err(ForkStoreError::ExternalAnchorMismatch);
+        }
         remove_pending_external_cas_commit(directory)?;
         return Ok(PendingRecoveryOutcome::NotCommitted(observed));
     }
@@ -3622,6 +3647,10 @@ mod tests {
             operation_id: [0xD3; 32],
             request_digest: [0xD4; 32],
         };
+        let floor_dir = TestDir::new();
+        let floor =
+            ExternalCasFloorStore::initialize(&floor_dir.0, pin.clone(), bootstrap.clone(), 1)
+                .unwrap();
         let shared = Arc::new(Mutex::new(MemoryCasState {
             record: bootstrap.clone(),
             object_generation: 1,
@@ -3674,7 +3703,7 @@ mod tests {
         assert_eq!(shared.lock().unwrap().record, bootstrap);
 
         let mut store =
-            QRunV05ExternalCasForkStore::open_from_checkpoint_with_parent_for_owner_genesis(
+            QRunV05ExternalCasForkStore::open_from_checkpoint_with_parent_for_owner_genesis_and_floor(
                 &dir.0,
                 genesis.clone(),
                 WALLET_BOUND_OWNER,
@@ -3687,8 +3716,7 @@ mod tests {
                 genesis_checkpoint_commitment,
                 pin.clone(),
                 client,
-                bootstrap,
-                1,
+                floor,
             )
             .unwrap();
         assert_eq!(store.canonical_height(), 1);
@@ -3717,8 +3745,92 @@ mod tests {
             assert_eq!(remote.object_generation, 2);
             assert!(!remote.lose_next_commit_response);
         }
-        let trusted = store.trusted_record().clone();
-        let minimum_object_generation = store.minimum_object_generation();
+        // Model a crash after the provider committed the next block but before QCF1 advanced.
+        // QAP1 is durable, the local PFS2 manifest is still at the previous record, and restart
+        // must install only the exact signed successor before reconciling the independent floor.
+        let third = qrun_fee_envelope_from_chain(
+            store.archive().canonical_chain(),
+            &params,
+            [0x78; 32],
+            215,
+        );
+        let mut candidate_archive = store.archive().clone();
+        let third_outcome = candidate_archive
+            .insert_encoded(&third, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+        write_branch_create_new(
+            &dir.0.join(branch_file_name(&third_outcome.block_digest)),
+            &third,
+        )
+        .unwrap();
+        let mut digests: Vec<[u8; 32]> = candidate_archive
+            .archive_envelopes()
+            .iter()
+            .map(|bytes| {
+                let decoded = decode_candidate_network_block(bytes).unwrap();
+                pow_digest(&decoded.header, params.pow).unwrap()
+            })
+            .collect();
+        digests.sort_unstable();
+        let canonical_tip = candidate_archive.canonical_chain().chain_tip().tip_hash;
+        let manifest = encode_manifest(
+            &store.store.genesis.network_id(),
+            &store.store.profile_fingerprint,
+            &store.store.genesis_tip,
+            &canonical_tip,
+            &digests,
+        )
+        .unwrap();
+        let next_state_digest = manifest_anchor_commitment(&manifest);
+        let previous_record = store.trusted_record().clone();
+        let previous_object_generation = store.minimum_object_generation();
+        let operation_id = [0xD5; 32];
+        let mut write_request = ExternalCasWriteRequest {
+            request_nonce: [0xD6; 32],
+            operation_id,
+            request_digest: [1; 32],
+            expected_generation: previous_record.generation,
+            expected_object_generation: previous_object_generation,
+            expected_record_digest: previous_record.digest().unwrap(),
+            expected_state_digest: previous_record.next_state_digest,
+            next_record: ExternalCasRecord {
+                generation: previous_record.generation.checked_add(1).unwrap(),
+                provider_id: pin.provider_id,
+                network_id: pin.network_id,
+                genesis_digest: pin.genesis_digest,
+                previous_record_digest: previous_record.digest().unwrap(),
+                previous_state_digest: previous_record.next_state_digest,
+                next_state_digest,
+                operation_id,
+                request_digest: [1; 32],
+            },
+        };
+        write_request.bind_request_digest(&pin).unwrap();
+        let recovered_record = write_request.next_record.clone();
+        write_pending_external_cas_commit(
+            &dir.0,
+            &PendingExternalCasCommit {
+                previous_record: previous_record.clone(),
+                next_record: recovered_record.clone(),
+                manifest: manifest.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            manifest_anchor_commitment(
+                &read_bounded_file(&dir.0.join(MANIFEST_NAME), MAX_MANIFEST_BYTES).unwrap()
+            ),
+            previous_record.next_state_digest
+        );
+        let expected_root = candidate_archive.canonical_chain().state().state_root();
+        let next_object_generation = previous_object_generation.checked_add(1).unwrap();
+        {
+            let mut remote = shared.lock().unwrap();
+            assert_eq!(remote.record, previous_record);
+            assert_eq!(remote.object_generation, previous_object_generation);
+            remote.record = recovered_record.clone();
+            remote.object_generation = next_object_generation;
+        }
         drop(store);
 
         let sign_key_2 = signing_key.clone();
@@ -3732,8 +3844,9 @@ mod tests {
         let client =
             VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
                 .unwrap();
+        let floor = ExternalCasFloorStore::open(&floor_dir.0, pin.clone()).unwrap();
         let reopened =
-            QRunV05ExternalCasForkStore::open_from_checkpoint_with_parent_for_owner_genesis(
+            QRunV05ExternalCasForkStore::open_from_checkpoint_with_parent_for_owner_genesis_and_floor(
                 &dir.0,
                 genesis,
                 WALLET_BOUND_OWNER,
@@ -3744,19 +3857,35 @@ mod tests {
                 checkpoint_commitment,
                 1,
                 genesis_checkpoint_commitment,
-                pin,
+                pin.clone(),
                 client,
-                trusted,
-                minimum_object_generation,
+                floor,
             )
             .unwrap();
-        assert_eq!(reopened.canonical_height(), 2);
+        assert_eq!(reopened.canonical_height(), 3);
         assert_eq!(reopened.owner_account, WALLET_BOUND_OWNER);
+        assert_eq!(reopened.canonical_state().state_root(), expected_root);
         assert_eq!(
             reopened.canonical_state().total_value().unwrap(),
             crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS
         );
-        assert_eq!(reopened.trusted_record().generation, 1);
+        assert_eq!(reopened.trusted_record(), &recovered_record);
+        assert!(!dir.0.join(QRUN_PENDING_NAME).exists());
+        assert_eq!(
+            manifest_anchor_commitment(
+                &read_bounded_file(&dir.0.join(MANIFEST_NAME), MAX_MANIFEST_BYTES).unwrap()
+            ),
+            next_state_digest
+        );
+        let floor_after_recovery = ExternalCasFloorStore::open(&floor_dir.0, pin)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(floor_after_recovery.trusted_record, recovered_record);
+        assert_eq!(
+            floor_after_recovery.minimum_object_generation,
+            next_object_generation
+        );
     }
 
     #[test]
