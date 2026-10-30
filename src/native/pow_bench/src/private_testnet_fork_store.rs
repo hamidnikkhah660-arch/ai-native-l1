@@ -477,7 +477,7 @@ impl PrivateTestnetForkStore {
         base_chain: Option<crate::private_testnet_driver::PrivateTestnetChain>,
         profile: ForkStoreProfile,
         mut preopen_recovery: Option<
-            &mut dyn FnMut(&Path) -> Result<Option<[u8; 32]>, ForkStoreError>,
+            &mut dyn FnMut(&Path) -> Result<Option<([u8; 32], bool)>, ForkStoreError>,
         >,
     ) -> Result<Self, ForkStoreError> {
         params.validate()?;
@@ -493,9 +493,13 @@ impl PrivateTestnetForkStore {
         let directory = directory.as_ref().to_path_buf();
         fs::create_dir_all(&directory)?;
         let writer_lock = acquire_writer_lock(&directory)?;
+        let mut retained_pending_anchor = None;
         if let Some(recover) = preopen_recovery.as_mut() {
-            if let Some(recovered_anchor) = recover(&directory)? {
+            if let Some((recovered_anchor, retain_pending)) = recover(&directory)? {
                 expected_manifest_anchor = Some(recovered_anchor);
+                if retain_pending {
+                    retained_pending_anchor = Some(recovered_anchor);
+                }
             }
         }
 
@@ -662,7 +666,7 @@ impl PrivateTestnetForkStore {
             (empty, known)
         };
 
-        cleanup_orphan_branch_files(&directory, &known_digests)?;
+        cleanup_orphan_branch_files(&directory, &known_digests, retained_pending_anchor)?;
         Ok(Self {
             directory,
             genesis,
@@ -875,9 +879,38 @@ where
         authenticator: &A,
         clock: &dyn ReferenceTimeProvider,
         pin: ExternalCasPin,
+        client: VerifiedExternalCasClient<P, V>,
+        trusted_record: ExternalCasRecord,
+        minimum_object_generation: u64,
+    ) -> Result<Self, ForkStoreError> {
+        Self::open_for_owner_genesis_with_optional_floor(
+            directory,
+            genesis,
+            owner_account,
+            params,
+            authenticator,
+            clock,
+            pin,
+            client,
+            trusted_record,
+            minimum_object_generation,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_for_owner_genesis_with_optional_floor<A: TransactionAuthenticator>(
+        directory: impl AsRef<Path>,
+        genesis: LedgerState,
+        owner_account: AccountId,
+        params: ConsensusParameters,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+        pin: ExternalCasPin,
         mut client: VerifiedExternalCasClient<P, V>,
         trusted_record: ExternalCasRecord,
         minimum_object_generation: u64,
+        defer_pending_cleanup: bool,
     ) -> Result<Self, ForkStoreError> {
         validate_wallet_bound_external_cas_genesis(&genesis, owner_account, &pin)?;
         trusted_record.validate_shape()?;
@@ -904,12 +937,15 @@ where
             owner_account,
             &recovery_pin,
             &recovery_expected_record,
+            defer_pending_cleanup,
             &recovery_profile_fingerprint,
             &recovery_genesis_tip,
             &mut client,
             minimum_object_generation,
         )? {
-            PendingRecoveryOutcome::Committed(record, _) => Ok(Some(record.next_state_digest)),
+            PendingRecoveryOutcome::Committed(record, _) => {
+                Ok(Some((record.next_state_digest, defer_pending_cleanup)))
+            }
             PendingRecoveryOutcome::NotCommitted(_) | PendingRecoveryOutcome::NotPresent => {
                 Ok(None)
             }
@@ -968,7 +1004,7 @@ where
             return Err(ForkStoreError::ExternalAnchorMismatch);
         }
         let snapshot = floor.snapshot().map_err(ForkStoreError::ExternalCasFloor)?;
-        let mut store = Self::open_for_owner_genesis(
+        let mut store = Self::open_for_owner_genesis_with_optional_floor(
             directory,
             genesis,
             owner_account,
@@ -979,10 +1015,12 @@ where
             client,
             snapshot.trusted_record,
             snapshot.minimum_object_generation,
+            true,
         )?;
         floor
             .reconcile_verified_observation(&store.trusted_record, store.minimum_object_generation)
             .map_err(ForkStoreError::ExternalCasFloor)?;
+        remove_pending_external_cas_commit(&store.store.directory)?;
         store.floor = Some(floor);
         Ok(store)
     }
@@ -1049,6 +1087,45 @@ where
         trusted_record: ExternalCasRecord,
         minimum_object_generation: u64,
     ) -> Result<Self, ForkStoreError> {
+        Self::open_from_checkpoint_with_parent_for_owner_genesis_with_pending_cleanup(
+            directory,
+            genesis,
+            owner_account,
+            params,
+            authenticator,
+            clock,
+            checkpoint_bytes,
+            expected_checkpoint_commitment,
+            minimum_checkpoint_height,
+            expected_parent_checkpoint_commitment,
+            pin,
+            client,
+            trusted_record,
+            minimum_object_generation,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_from_checkpoint_with_parent_for_owner_genesis_with_pending_cleanup<
+        A: TransactionAuthenticator,
+    >(
+        directory: impl AsRef<Path>,
+        genesis: LedgerState,
+        owner_account: AccountId,
+        params: ConsensusParameters,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+        checkpoint_bytes: &[u8],
+        expected_checkpoint_commitment: [u8; 32],
+        minimum_checkpoint_height: u64,
+        expected_parent_checkpoint_commitment: [u8; 32],
+        pin: ExternalCasPin,
+        client: VerifiedExternalCasClient<P, V>,
+        trusted_record: ExternalCasRecord,
+        minimum_object_generation: u64,
+        defer_pending_cleanup: bool,
+    ) -> Result<Self, ForkStoreError> {
         validate_wallet_bound_external_cas_genesis(&genesis, owner_account, &pin)?;
         crate::qrun_v05_checkpoint_candidate::QRunV05PowCheckpoint::decode_anchored_with_parent(
             checkpoint_bytes,
@@ -1060,7 +1137,7 @@ where
             expected_parent_checkpoint_commitment,
         )
         .map_err(|_| ForkStoreError::ManifestAnchorMismatch)?;
-        Self::open_from_checkpoint_for_owner_genesis(
+        Self::open_from_checkpoint_for_owner_genesis_with_pending_cleanup(
             directory,
             genesis,
             owner_account,
@@ -1074,6 +1151,7 @@ where
             client,
             trusted_record,
             minimum_object_generation,
+            defer_pending_cleanup,
         )
     }
 
@@ -1127,9 +1205,44 @@ where
         expected_checkpoint_commitment: [u8; 32],
         minimum_checkpoint_height: u64,
         pin: ExternalCasPin,
+        client: VerifiedExternalCasClient<P, V>,
+        trusted_record: ExternalCasRecord,
+        minimum_object_generation: u64,
+    ) -> Result<Self, ForkStoreError> {
+        Self::open_from_checkpoint_for_owner_genesis_with_pending_cleanup(
+            directory,
+            genesis,
+            owner_account,
+            params,
+            authenticator,
+            clock,
+            checkpoint_bytes,
+            expected_checkpoint_commitment,
+            minimum_checkpoint_height,
+            pin,
+            client,
+            trusted_record,
+            minimum_object_generation,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_from_checkpoint_for_owner_genesis_with_pending_cleanup<A: TransactionAuthenticator>(
+        directory: impl AsRef<Path>,
+        genesis: LedgerState,
+        owner_account: AccountId,
+        params: ConsensusParameters,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+        checkpoint_bytes: &[u8],
+        expected_checkpoint_commitment: [u8; 32],
+        minimum_checkpoint_height: u64,
+        pin: ExternalCasPin,
         mut client: VerifiedExternalCasClient<P, V>,
         trusted_record: ExternalCasRecord,
         minimum_object_generation: u64,
+        defer_pending_cleanup: bool,
     ) -> Result<Self, ForkStoreError> {
         validate_wallet_bound_external_cas_genesis(&genesis, owner_account, &pin)?;
         trusted_record.validate_shape()?;
@@ -1186,12 +1299,15 @@ where
             recovery_owner_account,
             &recovery_pin,
             &recovery_expected_record,
+            defer_pending_cleanup,
             &recovery_profile_fingerprint,
             &recovery_genesis_tip,
             &mut client,
             minimum_object_generation,
         )? {
-            PendingRecoveryOutcome::Committed(record, _) => Ok(Some(record.next_state_digest)),
+            PendingRecoveryOutcome::Committed(record, _) => {
+                Ok(Some((record.next_state_digest, defer_pending_cleanup)))
+            }
             PendingRecoveryOutcome::NotCommitted(_) | PendingRecoveryOutcome::NotPresent => {
                 Ok(None)
             }
@@ -1256,25 +1372,28 @@ where
             return Err(ForkStoreError::ExternalAnchorMismatch);
         }
         let snapshot = floor.snapshot().map_err(ForkStoreError::ExternalCasFloor)?;
-        let mut store = Self::open_from_checkpoint_with_parent_for_owner_genesis(
-            directory,
-            genesis,
-            owner_account,
-            params,
-            authenticator,
-            clock,
-            checkpoint_bytes,
-            expected_checkpoint_commitment,
-            minimum_checkpoint_height,
-            expected_parent_checkpoint_commitment,
-            pin,
-            client,
-            snapshot.trusted_record,
-            snapshot.minimum_object_generation,
-        )?;
+        let mut store =
+            Self::open_from_checkpoint_with_parent_for_owner_genesis_with_pending_cleanup(
+                directory,
+                genesis,
+                owner_account,
+                params,
+                authenticator,
+                clock,
+                checkpoint_bytes,
+                expected_checkpoint_commitment,
+                minimum_checkpoint_height,
+                expected_parent_checkpoint_commitment,
+                pin,
+                client,
+                snapshot.trusted_record,
+                snapshot.minimum_object_generation,
+                true,
+            )?;
         floor
             .reconcile_verified_observation(&store.trusted_record, store.minimum_object_generation)
             .map_err(ForkStoreError::ExternalCasFloor)?;
+        remove_pending_external_cas_commit(&store.store.directory)?;
         store.floor = Some(floor);
         Ok(store)
     }
@@ -1510,6 +1629,7 @@ where
                     self.owner_account,
                     &self.pin,
                     &self.trusted_record,
+                    self.floor.is_some(),
                     &self.store.profile_fingerprint,
                     &self.store.genesis_tip,
                     &mut self.client,
@@ -1534,6 +1654,12 @@ where
                         self.store.archive = candidate_archive;
                         self.trusted_record = record;
                         self.minimum_object_generation = generation;
+                        if let Err(error) =
+                            remove_pending_external_cas_commit(&self.store.directory)
+                        {
+                            self.floor_write_blocked = self.floor.is_some();
+                            return Err(error);
+                        }
                         Ok(outcome)
                     }
                     Ok(PendingRecoveryOutcome::NotPresent) | Err(_) => {
@@ -1794,6 +1920,7 @@ fn recover_pending_external_cas<P, V>(
     owner_account: AccountId,
     pin: &ExternalCasPin,
     expected_floor_record: &ExternalCasRecord,
+    defer_pending_cleanup: bool,
     expected_profile_fingerprint: &[u8; 32],
     expected_genesis_tip: &[u8; 32],
     client: &mut VerifiedExternalCasClient<P, V>,
@@ -1872,7 +1999,9 @@ where
 
     // The provider has signed the exact successor. Only now publish the manifest it names.
     write_manifest_atomic(&directory.join(MANIFEST_NAME), &pending.manifest)?;
-    remove_pending_external_cas_commit(directory)?;
+    if !defer_pending_cleanup {
+        remove_pending_external_cas_commit(directory)?;
+    }
     Ok(PendingRecoveryOutcome::Committed(
         observed,
         object_generation,
@@ -2080,7 +2209,37 @@ fn write_manifest_atomic(path: &Path, bytes: &[u8]) -> Result<(), ForkStoreError
 fn cleanup_orphan_branch_files(
     directory: &Path,
     known_digests: &BTreeSet<[u8; 32]>,
+    retained_pending_anchor: Option<[u8; 32]>,
 ) -> Result<(), ForkStoreError> {
+    let manifest_bytes = if retained_pending_anchor.is_some() {
+        Some(
+            read_bounded_file(&directory.join(MANIFEST_NAME), MAX_MANIFEST_BYTES).map_err(
+                |error| match error {
+                    BoundedReadError::Io(error) => ForkStoreError::Io(error),
+                    BoundedReadError::TooLarge => ForkStoreError::ManifestTooLarge,
+                },
+            )?,
+        )
+    } else {
+        None
+    };
+    if let Some(expected_anchor) = retained_pending_anchor {
+        let pending_bytes =
+            read_bounded_file(&directory.join(QRUN_PENDING_NAME), MAX_QRUN_PENDING_BYTES).map_err(
+                |error| match error {
+                    BoundedReadError::Io(error) => ForkStoreError::Io(error),
+                    BoundedReadError::TooLarge => ForkStoreError::PendingAnchorMalformed,
+                },
+            )?;
+        let pending = decode_pending_external_cas_commit(&pending_bytes)?;
+        if pending.next_record.next_state_digest != expected_anchor
+            || manifest_anchor_commitment(&pending.manifest) != expected_anchor
+            || manifest_bytes.as_deref() != Some(pending.manifest.as_slice())
+        {
+            return Err(ForkStoreError::PendingAnchorMalformed);
+        }
+    }
+
     let mut seen = 0usize;
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
@@ -2097,6 +2256,12 @@ fn cleanup_orphan_branch_files(
         let name = name.to_str().ok_or(ForkStoreError::UnexpectedStoreEntry)?;
         if name == LOCK_NAME || name == MANIFEST_NAME {
             continue;
+        }
+        if name == QRUN_PENDING_NAME {
+            if retained_pending_anchor.is_some() {
+                continue;
+            }
+            return Err(ForkStoreError::UnexpectedStoreEntry);
         }
         if name.starts_with(BRANCH_PREFIX) && name.ends_with(BRANCH_SUFFIX) {
             seen += 1;
@@ -3823,6 +3988,8 @@ mod tests {
             previous_record.next_state_digest
         );
         let expected_root = candidate_archive.canonical_chain().state().state_root();
+        let checkpoint_profile_fingerprint = store.store.profile_fingerprint;
+        let checkpoint_genesis_tip = store.store.genesis_tip;
         let next_object_generation = previous_object_generation.checked_add(1).unwrap();
         {
             let mut remote = shared.lock().unwrap();
@@ -3841,9 +4008,56 @@ mod tests {
                 .as_ref();
             receipt
         });
-        let client =
+        let mut client =
             VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
                 .unwrap();
+
+        // Simulate a second crash boundary: recovery has already installed the exact PFS2
+        // manifest, but QCF1 has not yet reconciled. The QAP1 marker must remain durable so a
+        // restart can repeat the signed observation and complete the floor/marker transition.
+        let old_floor = ExternalCasFloorStore::open(&floor_dir.0, pin.clone())
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(old_floor.trusted_record, previous_record);
+        assert_eq!(
+            old_floor.minimum_object_generation,
+            previous_object_generation
+        );
+        assert!(matches!(
+            recover_pending_external_cas(
+                &dir.0,
+                &genesis,
+                WALLET_BOUND_OWNER,
+                &pin,
+                &previous_record,
+                true,
+                &checkpoint_profile_fingerprint,
+                &checkpoint_genesis_tip,
+                &mut client,
+                previous_object_generation,
+            )
+            .unwrap(),
+            PendingRecoveryOutcome::Committed(record, generation)
+                if record == recovered_record && generation == next_object_generation
+        ));
+        assert!(dir.0.join(QRUN_PENDING_NAME).is_file());
+        assert_eq!(
+            manifest_anchor_commitment(
+                &read_bounded_file(&dir.0.join(MANIFEST_NAME), MAX_MANIFEST_BYTES).unwrap()
+            ),
+            next_state_digest
+        );
+        let still_old_floor = ExternalCasFloorStore::open(&floor_dir.0, pin.clone())
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(still_old_floor.trusted_record, previous_record);
+        assert_eq!(
+            still_old_floor.minimum_object_generation,
+            previous_object_generation
+        );
+
         let floor = ExternalCasFloorStore::open(&floor_dir.0, pin.clone()).unwrap();
         let reopened =
             QRunV05ExternalCasForkStore::open_from_checkpoint_with_parent_for_owner_genesis_and_floor(
