@@ -2409,6 +2409,10 @@ mod tests {
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(1);
 
     fn external_cas_cli_values() -> BTreeMap<String, String> {
+        // These are parser fixtures, not fixed Windows paths: the parser must accept
+        // native absolute paths on every CI operating system.
+        let temp = std::env::temp_dir();
+        let path = |name: &str| temp.join(name).to_string_lossy().into_owned();
         BTreeMap::from([
             ("--external-cas-endpoint".into(), "127.0.0.1:49410".into()),
             ("--external-cas-provider-id-hex".into(), "11".repeat(32)),
@@ -2419,20 +2423,20 @@ mod tests {
             ),
             (
                 "--external-cas-noise-private-key-file".into(),
-                r"C:\qrun\cas-client.npk1".into(),
+                path("qrun-cas-client.npk1"),
             ),
             ("--external-cas-receipt-key-id-hex".into(), "44".repeat(32)),
             (
                 "--external-cas-receipt-public-key-file".into(),
-                r"C:\qrun\cas-receipt.pub".into(),
+                path("qrun-cas-receipt.pub"),
             ),
             (
                 "--external-cas-bootstrap-record-file".into(),
-                r"C:\qrun\cas-bootstrap.ecr1".into(),
+                path("qrun-cas-bootstrap.ecr1"),
             ),
             (
                 "--external-cas-floor-dir".into(),
-                r"D:\qrun\independent-floor".into(),
+                path("qrun-independent-floor"),
             ),
         ])
     }
@@ -2478,7 +2482,7 @@ mod tests {
         assert!(config.initialize_floor);
         assert_eq!(
             config.floor_directory,
-            std::path::PathBuf::from(r"D:\qrun\independent-floor")
+            std::env::temp_dir().join("qrun-independent-floor")
         );
     }
 
@@ -2526,6 +2530,10 @@ mod tests {
         ));
     }
 
+    // DPAPI protects the client Noise private key on Windows; this integration
+    // path is intentionally exercised only on Windows rather than weakening key
+    // protection or adding a plaintext fallback on Unix CI.
+    #[cfg(windows)]
     #[test]
     fn external_cas_node_startup_uses_pinned_noise_provider_and_advances_floor_before_return() {
         let dir = TestDir::new();

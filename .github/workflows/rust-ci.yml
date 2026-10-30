@@ -162,3 +162,7 @@ jobs:
       - name: Run QRun authenticated startup sync and fail-closed listener guard
         shell: pwsh
         run: ./simulations/cp0449_qrun_authenticated_startup_sync_loopback.ps1
+
+      - name: Run QRun external-CAS DPAPI startup and floor integration tests
+        shell: pwsh
+        run: cargo +stable test --manifest-path src/native/pow_bench/Cargo.toml --locked --bin qrun_v05_pow_local_node -- --test-threads=1
