@@ -303,6 +303,7 @@ Relevant project records:
 - CP-0470 — durable external-CAS provider.
 - CP-0471 — independent local floor store.
 - CP-0472 — node external-CAS startup wiring.
+- CP-0474 — QRun Verifiable Asset Passport (QVAP), the proposed flagship evidence-linked RWA / asset-lifecycle capability.
 
 ## 14. Instructions for the next AI/engineering session
 

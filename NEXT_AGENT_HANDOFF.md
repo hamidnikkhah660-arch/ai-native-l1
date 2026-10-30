@@ -15,6 +15,7 @@ Build QRun as a modular, secure, evidence-led Layer-1 settlement platform. Strat
 - Real-world asset tokenization with legally valid rights, verified issuer/custody/oracles, lifecycle and redemption.
 - Payments, multi-assets, smart contracts, DeFi, interoperability and developer tooling.
 - Optional AI-agent / machine-to-machine payments with strict spending limits and scoped keys.
+- Flagship proposed capability: **QRun Verifiable Asset Passport (QVAP)** — evidence-linked asset identity and rights commitments, independently signed attestations, lifecycle events, revocation/expiry, selective disclosure, and programmable settlement. This is a design proposal, not a live feature. See [CP-0474](docs/CP-0474_QRUN_VERIFIABLE_ASSET_PASSPORT_DESIGN_2026-10-30.md).
 
 Preferred positioning: **Quantum-Resilient. Privacy-Preserving. Asset-Ready. Performance-Verified.**
 
@@ -71,6 +72,7 @@ At last verification:
 - CP-0471 separate QCF1 floor.
 - CP-0472 node startup wiring.
 - CP-0473 product vision and phased roadmap.
+- CP-0474 QRun Verifiable Asset Passport (QVAP) design; synthetic testnet prototype only, not a live feature.
 
 ## Safety / collaboration rules
 
