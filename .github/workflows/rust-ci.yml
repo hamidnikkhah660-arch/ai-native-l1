@@ -2,9 +2,9 @@ name: Rust validation
 
 on:
   push:
-    branches: [main, "ci/**", "public/**"]
+    branches: [main, "ci/**", "public/**", "work/**", "fix/**"]
   pull_request:
-    branches: [main]
+    branches: [main, "work/**"]
   workflow_dispatch:
 
 permissions:
@@ -26,6 +26,10 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      - name: Verify QZXB confirmed-swap candle engine
+        working-directory: .
+        run: node --test tools/qzxb-market/candles.test.mjs tools/qzxb-market/indexer.test.mjs
+
       - name: Install stable formatter
         run: |
           rustup update stable
@@ -38,6 +42,25 @@ jobs:
 
       - name: Verify independent candidate issuance schedule oracle
         run: python3 ../../../simulations/cp0366_monetary_issuance_oracle_candidate.py --check
+
+      - name: Verify CP-0422 canonical tokenomics and historical-version boundary
+        run: python3 ../../../simulations/quantumzxb_tokenomics_checker.py
+      - name: Verify CP-0450 QRun identity and Genesis commitment oracle
+        run: python3 ../../../simulations/qrun_v05_identity_manifest_checker.py
+      - name: Verify CP-0468 current wallet-bound QRun identity manifest
+        run: python3 ../../../simulations/qrun_v05_wallet_bound_identity_manifest_checker.py
+      - name: Verify CP-0468 identity checker fails closed under Python optimization
+        run: python3 ../../../simulations/test_qrun_v05_wallet_bound_identity_manifest_checker.py
+
+      - name: Verify CP-0459 QRun measured PoW calibration candidate
+        run: python3 ../../../simulations/qrun_v05_consensus_calibration_oracle.py
+
+      - name: Verify CP-0437 QRun full-supply Genesis direction
+        run: python3 ../../../simulations/qrun_full_genesis_direction_checker.py
+      - name: Verify CP-0419 QZBE checkpoint golden vector independently
+        run: python3 ../../../simulations/cp0419_qzbe_checkpoint_oracle.py
+      - name: Verify CP-0421 QZBE checkpoint-base durable suffix store
+        run: cargo +stable test --locked --lib monetary_pow_v04_checkpoint_store_candidate -- --test-threads=1
 
       - name: Verify CP-0397 v0.4 mining schedule candidate oracle
         run: python3 ../../../simulations/quantumzxb_v04_issuance_schedule_vectors.py --check
@@ -56,6 +79,29 @@ jobs:
         # and must not race with other lock probes on constrained hosted runners.
         run: cargo +stable test --all-targets --locked -- --test-threads=1
 
+  qrun-pow-benchmark-matrix:
+    name: QRun PoW benchmark (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        working-directory: src/native/pow_bench
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+
+      - name: Measure Argon2id PoW throughput on this independent runner
+        run: cargo run --release --locked --bin cpw_argon2id_pow_benchmark
+
   windows-pmt4-loopback:
     name: Windows PMT4 TXN4 two-node loopback
     runs-on: windows-latest
@@ -63,6 +109,10 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Verify QZXB confirmed-swap candle engine
+        shell: pwsh
+        run: node --test tools/qzxb-market/candles.test.mjs tools/qzxb-market/indexer.test.mjs
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
@@ -83,3 +133,32 @@ jobs:
       - name: Run QZBE store-profile lock, signed transaction and legacy downgrade guard through devnet_node
         shell: pwsh
         run: ./simulations/cp0415_devnet_qzbe_dispatch_transaction_loopback.ps1
+      - name: Run QZBE three-node static multi-peer propagation and replay
+        shell: pwsh
+        run: ./simulations/cp0418_qzbe_three_node_multi_peer_loopback.ps1
+
+      - name: Run QZBE continuous mining with height-bounded stop and two-node replay convergence
+        shell: pwsh
+        run: ./simulations/cp0424_qzbe_continuous_mining_loopback.ps1
+      - name: Run QZXB DPAPI wallet, canonical PoW founder allocation and local transfer
+        shell: pwsh
+        run: ./simulations/cp0425_qzxb_founder_wallet_local_transfer.ps1
+      - name: Run QZXB live signed TXN2 ingress, bounded mempool, mining and replay
+        shell: pwsh
+        run: ./simulations/cp0426_qzxb_live_tx_ingress_mempool.ps1
+      - name: Run QZXB three-node authenticated transaction gossip and replay convergence
+        shell: pwsh
+        run: ./simulations/cp0427_qzxb_three_node_transaction_gossip.ps1
+      - name: Run explicit public zero-value Devnet transport and state convergence
+        shell: pwsh
+        run: ./simulations/cp0429_public_zero_value_devnet_transport.ps1
+      - name: Run explicit public zero-value QZXB transaction ingress and replay
+        shell: pwsh
+        run: ./simulations/cp0440_public_zero_value_testnet_tx_ingress.ps1
+      - name: Run QZBE fresh-node bounded archive sync and state convergence
+        shell: pwsh
+        run: ./simulations/cp0437_qzbe_fresh_node_archive_sync.ps1
+
+      - name: Run QRun authenticated startup sync and fail-closed listener guard
+        shell: pwsh
+        run: ./simulations/cp0449_qrun_authenticated_startup_sync_loopback.ps1

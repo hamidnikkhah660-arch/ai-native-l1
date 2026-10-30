@@ -18,6 +18,8 @@ pub mod chain_admission;
 pub mod chain_import;
 pub mod chain_view;
 pub mod consensus;
+/// CP-0428 fail-closed recovery classification for the QZBE candidate node; not a Mainnet activation gate.
+pub mod consensus_native_recovery_gate_candidate;
 pub mod credential_binding;
 /// Candidate-only bounded Noise XX transport pinned to an explicit peer trust set.
 pub mod devnet_noise_transport_candidate;
@@ -55,6 +57,10 @@ pub mod monetary_ledger_v04_candidate;
 pub mod monetary_policy_v3_candidate;
 /// CP-0405 candidate QZBE PoW envelope, branch-local QZB4 v2 replay and cumulative-work fork choice; not a persistent branch store or canonical-node integration.
 pub mod monetary_pow_v04_candidate;
+/// CP-0419 candidate QZBE checkpoint codec binding monetary snapshots, chainwork and bounded target history; not yet store-integrated.
+pub mod monetary_pow_v04_checkpoint_candidate;
+/// CP-0421 local durable QZBE checkpoint-base suffix store; caller-supplied checkpoint trust only, no production CAS.
+pub mod monetary_pow_v04_checkpoint_store_candidate;
 /// CP-0406 local persistent QZBE branch archive with replay validation; not externally anchored or node-wired.
 pub mod monetary_pow_v04_store_candidate;
 /// CP-0404 candidate QZB4 v2 profile dispatcher, durable snapshot recovery and external-anchor contract; not canonical-node or PoW/fork-choice wired.
@@ -105,6 +111,15 @@ pub mod private_testnet_v4_hybrid_fork_store_candidate;
 /// Candidate-only PTB2 envelope for linked PoW headers + canonical block-body transport.
 pub mod private_testnet_wire;
 pub mod protocol_profile;
+/// Bounded QZAS/1 framing for canonical signed QAX1 operations; candidate-node ingress only.
+pub mod qzbe_amm_ingress_candidate;
+/// CP-0441 candidate: Genesis-rooted QZBE canonical replay across bounded in-memory segments; durable archive integration remains open.
+pub mod qzbe_history_replay_candidate;
+pub mod qzbe_tx_ingress_candidate;
+/// Candidate native AMM with QZB4 v3 transition and QZP4/QAMS snapshot integration; not Mainnet-approved.
+pub mod qzxb_amm_candidate;
+/// Read-only, fail-closed loader for Windows CurrentUser-DPAPI QZKW1 wallets; local custody only.
+pub mod qzxb_wallet_store_candidate;
 pub mod recovery;
 pub mod reference_time;
 pub mod reference_time_store;
@@ -408,3 +423,17 @@ mod tests {
 }
 
 pub mod token_forge;
+
+/// QRun canonical checkpoint codec with profile binding and external anti-rollback anchor checks.
+pub mod qrun_v05_checkpoint_candidate;
+/// Candidate QRun fee-only PoW envelope; payload commitment is not yet wired into fork choice.
+pub mod qrun_v05_fee_pow_wire_candidate;
+pub mod qrun_v05_genesis_candidate;
+/// Candidate-only, QRun-domain-separated Noise XX transport; not yet wired into the node or approved for public value-bearing traffic.
+pub mod qrun_v05_noise_transport_candidate;
+/// Candidate adapter joining QRun Genesis to persistent PoW fork choice; not a public node yet.
+pub mod qrun_v05_pow_fork_runtime_candidate;
+/// Candidate immutable QRun v0.5 network/owner identity; not Mainnet activation.
+pub mod qrun_v05_profile_identity_candidate;
+/// QRun v0.5 Genesis-bound transfer execution and snapshot candidate; not yet node/P2P wired.
+pub mod qrun_v05_runtime_candidate;

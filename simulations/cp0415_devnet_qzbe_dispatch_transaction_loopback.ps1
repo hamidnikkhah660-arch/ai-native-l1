@@ -39,7 +39,7 @@ function Make-Signed-TestTransaction([string]$SeedPath, [string]$Network, [strin
     [IO.File]::WriteAllBytes($SeedPath, $seed)
     [Array]::Clear($seed, 0, $seed.Length)
     try {
-        $out = @(& $txSignerExe --seed-file $SeedPath --network-id-hex $Network --recipient-id-hex $Recipient --nonce 1 --amount-atoms 2500 --fee-atoms 7 --expires-at 100000 2>&1)
+        $out = @(& $txSignerExe --seed-file $SeedPath --network-id-hex $Network --recipient-id-hex $Recipient --nonce 1 --amount-atoms 2500 --fee-atoms 7 --expires-at 4102444800 2>&1)
         $signerExit = $LASTEXITCODE
         if ($signerExit -ne 0) { throw ("CP-0415 transaction signing helper failed: " + ($out -join [Environment]::NewLine)) }
         $all = $out -join [Environment]::NewLine
@@ -69,8 +69,9 @@ $owner = $tx.Sender
 $txPublicKey = $tx.PublicKey
 $txSignature = $tx.Signature
 $miner = '33' * 32
-$subsidy = '1000000'
-$halving = '1000'
+$subsidy = '35673515981' # v0.4 candidate: 356.73515981 QZXB in atoms
+$halving = '4204800' # v0.4 candidate halving interval
+$expectedMinedAtoms = '71347031962' # two height-1/2 rewards before the first halving
 $keyA = Join-Path $root 'node-a.npk1'
 $keyB = Join-Path $root 'node-b.npk1'
 $pubA = Provision-Key $keyA $network
@@ -93,13 +94,14 @@ try {
     $bindOutput = @(& $nodeExe --qzbe-v04-peer-smoke --data-dir (Join-Path $root 'invalid-bind') --listen '0.0.0.0:49331' 2>&1)
     $bindExitCode = $LASTEXITCODE
     $ErrorActionPreference = $savedErrorPreference
-    if ($bindExitCode -ne 1 -or (($bindOutput -join [Environment]::NewLine) -notmatch 'refuses all non-loopback listen addresses')) {
+    if ($bindExitCode -ne 1 -or (($bindOutput -join [Environment]::NewLine) -notmatch 'non-loopback QZBE P2P bind requires both --test-easy-pow and --public-testnet-p2p')) {
         throw ("CP-0415 public-bind guard did not fail closed (exit=$bindExitCode): " + ($bindOutput -join [Environment]::NewLine))
     }
     Write-Host 'CP-0415 PUBLIC_BIND_GUARD_PASS'
 
     $argsB = @(
         '--qzbe-v04-peer-smoke',
+        '--test-easy-pow',
         '--network-id', $network,
         '--owner-id', $owner,
         '--miner-id', $miner,
@@ -122,6 +124,7 @@ try {
 
     $argsA = @(
         '--qzbe-v04-peer-smoke',
+        '--test-easy-pow',
         '--network-id', $network,
         '--owner-id', $owner,
         '--miner-id', $miner,
@@ -138,7 +141,7 @@ try {
         '--tx-nonce', '1',
         '--tx-amount-atoms', '2500',
         '--tx-fee-atoms', '7',
-        '--tx-expires-at', '100000',
+        '--tx-expires-at', '4102444800',
         '--tx-signature-hex', $txSignature,
         '--probe-invalid-signature-first',
         '--mine-blocks', '2',
@@ -180,7 +183,7 @@ try {
     if ($textA -match 'event=qzbe_v04_peer_smoke_failed') { throw ("CP-0415 node A reported runtime failure: " + $textA) }
     if ($textB -match 'event=qzbe_v04_peer_smoke_failed') { throw ("CP-0415 node B reported runtime failure: " + $textB) }
 
-    $pattern = 'event=qzbe_v04_peer_smoke_stopped .*height=2 state_root=([0-9a-f]{64}) tip=([0-9a-f]{64}) generation=2 observed_account=' + $recipient + ' observed_balance_atoms=2500 accepted_peer_blocks=\d+ sent_peer_blocks=\d+ replay=matched local_only=true public_launch_approved=false'
+    $pattern = 'event=qzbe_v04_peer_smoke_stopped .*height=2 state_root=([0-9a-f]{64}) tip=([0-9a-f]{64}) generation=2 total_mined_atoms=' + $expectedMinedAtoms + ' observed_account=' + $recipient + ' observed_balance_atoms=2500 accepted_peer_blocks=\d+ sent_peer_blocks=\d+(?: tx_submissions=\d+ mempool_count=\d+)?(?: amm_submissions=\d+ amm_mempool_count=\d+)? replay=matched tx_rpc_loopback_only=true mainnet=false network_surface=loopback_only local_only=true public_launch_approved=false'
     $finalA = [regex]::Match((Get-Text $logA), $pattern)
     $finalB = [regex]::Match((Get-Text $logB), $pattern)
     if (-not ($finalA.Success -and $finalB.Success)) {

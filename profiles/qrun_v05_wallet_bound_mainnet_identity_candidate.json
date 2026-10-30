@@ -1,0 +1,42 @@
+{
+  "manifest_version": 1,
+  "manifest_status": "wallet_bound_candidate_not_activated",
+  "date": "2026-10-29",
+  "network_name": "QRun",
+  "protocol_profile": "QRun v0.5 wallet-bound mainnet candidate",
+  "native_asset": "QZXB",
+  "decimals": 8,
+  "mainnet_activated": false,
+  "network_identity_source": "Current wallet-bound runtime constants in src/native/pow_bench/src/bin/qrun_v05_pow_local_node.rs; this is identity parity evidence, not a production release approval.",
+  "network_id_hex": "8b5d169205ac49cb9866a9d27ff1a6c3c2571fca65f634854c41c112e506aebb",
+  "owner_account_id_hex": "a14d67bd195c6a0044bedac8532e742811f92501630764d73a98b2f0cc335fdd",
+  "owner_public_key_hex": "fca65e26f596fa60674f5ec35808ec80b317a701e97feee343d85007713bd93f",
+  "genesis_id_hex": "91229b7d21b23cee83f00cec53a566ef1b30db70c644c1e9d05a431c1acf4dbc",
+  "profile_id_hex": "75596fa188dc308088efc6b138e9fcd50be6de82ec2bc117c13e81d7eebfdb09",
+  "genesis_state_root_hex": "a44e545c2cd8fa4e56e228f4f242cbf5445b1cc983c7b1f8fe89c5b42aef88d7",
+  "maximum_supply_coins": "10000000000",
+  "atoms_per_coin": "100000000",
+  "maximum_supply_atoms": "1000000000000000000",
+  "genesis_owner_balance_atoms": "1000000000000000000",
+  "post_genesis_minting_enabled": false,
+  "miner_subsidy_atoms_per_block": "0",
+  "historical_candidate": {
+    "path": "profiles/qrun_v05_mainnet_identity_candidate.json",
+    "network_id_hex": "70fdcdbe6f0afa1edb0c4fb4a85252831376f7b9ecf2a13a86dcf61979cdcad7",
+    "status": "Historical CP-0450 candidate; its identity differs from the current wallet-bound runtime identity and must not be mixed with this candidate."
+  },
+  "release_gates": {
+    "canonical_producer_importer_replay_wired": true,
+    "fee_only_producer_payout_committed_in_block": true,
+    "production_consensus_profile_frozen": false,
+    "at_least_three_independent_operators_verified": false,
+    "full_history_or_verified_checkpoint_rollover": false,
+    "independent_monotonic_anchor_provider": false,
+    "adversarial_multihost_restart_reorg_partition_tests_complete": false,
+    "independent_security_review_complete": false,
+    "external_p2p_reachability_verified": false,
+    "public_operations_and_monitored_recovery_verified": false,
+    "public_mainnet_activation": false,
+    "genuine_qzxb_usdt_market_live": false
+  }
+}

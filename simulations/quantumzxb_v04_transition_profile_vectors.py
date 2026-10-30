@@ -284,15 +284,33 @@ def derive():
         TRANSITION_ROOT_DOMAIN,
         profile_fp + genesis_ledger_root + accounting_commitment + be(0, 16),
     )
+
+    # Independently encode an empty canonical QAMS v2 state. The state is network-bound,
+    # resource-limited, and checksummed, and is now nested in QZP4 v2 so AMM reserves and
+    # nonces survive restart/replay rather than disappearing on node restart.
+    amm_snapshot_preimage = bytearray(b"QAMS")
+    amm_snapshot_preimage.extend(be(2, 2))
+    amm_snapshot_preimage.extend(NETWORK)
+    amm_snapshot_preimage.extend(be(4096, 4))   # maximum assets
+    amm_snapshot_preimage.extend(be(4096, 4))   # maximum pairs
+    amm_snapshot_preimage.extend(be(65536, 4))  # maximum account/LP holdings
+    for _ in range(4):
+        amm_snapshot_preimage.extend(be(0, 4))  # no assets, balances, AMM nonces, or pairs
+    amm_snapshot = bytes(amm_snapshot_preimage) + h(
+        b"QZXB-NATIVE-AMM-SNAPSHOT-CHECK-V1\0", bytes(amm_snapshot_preimage)
+    )
+    assert len(amm_snapshot) == 98
+
     qzp4_preimage = (
-        b"QZP4" + be(1, 2) + NETWORK + profile_bytes
-        + be(len(qzl4_snapshot), 4) + qzl4_snapshot + transition_genesis_root
+        b"QZP4" + be(2, 2) + NETWORK + profile_bytes
+        + be(len(qzl4_snapshot), 4) + qzl4_snapshot
+        + be(len(amm_snapshot), 4) + amm_snapshot + transition_genesis_root
     )
     qzp4_snapshot = qzp4_preimage + h(
         b"QUANTUMZXB-V04-PROFILE-BOUND-SNAPSHOT-CHECK-CANDIDATE-V1\0",
         qzp4_preimage,
     )
-    assert len(qzp4_snapshot) == 810
+    assert len(qzp4_snapshot) == 912
 
     return [
         ("profile_label", "TEST_ONLY_PARAMETERS_NOT_APPROVED_FOR_NETWORK"),

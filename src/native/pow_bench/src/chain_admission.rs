@@ -6,8 +6,8 @@
 
 use crate::{
     state_machine::{
-        Block, BlockApplySummary, LedgerState, MonetaryBlock, MonetaryLedgerState, StateError,
-        TransactionAuthenticator, V4HybridMonetaryBlock,
+        Block, BlockApplySummary, LedgerState, MonetaryBlock, MonetaryLedgerState, QRunV05FeeBlock,
+        StateError, TransactionAuthenticator, V4HybridMonetaryBlock,
     },
     timestamp_policy::TimestampPolicy,
 };
@@ -227,6 +227,80 @@ impl ChainAdmissionBoundary {
             mode: BlockApplicationMode::LiveAdmission,
             reference_time: Some(reference_time),
             timestamp_policy: Some(self.config.timestamp_policy),
+        })
+    }
+
+    /// Live admission for QRun QFB5 blocks. Uses the same clock provenance and timestamp guards
+    /// as the legacy path, but executes the fee-only transition instead of a plain BLK2 transition.
+    pub fn admit_live_qrun_v05_fee<A: TransactionAuthenticator>(
+        &self,
+        state: &mut LedgerState,
+        block: &QRunV05FeeBlock,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+    ) -> Result<BlockAdmissionReceipt, ChainAdmissionError> {
+        let reference_time = clock.sample().map_err(|error| match error {
+            ReferenceTimeError::ClockBeforeUnixEpoch | ReferenceTimeError::ProviderUnavailable => {
+                ChainAdmissionError::ReferenceTimeUnavailable(error)
+            }
+            other => ChainAdmissionError::ReferenceTimeRejected(other),
+        })?;
+        if !self
+            .config
+            .reference_time_source_policy
+            .accepts(reference_time.provenance)
+        {
+            return Err(ChainAdmissionError::ReferenceTimeSourceDisallowed(
+                reference_time.provenance,
+            ));
+        }
+        if reference_time.source_id.trim().is_empty() {
+            return Err(ChainAdmissionError::ReferenceTimeSourceUnlabeled(
+                reference_time.provenance,
+            ));
+        }
+        if let ReferenceTimeSourcePolicy::RequireConfiguredSourceId(expected_source_id) =
+            self.config.reference_time_source_policy
+        {
+            if reference_time.source_id != expected_source_id {
+                return Err(ChainAdmissionError::ReferenceTimeSourceMismatch {
+                    expected_source_id,
+                    actual_source_id: reference_time.source_id,
+                });
+            }
+        }
+        let summary = state
+            .apply_qrun_v05_fee_block_with_timestamp_policy(
+                block,
+                authenticator,
+                reference_time.unix_seconds,
+                self.config.timestamp_policy,
+            )
+            .map_err(ChainAdmissionError::State)?;
+        Ok(BlockAdmissionReceipt {
+            summary,
+            mode: BlockApplicationMode::LiveAdmission,
+            reference_time: Some(reference_time),
+            timestamp_policy: Some(self.config.timestamp_policy),
+        })
+    }
+
+    /// Deterministic historical replay for QRun QFB5. It does not sample wall-clock time or use
+    /// a moving future-window; the fee transition and parent/height checks still run in full.
+    pub fn replay_qrun_v05_fee<A: TransactionAuthenticator>(
+        &self,
+        state: &mut LedgerState,
+        block: &QRunV05FeeBlock,
+        authenticator: &A,
+    ) -> Result<BlockAdmissionReceipt, ChainAdmissionError> {
+        let summary = state
+            .apply_qrun_v05_fee_block(block, authenticator)
+            .map_err(ChainAdmissionError::State)?;
+        Ok(BlockAdmissionReceipt {
+            summary,
+            mode: BlockApplicationMode::HistoricalReplay,
+            reference_time: None,
+            timestamp_policy: None,
         })
     }
 

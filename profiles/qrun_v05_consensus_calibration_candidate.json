@@ -1,0 +1,135 @@
+{
+  "profile_status": "candidate_multi_runner_calibrated_not_frozen",
+  "network_profile": "QRun v0.5 / QZXB; candidate identity only",
+  "mainnet_activated": false,
+  "production_consensus_profile_frozen": false,
+  "pow": {
+    "algorithm": "Argon2id-v1.3",
+    "memory_kib": 65536,
+    "iterations": 1,
+    "lanes": 1,
+    "output_bytes": 32
+  },
+  "difficulty": {
+    "target_block_time_seconds": 30,
+    "window_blocks": 2016,
+    "minimum_adjustment_ratio_divisor": 4,
+    "maximum_adjustment_ratio": 4,
+    "pow_limit_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "initial_target_hex": "00c34aaf0f8c0ba80ec4d914373b1f1bff34e587607897b79eb865eaf9c2837c",
+    "initial_target_derivation": "floor((2^256-1)*1000/(median_hashes_per_second_milli*target_block_time_seconds))"
+  },
+  "calibration_evidence": {
+    "bench_command": "cargo run --release --bin cpw_argon2id_pow_benchmark",
+    "scope": "One local Windows development host plus three separate GitHub-hosted OS runners; seven trials per memory case, eight hashes per trial, two warm-up hashes per run.",
+    "samples": [
+      {
+        "memory_mib": 16,
+        "median_seconds_per_8_hashes": 0.116017,
+        "median_hashes_per_second": 68.955,
+        "hps_mad": 2.245
+      },
+      {
+        "memory_mib": 32,
+        "median_seconds_per_8_hashes": 0.270532,
+        "median_hashes_per_second": 29.571,
+        "hps_mad": 2.363
+      },
+      {
+        "memory_mib": 64,
+        "median_seconds_per_8_hashes": 0.715189,
+        "median_hashes_per_second": 11.186,
+        "hps_mad": 1.105
+      }
+    ],
+    "selected_memory_mib": 64,
+    "selected_median_hashes_per_second_milli": 11186,
+    "selected_hps_mad_milli": 1105,
+    "expected_attempts_at_30_seconds": 335.58,
+    "independent_host_count": 4,
+    "required_independent_host_count": 3,
+    "power_watts_measured": false,
+    "independent_operator_count": 2,
+    "required_independent_operator_count": 3,
+    "cross_platform_runner_matrix": {
+      "run_id": 40744185485,
+      "commit": "188faee3034dd46f41a285b377483083c22b685e",
+      "url": "https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/40744185485",
+      "successful_runner_count": 3,
+      "runner_results": [
+        {
+          "job_id": 123013606001,
+          "samples": [
+            {
+              "median_hashes_per_second": 146.391,
+              "hps_mad": 0.572,
+              "memory_mib": 16
+            },
+            {
+              "median_hashes_per_second": 30.997,
+              "hps_mad": 0.9,
+              "memory_mib": 32
+            },
+            {
+              "median_hashes_per_second": 15.556,
+              "hps_mad": 0.041,
+              "memory_mib": 64
+            }
+          ],
+          "os": "ubuntu-latest"
+        },
+        {
+          "job_id": 123013605995,
+          "samples": [
+            {
+              "median_hashes_per_second": 93.823,
+              "hps_mad": 1.105,
+              "memory_mib": 16
+            },
+            {
+              "median_hashes_per_second": 45.641,
+              "hps_mad": 0.37,
+              "memory_mib": 32
+            },
+            {
+              "median_hashes_per_second": 21.601,
+              "hps_mad": 0.193,
+              "memory_mib": 64
+            }
+          ],
+          "os": "windows-latest"
+        },
+        {
+          "job_id": 123013606054,
+          "samples": [
+            {
+              "median_hashes_per_second": 94.012,
+              "hps_mad": 19.548,
+              "memory_mib": 16
+            },
+            {
+              "median_hashes_per_second": 41.532,
+              "hps_mad": 5.053,
+              "memory_mib": 32
+            },
+            {
+              "median_hashes_per_second": 19.058,
+              "hps_mad": 2.437,
+              "memory_mib": 64
+            }
+          ],
+          "os": "macos-latest"
+        }
+      ],
+      "measurement_design": "7 trials per memory case; 8 hashes per trial; two warm-up hashes",
+      "cpu_model_recorded": false,
+      "power_watts_measured": false,
+      "independent_operator_count": 2,
+      "required_independent_operator_count": 3,
+      "interpretation": "Three separate GitHub-hosted OS runners plus one local host; throughput samples expand the evidence but do not establish production network consensus or three independent operators."
+    }
+  },
+  "launch_note": "The initial target uses the slowest observed 64 MiB median throughput (11.186 hashes/s) across four benchmark hosts: one local Windows host and GitHub-hosted Ubuntu, Windows, and macOS runners. The production consensus profile remains unfrozen: only two operators are represented, CPU models and power are not recorded, and difficulty/timestamp manipulation, sudden hashrate changes, reorganizations, producer/importer/replay equality, public peer churn, and external-CAS anchoring still need production evidence.",
+  "post_genesis_minting_enabled": false,
+  "miner_subsidy_atoms_per_block": "0"
+}
