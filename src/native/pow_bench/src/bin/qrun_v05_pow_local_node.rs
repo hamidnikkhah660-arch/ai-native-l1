@@ -8,12 +8,25 @@
 //! This binary is not a production-certified public-network release.
 use ai_native_l1_pow_bench::chain_admission::SystemClockReferenceTime;
 use ai_native_l1_pow_bench::consensus::{ConsensusParameters, PowAlgorithm, Uint256};
+use ai_native_l1_pow_bench::external_cas_anchor_candidate::{
+    ExternalCasPin, ExternalCasRecord, VerifiedExternalCasClient, EXTERNAL_CAS_RECORD_BYTES,
+};
+use ai_native_l1_pow_bench::external_cas_floor_store_candidate::{
+    ExternalCasFloorError, ExternalCasFloorStore,
+};
+use ai_native_l1_pow_bench::external_cas_noise_transport_candidate::NoiseTcpExternalCasProviderTransport;
 use ai_native_l1_pow_bench::noise_key_provisioning::load_protected_noise_private_key;
+use ai_native_l1_pow_bench::private_testnet_fork_choice::ForkChoiceOutcome;
+use ai_native_l1_pow_bench::private_testnet_fork_store::{
+    ForkStoreError, PrivateTestnetForkStore, QRunV05ExternalCasForkStore,
+};
 use ai_native_l1_pow_bench::private_testnet_wire::decode_candidate_network_block;
+use ai_native_l1_pow_bench::qrun_v05_genesis_candidate::QRunGenesisV05;
 use ai_native_l1_pow_bench::qrun_v05_noise_transport_candidate::{
     QRunV05NoiseSession, MAX_NOISE_APPLICATION_RECORD_BYTES,
 };
 use ai_native_l1_pow_bench::qrun_v05_pow_fork_runtime_candidate::QRunV05PowForkRuntime;
+use ai_native_l1_pow_bench::qrun_v05_pow_fork_runtime_candidate::QRunV05RuntimeStore;
 use ai_native_l1_pow_bench::qzbe_tx_ingress_candidate::{
     decode_request_header, encode_ack, TxIngressAck, TxIngressStatus, ACK_BYTES,
     REQUEST_HEADER_BYTES,
@@ -21,10 +34,12 @@ use ai_native_l1_pow_bench::qzbe_tx_ingress_candidate::{
 use ai_native_l1_pow_bench::state_machine::{
     decode_transaction, transaction_id, AccountId, NetworkId, MAX_TRANSACTION_BYTES,
 };
+use ai_native_l1_pow_bench::state_machine::{LedgerState, TransactionAuthenticator};
 use ai_native_l1_pow_bench::transaction_auth::{
     account_id_from_public_key, AccountPublicKey, Ed25519TransactionAuthenticator,
     TransactionAuthenticatorKind,
 };
+use ai_native_l1_pow_bench::v4_fat1_mldsa65_candidate::LibcruxMlDsa65VerifierCandidate;
 use ed25519_dalek::VerifyingKey;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -89,8 +104,263 @@ struct Receipt {
     height: u64,
 }
 
+type ExternalCasNodeStore = QRunV05ExternalCasForkStore<
+    NoiseTcpExternalCasProviderTransport,
+    LibcruxMlDsa65VerifierCandidate,
+>;
+
+/// Runtime storage adapter. Every node operation still goes through the same validated
+/// QRunV05PowForkRuntime; only the durable commit backend differs.
+enum NodeForkStore {
+    Local(PrivateTestnetForkStore),
+    ExternalCas(ExternalCasNodeStore),
+}
+
+impl QRunV05RuntimeStore for NodeForkStore {
+    fn archive(
+        &self,
+    ) -> &ai_native_l1_pow_bench::private_testnet_fork_choice::PrivateTestnetForkChoice {
+        match self {
+            Self::Local(store) => store.archive(),
+            Self::ExternalCas(store) => store.archive(),
+        }
+    }
+
+    fn genesis_state(&self) -> &LedgerState {
+        match self {
+            Self::Local(store) => store.genesis_state(),
+            Self::ExternalCas(store) => store.genesis_state(),
+        }
+    }
+
+    fn is_qrun_v05_fee_only(&self) -> bool {
+        match self {
+            Self::Local(store) => store.is_qrun_v05_fee_only(),
+            Self::ExternalCas(store) => store.is_qrun_v05_fee_only(),
+        }
+    }
+
+    fn matches_qrun_v05_genesis_and_profile(
+        &self,
+        genesis: &LedgerState,
+        params: &ConsensusParameters,
+    ) -> bool {
+        match self {
+            Self::Local(store) => store.matches_qrun_v05_genesis_and_profile(genesis, params),
+            Self::ExternalCas(store) => store.matches_qrun_v05_genesis_and_profile(genesis, params),
+        }
+    }
+
+    fn canonical_height(&self) -> u64 {
+        match self {
+            Self::Local(store) => store.canonical_height(),
+            Self::ExternalCas(store) => store.canonical_height(),
+        }
+    }
+
+    fn canonical_tip(&self) -> [u8; 32] {
+        match self {
+            Self::Local(store) => store.canonical_tip(),
+            Self::ExternalCas(store) => store.archive().canonical_chain().chain_tip().tip_hash,
+        }
+    }
+
+    fn manifest_anchor(&self) -> Result<[u8; 32], ForkStoreError> {
+        match self {
+            Self::Local(store) => store.manifest_anchor(),
+            Self::ExternalCas(store) => store.manifest_anchor(),
+        }
+    }
+
+    fn submit<A: TransactionAuthenticator>(
+        &mut self,
+        envelope: &[u8],
+        authenticator: &A,
+        clock: &dyn ai_native_l1_pow_bench::chain_admission::ReferenceTimeProvider,
+    ) -> Result<ForkChoiceOutcome, ForkStoreError> {
+        match self {
+            Self::Local(store) => store.submit(envelope, authenticator, clock),
+            Self::ExternalCas(store) => store.submit(envelope, authenticator, clock),
+        }
+    }
+}
+
+type NodeRuntime = QRunV05PowForkRuntime<NodeForkStore>;
+
+fn read_exact_regular_file(
+    path: &std::path::Path,
+    expected_len: usize,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| format!("inspect {label}: {error}"))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() != expected_len as u64
+    {
+        return Err(format!(
+            "{label} must be a regular non-symlink file of exactly {expected_len} bytes"
+        ));
+    }
+    let bytes = fs::read(path).map_err(|error| format!("read {label}: {error}"))?;
+    if bytes.len() != expected_len {
+        return Err(format!("{label} changed size while being read"));
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+fn open_local_node_runtime<A: TransactionAuthenticator>(
+    directory: &std::path::Path,
+    network_id: NetworkId,
+    owner_account: AccountId,
+    params: ConsensusParameters,
+    authenticator: &A,
+    clock: &dyn ai_native_l1_pow_bench::chain_admission::ReferenceTimeProvider,
+) -> Result<NodeRuntime, String> {
+    open_node_runtime(
+        directory,
+        network_id,
+        owner_account,
+        params,
+        authenticator,
+        clock,
+        None,
+    )
+}
+
+fn open_node_runtime<A: TransactionAuthenticator>(
+    directory: &std::path::Path,
+    network_id: NetworkId,
+    owner_account: AccountId,
+    params: ConsensusParameters,
+    authenticator: &A,
+    clock: &dyn ai_native_l1_pow_bench::chain_admission::ReferenceTimeProvider,
+    external_config: Option<&ExternalCasNodeConfig>,
+) -> Result<NodeRuntime, String> {
+    let Some(external) = external_config else {
+        let runtime = QRunV05PowForkRuntime::open(
+            directory,
+            network_id,
+            owner_account,
+            params.clone(),
+            authenticator,
+            clock,
+        )
+        .map_err(|error| format!("open local QRun runtime backend: {error:?}"))?;
+        return QRunV05PowForkRuntime::from_store(
+            network_id,
+            owner_account,
+            params,
+            NodeForkStore::Local(runtime.into_store()),
+        )
+        .map_err(|error| format!("bind local QRun runtime backend: {error:?}"));
+    };
+
+    if params.protocol_version != 5 {
+        return Err("external-CAS backend is supported only for the QFP5 fee-only profile".into());
+    }
+    let genesis = QRunGenesisV05::new(network_id, owner_account)
+        .map_err(|error| format!("construct wallet-bound QRun Genesis: {error:?}"))?;
+    if genesis.commitment() != external.genesis_commitment {
+        return Err("external-CAS Genesis pin differs from the node's wallet-bound Genesis".into());
+    }
+
+    let receipt_key_bytes = read_exact_regular_file(
+        &external.receipt_public_key_file,
+        ai_native_l1_pow_bench::v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES,
+        "external-CAS ML-DSA-65 receipt public key",
+    )?;
+    let mut receipt_public_key =
+        [0u8; ai_native_l1_pow_bench::v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES];
+    receipt_public_key.copy_from_slice(&receipt_key_bytes);
+    if receipt_public_key.iter().all(|byte| *byte == 0) {
+        return Err("external-CAS ML-DSA-65 receipt public key must be nonzero".into());
+    }
+    let pin = ExternalCasPin {
+        provider_id: external.provider_id,
+        network_id,
+        genesis_digest: external.genesis_commitment,
+        receipt_key_id: external.receipt_key_id,
+        receipt_public_key,
+    };
+    pin.validate()
+        .map_err(|error| format!("validate external-CAS provider pin: {error:?}"))?;
+
+    let bootstrap_bytes = read_exact_regular_file(
+        &external.bootstrap_record_file,
+        EXTERNAL_CAS_RECORD_BYTES,
+        "external-CAS ECR1 bootstrap record",
+    )?;
+    let bootstrap = ExternalCasRecord::decode(&bootstrap_bytes)
+        .map_err(|error| format!("decode external-CAS ECR1 bootstrap: {error:?}"))?;
+    if bootstrap.generation != 0
+        || bootstrap.provider_id != pin.provider_id
+        || bootstrap.network_id != pin.network_id
+        || bootstrap.genesis_digest != pin.genesis_digest
+    {
+        return Err(
+            "external-CAS bootstrap record does not match the pinned provider/network/Genesis"
+                .into(),
+        );
+    }
+
+    // The explicit initialize switch is safe to keep enabled across restarts:
+    // AlreadyInitialized opens the existing floor; MissingState after initialization stays fatal.
+    let floor_directory = &external.floor_directory;
+    let floor = if external.initialize_floor {
+        match ExternalCasFloorStore::initialize(&floor_directory, pin.clone(), bootstrap, 1) {
+            Ok(floor) => floor,
+            Err(ExternalCasFloorError::AlreadyInitialized) => {
+                ExternalCasFloorStore::open(floor_directory, pin.clone())
+                    .map_err(|error| format!("open existing external-CAS QCF1 floor: {error}"))?
+            }
+            Err(error) => return Err(format!("initialize external-CAS QCF1 floor: {error}")),
+        }
+    } else {
+        ExternalCasFloorStore::open(floor_directory, pin.clone())
+            .map_err(|error| format!("open external-CAS QCF1 floor: {error}"))?
+    };
+
+    let mut local_noise_private_key =
+        load_protected_noise_private_key(&external.noise_private_key_file, &network_id).map_err(
+            |error| format!("load DPAPI-protected external-CAS Noise client key: {error}"),
+        )?;
+    let transport_result = NoiseTcpExternalCasProviderTransport::new(
+        external.endpoint,
+        local_noise_private_key,
+        external.noise_server_static_public_key,
+        pin.clone(),
+    );
+    local_noise_private_key.fill(0);
+    let transport = transport_result
+        .map_err(|error| format!("configure pinned external-CAS Noise/TCP transport: {error:?}"))?;
+    let client =
+        VerifiedExternalCasClient::new(pin.clone(), transport, LibcruxMlDsa65VerifierCandidate)
+            .map_err(|error| format!("configure verified external-CAS client: {error:?}"))?;
+    let external_store = QRunV05ExternalCasForkStore::open_for_owner_genesis_with_floor(
+        directory,
+        genesis.ledger().clone(),
+        owner_account,
+        params.clone(),
+        authenticator,
+        clock,
+        pin,
+        client,
+        floor,
+    )
+    .map_err(|error| format!("open QRun external-CAS fork store: {error:?}"))?;
+    QRunV05PowForkRuntime::from_store(
+        network_id,
+        owner_account,
+        params,
+        NodeForkStore::ExternalCas(external_store),
+    )
+    .map_err(|error| format!("bind external-CAS QRun runtime backend: {error:?}"))
+}
+
 struct NodeState {
-    runtime: QRunV05PowForkRuntime,
+    runtime: NodeRuntime,
     public_alpha: bool,
     mainnet: bool,
     authenticator: Ed25519TransactionAuthenticator,
@@ -141,6 +411,21 @@ struct Config {
     noise_private_key_file: Option<PathBuf>,
     peer_static_public_keys: Vec<[u8; 32]>,
     sync_on_start: bool,
+    external_cas: Option<ExternalCasNodeConfig>,
+}
+
+#[derive(Clone, Debug)]
+struct ExternalCasNodeConfig {
+    endpoint: SocketAddr,
+    provider_id: [u8; 32],
+    genesis_commitment: [u8; 32],
+    receipt_key_id: [u8; 32],
+    noise_server_static_public_key: [u8; 32],
+    noise_private_key_file: PathBuf,
+    receipt_public_key_file: PathBuf,
+    bootstrap_record_file: PathBuf,
+    floor_directory: PathBuf,
+    initialize_floor: bool,
 }
 
 fn parse_hex32(value: &str, name: &str) -> Result<[u8; 32], String> {
@@ -153,6 +438,118 @@ fn parse_hex32(value: &str, name: &str) -> Result<[u8; 32], String> {
             .map_err(|_| format!("{name} contains a non-hex character"))?;
     }
     Ok(output)
+}
+
+fn parse_external_cas_config(
+    values: &BTreeMap<String, String>,
+    allow_public_endpoint: bool,
+) -> Result<Option<ExternalCasNodeConfig>, String> {
+    const REQUIRED: [&str; 9] = [
+        "--external-cas-endpoint",
+        "--external-cas-provider-id-hex",
+        "--external-cas-genesis-id-hex",
+        "--external-cas-noise-server-static-public-key-hex",
+        "--external-cas-noise-private-key-file",
+        "--external-cas-receipt-key-id-hex",
+        "--external-cas-receipt-public-key-file",
+        "--external-cas-bootstrap-record-file",
+        "--external-cas-floor-dir",
+    ];
+    let present = REQUIRED
+        .iter()
+        .filter(|key| values.contains_key(**key))
+        .count();
+    let initialize_requested = values.contains_key("--external-cas-initialize-floor");
+    if present == 0 {
+        if initialize_requested {
+            return Err(
+                "--external-cas-initialize-floor requires the complete external-CAS pin set".into(),
+            );
+        }
+        return Ok(None);
+    }
+    if present != REQUIRED.len() {
+        let missing = REQUIRED
+            .iter()
+            .filter(|key| !values.contains_key(**key))
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "external-CAS configuration is all-or-none; missing: {missing}"
+        ));
+    }
+    if values.contains_key("--mainnet") {
+        return Err("internal external-CAS parser received an invalid mode map".into());
+    }
+    let required = |key: &str| {
+        values
+            .get(key)
+            .map(String::as_str)
+            .ok_or_else(|| format!("required external-CAS option missing: {key}"))
+    };
+    let endpoint = parse_socket(
+        required("--external-cas-endpoint")?,
+        "--external-cas-endpoint",
+        allow_public_endpoint,
+    )?;
+    let provider_id = parse_hex32(
+        required("--external-cas-provider-id-hex")?,
+        "external-CAS provider ID",
+    )?;
+    let genesis_commitment = parse_hex32(
+        required("--external-cas-genesis-id-hex")?,
+        "external-CAS Genesis commitment",
+    )?;
+    let noise_server_static_public_key = parse_hex32(
+        required("--external-cas-noise-server-static-public-key-hex")?,
+        "external-CAS Noise server static public key",
+    )?;
+    let receipt_key_id = parse_hex32(
+        required("--external-cas-receipt-key-id-hex")?,
+        "external-CAS receipt key ID",
+    )?;
+    if provider_id == [0; 32]
+        || genesis_commitment == [0; 32]
+        || noise_server_static_public_key == [0; 32]
+        || receipt_key_id == [0; 32]
+    {
+        return Err(
+            "external-CAS provider, Genesis, Noise and receipt pins must be nonzero".into(),
+        );
+    }
+    let absolute_file_path = |key: &str| -> Result<PathBuf, String> {
+        let path = PathBuf::from(required(key)?);
+        if !path.is_absolute() || path.file_name().is_none() {
+            return Err(format!("{key} must be an absolute file path"));
+        }
+        Ok(path)
+    };
+    let floor_directory = PathBuf::from(required("--external-cas-floor-dir")?);
+    if !floor_directory.is_absolute() || floor_directory.file_name().is_none() {
+        return Err("--external-cas-floor-dir must be an absolute directory path".into());
+    }
+    let initialize_floor = match values
+        .get("--external-cas-initialize-floor")
+        .map(String::as_str)
+        .unwrap_or("false")
+    {
+        "true" => true,
+        "false" => false,
+        _ => return Err("--external-cas-initialize-floor must be exactly true or false".into()),
+    };
+    Ok(Some(ExternalCasNodeConfig {
+        endpoint,
+        provider_id,
+        genesis_commitment,
+        receipt_key_id,
+        noise_server_static_public_key,
+        noise_private_key_file: absolute_file_path("--external-cas-noise-private-key-file")?,
+        receipt_public_key_file: absolute_file_path("--external-cas-receipt-public-key-file")?,
+        bootstrap_record_file: absolute_file_path("--external-cas-bootstrap-record-file")?,
+        floor_directory,
+        initialize_floor,
+    }))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -344,6 +741,20 @@ fn validate_frozen_mainnet_genesis(
     Ok(())
 }
 
+fn paths_overlap(left: &std::path::Path, right: &std::path::Path) -> bool {
+    let normalize = |path: &std::path::Path| {
+        path.to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    };
+    let left = normalize(left);
+    let right = normalize(right);
+    left == right
+        || left.starts_with(&(right.clone() + "\\"))
+        || right.starts_with(&(left.clone() + "\\"))
+}
+
 fn parse_config() -> Result<Config, String> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -352,7 +763,7 @@ fn parse_config() -> Result<Config, String> {
 Local test: qrun_v05_pow_local_node --local-testnet --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH\n\
 Public alpha: qrun_v05_pow_local_node --public-alpha --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH --noise-private-key-file NPK1\n\
 Mainnet: qrun_v05_pow_local_node --mainnet --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH --noise-private-key-file NPK1 --peer IP:PORT --peer-static-public-key-hex HEX64 --sync-on-start true\n\
-Mainnet also requires --sync-on-start true, non-loopback pinned peers, and frozen identity checks. RPC/transaction ingress stay loopback-only. IMPORTANT: this candidate build keeps --mainnet blocked until production consensus, full-history recovery, independent-operator validation, and security/release tests are complete."
+External CAS (QFP5 only): add --external-cas-endpoint IP:PORT --external-cas-provider-id-hex HEX64 --external-cas-genesis-id-hex HEX64 --external-cas-noise-server-static-public-key-hex HEX64 --external-cas-noise-private-key-file NPK1 --external-cas-receipt-key-id-hex HEX64 --external-cas-receipt-public-key-file RAW_MLDSA65_PUBLIC_KEY --external-cas-bootstrap-record-file ECR1_FILE --external-cas-floor-dir ABSOLUTE_SEPARATE_DIRECTORY. Keep the floor directory outside --data-dir and back it up separately. On first install, set --external-cas-initialize-floor true to create the QCF1 floor from the out-of-band generation-zero bootstrap; keep it true on later starts (existing floors are reopened, missing-after-initialization remains fatal). External-CAS options are all-or-none; no local fallback occurs after provider config is supplied.\nMainnet also requires --sync-on-start true, non-loopback pinned peers, and frozen identity checks. RPC/transaction ingress stay loopback-only. IMPORTANT: this candidate build keeps --mainnet blocked until production consensus, full-history recovery, independent-operator validation, and security/release tests are complete."
         );
         return Err("__help__".into());
     }
@@ -421,6 +832,16 @@ Mainnet also requires --sync-on-start true, non-loopback pinned peers, and froze
         "--block-listen",
         "--noise-private-key-file",
         "--sync-on-start",
+        "--external-cas-endpoint",
+        "--external-cas-provider-id-hex",
+        "--external-cas-genesis-id-hex",
+        "--external-cas-noise-server-static-public-key-hex",
+        "--external-cas-noise-private-key-file",
+        "--external-cas-receipt-key-id-hex",
+        "--external-cas-receipt-public-key-file",
+        "--external-cas-bootstrap-record-file",
+        "--external-cas-floor-dir",
+        "--external-cas-initialize-floor",
     ];
     if let Some(key) = values.keys().find(|key| !allowed.contains(&key.as_str())) {
         return Err(format!("unknown option {key}"));
@@ -562,6 +983,18 @@ Mainnet also requires --sync-on-start true, non-loopback pinned peers, and froze
     } else if !peer_static_public_keys.is_empty() {
         return Err("--peer-static-public-key-hex requires --noise-private-key-file".into());
     }
+    let external_cas = parse_external_cas_config(&values, public_network)?;
+    if mainnet && external_cas.is_none() {
+        return Err("--mainnet requires an explicitly pinned external-CAS provider".into());
+    }
+    if let Some(external) = &external_cas {
+        if paths_overlap(&data_dir, &external.floor_directory) {
+            return Err(
+                "--external-cas-floor-dir must not overlap --data-dir; keep the floor in a separately managed directory"
+                    .into(),
+            );
+        }
+    }
     Ok(Config {
         public_alpha: public_network,
         mainnet,
@@ -577,6 +1010,7 @@ Mainnet also requires --sync-on-start true, non-loopback pinned peers, and froze
         noise_private_key_file,
         peer_static_public_keys,
         sync_on_start,
+        external_cas,
     })
 }
 
@@ -1720,15 +2154,15 @@ fn run(config: Config) -> Result<(), String> {
         // its profile-specific directory so the two modes cannot share a manifest accidentally.
         config.data_dir.join("qrun-v05-pow-fork-store")
     };
-    let mut runtime = QRunV05PowForkRuntime::open(
+    let mut runtime = open_node_runtime(
         &store_dir,
         config.network_id,
         config.owner_account,
         params,
         &authenticator,
         &clock,
-    )
-    .map_err(|error| format!("open QRun QFP5 fee-only runtime: {error:?}"))?;
+        config.external_cas.as_ref(),
+    )?;
     runtime
         .set_producer_account(config.producer_account)
         .map_err(|error| format!("configure fee-only producer: {error:?}"))?;
@@ -1962,13 +2396,340 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ai_native_l1_pow_bench::external_cas_disk_provider_candidate::DurableExternalCasProvider;
     use ai_native_l1_pow_bench::state_machine::Transaction;
     use ai_native_l1_pow_bench::transaction_auth::Ed25519TransactionSigner;
+    use libcrux_ml_dsa::ml_dsa_65::portable;
     use snow::{params::NoiseParams, Builder};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::thread;
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(1);
+
+    fn external_cas_cli_values() -> BTreeMap<String, String> {
+        // These are parser fixtures, not fixed Windows paths: the parser must accept
+        // native absolute paths on every CI operating system.
+        let temp = std::env::temp_dir();
+        let path = |name: &str| temp.join(name).to_string_lossy().into_owned();
+        BTreeMap::from([
+            ("--external-cas-endpoint".into(), "127.0.0.1:49410".into()),
+            ("--external-cas-provider-id-hex".into(), "11".repeat(32)),
+            ("--external-cas-genesis-id-hex".into(), "22".repeat(32)),
+            (
+                "--external-cas-noise-server-static-public-key-hex".into(),
+                "33".repeat(32),
+            ),
+            (
+                "--external-cas-noise-private-key-file".into(),
+                path("qrun-cas-client.npk1"),
+            ),
+            ("--external-cas-receipt-key-id-hex".into(), "44".repeat(32)),
+            (
+                "--external-cas-receipt-public-key-file".into(),
+                path("qrun-cas-receipt.pub"),
+            ),
+            (
+                "--external-cas-bootstrap-record-file".into(),
+                path("qrun-cas-bootstrap.ecr1"),
+            ),
+            (
+                "--external-cas-floor-dir".into(),
+                path("qrun-independent-floor"),
+            ),
+        ])
+    }
+
+    #[test]
+    fn external_cas_cli_config_is_all_or_none_and_requires_numeric_endpoint() {
+        assert!(parse_external_cas_config(&BTreeMap::new(), false)
+            .unwrap()
+            .is_none());
+
+        let mut partial = external_cas_cli_values();
+        partial.remove("--external-cas-bootstrap-record-file");
+        assert!(parse_external_cas_config(&partial, true)
+            .unwrap_err()
+            .contains("all-or-none"));
+
+        let mut init_alone = BTreeMap::new();
+        init_alone.insert("--external-cas-initialize-floor".into(), "true".into());
+        assert!(parse_external_cas_config(&init_alone, true)
+            .unwrap_err()
+            .contains("requires the complete"));
+
+        let mut bad_endpoint = external_cas_cli_values();
+        bad_endpoint.insert(
+            "--external-cas-endpoint".into(),
+            "provider.example:49410".into(),
+        );
+        assert!(parse_external_cas_config(&bad_endpoint, true)
+            .unwrap_err()
+            .contains("numeric IP:PORT"));
+    }
+
+    #[test]
+    fn external_cas_cli_config_parses_pins_paths_and_explicit_floor_initialization() {
+        let mut values = external_cas_cli_values();
+        values.insert("--external-cas-initialize-floor".into(), "true".into());
+        let config = parse_external_cas_config(&values, false).unwrap().unwrap();
+        assert_eq!(config.endpoint, "127.0.0.1:49410".parse().unwrap());
+        assert_eq!(config.provider_id, [0x11; 32]);
+        assert_eq!(config.genesis_commitment, [0x22; 32]);
+        assert_eq!(config.noise_server_static_public_key, [0x33; 32]);
+        assert_eq!(config.receipt_key_id, [0x44; 32]);
+        assert!(config.initialize_floor);
+        assert_eq!(
+            config.floor_directory,
+            std::env::temp_dir().join("qrun-independent-floor")
+        );
+    }
+
+    #[test]
+    fn external_cas_cli_config_rejects_zero_pins_public_endpoint_in_local_mode_and_bad_boolean() {
+        let mut zero_pin = external_cas_cli_values();
+        zero_pin.insert("--external-cas-provider-id-hex".into(), "00".repeat(32));
+        assert!(parse_external_cas_config(&zero_pin, true)
+            .unwrap_err()
+            .contains("must be nonzero"));
+
+        let mut public_endpoint = external_cas_cli_values();
+        public_endpoint.insert(
+            "--external-cas-endpoint".into(),
+            "203.0.113.10:49410".into(),
+        );
+        assert!(parse_external_cas_config(&public_endpoint, false)
+            .unwrap_err()
+            .contains("loopback-only"));
+
+        let mut bad_boolean = external_cas_cli_values();
+        bad_boolean.insert("--external-cas-initialize-floor".into(), "yes".into());
+        assert!(parse_external_cas_config(&bad_boolean, true)
+            .unwrap_err()
+            .contains("exactly true or false"));
+    }
+
+    #[test]
+    fn external_cas_floor_directory_must_not_overlap_node_data() {
+        assert!(paths_overlap(
+            std::path::Path::new(r"C:\qrun\data"),
+            std::path::Path::new(r"C:\qrun\data\floor")
+        ));
+        assert!(paths_overlap(
+            std::path::Path::new(r"C:\qrun\data"),
+            std::path::Path::new(r"c:\QRUN\data")
+        ));
+        assert!(!paths_overlap(
+            std::path::Path::new(r"C:\qrun\data"),
+            std::path::Path::new(r"D:\qrun\floor")
+        ));
+        assert!(!paths_overlap(
+            std::path::Path::new(r"C:\qrun\data"),
+            std::path::Path::new(r"C:\qrun\data-floor")
+        ));
+    }
+
+    // DPAPI protects the client Noise private key on Windows; this integration
+    // path is intentionally exercised only on Windows rather than weakening key
+    // protection or adding a plaintext fallback on Unix CI.
+    #[cfg(windows)]
+    #[test]
+    fn external_cas_node_startup_uses_pinned_noise_provider_and_advances_floor_before_return() {
+        let dir = TestDir::new();
+        let node_data_dir = dir.0.join("node-data");
+        let floor_dir = dir.0.join("independent-floor");
+        let provider_dir = dir.0.join("provider");
+        let local_anchor_dir = dir.0.join("initial-manifest");
+        fs::create_dir_all(&node_data_dir).unwrap();
+
+        let network = [0x71; 32];
+        let signer = Ed25519TransactionSigner::from_seed([0x72; 32]);
+        let owner = signer.account_id();
+        let authenticator = Ed25519TransactionAuthenticator::select(
+            TransactionAuthenticatorKind::Ed25519V1,
+            [AccountPublicKey {
+                account_id: owner,
+                public_key: signer.public_key(),
+            }],
+        )
+        .unwrap();
+        let clock = SystemClockReferenceTime;
+        let mut params = smoke_params();
+        params.protocol_version = 5;
+        let genesis = QRunGenesisV05::new(network, owner).unwrap();
+
+        // The provider bootstrap must name the exact empty QFP5 PFS2 manifest for this identity.
+        let initial_anchor = PrivateTestnetForkStore::open_qrun_v05_fee_only(
+            &local_anchor_dir,
+            genesis.ledger().clone(),
+            params.clone(),
+            &authenticator,
+            &clock,
+        )
+        .unwrap()
+        .manifest_anchor()
+        .unwrap();
+
+        let receipt_keys = portable::generate_key_pair([0x73; 32]);
+        let receipt_signing_key = Arc::new(receipt_keys.signing_key);
+        let receipt_public_key: [u8;
+            ai_native_l1_pow_bench::v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES] =
+            *receipt_keys.verification_key.as_ref();
+        let pin = ExternalCasPin {
+            provider_id: [0x74; 32],
+            network_id: network,
+            genesis_digest: genesis.commitment(),
+            receipt_key_id: [0x75; 32],
+            receipt_public_key,
+        };
+        let bootstrap = ExternalCasRecord {
+            generation: 0,
+            provider_id: pin.provider_id,
+            network_id: pin.network_id,
+            genesis_digest: pin.genesis_digest,
+            previous_record_digest: [0; 32],
+            previous_state_digest: [0; 32],
+            next_state_digest: initial_anchor,
+            operation_id: [0x76; 32],
+            request_digest: [0x77; 32],
+        };
+        DurableExternalCasProvider::initialize(&provider_dir, pin.clone(), bootstrap.clone(), {
+            let key = receipt_signing_key.clone();
+            move |digest| {
+                let signature = portable::sign(&key, digest, &[], [0x78; 32])
+                    .map_err(|error| format!("{error:?}"))?;
+                Ok(*signature.as_ref())
+            }
+        })
+        .unwrap();
+
+        let noise_params: NoiseParams = "Noise_XX_25519_ChaChaPoly_SHA256".parse().unwrap();
+        let server_noise = Builder::new(noise_params.clone())
+            .generate_keypair()
+            .unwrap();
+        let client_noise = Builder::new(noise_params).generate_keypair().unwrap();
+        let server_private: [u8; 32] = server_noise.private.as_slice().try_into().unwrap();
+        let server_public: [u8; 32] = server_noise.public.as_slice().try_into().unwrap();
+        let client_private: [u8; 32] = client_noise.private.as_slice().try_into().unwrap();
+        let client_public: [u8; 32] = client_noise.public.as_slice().try_into().unwrap();
+
+        let noise_private_key_file = dir.0.join("cas-client.npk1");
+        ai_native_l1_pow_bench::noise_key_provisioning::store_protected_noise_private_key(
+            &noise_private_key_file,
+            &network,
+            &client_private,
+        )
+        .unwrap();
+        let receipt_public_key_file = dir.0.join("receipt-key.pub");
+        fs::write(&receipt_public_key_file, receipt_public_key).unwrap();
+        let bootstrap_record_file = dir.0.join("provider-bootstrap.ecr1");
+        fs::write(&bootstrap_record_file, bootstrap.encode().unwrap()).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server_pin = pin.clone();
+        let server_receipt_key = receipt_signing_key.clone();
+        let server_stop = Arc::new(AtomicBool::new(false));
+        let server_stop_thread = server_stop.clone();
+        let server_dir = provider_dir.clone();
+        let server = thread::spawn(move || -> Result<(), String> {
+            while !server_stop_thread.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .map_err(|error| error.to_string())?;
+                        stream
+                            .set_write_timeout(Some(Duration::from_secs(5)))
+                            .map_err(|error| error.to_string())?;
+                        let key = server_receipt_key.clone();
+                        let mut provider = DurableExternalCasProvider::open(
+                            &server_dir,
+                            server_pin.clone(),
+                            move |digest| {
+                                let signature = portable::sign(&key, digest, &[], [0x78; 32])
+                                    .map_err(|error| format!("{error:?}"))?;
+                                Ok(*signature.as_ref())
+                            },
+                        )
+                        .map_err(|error| error.to_string())?;
+                        ai_native_l1_pow_bench::external_cas_noise_transport_candidate::serve_external_cas_noise_connection(
+                            &mut stream,
+                            &server_private,
+                            &[client_public],
+                            &server_pin,
+                            &mut provider,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            Ok(())
+        });
+
+        let external = ExternalCasNodeConfig {
+            endpoint,
+            provider_id: pin.provider_id,
+            genesis_commitment: pin.genesis_digest,
+            receipt_key_id: pin.receipt_key_id,
+            noise_server_static_public_key: server_public,
+            noise_private_key_file,
+            receipt_public_key_file,
+            bootstrap_record_file,
+            floor_directory: floor_dir.clone(),
+            initialize_floor: true,
+        };
+
+        let opened = open_node_runtime(
+            &node_data_dir.join("qrun-v05-qfp5-store"),
+            network,
+            owner,
+            params,
+            &authenticator,
+            &clock,
+            Some(&external),
+        );
+        let mut runtime = match opened {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                server_stop.store(true, Ordering::Release);
+                let _ = server.join();
+                panic!("external-CAS node startup failed: {error}");
+            }
+        };
+        runtime.set_producer_account(owner).unwrap();
+        assert_eq!(runtime.canonical_height(), 0);
+        let envelope = runtime
+            .mine_candidate(now_unix().unwrap() + 5, Vec::new(), &authenticator, 1)
+            .unwrap();
+        runtime
+            .submit_block(&envelope, &authenticator, &clock)
+            .unwrap();
+        assert_eq!(runtime.canonical_height(), 1);
+
+        let store = runtime.into_store();
+        let local_manifest_anchor = store.manifest_anchor().unwrap();
+        assert!(matches!(store, NodeForkStore::ExternalCas(_)));
+
+        let floor = ExternalCasFloorStore::open(&floor_dir, pin.clone()).unwrap();
+        let floor_snapshot = floor.snapshot().unwrap();
+        assert_eq!(floor_snapshot.trusted_record.generation, 1);
+        assert_eq!(floor_snapshot.minimum_object_generation, 2);
+        assert_eq!(
+            floor_snapshot.trusted_record.next_state_digest,
+            local_manifest_anchor
+        );
+        assert!(node_data_dir.exists());
+
+        server_stop.store(true, Ordering::Release);
+        server.join().unwrap().unwrap();
+    }
 
     #[test]
     fn qrun_v05_identity_recognizes_current_wallet_bound_and_historical_candidate() {
@@ -2214,7 +2975,7 @@ mod tests {
         let clock = SystemClockReferenceTime;
         let profile_params = params.clone();
         let runtime =
-            QRunV05PowForkRuntime::open(directory, network, owner, params, &authenticator, &clock)
+            open_local_node_runtime(directory, network, owner, params, &authenticator, &clock)
                 .unwrap();
         let profile_id = profile_id(&network, &profile_params, &runtime.genesis_commitment());
         let mut state = NodeState {
@@ -2254,7 +3015,7 @@ mod tests {
         params.protocol_version = 5;
         let profile_params = params.clone();
         let mut runtime =
-            QRunV05PowForkRuntime::open(directory, network, owner, params, &authenticator, &clock)
+            open_local_node_runtime(directory, network, owner, params, &authenticator, &clock)
                 .unwrap();
         runtime.set_producer_account(owner).unwrap();
         assert!(runtime.is_qrun_v05_fee_only());
@@ -3354,15 +4115,9 @@ mod tx_ingress_tests {
         let clock = SystemClockReferenceTime;
         let params = test_params();
         let profile_params = params.clone();
-        let runtime = QRunV05PowForkRuntime::open(
-            directory,
-            network,
-            account,
-            params,
-            &authenticator,
-            &clock,
-        )
-        .unwrap();
+        let runtime =
+            open_local_node_runtime(directory, network, account, params, &authenticator, &clock)
+                .unwrap();
         let profile_id = profile_id(&network, &profile_params, &runtime.genesis_commitment());
         let mut state = NodeState {
             runtime,

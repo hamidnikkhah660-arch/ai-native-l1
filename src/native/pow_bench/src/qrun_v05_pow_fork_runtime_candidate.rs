@@ -466,15 +466,18 @@ where
     ///
     /// The backend must have validated its Genesis/profile on open. This method rechecks that
     /// exact binding before exposing mining/import operations through the runtime.
-    pub fn from_fee_only_store(
+    /// Construct a runtime from an already opened, profile-validated backend.
+    ///
+    /// The backend must have authenticated its own persistent identity before being passed here.
+    /// This supports both QFP5 and isolated legacy fixtures without weakening profile checks.
+    pub fn from_store(
         network_id: NetworkId,
         owner_account: AccountId,
         params: ConsensusParameters,
         store: S,
     ) -> Result<Self, QRunV05PowRuntimeError> {
         params.validate()?;
-        if params.protocol_version != 5
-            || params.issuance.maximum_supply() != MAX_TOTAL_SUPPLY_ATOMS
+        if params.issuance.maximum_supply() != MAX_TOTAL_SUPPLY_ATOMS
             || params
                 .issuance
                 .reward_for_block(1, MAX_TOTAL_SUPPLY_ATOMS)
@@ -484,9 +487,10 @@ where
             return Err(QRunV05PowRuntimeError::WrongSupplyProfile);
         }
         let genesis = QRunGenesisV05::new(network_id, owner_account)?;
+        let fee_only = params.protocol_version == 5;
         if store.genesis_state() != genesis.ledger()
-            || !store.is_qrun_v05_fee_only()
-            || !store.matches_qrun_v05_genesis_and_profile(genesis.ledger(), &params)
+            || store.is_qrun_v05_fee_only() != fee_only
+            || (fee_only && !store.matches_qrun_v05_genesis_and_profile(genesis.ledger(), &params))
             || store.archive().canonical_chain().state().network_id() != network_id
         {
             return Err(QRunV05PowRuntimeError::WrongNetwork);
@@ -497,11 +501,24 @@ where
             genesis_commitment: genesis.commitment(),
             params,
             store,
-            fee_only: true,
+            fee_only,
             producer_account: owner_account,
         };
         runtime.validate_all_branch_supplies()?;
         Ok(runtime)
+    }
+
+    /// Construct a QFP5 runtime only from a validated fee-only backend.
+    pub fn from_fee_only_store(
+        network_id: NetworkId,
+        owner_account: AccountId,
+        params: ConsensusParameters,
+        store: S,
+    ) -> Result<Self, QRunV05PowRuntimeError> {
+        if params.protocol_version != 5 {
+            return Err(QRunV05PowRuntimeError::WrongSupplyProfile);
+        }
+        Self::from_store(network_id, owner_account, params, store)
     }
 
     /// Recover the backend after the runtime owner has finished using it.
