@@ -304,6 +304,7 @@ Relevant project records:
 - CP-0471 — independent local floor store.
 - CP-0472 — node external-CAS startup wiring.
 - CP-0474 — QRun Verifiable Asset Passport (QVAP), the proposed flagship evidence-linked RWA / asset-lifecycle capability.
+- CP-0475 — QRun Verifiable Agentic Asset Commerce (QVAAC), composing QVAP with interoperable agent identity, bounded delegated authority, evidence-gated fulfilment and conditional settlement. It is a research proposal; broad 'first' claims are explicitly not approved.
 
 ## 14. Instructions for the next AI/engineering session
 

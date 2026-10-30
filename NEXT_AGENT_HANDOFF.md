@@ -15,7 +15,8 @@ Build QRun as a modular, secure, evidence-led Layer-1 settlement platform. Strat
 - Real-world asset tokenization with legally valid rights, verified issuer/custody/oracles, lifecycle and redemption.
 - Payments, multi-assets, smart contracts, DeFi, interoperability and developer tooling.
 - Optional AI-agent / machine-to-machine payments with strict spending limits and scoped keys.
-- Flagship proposed capability: **QRun Verifiable Asset Passport (QVAP)** — evidence-linked asset identity and rights commitments, independently signed attestations, lifecycle events, revocation/expiry, selective disclosure, and programmable settlement. This is a design proposal, not a live feature. See [CP-0474](docs/CP-0474_QRUN_VERIFIABLE_ASSET_PASSPORT_DESIGN_2026-10-30.md).
+- Flagship proposed capability: **QRun Verifiable Asset Passport (QVAP)** — evidence-linked asset identity and rights commitments, independently signed attestations, lifecycle events, revocation/expiry, selective disclosure, and programmable settlement. An isolated non-consensus Rust candidate now exists; it is not a live feature. See [CP-0474](docs/CP-0474_QRUN_VERIFIABLE_ASSET_PASSPORT_DESIGN_2026-10-30.md).
+- AI product direction: **QRun Verifiable Agentic Asset Commerce (QVAAC)** — compose QVAP with interoperable agent identity, owner-approved capability grants, deterministic evidence checks and conditional settlement. See [CP-0475](docs/CP-0475_QRUN_VERIFIABLE_AGENTIC_ASSET_COMMERCE_2026-10-30.md). Novelty is a hypothesis; no first-in-world claim is approved.
 
 Preferred positioning: **Quantum-Resilient. Privacy-Preserving. Asset-Ready. Performance-Verified.**
 
@@ -33,6 +34,19 @@ At last verification:
 - PR #90 OPEN / Draft / CLEAN. Base: work/qrun-v05-cas-floor-20261030; head: work/qrun-v05-cas-node-wiring-20261030; SHA: 627d901e94f630fa19e6dbfbc080e0bc8acf0c60. CI checks green. https://github.com/hamidnikkhah660-arch/ai-native-l1/pull/90
 - PR #91 OPEN / Draft / CLEAN. Base is PR90 head branch work/qrun-v05-cas-node-wiring-20261030; head: work/qrun-v05-cas-kms-signer-20261030; SHA: 7f736565ccddbf2eee5a9f17583848c23d4e0789. CI checks green on Ubuntu, Windows, macOS, and Windows loopback. https://github.com/hamidnikkhah660-arch/ai-native-l1/pull/91
 - Keep stack order: PR90 before PR91. Neither is merged. Re-query GitHub before acting.
+
+## Current work in progress — 2026-10-30
+
+- Working feature branch: feat/qrun-qvap-offline-prototype-20261030, created from docs branch head 9f7b9bb4804a3db0f7d26c56be07cf93c16edbf3. At this handoff update the feature work is local and not yet committed/pushed; check git status and exact HEAD before acting.
+- New isolated offline candidate modules:
+  - src/native/pow_bench/src/qrun_verifiable_asset_passport_candidate.rs
+  - src/native/pow_bench/src/qrun_verifiable_agentic_settlement_candidate.rs
+  Both are exposed from lib.rs for test purposes only. Neither is wired into the production node, TXN2/TXN4, QFP5, block/state roots, Genesis or monetary supply.
+- Focused verification on current code: QVAP 15/15 tests passed; QVAAC 16/16 passed; cargo +stable check --all-targets --locked --offline passed; git diff --check passed. Existing unrelated repository warnings remain.
+- A previous full library test run yielded 962 passed / 1 failed due to a Windows multi-process reward-pool writer file-I/O error (Access Denied / path not found); the one test passed when rerun in isolation. Do not claim the full library suite is entirely green.
+- QVAAC also enforces distinct buyer/agent/seller/evaluator identities and rejects future-dated delivery attestations. Both test suites use deliberately non-cryptographic test-only verifiers. No production AAP, ERC-8004, QVAP attestor, evaluator or ML-DSA agent-commerce verifier is connected. No trusted clock, persisted global grant revocation/sequence registry, real escrow, real payments, production API/explorer, independent-node replay or deployment exists.
+- PR #92 remains a documentation-only Draft PR, all 5 observed CI checks passed: https://github.com/hamidnikkhah660-arch/ai-native-l1/pull/92. It is stacked on PR #91. PR #93 for the candidate code has not yet been created.
+- The feature work is a separate experiment and must not block QRun v0.5 public release work. Keep it Draft, isolated and reversible. Before commit/push, rerun format, both focused test suites, all-target check and git diff --check on the exact HEAD.
 
 ## Current technical truth
 
@@ -72,7 +86,8 @@ At last verification:
 - CP-0471 separate QCF1 floor.
 - CP-0472 node startup wiring.
 - CP-0473 product vision and phased roadmap.
-- CP-0474 QRun Verifiable Asset Passport (QVAP) design; synthetic testnet prototype only, not a live feature.
+- CP-0474 QRun Verifiable Asset Passport (QVAP) design and isolated offline Rust candidate; no production cryptography or consensus wiring.
+- CP-0475 QRun Verifiable Agentic Asset Commerce (QVAAC); research-backed design proposal, interoperate with existing agent standards, no first claim.
 
 ## Safety / collaboration rules
 
