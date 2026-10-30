@@ -316,3 +316,38 @@ Do not report an asset as "backed" based only on total token supply, issuer self
 - NIST Post-Quantum Cryptography: https://csrc.nist.gov/Projects/post-quantum-cryptography
 
 This is an architecture proposal and research checkpoint. It does not certify the protocol, establish the truth of an external asset claim, authorize a securities offering or replace independent legal/security review.
+
+
+## 15. Offline Rust candidate implementation snapshot — 2026-10-30
+
+An isolated Rust model has now been added on branch feat/qrun-qvap-offline-prototype-20261030:
+
+- src/native/pow_bench/src/qrun_verifiable_asset_passport_candidate.rs
+- lib.rs exposes the module for offline tests only; no production node or consensus call site was changed.
+
+The candidate currently covers:
+- fixed-width canonical QVP1 definition encoding and network/asset binding;
+- role-bound signed attestation claims with signature algorithm identifiers;
+- issuer, custodian and inspector role separation;
+- attestation sequence, validity window and expiry checks;
+- supply ceiling derived from independently signed custody quantity and a rational representation ratio;
+- cumulative issuance that is not reopened by redemption;
+- separately authorized, quota-consumed redemption;
+- encumbrance and release bound to the same commitment;
+- registrar-authorized terminal revocation;
+- event hash chain committing to the exact evidence digests used for activation, issuance, lien, release, revocation and redemption.
+
+Verification on the Windows development checkout (2026-10-30):
+- 15 focused QVAP unit tests passed, including canonical descriptor/network binding, three independent attestor roles, expiry, role/key history, custody quantity reductions, redemption quota, lien release commitment and terminal revocation.
+- 16 focused QVAAC settlement tests passed in the companion module; see CP-0475. The QVAAC candidate separates buyer, agent, seller and evaluator identities and rejects future-dated fulfilment proofs.
+- `cargo +stable check --all-targets --locked --offline` passed after both candidate modules were added. Existing warnings remain in unrelated legacy modules/binaries.
+- `git diff --check` passed.
+- A previous full library run reported 962 passed and one failure in the pre-existing Windows multi-process reward-pool file writer test (transient Access Denied / missing path); rerunning that test alone passed. Do not describe the full suite as entirely green.
+
+Important limitations:
+- The QVAP test verifier is intentionally non-cryptographic and must never be used in production.
+- No ML-DSA production adapter is connected; signature algorithm is an injected verifier contract only.
+- No trusted clock, external key registry, persistent database, canonical node transaction decoder, block/state-root integration, reorg persistence adapter, wallet UI, explorer/API or independent operator deployment exists for this candidate.
+- No real asset, legal claim, custody service or funds are involved.
+- The code is a testbed candidate, not Mainnet readiness, not QVAP production and not proof of novelty.
+- Neither QVAP nor QVAAC is wired into QFP5, Genesis, Network ID, QZXB monetary supply or the live public node.

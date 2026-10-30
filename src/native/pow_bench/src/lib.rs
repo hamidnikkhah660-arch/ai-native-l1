@@ -427,6 +427,10 @@ mod tests {
     }
 }
 
+/// Offline QRun Verifiable Agentic Asset Commerce escrow/receipt candidate; not wired into consensus.
+pub mod qrun_verifiable_agentic_settlement_candidate;
+/// Offline QRun Verifiable Asset Passport state-machine candidate; not wired into consensus.
+pub mod qrun_verifiable_asset_passport_candidate;
 pub mod token_forge;
 
 /// QRun canonical checkpoint codec with profile binding and external anti-rollback anchor checks.
