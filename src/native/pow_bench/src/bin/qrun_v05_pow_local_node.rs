@@ -267,6 +267,16 @@ fn validate_listener_bind_policy(
     Ok(())
 }
 
+fn is_qrun_v05_identity(network_id: &NetworkId, owner_account: &AccountId) -> bool {
+    let historical_candidate = *network_id
+        == ai_native_l1_pow_bench::qrun_v05_profile_identity_candidate::PROPOSED_QRUN_V05_NETWORK_ID
+        && *owner_account
+            == ai_native_l1_pow_bench::qrun_v05_profile_identity_candidate::PROPOSED_OWNER_ACCOUNT_ID;
+    let current_wallet_bound_candidate =
+        *network_id == QZXB_MAINNET_NETWORK_ID && *owner_account == QZXB_MAINNET_OWNER_ACCOUNT_ID;
+    historical_candidate || current_wallet_bound_candidate
+}
+
 fn consensus_parameters_for_mode(
     public_alpha: bool,
     mainnet: bool,
@@ -1690,10 +1700,7 @@ fn run(config: Config) -> Result<(), String> {
     // and Mainnet use the calibrated QRun v0.5 consensus profile. A wallet-bound Genesis may use a
     // custom network ID and owner account; those inputs deterministically change the Genesis and
     // profile IDs, so every peer must be configured with the same values to join the same chain.
-    let qrun_v05_identity = config.network_id
-        == ai_native_l1_pow_bench::qrun_v05_profile_identity_candidate::PROPOSED_QRUN_V05_NETWORK_ID
-        && config.owner_account
-            == ai_native_l1_pow_bench::qrun_v05_profile_identity_candidate::PROPOSED_OWNER_ACCOUNT_ID;
+    let qrun_v05_identity = is_qrun_v05_identity(&config.network_id, &config.owner_account);
     if config.public_alpha && config.noise_private_key_file.is_none() {
         return Err("--public-alpha requires the network-bound Noise static key".into());
     }
@@ -1962,6 +1969,23 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn qrun_v05_identity_recognizes_current_wallet_bound_and_historical_candidate() {
+        assert!(is_qrun_v05_identity(
+            &QZXB_MAINNET_NETWORK_ID,
+            &QZXB_MAINNET_OWNER_ACCOUNT_ID
+        ));
+        assert!(is_qrun_v05_identity(
+            &ai_native_l1_pow_bench::qrun_v05_profile_identity_candidate::PROPOSED_QRUN_V05_NETWORK_ID,
+            &ai_native_l1_pow_bench::qrun_v05_profile_identity_candidate::PROPOSED_OWNER_ACCOUNT_ID
+        ));
+        assert!(!is_qrun_v05_identity(
+            &[0x99; 32],
+            &QZXB_MAINNET_OWNER_ACCOUNT_ID
+        ));
+        assert!(!is_qrun_v05_identity(&QZXB_MAINNET_NETWORK_ID, &[0x99; 32]));
+    }
 
     #[test]
     fn mainnet_release_gate_fails_closed_without_source_approval() {
