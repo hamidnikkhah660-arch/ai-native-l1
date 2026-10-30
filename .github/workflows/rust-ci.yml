@@ -47,6 +47,10 @@ jobs:
         run: python3 ../../../simulations/quantumzxb_tokenomics_checker.py
       - name: Verify CP-0450 QRun identity and Genesis commitment oracle
         run: python3 ../../../simulations/qrun_v05_identity_manifest_checker.py
+      - name: Verify CP-0468 current wallet-bound QRun identity manifest
+        run: python3 ../../../simulations/qrun_v05_wallet_bound_identity_manifest_checker.py
+      - name: Verify CP-0468 identity checker fails closed under Python optimization
+        run: python3 ../../../simulations/test_qrun_v05_wallet_bound_identity_manifest_checker.py
 
       - name: Verify CP-0459 QRun measured PoW calibration candidate
         run: python3 ../../../simulations/qrun_v05_consensus_calibration_oracle.py

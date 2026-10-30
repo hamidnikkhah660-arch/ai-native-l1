@@ -7,7 +7,9 @@ Reference CI: [GitHub Actions run 40433578254](https://github.com/hamidnikkhah66
 
 ## Purpose and current status
 
-This packet is for recruiting and qualifying independent operators for a future **zero-value public devnet**. It is not a production release, deployment instruction, or promise of an immediate public endpoint. The current QZBE node path is an isolated candidate/test runtime; a green CI run does not approve mainnet or value-bearing public transactions.
+This packet is for recruiting and qualifying independent operators for a future **zero-value public devnet**. It is not a production release, deployment instruction, or promise of an immediate public endpoint. The referenced QZBE node path is an isolated candidate/test runtime; a green CI run does not approve mainnet or value-bearing public transactions.
+
+> **Version warning (2026-10-29):** V01 is an interest-only packet and its reference commit predates the current wallet-bound QRun v0.5 identity. Do not use it as a launch recipe or expose any node based on it. The current runtime identity is recorded in [CP-0468](CP-0468_QRUN_WALLET_BOUND_IDENTITY_RECONCILIATION_2026-10-29.md) and [the current candidate manifest](../profiles/qrun_v05_wallet_bound_mainnet_identity_candidate.json). Independent operators may register interest here or in [issue #72](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/72); a reviewed V02 onboarding bundle and explicit safe configuration are still required before a public endpoint is announced.
 
 As of this packet's date, Gate 2 (production Genesis/monetary policy freeze and canonical runtime integration), Gate 8 (deployed independent anti-rollback CAS/anchor), Gate 13 (qualified multi-operator public devnet), and Gate 14 (independent security/provenance/compliance review) remain OPEN. No native QZXB Mainnet, verified QZXB/USDT pair, or genuine QZXB market-data feed is established by this packet.
 
