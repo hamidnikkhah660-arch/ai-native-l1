@@ -9,8 +9,12 @@
 use crate::{
     chain_admission::ReferenceTimeProvider,
     consensus::{pow_digest, ConsensusError, ConsensusParameters, PowHeader, Uint256},
+    external_cas_anchor_candidate::ExternalCasProviderTransport,
     private_testnet_driver::PrivateTestnetChain,
-    private_testnet_fork_store::{ForkStoreError, PrivateTestnetForkStore},
+    private_testnet_fork_choice::{ForkChoiceOutcome, PrivateTestnetForkChoice},
+    private_testnet_fork_store::{
+        ForkStoreError, PrivateTestnetForkStore, QRunV05ExternalCasForkStore,
+    },
     private_testnet_wire::{
         decode_candidate_network_block, encode_candidate_network_block, PrivateTestnetWireError,
     },
@@ -26,6 +30,7 @@ use crate::{
         transaction_id, AccountId, Block, LedgerState, NetworkId, QRunV05FeeBlock, StateError,
         Transaction, TransactionAuthenticator, MAX_TOTAL_SUPPLY_ATOMS,
     },
+    v4_fat1_trust_candidate::MlDsa65Verifier,
 };
 use std::path::Path;
 
@@ -77,19 +82,133 @@ impl From<QRunCheckpointError> for QRunV05PowRuntimeError {
     }
 }
 
+/// Minimal compile-time storage contract used by the QRun v0.5 runtime.
+///
+/// Backends expose the same already-validated fork-choice graph. A CAS implementation must not
+/// publish this graph's next manifest until its external signed compare-and-swap has succeeded.
+pub trait QRunV05RuntimeStore {
+    fn archive(&self) -> &PrivateTestnetForkChoice;
+    fn genesis_state(&self) -> &LedgerState;
+    fn is_qrun_v05_fee_only(&self) -> bool;
+    fn matches_qrun_v05_genesis_and_profile(
+        &self,
+        genesis: &LedgerState,
+        params: &ConsensusParameters,
+    ) -> bool;
+    fn canonical_height(&self) -> u64;
+    fn canonical_tip(&self) -> [u8; 32];
+    fn manifest_anchor(&self) -> Result<[u8; 32], ForkStoreError>;
+    fn submit<A: TransactionAuthenticator>(
+        &mut self,
+        envelope: &[u8],
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+    ) -> Result<ForkChoiceOutcome, ForkStoreError>;
+}
+
+impl QRunV05RuntimeStore for PrivateTestnetForkStore {
+    fn archive(&self) -> &PrivateTestnetForkChoice {
+        PrivateTestnetForkStore::archive(self)
+    }
+
+    fn genesis_state(&self) -> &LedgerState {
+        PrivateTestnetForkStore::genesis_state(self)
+    }
+
+    fn is_qrun_v05_fee_only(&self) -> bool {
+        PrivateTestnetForkStore::is_qrun_v05_fee_only(self)
+    }
+
+    fn matches_qrun_v05_genesis_and_profile(
+        &self,
+        genesis: &LedgerState,
+        params: &ConsensusParameters,
+    ) -> bool {
+        PrivateTestnetForkStore::matches_qrun_v05_genesis_and_profile(self, genesis, params)
+    }
+
+    fn canonical_height(&self) -> u64 {
+        PrivateTestnetForkStore::canonical_height(self)
+    }
+
+    fn canonical_tip(&self) -> [u8; 32] {
+        PrivateTestnetForkStore::canonical_tip(self)
+    }
+
+    fn manifest_anchor(&self) -> Result<[u8; 32], ForkStoreError> {
+        PrivateTestnetForkStore::manifest_anchor(self)
+    }
+
+    fn submit<A: TransactionAuthenticator>(
+        &mut self,
+        envelope: &[u8],
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+    ) -> Result<ForkChoiceOutcome, ForkStoreError> {
+        PrivateTestnetForkStore::submit(self, envelope, authenticator, clock)
+    }
+}
+
+impl<P, V> QRunV05RuntimeStore for QRunV05ExternalCasForkStore<P, V>
+where
+    P: ExternalCasProviderTransport,
+    V: MlDsa65Verifier,
+{
+    fn archive(&self) -> &PrivateTestnetForkChoice {
+        QRunV05ExternalCasForkStore::archive(self)
+    }
+
+    fn genesis_state(&self) -> &LedgerState {
+        QRunV05ExternalCasForkStore::genesis_state(self)
+    }
+
+    fn is_qrun_v05_fee_only(&self) -> bool {
+        QRunV05ExternalCasForkStore::is_qrun_v05_fee_only(self)
+    }
+
+    fn matches_qrun_v05_genesis_and_profile(
+        &self,
+        genesis: &LedgerState,
+        params: &ConsensusParameters,
+    ) -> bool {
+        QRunV05ExternalCasForkStore::matches_qrun_v05_genesis_and_profile(self, genesis, params)
+    }
+
+    fn canonical_height(&self) -> u64 {
+        QRunV05ExternalCasForkStore::canonical_height(self)
+    }
+
+    fn canonical_tip(&self) -> [u8; 32] {
+        self.archive().canonical_chain().chain_tip().tip_hash
+    }
+
+    fn manifest_anchor(&self) -> Result<[u8; 32], ForkStoreError> {
+        QRunV05ExternalCasForkStore::manifest_anchor(self)
+    }
+
+    fn submit<A: TransactionAuthenticator>(
+        &mut self,
+        envelope: &[u8],
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+    ) -> Result<ForkChoiceOutcome, ForkStoreError> {
+        QRunV05ExternalCasForkStore::submit(self, envelope, authenticator, clock)
+    }
+}
+
 /// QRun Genesis + deterministic PoW validation + persisted branch selection.
 /// Network listeners should submit complete PTB2 envelopes through submit_block.
-pub struct QRunV05PowForkRuntime {
+pub struct QRunV05PowForkRuntime<S = PrivateTestnetForkStore> {
     network_id: NetworkId,
     owner_account: AccountId,
     genesis_commitment: [u8; 32],
     params: ConsensusParameters,
-    store: PrivateTestnetForkStore,
+    store: S,
     fee_only: bool,
     producer_account: AccountId,
 }
 
-impl QRunV05PowForkRuntime {
+impl QRunV05PowForkRuntime<PrivateTestnetForkStore> {
     pub fn open<A: TransactionAuthenticator>(
         directory: impl AsRef<Path>,
         network_id: NetworkId,
@@ -336,6 +455,58 @@ impl QRunV05PowForkRuntime {
         };
         runtime.validate_all_branch_supplies()?;
         Ok(runtime)
+    }
+}
+
+impl<S> QRunV05PowForkRuntime<S>
+where
+    S: QRunV05RuntimeStore,
+{
+    /// Construct a QRun v0.5 runtime from an already opened QFP5 store backend.
+    ///
+    /// The backend must have validated its Genesis/profile on open. This method rechecks that
+    /// exact binding before exposing mining/import operations through the runtime.
+    pub fn from_fee_only_store(
+        network_id: NetworkId,
+        owner_account: AccountId,
+        params: ConsensusParameters,
+        store: S,
+    ) -> Result<Self, QRunV05PowRuntimeError> {
+        params.validate()?;
+        if params.protocol_version != 5
+            || params.issuance.maximum_supply() != MAX_TOTAL_SUPPLY_ATOMS
+            || params
+                .issuance
+                .reward_for_block(1, MAX_TOTAL_SUPPLY_ATOMS)
+                .map_err(|error| QRunV05PowRuntimeError::InvalidCandidate(error.to_string()))?
+                != 0
+        {
+            return Err(QRunV05PowRuntimeError::WrongSupplyProfile);
+        }
+        let genesis = QRunGenesisV05::new(network_id, owner_account)?;
+        if store.genesis_state() != genesis.ledger()
+            || !store.is_qrun_v05_fee_only()
+            || !store.matches_qrun_v05_genesis_and_profile(genesis.ledger(), &params)
+            || store.archive().canonical_chain().state().network_id() != network_id
+        {
+            return Err(QRunV05PowRuntimeError::WrongNetwork);
+        }
+        let runtime = Self {
+            network_id,
+            owner_account,
+            genesis_commitment: genesis.commitment(),
+            params,
+            store,
+            fee_only: true,
+            producer_account: owner_account,
+        };
+        runtime.validate_all_branch_supplies()?;
+        Ok(runtime)
+    }
+
+    /// Recover the backend after the runtime owner has finished using it.
+    pub fn into_store(self) -> S {
+        self.store
     }
 
     /// Mine a block on the selected branch. QRun v0.5 uses the producer-bound QFP5 fee-only

@@ -634,6 +634,25 @@ impl PrivateTestnetForkStore {
         &self.archive
     }
 
+    pub fn genesis_state(&self) -> &LedgerState {
+        &self.genesis
+    }
+
+    pub fn is_qrun_v05_fee_only(&self) -> bool {
+        self.profile.is_qrun_fee_only()
+    }
+
+    pub fn matches_qrun_v05_genesis_and_profile(
+        &self,
+        genesis: &LedgerState,
+        params: &ConsensusParameters,
+    ) -> bool {
+        genesis == &self.genesis
+            && qrun_v05_fee_profile_fingerprint(genesis, params)
+                .map(|fingerprint| fingerprint == self.profile_fingerprint)
+                .unwrap_or(false)
+    }
+
     pub fn canonical_tip(&self) -> [u8; 32] {
         self.archive.canonical_chain().chain_tip().tip_hash
     }
@@ -1031,6 +1050,27 @@ where
             trusted_record: observed,
             minimum_object_generation: object_generation,
         })
+    }
+
+    pub fn archive(&self) -> &PrivateTestnetForkChoice {
+        self.store.archive()
+    }
+
+    pub fn genesis_state(&self) -> &LedgerState {
+        self.store.genesis_state()
+    }
+
+    pub fn is_qrun_v05_fee_only(&self) -> bool {
+        self.store.is_qrun_v05_fee_only()
+    }
+
+    pub fn matches_qrun_v05_genesis_and_profile(
+        &self,
+        genesis: &LedgerState,
+        params: &ConsensusParameters,
+    ) -> bool {
+        self.store
+            .matches_qrun_v05_genesis_and_profile(genesis, params)
     }
 
     pub fn canonical_height(&self) -> u64 {
@@ -3047,7 +3087,7 @@ mod tests {
         let client =
             VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
                 .unwrap();
-        let mut store = QRunV05ExternalCasForkStore::open_for_owner_genesis(
+        let store = QRunV05ExternalCasForkStore::open_for_owner_genesis(
             &dir.0,
             genesis.clone(),
             WALLET_BOUND_OWNER,
@@ -3061,16 +3101,27 @@ mod tests {
         )
         .unwrap();
 
-        let envelope = qrun_fee_envelope(&genesis, &params);
-        let outcome = store
-            .submit(&envelope, &EmptyAuthenticator, &FixedClock)
+        // Exercise the generic runtime API against the externally anchored backend.
+        let mut runtime =
+            crate::qrun_v05_pow_fork_runtime_candidate::QRunV05PowForkRuntime::from_fee_only_store(
+                WALLET_BOUND_NETWORK_ID,
+                WALLET_BOUND_OWNER,
+                params.clone(),
+                store,
+            )
             .unwrap();
-        assert_eq!(outcome.canonical_height, 1);
-        assert_eq!(store.canonical_height(), 1);
+        let envelope = runtime
+            .mine_candidate(100, Vec::new(), &EmptyAuthenticator, 1)
+            .unwrap();
+        runtime
+            .submit_block(&envelope, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+        assert_eq!(runtime.canonical_height(), 1);
         assert_eq!(
-            store.canonical_state().total_value().unwrap(),
+            runtime.canonical_state().total_value().unwrap(),
             crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS
         );
+        let store = runtime.into_store();
         assert_eq!(store.trusted_record().generation, 1);
         assert_eq!(store.minimum_object_generation(), 2);
         assert!(!dir.0.join(QRUN_PENDING_NAME).exists());
