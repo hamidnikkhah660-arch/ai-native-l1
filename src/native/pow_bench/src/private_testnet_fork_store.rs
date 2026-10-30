@@ -218,6 +218,9 @@ pub struct QRunV05ExternalCasForkStore<P, V> {
     store: PrivateTestnetForkStore,
     client: VerifiedExternalCasClient<P, V>,
     pin: ExternalCasPin,
+    /// Original height-zero Genesis used for CAS identity and supply validation during recovery.
+    /// Checkpoint-rooted local state is not the original Genesis and must not be substituted.
+    genesis_identity: LedgerState,
     owner_account: AccountId,
     trusted_record: ExternalCasRecord,
     minimum_object_generation: u64,
@@ -227,12 +230,12 @@ pub struct QRunV05ExternalCasForkStore<P, V> {
 enum ForkStoreProfile {
     LegacyPtb2,
     QRunV05FeeOnly,
-    QRunV05FeeCheckpoint([u8; 32]),
+    QRunV05FeeCheckpoint([u8; 32], [u8; 32]),
 }
 
 impl ForkStoreProfile {
     fn is_qrun_fee_only(self) -> bool {
-        matches!(self, Self::QRunV05FeeOnly | Self::QRunV05FeeCheckpoint(_))
+        matches!(self, Self::QRunV05FeeOnly | Self::QRunV05FeeCheckpoint(..))
     }
 }
 
@@ -336,6 +339,9 @@ impl PrivateTestnetForkStore {
     /// Open a QRun QFP5 PFS2 suffix store rooted at a QRCP checkpoint whose exact commitment and
     /// monotonic height floor are supplied independently on every open. This constructor does not
     /// contact the external CAS provider; use the CAS wrapper for value-bearing production work.
+    /// Historical CP-0450 compatibility shorthand. Current wallet-bound deployments must use
+    /// open_qrun_v05_fee_only_from_checkpoint_for_owner_genesis with their exact owner.
+    #[allow(clippy::too_many_arguments)]
     pub fn open_qrun_v05_fee_only_from_checkpoint<A: TransactionAuthenticator>(
         directory: impl AsRef<Path>,
         genesis: LedgerState,
@@ -347,33 +353,54 @@ impl PrivateTestnetForkStore {
         minimum_checkpoint_height: u64,
         expected_manifest_anchor: Option<[u8; 32]>,
     ) -> Result<Self, ForkStoreError> {
-        if genesis.network_id()
-            != crate::qrun_v05_profile_identity_candidate::PROPOSED_QRUN_V05_NETWORK_ID
-            || genesis.state_root()
-                != crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_STATE_ROOT
-            || expected_checkpoint_commitment == [0; 32]
+        Self::open_qrun_v05_fee_only_from_checkpoint_for_owner_genesis(
+            directory,
+            genesis,
+            crate::qrun_v05_profile_identity_candidate::PROPOSED_OWNER_ACCOUNT_ID,
+            params,
+            authenticator,
+            clock,
+            checkpoint_bytes,
+            expected_checkpoint_commitment,
+            minimum_checkpoint_height,
+            expected_manifest_anchor,
+        )
+    }
+
+    /// Open a checkpoint-rooted QFP5 suffix after recomputing the exact Genesis from the
+    /// supplied Network ID and owner. The checkpoint must bind that Genesis commitment.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_qrun_v05_fee_only_from_checkpoint_for_owner_genesis<A: TransactionAuthenticator>(
+        directory: impl AsRef<Path>,
+        genesis: LedgerState,
+        owner_account: AccountId,
+        params: ConsensusParameters,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+        checkpoint_bytes: &[u8],
+        expected_checkpoint_commitment: [u8; 32],
+        minimum_checkpoint_height: u64,
+        expected_manifest_anchor: Option<[u8; 32]>,
+    ) -> Result<Self, ForkStoreError> {
+        if expected_checkpoint_commitment == [0; 32]
+            || minimum_checkpoint_height == 0
+            || params.protocol_version != 5
         {
             return Err(ForkStoreError::ManifestProfileMismatch);
         }
-        let frozen = crate::qrun_v05_profile_identity_candidate::build_candidate_genesis()
-            .map_err(|_| ForkStoreError::ManifestProfileMismatch)?;
-        if frozen.commitment()
-            != crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT
-        {
-            return Err(ForkStoreError::ManifestProfileMismatch);
-        }
+        let genesis_commitment = qrun_v05_genesis_commitment_for_owner(&genesis, owner_account)?;
         let mut base_chain =
             crate::qrun_v05_checkpoint_candidate::QRunV05PowCheckpoint::restore_chain_anchored(
                 checkpoint_bytes,
                 &genesis.network_id(),
-                &crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT,
+                &genesis_commitment,
                 &params,
                 expected_checkpoint_commitment,
                 minimum_checkpoint_height,
             )
             .map_err(|_| ForkStoreError::ManifestAnchorMismatch)?;
         base_chain
-            .enable_qrun_v05_fee_only_execution()
+            .enable_qrun_v05_fee_only_execution_for_genesis(genesis_commitment)
             .map_err(|_| ForkStoreError::ManifestProfileMismatch)?;
         let checkpoint_commitment = expected_checkpoint_commitment;
         let base_state = base_chain.state().clone();
@@ -385,7 +412,7 @@ impl PrivateTestnetForkStore {
             clock,
             expected_manifest_anchor,
             Some(base_chain),
-            ForkStoreProfile::QRunV05FeeCheckpoint(checkpoint_commitment),
+            ForkStoreProfile::QRunV05FeeCheckpoint(checkpoint_commitment, genesis_commitment),
         )
     }
 
@@ -451,7 +478,7 @@ impl PrivateTestnetForkStore {
             ForkStoreProfile::QRunV05FeeOnly if base_chain.is_some() => {
                 return Err(ForkStoreError::ManifestProfileMismatch);
             }
-            ForkStoreProfile::QRunV05FeeCheckpoint(_) if base_chain.is_none() => {
+            ForkStoreProfile::QRunV05FeeCheckpoint(_, _) if base_chain.is_none() => {
                 return Err(ForkStoreError::ManifestProfileMismatch);
             }
             _ => {}
@@ -468,23 +495,28 @@ impl PrivateTestnetForkStore {
             ForkStoreProfile::QRunV05FeeOnly => {
                 qrun_v05_fee_profile_fingerprint(&genesis, &params)?
             }
-            ForkStoreProfile::QRunV05FeeCheckpoint(commitment) => {
-                qrun_v05_fee_checkpoint_profile_fingerprint(&genesis, &params, commitment)?
+            ForkStoreProfile::QRunV05FeeCheckpoint(checkpoint_commitment, _) => {
+                qrun_v05_fee_checkpoint_profile_fingerprint(
+                    &genesis,
+                    &params,
+                    checkpoint_commitment,
+                )?
             }
         };
         let empty = match profile {
             ForkStoreProfile::QRunV05FeeOnly => {
                 PrivateTestnetForkChoice::new_qrun_v05_fee_only(genesis.clone(), params.clone())?
             }
-            ForkStoreProfile::QRunV05FeeCheckpoint(commitment) => {
+            ForkStoreProfile::QRunV05FeeCheckpoint(checkpoint_commitment, genesis_commitment) => {
                 let base = base_chain
                     .as_ref()
                     .ok_or(ForkStoreError::ManifestProfileMismatch)?;
-                PrivateTestnetForkChoice::new_qrun_v05_fee_only_from_checkpoint(
+                PrivateTestnetForkChoice::new_qrun_v05_fee_only_from_checkpoint_for_genesis(
                     genesis.clone(),
                     params.clone(),
                     base.clone(),
-                    commitment,
+                    checkpoint_commitment,
+                    genesis_commitment,
                 )?
             }
             ForkStoreProfile::LegacyPtb2 => match base_chain.as_ref() {
@@ -559,15 +591,19 @@ impl PrivateTestnetForkStore {
                         clock,
                     )?
                 }
-                ForkStoreProfile::QRunV05FeeCheckpoint(commitment) => {
+                ForkStoreProfile::QRunV05FeeCheckpoint(
+                    checkpoint_commitment,
+                    genesis_commitment,
+                ) => {
                     let base = base_chain
                         .as_ref()
                         .ok_or(ForkStoreError::ManifestProfileMismatch)?;
-                    PrivateTestnetForkChoice::rebuild_qrun_v05_fee_from_checkpoint(
+                    PrivateTestnetForkChoice::rebuild_qrun_v05_fee_from_checkpoint_for_genesis(
                         genesis.clone(),
                         params.clone(),
                         base.clone(),
-                        commitment,
+                        checkpoint_commitment,
+                        genesis_commitment,
                         envelopes,
                         authenticator,
                         clock,
@@ -754,19 +790,29 @@ impl PrivateTestnetForkStore {
     }
 }
 
+fn qrun_v05_genesis_commitment_for_owner(
+    genesis: &LedgerState,
+    owner_account: AccountId,
+) -> Result<[u8; 32], ForkStoreError> {
+    let expected_genesis = QRunGenesisV05::new(genesis.network_id(), owner_account)
+        .map_err(|_| ForkStoreError::ManifestProfileMismatch)?;
+    if expected_genesis.state_root() != genesis.state_root()
+        || genesis.total_value().ok() != Some(crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS)
+    {
+        return Err(ForkStoreError::ManifestProfileMismatch);
+    }
+    Ok(expected_genesis.commitment())
+}
+
 fn validate_wallet_bound_external_cas_genesis(
     genesis: &LedgerState,
     owner_account: AccountId,
     pin: &ExternalCasPin,
 ) -> Result<(), ForkStoreError> {
     pin.validate()?;
-    let expected_genesis = QRunGenesisV05::new(genesis.network_id(), owner_account)
+    let expected_commitment = qrun_v05_genesis_commitment_for_owner(genesis, owner_account)
         .map_err(|_| ForkStoreError::ExternalAnchorMismatch)?;
-    if pin.network_id != genesis.network_id()
-        || pin.genesis_digest != expected_genesis.commitment()
-        || expected_genesis.state_root() != genesis.state_root()
-        || genesis.total_value().ok() != Some(crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS)
-    {
+    if pin.network_id != genesis.network_id() || pin.genesis_digest != expected_commitment {
         return Err(ForkStoreError::ExternalAnchorMismatch);
     }
     Ok(())
@@ -881,6 +927,7 @@ where
             store,
             client,
             pin,
+            genesis_identity: recovery_genesis,
             owner_account,
             trusted_record: observed,
             minimum_object_generation: object_generation,
@@ -891,6 +938,9 @@ where
     /// local files or consulting the provider, then apply the normal signed-CAS-anchored open.
     /// The caller must independently retain both this checkpoint commitment and its expected
     /// predecessor commitment. The provider pin and bootstrap record remain out-of-band.
+    #[allow(clippy::too_many_arguments)]
+    /// Historical CP-0450 compatibility shorthand. Current wallet-bound deployments must use
+    /// open_from_checkpoint_with_parent_for_owner_genesis with their exact owner account.
     #[allow(clippy::too_many_arguments)]
     pub fn open_from_checkpoint_with_parent<A: TransactionAuthenticator>(
         directory: impl AsRef<Path>,
@@ -907,19 +957,60 @@ where
         trusted_record: ExternalCasRecord,
         minimum_object_generation: u64,
     ) -> Result<Self, ForkStoreError> {
+        Self::open_from_checkpoint_with_parent_for_owner_genesis(
+            directory,
+            genesis,
+            crate::qrun_v05_profile_identity_candidate::PROPOSED_OWNER_ACCOUNT_ID,
+            params,
+            authenticator,
+            clock,
+            checkpoint_bytes,
+            expected_checkpoint_commitment,
+            minimum_checkpoint_height,
+            expected_parent_checkpoint_commitment,
+            pin,
+            client,
+            trusted_record,
+            minimum_object_generation,
+        )
+    }
+
+    /// Strict wallet-bound checkpoint rollover entry point. Validate the exact parent link and
+    /// derive the Genesis commitment from Network ID + explicit owner before opening local storage
+    /// or consulting the provider. Both checkpoint commitments and the provider bootstrap record
+    /// must be retained independently by the caller.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_from_checkpoint_with_parent_for_owner_genesis<A: TransactionAuthenticator>(
+        directory: impl AsRef<Path>,
+        genesis: LedgerState,
+        owner_account: AccountId,
+        params: ConsensusParameters,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+        checkpoint_bytes: &[u8],
+        expected_checkpoint_commitment: [u8; 32],
+        minimum_checkpoint_height: u64,
+        expected_parent_checkpoint_commitment: [u8; 32],
+        pin: ExternalCasPin,
+        client: VerifiedExternalCasClient<P, V>,
+        trusted_record: ExternalCasRecord,
+        minimum_object_generation: u64,
+    ) -> Result<Self, ForkStoreError> {
+        validate_wallet_bound_external_cas_genesis(&genesis, owner_account, &pin)?;
         crate::qrun_v05_checkpoint_candidate::QRunV05PowCheckpoint::decode_anchored_with_parent(
             checkpoint_bytes,
             &genesis.network_id(),
-            &crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT,
+            &pin.genesis_digest,
             &params,
             expected_checkpoint_commitment,
             minimum_checkpoint_height,
             expected_parent_checkpoint_commitment,
         )
         .map_err(|_| ForkStoreError::ManifestAnchorMismatch)?;
-        Self::open_from_checkpoint(
+        Self::open_from_checkpoint_for_owner_genesis(
             directory,
             genesis,
+            owner_account,
             params,
             authenticator,
             clock,
@@ -933,10 +1024,8 @@ where
         )
     }
 
-    /// Open a checkpoint-rooted QFP5 suffix only when the externally retained signed-CAS
-    /// record anchors this exact checkpoint-profile manifest. The provider pin and bootstrap
-    /// record must already be provisioned out-of-band; this method never initializes or advances
-    /// an external provider implicitly. For rollover, prefer open_from_checkpoint_with_parent.
+    /// Historical CP-0450 compatibility shorthand. Current wallet-bound deployments must use
+    /// open_from_checkpoint_for_owner_genesis with their exact owner account.
     #[allow(clippy::too_many_arguments)]
     pub fn open_from_checkpoint<A: TransactionAuthenticator>(
         directory: impl AsRef<Path>,
@@ -948,33 +1037,57 @@ where
         expected_checkpoint_commitment: [u8; 32],
         minimum_checkpoint_height: u64,
         pin: ExternalCasPin,
+        client: VerifiedExternalCasClient<P, V>,
+        trusted_record: ExternalCasRecord,
+        minimum_object_generation: u64,
+    ) -> Result<Self, ForkStoreError> {
+        Self::open_from_checkpoint_for_owner_genesis(
+            directory,
+            genesis,
+            crate::qrun_v05_profile_identity_candidate::PROPOSED_OWNER_ACCOUNT_ID,
+            params,
+            authenticator,
+            clock,
+            checkpoint_bytes,
+            expected_checkpoint_commitment,
+            minimum_checkpoint_height,
+            pin,
+            client,
+            trusted_record,
+            minimum_object_generation,
+        )
+    }
+
+    /// Open a wallet-bound checkpoint-rooted QFP5 suffix. Genesis identity is always recomputed
+    /// from the original height-zero ledger and explicit owner; checkpoint state is used only to
+    /// rebuild the suffix. Pending-CAS recovery receives the original Genesis identity separately
+    /// from the checkpoint state, so a crash during a checkpoint-rooted write remains recoverable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_from_checkpoint_for_owner_genesis<A: TransactionAuthenticator>(
+        directory: impl AsRef<Path>,
+        genesis: LedgerState,
+        owner_account: AccountId,
+        params: ConsensusParameters,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+        checkpoint_bytes: &[u8],
+        expected_checkpoint_commitment: [u8; 32],
+        minimum_checkpoint_height: u64,
+        pin: ExternalCasPin,
         mut client: VerifiedExternalCasClient<P, V>,
         trusted_record: ExternalCasRecord,
         minimum_object_generation: u64,
     ) -> Result<Self, ForkStoreError> {
-        pin.validate()?;
+        validate_wallet_bound_external_cas_genesis(&genesis, owner_account, &pin)?;
         trusted_record.validate_shape()?;
         if params.protocol_version != 5
             || minimum_checkpoint_height == 0
             || expected_checkpoint_commitment == [0; 32]
             || minimum_object_generation == 0
             || !client.is_pinned_to(&pin)
-            || pin.network_id != genesis.network_id()
-            || pin.network_id
-                != crate::qrun_v05_profile_identity_candidate::PROPOSED_QRUN_V05_NETWORK_ID
-            || pin.genesis_digest
-                != crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT
             || trusted_record.provider_id != pin.provider_id
             || trusted_record.network_id != pin.network_id
             || trusted_record.genesis_digest != pin.genesis_digest
-        {
-            return Err(ForkStoreError::ExternalAnchorMismatch);
-        }
-        let frozen_genesis = crate::qrun_v05_profile_identity_candidate::build_candidate_genesis()
-            .map_err(|_| ForkStoreError::ExternalAnchorMismatch)?;
-        if frozen_genesis.state_root() != genesis.state_root()
-            || frozen_genesis.commitment()
-                != crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT
         {
             return Err(ForkStoreError::ExternalAnchorMismatch);
         }
@@ -983,7 +1096,7 @@ where
             crate::qrun_v05_checkpoint_candidate::QRunV05PowCheckpoint::restore_chain_anchored(
                 checkpoint_bytes,
                 &genesis.network_id(),
-                &crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT,
+                &pin.genesis_digest,
                 &params,
                 expected_checkpoint_commitment,
                 minimum_checkpoint_height,
@@ -1006,7 +1119,10 @@ where
         )?
         .genesis_tip();
 
-        let recovery_genesis = base_state.clone();
+        // Keep the original height-zero Genesis for domain/supply validation during crash
+        // recovery. The checkpoint state is a different object and must not be substituted here.
+        let recovery_genesis = genesis.clone();
+        let recovery_owner_account = owner_account;
         let recovery_pin = pin.clone();
         let recovery_profile_fingerprint = profile_fingerprint;
         let recovery_genesis_tip = expected_genesis_tip;
@@ -1014,7 +1130,7 @@ where
             recover_pending_external_cas(
                 path,
                 &recovery_genesis,
-                crate::qrun_v05_profile_identity_candidate::PROPOSED_OWNER_ACCOUNT_ID,
+                recovery_owner_account,
                 &recovery_pin,
                 &recovery_profile_fingerprint,
                 &recovery_genesis_tip,
@@ -1031,7 +1147,10 @@ where
             clock,
             Some(trusted_record.next_state_digest),
             Some(base_chain),
-            ForkStoreProfile::QRunV05FeeCheckpoint(expected_checkpoint_commitment),
+            ForkStoreProfile::QRunV05FeeCheckpoint(
+                expected_checkpoint_commitment,
+                pin.genesis_digest,
+            ),
             Some(&mut recovery),
         )?;
         drop(recovery);
@@ -1046,7 +1165,8 @@ where
             store,
             client,
             pin,
-            owner_account: crate::qrun_v05_profile_identity_candidate::PROPOSED_OWNER_ACCOUNT_ID,
+            genesis_identity: recovery_genesis,
+            owner_account,
             trusted_record: observed,
             minimum_object_generation: object_generation,
         })
@@ -1238,7 +1358,7 @@ where
                 // only from a fresh, signed read of the exact pending successor.
                 match recover_pending_external_cas(
                     &self.store.directory,
-                    &self.store.genesis,
+                    &self.genesis_identity,
                     self.owner_account,
                     &self.pin,
                     &self.store.profile_fingerprint,
@@ -1348,8 +1468,7 @@ fn qrun_v05_fee_checkpoint_profile_fingerprint(
     checkpoint_commitment: [u8; 32],
 ) -> Result<[u8; 32], ForkStoreError> {
     if checkpoint_commitment == [0; 32]
-        || base_state.network_id()
-            != crate::qrun_v05_profile_identity_candidate::PROPOSED_QRUN_V05_NETWORK_ID
+        || base_state.network_id().iter().all(|byte| *byte == 0)
         || base_state.height() == 0
         || base_state.total_value().ok() != Some(crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS)
     {
@@ -3161,6 +3280,259 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reopened.canonical_height(), 1);
+        assert_eq!(
+            reopened.canonical_state().total_value().unwrap(),
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+        );
+        assert_eq!(reopened.trusted_record().generation, 1);
+    }
+
+    #[test]
+    fn qrun_wallet_bound_external_cas_checkpoint_rollover_recovers_lost_receipt_and_reopens() {
+        const WALLET_BOUND_NETWORK_ID: [u8; 32] = [
+            0x8b, 0x5d, 0x16, 0x92, 0x05, 0xac, 0x49, 0xcb, 0x98, 0x66, 0xa9, 0xd2, 0x7f, 0xf1,
+            0xa6, 0xc3, 0xc2, 0x57, 0x1f, 0xca, 0x65, 0xf6, 0x34, 0x85, 0x4c, 0x41, 0xc1, 0x12,
+            0xe5, 0x06, 0xae, 0xbb,
+        ];
+        const WALLET_BOUND_OWNER: AccountId = [
+            0xa1, 0x4d, 0x67, 0xbd, 0x19, 0x5c, 0x6a, 0x00, 0x44, 0xbe, 0xda, 0xc8, 0x53, 0x2e,
+            0x74, 0x28, 0x11, 0xf9, 0x25, 0x01, 0x63, 0x07, 0x64, 0xd7, 0x3a, 0x98, 0xb2, 0xf0,
+            0xcc, 0x33, 0x5f, 0xdd,
+        ];
+
+        let dir = TestDir::new();
+        let genesis_candidate =
+            QRunGenesisV05::new(WALLET_BOUND_NETWORK_ID, WALLET_BOUND_OWNER).unwrap();
+        let genesis = genesis_candidate.ledger().clone();
+        let mut params = params();
+        params.protocol_version = 5;
+        params.initial_target = Uint256::MAX;
+        params.pow_limit = Uint256::MAX;
+        params.pow.memory_kib = 8;
+        params.pow.iterations = 1;
+        params.pow.lanes = 1;
+
+        // Produce a one-block checkpoint whose parent is the exact Genesis checkpoint.
+        let mut archive =
+            PrivateTestnetForkChoice::new_qrun_v05_fee_only(genesis.clone(), params.clone())
+                .unwrap();
+        let genesis_checkpoint =
+            crate::qrun_v05_checkpoint_candidate::QRunV05PowCheckpoint::capture(
+                WALLET_BOUND_NETWORK_ID,
+                genesis_candidate.commitment(),
+                &params,
+                archive.canonical_chain(),
+                [0; 32],
+            )
+            .unwrap();
+        let genesis_checkpoint_commitment = genesis_checkpoint.commitment(&params).unwrap();
+        let first = qrun_fee_envelope(&genesis, &params);
+        archive
+            .insert_encoded(&first, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+        let checkpoint = crate::qrun_v05_checkpoint_candidate::QRunV05PowCheckpoint::capture(
+            WALLET_BOUND_NETWORK_ID,
+            genesis_candidate.commitment(),
+            &params,
+            archive.canonical_chain(),
+            genesis_checkpoint_commitment,
+        )
+        .unwrap();
+        let checkpoint_bytes = checkpoint.encode(&params).unwrap();
+        let checkpoint_commitment = checkpoint.commitment(&params).unwrap();
+
+        // Assert the wallet-bound Genesis and checkpoint commitments independently before
+        // exercising the owner-aware local PFS2 opener.
+        assert_eq!(
+            qrun_v05_genesis_commitment_for_owner(&genesis, WALLET_BOUND_OWNER).unwrap(),
+            genesis_candidate.commitment()
+        );
+        assert_eq!(
+            crate::qrun_v05_checkpoint_candidate::QRunV05PowCheckpoint::restore_chain_anchored(
+                &checkpoint_bytes,
+                &WALLET_BOUND_NETWORK_ID,
+                &genesis_candidate.commitment(),
+                &params,
+                checkpoint_commitment,
+                1,
+            )
+            .unwrap()
+            .state()
+            .height(),
+            1
+        );
+
+        // Create the exact local checkpoint-rooted manifest without assuming the historical owner.
+        let local =
+            PrivateTestnetForkStore::open_qrun_v05_fee_only_from_checkpoint_for_owner_genesis(
+                &dir.0,
+                genesis.clone(),
+                WALLET_BOUND_OWNER,
+                params.clone(),
+                &EmptyAuthenticator,
+                &FixedClock,
+                &checkpoint_bytes,
+                checkpoint_commitment,
+                1,
+                None,
+            )
+            .unwrap();
+        let initial_anchor = local.manifest_anchor().unwrap();
+        assert_eq!(local.canonical_height(), 1);
+        drop(local);
+
+        let receipt_keys = portable::generate_key_pair([0x5Bu8; 32]);
+        let signing_key = Arc::new(receipt_keys.signing_key);
+        let public_key: [u8; crate::v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES] =
+            *receipt_keys.verification_key.as_ref();
+        let pin = ExternalCasPin {
+            provider_id: [0xD1; 32],
+            network_id: WALLET_BOUND_NETWORK_ID,
+            genesis_digest: genesis_candidate.commitment(),
+            receipt_key_id: [0xD2; 32],
+            receipt_public_key: public_key,
+        };
+        let bootstrap = ExternalCasRecord {
+            generation: 0,
+            provider_id: pin.provider_id,
+            network_id: pin.network_id,
+            genesis_digest: pin.genesis_digest,
+            previous_record_digest: [0; 32],
+            previous_state_digest: [0; 32],
+            next_state_digest: initial_anchor,
+            operation_id: [0xD3; 32],
+            request_digest: [0xD4; 32],
+        };
+        let shared = Arc::new(Mutex::new(MemoryCasState {
+            record: bootstrap.clone(),
+            object_generation: 1,
+            // Force the second-block submit to recover through a newly signed provider read.
+            lose_next_commit_response: true,
+            reject_next_commit_before_apply: false,
+        }));
+        let sign_key_1 = signing_key.clone();
+        let provider = make_memory_cas_provider(pin.clone(), shared.clone(), move |mut receipt| {
+            let digest = receipt.signing_digest().unwrap();
+            receipt.signature = *portable::sign(&sign_key_1, &digest, &[], [0x73u8; 32])
+                .unwrap()
+                .as_ref();
+            receipt
+        });
+        let client =
+            VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
+                .unwrap();
+
+        // Wrong owner must fail before creating a local manifest or reading/advancing the provider.
+        let rejected_dir = TestDir::new();
+        let rejected_provider =
+            make_memory_cas_provider(pin.clone(), shared.clone(), |receipt| receipt);
+        let rejected_client = VerifiedExternalCasClient::new(
+            pin.clone(),
+            rejected_provider,
+            LibcruxMlDsa65VerifierCandidate,
+        )
+        .unwrap();
+        assert!(matches!(
+            QRunV05ExternalCasForkStore::open_from_checkpoint_with_parent_for_owner_genesis(
+                &rejected_dir.0,
+                genesis.clone(),
+                [0xEF; 32],
+                params.clone(),
+                &EmptyAuthenticator,
+                &FixedClock,
+                &checkpoint_bytes,
+                checkpoint_commitment,
+                1,
+                genesis_checkpoint_commitment,
+                pin.clone(),
+                rejected_client,
+                bootstrap.clone(),
+                1,
+            ),
+            Err(ForkStoreError::ExternalAnchorMismatch)
+        ));
+        assert!(!rejected_dir.0.join(MANIFEST_NAME).exists());
+        assert_eq!(shared.lock().unwrap().record, bootstrap);
+
+        let mut store =
+            QRunV05ExternalCasForkStore::open_from_checkpoint_with_parent_for_owner_genesis(
+                &dir.0,
+                genesis.clone(),
+                WALLET_BOUND_OWNER,
+                params.clone(),
+                &EmptyAuthenticator,
+                &FixedClock,
+                &checkpoint_bytes,
+                checkpoint_commitment,
+                1,
+                genesis_checkpoint_commitment,
+                pin.clone(),
+                client,
+                bootstrap,
+                1,
+            )
+            .unwrap();
+        assert_eq!(store.canonical_height(), 1);
+        assert_eq!(store.owner_account, WALLET_BOUND_OWNER);
+        assert_eq!(
+            store.canonical_state().total_value().unwrap(),
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+        );
+
+        let second = qrun_fee_envelope_from_chain(
+            store.archive().canonical_chain(),
+            &params,
+            [0x77; 32],
+            200,
+        );
+        store
+            .submit(&second, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+        assert_eq!(store.canonical_height(), 2);
+        assert_eq!(store.trusted_record().generation, 1);
+        assert_eq!(store.minimum_object_generation(), 2);
+        assert!(!dir.0.join(QRUN_PENDING_NAME).exists());
+        {
+            let remote = shared.lock().unwrap();
+            assert_eq!(remote.record, *store.trusted_record());
+            assert_eq!(remote.object_generation, 2);
+            assert!(!remote.lose_next_commit_response);
+        }
+        let trusted = store.trusted_record().clone();
+        let minimum_object_generation = store.minimum_object_generation();
+        drop(store);
+
+        let sign_key_2 = signing_key.clone();
+        let provider = make_memory_cas_provider(pin.clone(), shared.clone(), move |mut receipt| {
+            let digest = receipt.signing_digest().unwrap();
+            receipt.signature = *portable::sign(&sign_key_2, &digest, &[], [0x73u8; 32])
+                .unwrap()
+                .as_ref();
+            receipt
+        });
+        let client =
+            VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
+                .unwrap();
+        let reopened =
+            QRunV05ExternalCasForkStore::open_from_checkpoint_with_parent_for_owner_genesis(
+                &dir.0,
+                genesis,
+                WALLET_BOUND_OWNER,
+                params,
+                &EmptyAuthenticator,
+                &FixedClock,
+                &checkpoint_bytes,
+                checkpoint_commitment,
+                1,
+                genesis_checkpoint_commitment,
+                pin,
+                client,
+                trusted,
+                minimum_object_generation,
+            )
+            .unwrap();
+        assert_eq!(reopened.canonical_height(), 2);
+        assert_eq!(reopened.owner_account, WALLET_BOUND_OWNER);
         assert_eq!(
             reopened.canonical_state().total_value().unwrap(),
             crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS
