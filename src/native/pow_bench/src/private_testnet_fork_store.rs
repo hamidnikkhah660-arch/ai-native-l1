@@ -218,6 +218,7 @@ pub struct QRunV05ExternalCasForkStore<P, V> {
     store: PrivateTestnetForkStore,
     client: VerifiedExternalCasClient<P, V>,
     pin: ExternalCasPin,
+    owner_account: AccountId,
     trusted_record: ExternalCasRecord,
     minimum_object_generation: u64,
 }
@@ -826,6 +827,7 @@ where
             recover_pending_external_cas(
                 directory,
                 &recovery_genesis,
+                owner_account,
                 &recovery_pin,
                 &recovery_profile_fingerprint,
                 &recovery_genesis_tip,
@@ -860,6 +862,7 @@ where
             store,
             client,
             pin,
+            owner_account,
             trusted_record: observed,
             minimum_object_generation: object_generation,
         })
@@ -992,6 +995,7 @@ where
             recover_pending_external_cas(
                 path,
                 &recovery_genesis,
+                crate::qrun_v05_profile_identity_candidate::PROPOSED_OWNER_ACCOUNT_ID,
                 &recovery_pin,
                 &recovery_profile_fingerprint,
                 &recovery_genesis_tip,
@@ -1023,6 +1027,7 @@ where
             store,
             client,
             pin,
+            owner_account: crate::qrun_v05_profile_identity_candidate::PROPOSED_OWNER_ACCOUNT_ID,
             trusted_record: observed,
             minimum_object_generation: object_generation,
         })
@@ -1194,6 +1199,7 @@ where
                 match recover_pending_external_cas(
                     &self.store.directory,
                     &self.store.genesis,
+                    self.owner_account,
                     &self.pin,
                     &self.store.profile_fingerprint,
                     &self.store.genesis_tip,
@@ -1466,6 +1472,7 @@ where
 fn recover_pending_external_cas<P, V>(
     directory: &Path,
     genesis: &LedgerState,
+    owner_account: AccountId,
     pin: &ExternalCasPin,
     expected_profile_fingerprint: &[u8; 32],
     expected_genesis_tip: &[u8; 32],
@@ -1493,6 +1500,8 @@ where
     })?;
     let pending = decode_pending_external_cas_commit(&bytes)?;
     pin.validate()?;
+    let expected_genesis = QRunGenesisV05::new(genesis.network_id(), owner_account)
+        .map_err(|_| ForkStoreError::PendingAnchorMalformed)?;
     if pending.previous_record.provider_id != pin.provider_id
         || pending.next_record.provider_id != pin.provider_id
         || pending.previous_record.network_id != pin.network_id
@@ -1500,8 +1509,9 @@ where
         || pending.previous_record.genesis_digest != pin.genesis_digest
         || pending.next_record.genesis_digest != pin.genesis_digest
         || genesis.network_id() != pin.network_id
-        || pin.genesis_digest
-            != crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT
+        || expected_genesis.commitment() != pin.genesis_digest
+        || expected_genesis.state_root() != genesis.state_root()
+        || genesis.total_value().ok() != Some(crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS)
     {
         return Err(ForkStoreError::PendingAnchorMalformed);
     }
@@ -2954,9 +2964,20 @@ mod tests {
     }
 
     #[test]
-    fn qrun_external_cas_store_resolves_lost_receipt_and_reopens_on_signed_anchor() {
+    fn qrun_wallet_bound_external_cas_store_resolves_lost_receipt_and_reopens() {
+        const WALLET_BOUND_NETWORK_ID: [u8; 32] = [
+            0x8b, 0x5d, 0x16, 0x92, 0x05, 0xac, 0x49, 0xcb, 0x98, 0x66, 0xa9, 0xd2, 0x7f, 0xf1,
+            0xa6, 0xc3, 0xc2, 0x57, 0x1f, 0xca, 0x65, 0xf6, 0x34, 0x85, 0x4c, 0x41, 0xc1, 0x12,
+            0xe5, 0x06, 0xae, 0xbb,
+        ];
+        const WALLET_BOUND_OWNER: crate::state_machine::AccountId = [
+            0xa1, 0x4d, 0x67, 0xbd, 0x19, 0x5c, 0x6a, 0x00, 0x44, 0xbe, 0xda, 0xc8, 0x53, 0x2e,
+            0x74, 0x28, 0x11, 0xf9, 0x25, 0x01, 0x63, 0x07, 0x64, 0xd7, 0x3a, 0x98, 0xb2, 0xf0,
+            0xcc, 0x33, 0x5f, 0xdd,
+        ];
+
         let dir = TestDir::new();
-        let genesis = crate::qrun_v05_profile_identity_candidate::build_candidate_genesis()
+        let genesis = QRunGenesisV05::new(WALLET_BOUND_NETWORK_ID, WALLET_BOUND_OWNER)
             .unwrap()
             .ledger()
             .clone();
@@ -2988,8 +3009,13 @@ mod tests {
             *keypair.verification_key.as_ref();
         let pin = ExternalCasPin {
             provider_id: [0x91; 32],
-            network_id: genesis.network_id(),
-            genesis_digest: crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT,
+            network_id: WALLET_BOUND_NETWORK_ID,
+            genesis_digest: crate::qrun_v05_genesis_candidate::QRunGenesisV05::new(
+                WALLET_BOUND_NETWORK_ID,
+                WALLET_BOUND_OWNER,
+            )
+            .unwrap()
+            .commitment(),
             receipt_key_id: [0x92; 32],
             receipt_public_key: public_key,
         };
@@ -3021,9 +3047,10 @@ mod tests {
         let client =
             VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
                 .unwrap();
-        let mut store = QRunV05ExternalCasForkStore::open(
+        let mut store = QRunV05ExternalCasForkStore::open_for_owner_genesis(
             &dir.0,
             genesis.clone(),
+            WALLET_BOUND_OWNER,
             params.clone(),
             &EmptyAuthenticator,
             &FixedClock,
@@ -3057,7 +3084,7 @@ mod tests {
         let minimum_object_generation = store.minimum_object_generation();
         drop(store);
 
-        // A new client process can reopen only using the independently retained signed record.
+        // Reopen only with the same wallet-bound identity and independently retained signed record.
         let sign_key_2 = signing_key.clone();
         let provider = make_memory_cas_provider(pin.clone(), shared.clone(), move |mut receipt| {
             let digest = receipt.signing_digest().unwrap();
@@ -3069,9 +3096,10 @@ mod tests {
         let client =
             VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
                 .unwrap();
-        let reopened = QRunV05ExternalCasForkStore::open(
+        let reopened = QRunV05ExternalCasForkStore::open_for_owner_genesis(
             &dir.0,
             genesis,
+            WALLET_BOUND_OWNER,
             params,
             &EmptyAuthenticator,
             &FixedClock,

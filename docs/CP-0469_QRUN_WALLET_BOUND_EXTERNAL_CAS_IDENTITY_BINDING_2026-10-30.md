@@ -22,14 +22,15 @@ A second mismatch was in the node's profile/store selector: it recognized only t
 1. Added QRunV05ExternalCasForkStore::open_for_owner_genesis. It recomputes the full-supply Genesis from the supplied Network ID and owner account, then checks that the supplied ledger root, fixed supply, external-CAS pin domain, provider record domain and QFP5 profile agree. It still requires an independently provisioned provider pin, signed bootstrap record, verifier and nonzero object-generation floor; it does not create or simulate an independent provider.
 2. Retained the old open convenience method for the historical proposed owner identity, so existing historical fixtures remain usable.
 3. Updated the QRun node identity selector to recognize both the explicitly retained historical candidate and the current wallet-bound candidate. Arbitrary network/owner pairs are not accepted as either frozen identity.
-4. Added regression coverage that binds the exact current wallet-bound Network ID, owner account, Genesis commitment and state root to the external-CAS pin domain, and rejects mismatched owner, network or Genesis values.
+4. Retained the owner account in the external-CAS store wrapper and made pending-commit recovery recompute the expected Genesis from that owner. This removes the second CP-0450 hard-coded commitment check that previously rejected a correctly pinned CP-0468 identity after a lost CAS response.
+5. Added an end-to-end wallet-bound CAS integration regression using the existing signed in-memory provider fixture: open the current identity, submit QFP5, lose the first commit response after the provider applies it, resolve by fresh signed read, close the store, and reopen with the independently retained signed record.
 
 ## Validation performed
 
 - cargo +stable fmt --manifest-path src/native/pow_bench/Cargo.toml --all: PASS.
 - cargo +stable test --manifest-path src/native/pow_bench/Cargo.toml --bin qrun_v05_pow_local_node qrun_v05_identity_recognizes_current_wallet_bound_and_historical_candidate --locked --offline: PASS, 1/1.
 - cargo +stable test --manifest-path src/native/pow_bench/Cargo.toml --lib wallet_bound_genesis_identity_matches_external_cas_pin_domain --locked --offline: PASS, 1/1.
-- Existing CAS lost-receipt recovery regression qrun_external_cas_store_resolves_lost_receipt_and_reopens_on_signed_anchor: PASS, 1/1.
+- Wallet-bound end-to-end CAS lost-receipt/reopen regression qrun_wallet_bound_external_cas_store_resolves_lost_receipt_and_reopens: PASS, 1/1. It validates the CP-0468 Genesis identity, signed CAS generation advance, ambiguous/lost response recovery, and reopen with the retained signed record.
 - cargo +stable check --manifest-path src/native/pow_bench/Cargo.toml --all-targets --locked --offline: PASS. Existing unused/dead-code warnings remain in unrelated candidate modules and node tests.
 - Exact-head GitHub CI has not yet run for this follow-up branch.
 
@@ -37,7 +38,7 @@ A second mismatch was in the node's profile/store selector: it recognized only t
 
 - ExternalCasProviderTransport is still a trait boundary; the available in-memory provider is a test fixture. No concrete independently operated network provider/adapter or service deployment is verified.
 - The executable's current runtime still opens QRunV05PowForkRuntime::open; it does not yet construct QRunV05ExternalCasForkStore or route every accepted local/peer block through external CAS before canonical publication.
-- The signed CAS record, receipt-key pin and monotonic object-generation floor still need durable out-of-band provisioning and recovery that is independent of the mutable node data directory and its backup/rollback domain.
+- The signed CAS record, receipt-key pin and monotonic object-generation floor still need durable out-of-band provisioning and recovery that is independent of the mutable node data directory and its backup/rollback domain. The in-memory provider regression exercises the protocol contract only; it does not qualify a cloud service or operator.
 - The checkpoint-rooted external-CAS open/rollover helpers still retain historical identity assumptions and require a wallet-bound owner-aware counterpart before they can serve the current identity.
 - Required adversarial tests include provider outage, ambiguous/lost commit receipts, retry/idempotency, concurrent CAS conflicts, signed equivocation, stale object generations, local disk rollback, crash windows and checkpoint-parent rollback.
 - Production consensus is still a candidate; the recorded calibration evidence represents two independent operators, below the three-operator evidence target. Full-history/recovery integration, external P2P reachability, independent security review and operations remain open.
