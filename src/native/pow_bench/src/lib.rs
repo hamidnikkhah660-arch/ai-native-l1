@@ -31,6 +31,7 @@ pub mod devnet_signed_peer_identity_candidate;
 pub mod difficulty_adjustment_candidates;
 /// CP-0313 canonical external append-only CAS record and ML-DSA receipt candidate; no provider runtime or consensus callsite.
 pub mod external_cas_anchor_candidate;
+pub mod external_cas_noise_transport_candidate;
 pub mod governance_root_chain;
 pub mod identity_generation_store;
 pub mod identity_policy;
