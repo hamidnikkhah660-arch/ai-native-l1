@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Current v0.4 tokenomics/documentation preflight; legacy CP-0343 arithmetic is historical-only."""
+"""Historical CP-0422/v0.4 proposal preflight; does not validate current CP-0437 Genesis policy."""
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -89,9 +89,16 @@ for label, (percent, amount) in BUCKETS.items():
 assert "1B / 10%" in policy and "1B / 10%" in readme
 assert "CP-0422" in readme and "CP-0422" in roadmap and "CP-0422" in policy
 assert "HISTORICAL_V03_ONLY" in historical_checker
-assert "current v0.4 allocator" in readme
+assert "historical CP-0422/v0.4 proposal preflight only" in readme
 assert "never restores mint headroom" in policy.lower()
 assert "historical" in decision.lower() and "1,000,000,000 QZXB (10%" in decision
+current_genesis = load("docs/CP-0437_QRUN_FULL_SUPPLY_GENESIS_DIRECTION_2026-10-28.md")
+assert "10,000,000,000 QZXB (100% of supply)" in current_genesis
+assert "Subsequent minting and miner subsidy: **zero**" in current_genesis
+assert "CP-0437" in readme and "zero block subsidy" in readme.lower()
+assert "Historical v0.4 mining and halving research model" in site
+assert "superseded for current QRun Genesis by CP-0437" in site
+assert "CP-0437 (2026-10-28) later supersedes" in roadmap
 assert "Gate 2" in policy and "Gate 8" in policy
 
 # Independent arithmetic parity with the recorded v0.4 issuance oracle:
@@ -114,8 +121,8 @@ class HTMLSmokeParser(HTMLParser):
 
 
 HTMLSmokeParser().feed(site)
-print("QZXB_TOKENOMICS_V04_CHECK=PASS")
+print("QZXB_TOKENOMICS_V04_HISTORICAL_CHECK=PASS")
 print(f"cap={CAP}; buckets={len(BUCKETS)}; percentages={sum(p for p, _ in BUCKETS.values())}; amounts={sum(n for _, n in BUCKETS.values())}")
-print("founder=1000000000 (10%); old_4B_policy=historical_only; gross_issuance_and_burn=distinct")
+print("historical_CP-0422_founder=1000000000 (10%); superseded_by_CP-0437=10B_genesis; zero_post_genesis_issuance_and_subsidy")
 print(f"mining_emission_atoms={cumulative_mining_atoms}; unissued_mining_residual_atoms={mining_residual_atoms}")
 print("readme_site_whitepaper_roadmap_policy=checked; rust_schedule_is_pinned; qzbe_checkpoint_store_runtime_multi_peer_durable_replay=checked; gate_2_and_gate_8_remain_open")

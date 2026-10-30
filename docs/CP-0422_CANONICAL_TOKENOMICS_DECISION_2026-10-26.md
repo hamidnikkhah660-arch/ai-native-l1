@@ -61,7 +61,7 @@ The current v0.4 Genesis candidate records only the 1B founder balance. Other ca
 
 ## 5. Version boundary: preserve history, do not silently downgrade
 
-The old v3 policy/state machine and v0.3 sponsor calculator may retain 4B/40% arithmetic only as historical protocol/test material. They must be marked **historical v0.3 only** and must not be presented as current v0.4 policy. Do not rewrite old policy fingerprints or snapshots in place. The current v0.4 tokenomics checker is the active policy arithmetic check.
+The old v3 policy/state machine and v0.3 sponsor calculator may retain 4B/40% arithmetic only as historical protocol/test material. They must be marked **historical v0.3 only** and must not be presented as current v0.4 policy. Do not rewrite old policy fingerprints or snapshots in place. The v0.4 tokenomics checker validates this historical CP-0422 proposal only; CP-0437 later supersedes the allocation model for the current QRun Genesis target, so this checker is not a validator of the active Genesis policy.
 
 ## 6. Required reconciliation before a production Genesis
 

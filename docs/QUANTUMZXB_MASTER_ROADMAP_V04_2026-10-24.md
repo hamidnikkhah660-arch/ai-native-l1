@@ -14,7 +14,7 @@ A native QZXB Mainnet launch and a QZXB/USDT market are separate decisions. Do n
 
 ## Canonical monetary decision
 
-The latest founder-directed allocation is recorded in [CP-0422 — Canonical Tokenomics Decision](CP-0422_CANONICAL_TOKENOMICS_DECISION_2026-10-26.md): 10B QZXB maximum cap, 1B / 10% founder envelope and seven other v0.4 category ceilings. This resolves intent only. Gate 2 remains open until the policy is integrated and proven through the actual canonical producer/importer, fork choice, durable store, replay, reorg and state-root paths; the older v0.3 policy remains historical and must not be silently reinterpreted.
+The historical v0.4 proposal is recorded in [CP-0422 - Canonical Tokenomics Decision](CP-0422_CANONICAL_TOKENOMICS_DECISION_2026-10-26.md): a 10B QZXB maximum cap, a 1B / 10% founder ceiling and seven other category ceilings. CP-0437 (2026-10-28) later supersedes that allocation model for the current QRun Genesis target: 10B QZXB credited to one owner account at Genesis, zero post-Genesis minting and zero block subsidy. This is still a candidate direction, not live supply. Gate 2 remains open until the CP-0437 Genesis and zero-issuance policy are proven through canonical production/import, fork choice, durable storage, replay, reorg and state-root paths.
 
 ## Executive status
 
