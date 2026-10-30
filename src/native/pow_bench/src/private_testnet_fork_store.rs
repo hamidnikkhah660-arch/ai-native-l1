@@ -4058,6 +4058,22 @@ mod tests {
             previous_object_generation
         );
 
+        // Simulate a third crash boundary: QCF1 has been advanced to the exact signed
+        // successor, but the process dies before deleting QAP1. Recovery must be idempotent
+        // when the independent floor already names the successor.
+        let floor_before_marker_cleanup =
+            ExternalCasFloorStore::open(&floor_dir.0, pin.clone()).unwrap();
+        floor_before_marker_cleanup
+            .reconcile_verified_observation(&recovered_record, next_object_generation)
+            .unwrap();
+        assert!(dir.0.join(QRUN_PENDING_NAME).is_file());
+        let floor_already_advanced = floor_before_marker_cleanup.snapshot().unwrap();
+        assert_eq!(floor_already_advanced.trusted_record, recovered_record);
+        assert_eq!(
+            floor_already_advanced.minimum_object_generation,
+            next_object_generation
+        );
+
         let floor = ExternalCasFloorStore::open(&floor_dir.0, pin.clone()).unwrap();
         let reopened =
             QRunV05ExternalCasForkStore::open_from_checkpoint_with_parent_for_owner_genesis_and_floor(
