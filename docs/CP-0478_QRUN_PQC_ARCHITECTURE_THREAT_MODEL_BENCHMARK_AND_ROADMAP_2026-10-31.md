@@ -1,4 +1,4 @@
-# CP-0476 — QRun PQC Architecture, Threat Model, Benchmark Plan and Integration Roadmap
+# CP-0478 — QRun PQC Architecture, Threat Model, Benchmark Plan and Integration Roadmap
 
 Date: 2026-10-31
 
