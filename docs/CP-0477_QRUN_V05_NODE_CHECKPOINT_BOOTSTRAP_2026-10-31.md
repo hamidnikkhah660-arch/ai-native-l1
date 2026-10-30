@@ -23,10 +23,12 @@ These options are all-or-none and are accepted only with the complete external-C
 2. Read the QRCP using a bounded, non-symlink regular-file check.
 3. Validate QRCP checksum, exact commitment, network, Genesis, consensus profile, supply, state metadata, target-history height, minimum height, and independently supplied parent commitment.
 4. Only after QRCP validation, read and validate the external-CAS ECR1 bootstrap and remaining receipt/Noise configuration.
-5. For a **new** node data directory only, create the deterministic empty QFP5 PFS2 suffix manifest rooted at the supplied checkpoint. Compare its exact manifest commitment with ECR1 `next_state_digest`. Existing directories are not silently recreated or repaired.
-6. Initialize or reopen the separate QCF1 monotonic floor from the ECR1 bootstrap. The regular external-CAS opener then performs its pinned Noise/TCP provider read, verifies the signed receipt and exact manifest digest, and reconciles the floor.
-7. Construct the QRun runtime only after verifying the original height-zero Genesis identity and the checkpoint-specific profile fingerprint. A checkpoint-backed replay base is not substituted for the original Genesis identity.
-8. Writes continue through the existing external compare-and-swap path; the integration test confirms the signed provider generation and QCF1 object-generation floor advance together, followed by a successful restart.
+5. For a new node directory with no pre-existing QCF1 floor, create the deterministic empty QFP5 PFS2 suffix manifest rooted at the supplied checkpoint and compare its exact manifest commitment with the generation-zero ECR1 `next_state_digest`. If a failed first boot left only that empty manifest, a retry must still match it to ECR1 before any floor initialization.
+6. If QCF1 does not exist but a PFS2 directory remains from a failed first boot, require its manifest to match the generation-zero ECR1 anchor before initializing QCF1. Once QCF1 exists, do not pre-stage or compare a potentially newer PFS2 manifest to the old ECR1 digest. ECR1 is never rewritten after later CAS commits.
+7. With an existing QCF1 floor, hand the validated QRCP, floor, and local store to the external-CAS opener. It first processes its durable pending-CAS recovery journal, then verifies the current manifest against the independently retained floor and a fresh signed provider observation. This preserves recovery if a crash occurred after provider CAS or local manifest replacement but before floor advancement. If QCF1 exists while the PFS2 directory/manifest is missing, startup fails closed rather than creating a new empty suffix.
+8. On first boot, initialize QCF1 from the generation-zero ECR1 only after the staged empty PFS2 manifest matches it. On restart, reopen the existing floor; never reinitialize it from ECR1 or roll its digest backward.
+9. Construct the QRun runtime only after verifying the original height-zero Genesis identity and the checkpoint-specific profile fingerprint. A checkpoint-backed replay base is not substituted for the original Genesis identity.
+10. Writes continue through the existing external compare-and-swap path; the integration test confirms the signed provider generation and QCF1 object-generation floor advance together, followed by a successful restart.
 
 ## Failure behavior and tests
 
@@ -35,6 +37,7 @@ The Windows integration test exercises:
 - A wrong parent checkpoint commitment: rejected before local node-store or QCF1-floor creation.
 - A wrong QRCP commitment: rejected before local node-store or QCF1-floor creation.
 - An ECR1 digest that does not match the deterministic checkpoint-rooted PFS2 manifest: rejected before QCF1 initialization.
+- Retrying the same bad ECR1 against the already staged empty manifest: rejected again without creating QCF1; restoring the correct ECR1 then permits first boot.
 - A valid checkpoint with its exact parent and ECR1 manifest anchor: node starts at checkpoint height, mines/submits the next block through the authenticated external-CAS provider, advances the QCF1 floor, and restarts with identical canonical tip and state root.
 
 The CLI parser test verifies the four checkpoint flags are all-or-none, have nonzero/positive values, and cannot be supplied without the full external-CAS pin configuration.

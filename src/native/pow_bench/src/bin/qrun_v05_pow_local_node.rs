@@ -351,46 +351,50 @@ fn open_node_runtime<A: TransactionAuthenticator>(
         );
     }
 
-    // A brand-new checkpoint-rooted node must first persist the deterministic empty suffix
-    // manifest. Its anchor is compared with the independently supplied ECR1 before the QCF1 floor
-    // is initialized; the external-CAS opener then verifies the provider's fresh signed read.
-    // Existing node directories are never silently re-created or repaired by this path.
+    let floor_directory = &external.floor_directory;
+
+    // Only a first boot without an existing QCF1 floor needs to stage the checkpoint-rooted empty
+    // suffix manifest here. A failed first boot may leave that manifest behind; on retry, ECR1
+    // must still match it before QCF1 is initialized. Once QCF1 exists, leave PFS2 inspection and
+    // any pending CAS recovery to the external-CAS store opener so a crash between remote CAS,
+    // local manifest replacement and floor advancement can be reconciled in its journal.
     if let (Some(checkpoint), Some(checkpoint_bytes)) =
         (external.checkpoint.as_ref(), checkpoint_bytes.as_deref())
     {
-        // On a fresh directory, create the deterministic empty suffix manifest. On an existing
-        // directory (including a retry after a failed first boot), require its current manifest
-        // to match ECR1 before the floor can be initialized or opened.
-        let expected_manifest_anchor = directory.exists().then_some(bootstrap.next_state_digest);
-        let staged =
-            PrivateTestnetForkStore::open_qrun_v05_fee_only_from_checkpoint_for_owner_genesis(
-                directory,
-                genesis.ledger().clone(),
-                owner_account,
-                params.clone(),
-                authenticator,
-                clock,
-                checkpoint_bytes,
-                checkpoint.expected_commitment,
-                checkpoint.minimum_height,
-                expected_manifest_anchor,
-            )
-            .map_err(|error| format!("stage/open checkpoint-rooted QFP5 manifest: {error:?}"))?;
-        let staged_anchor = staged
-            .manifest_anchor()
-            .map_err(|error| format!("read checkpoint-rooted PFS2 manifest anchor: {error:?}"))?;
-        drop(staged);
-        if bootstrap.next_state_digest != staged_anchor {
-            return Err(
-                "external-CAS ECR1 bootstrap does not anchor the exact checkpoint-rooted PFS2 manifest"
-                    .into(),
-            );
+        if !floor_directory.exists() {
+            let expected_manifest_anchor =
+                directory.exists().then_some(bootstrap.next_state_digest);
+            let staged =
+                PrivateTestnetForkStore::open_qrun_v05_fee_only_from_checkpoint_for_owner_genesis(
+                    directory,
+                    genesis.ledger().clone(),
+                    owner_account,
+                    params.clone(),
+                    authenticator,
+                    clock,
+                    checkpoint_bytes,
+                    checkpoint.expected_commitment,
+                    checkpoint.minimum_height,
+                    expected_manifest_anchor,
+                )
+                .map_err(|error| {
+                    format!("stage/open checkpoint-rooted QFP5 manifest: {error:?}")
+                })?;
+            let staged_anchor = staged.manifest_anchor().map_err(|error| {
+                format!("read checkpoint-rooted PFS2 manifest anchor: {error:?}")
+            })?;
+            drop(staged);
+            if bootstrap.next_state_digest != staged_anchor {
+                return Err(
+                    "external-CAS ECR1 bootstrap does not anchor the exact checkpoint-rooted PFS2 manifest"
+                        .into(),
+                );
+            }
         }
     }
 
     // The explicit initialize switch is safe to keep enabled across restarts:
     // AlreadyInitialized opens the existing floor; MissingState after initialization stays fatal.
-    let floor_directory = &external.floor_directory;
     let floor = if external.initialize_floor {
         match ExternalCasFloorStore::initialize(&floor_directory, pin.clone(), bootstrap, 1) {
             Ok(floor) => floor,
@@ -3047,7 +3051,8 @@ mod tests {
             Ok(_) => panic!("node startup accepted an ECR1 record for another PFS2 manifest"),
             Err(error) => error,
         };
-        assert!(rejection.contains("does not anchor the exact checkpoint-rooted PFS2 manifest"));
+        assert!(rejection
+            .contains("ECR1 bootstrap does not anchor the exact checkpoint-rooted PFS2 manifest"));
         assert!(!floor_dir.exists());
 
         // Repeating the same bad first-boot request must verify the already staged manifest again
