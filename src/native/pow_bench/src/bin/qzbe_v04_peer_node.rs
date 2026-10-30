@@ -1,19 +1,23 @@
 //! CP-0413: isolated QZBE v2 authenticated two-node loopback runtime candidate.
 //!
-//! This binary is a QZBE v2 runtime candidate: it requires explicit network, Genesis-owner,
+//! This binary is a QZBE v2/v3 runtime candidate: it requires explicit network, Genesis-owner,
 //! miner and issuance-schedule arguments and accepts one pinned Noise peer. Canonical v0.4 Argon2id
 //! parameters are the default; the deliberately easy 8 MiB profile requires an explicit test-only
-//! flag. Listener and peer addresses remain loopback-only until persistent external anti-rollback
-//! anchoring and canonical-runtime activation are complete.
+//! flag. Transaction and AMM ingress default to loopback; public test ingress remains explicitly
+//! zero-value/easy-PoW gated. This candidate is not a Mainnet activation.
 
 use ai_native_l1_pow_bench::{
     consensus::{ConsensusParameters, Uint256},
+    consensus_native_recovery_gate_candidate::{
+        EvidenceStatus, RecoveryCheck, RecoveryEvidence, RecoveryFault, RecoveryReadiness,
+    },
     devnet_noise_transport_candidate::{DevnetNoiseSession, MAX_NOISE_APPLICATION_RECORD_BYTES},
     monetary_genesis_v04_candidate::GenesisManifestV04,
     monetary_issuance_v04_candidate::V04MiningIssuanceScheduleCandidate,
     monetary_pow_v04_candidate::{
         qzbe_pow_digest, V04ExecutionForkChoiceOutcome, V04ExecutionPowEnvelope,
         MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES, MAX_QZBE_MINING_ATTEMPTS,
+        MAX_V04_EXECUTION_FORK_ARCHIVE_BLOCKS, MAX_V04_EXECUTION_FORK_ARCHIVE_HEIGHT,
     },
     monetary_pow_v04_checkpoint_candidate::{
         QzbeCheckpointRecord, QzbeCheckpointValidationContext,
@@ -21,10 +25,26 @@ use ai_native_l1_pow_bench::{
     monetary_pow_v04_checkpoint_store_candidate::V04ExecutionCheckpointForkStoreCandidate,
     monetary_transition_v04_candidate::{
         MonetaryLedgerStateV04TransitionCandidate, V04ConsensusProfileCandidate,
+        MAX_AMM_OPERATIONS_PER_BLOCK,
     },
     noise_key_provisioning::load_protected_noise_private_key,
     private_testnet_driver::TargetHistory,
-    state_machine::{AccountId, Transaction},
+    private_testnet_mempool_candidate::{BoundedMempool, MempoolError, MempoolLimits},
+    qzbe_amm_ingress_candidate::{
+        decode_request_header as decode_amm_request_header, encode_ack as encode_amm_ingress_ack,
+        operation_id as amm_operation_id, AmmIngressAck, AmmIngressStatus,
+        AMM_INGRESS_REQUEST_HEADER_BYTES,
+    },
+    qzbe_history_replay_candidate::replay_canonical_history_from_genesis,
+    qzbe_tx_ingress_candidate::{
+        decode_ack as decode_tx_ingress_ack, decode_gossip_frame, decode_request_header,
+        encode_ack as encode_tx_ingress_ack, encode_gossip_frame, TxIngressAck, TxIngressStatus,
+        GOSSIP_MAGIC, REQUEST_HEADER_BYTES,
+    },
+    qzxb_amm_candidate::{AmmSignedOperation, MAX_AMM_SIGNED_OPERATION_BYTES},
+    state_machine::{
+        decode_transaction, transaction_id, AccountId, Transaction, MAX_TRANSACTION_BYTES,
+    },
     transaction_auth::{
         account_id_from_public_key, AccountPublicKey, Ed25519TransactionAuthenticator,
         TransactionAuthenticatorKind,
@@ -32,7 +52,7 @@ use ai_native_l1_pow_bench::{
 };
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     env,
     fs::{self, OpenOptions},
     io::{self, Read, Write},
@@ -45,6 +65,14 @@ use std::{
 const ACK_MAGIC: &[u8; 4] = b"QZA4";
 const ACK_VERSION: u16 = 1;
 const ACK_BYTES: usize = 183;
+const ARCHIVE_SYNC_REQUEST_MAGIC: &[u8; 4] = b"QZSR";
+const ARCHIVE_SYNC_HEADER_MAGIC: &[u8; 4] = b"QZSH";
+const ARCHIVE_SYNC_VERSION: u16 = 1;
+const ARCHIVE_SYNC_REQUEST_BYTES: usize = 4 + 2 + 2 + 32 + 32;
+const ARCHIVE_SYNC_HEADER_BYTES: usize = 4 + 2 + 2 + 32 + 32 + 8 + 32 + 32 + 8 + 32 + 4 + 8 + 32;
+const MAX_ARCHIVE_SYNC_BLOCKS: usize = MAX_V04_EXECUTION_FORK_ARCHIVE_BLOCKS;
+const MAX_ARCHIVE_SYNC_BYTES: usize = 64 * 1024 * 1024;
+const ARCHIVE_SYNC_DIGEST_DOMAIN: &[u8] = b"QUANTUMZXB-QZBE-ARCHIVE-SYNC-V1\0";
 /// Root-level immutable profile lock for every QZBE candidate data directory.
 /// Legacy PTB2/PFS2 and PMT3/PMT4 entrypoints detect its presence and fail closed.
 const QZBE_RUNTIME_PROFILE_FILE: &str = "qzbe-runtime.profile";
@@ -56,6 +84,10 @@ const QZBE_RUNTIME_PROFILE_PREFIX_BYTES: usize = 4 + 2 + 32 * 4;
 const QZBE_RUNTIME_PROFILE_MARKER_BYTES: usize = QZBE_RUNTIME_PROFILE_PREFIX_BYTES + 32;
 const MAX_MINE_BLOCKS: u64 = 32;
 const MAX_PEER_MESSAGES: u64 = 512;
+const MAX_TX_SUBMISSIONS_PER_POLL: usize = 8;
+const MAX_TX_SUBMISSIONS: u64 = 65_536;
+const MAX_RPC_REQUEST_BYTES: usize = 2_048;
+const MAX_RPC_CONNECTIONS_PER_POLL: usize = 8;
 const DEFAULT_RUN_SECONDS: u64 = 30;
 
 struct SecretKey([u8; 32]);
@@ -69,6 +101,9 @@ impl Drop for SecretKey {
 struct Args {
     data_dir: PathBuf,
     listen: SocketAddr,
+    tx_listen: Option<SocketAddr>,
+    amm_listen: Option<SocketAddr>,
+    rpc_listen: Option<SocketAddr>,
     peers: Vec<SocketAddr>,
     network_id: [u8; 32],
     owner_id: [u8; 32],
@@ -76,16 +111,23 @@ struct Args {
     tx_public_key: [u8; 32],
     observe_account_id: [u8; 32],
     transaction: Option<Transaction>,
+    defer_configured_transaction: bool,
+    wait_for_transaction_ms: u64,
     probe_invalid_signature_first: bool,
     trusted_peer_keys: Vec<[u8; 32]>,
     noise_key_path: PathBuf,
     initial_subsidy_atoms: u128,
     blocks_per_halving: u64,
     mine_blocks: u64,
+    mine_forever: bool,
     run_seconds: u64,
     stop_after_height: Option<u64>,
     exit_after_mining: bool,
     test_easy_pow: bool,
+    public_testnet_p2p: bool,
+    public_testnet_tx_ingress: bool,
+    public_testnet_amm_ingress: bool,
+    sync_from_peers: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +138,82 @@ struct Snapshot {
     generation: u64,
 }
 
+const MAX_AMM_MEMPOOL_BYTES: usize = 1 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+struct PendingAmmOperation {
+    id: [u8; 32],
+    wire: Vec<u8>,
+    operation: AmmSignedOperation,
+}
+
+#[derive(Debug, Default)]
+struct BoundedAmmMempool {
+    operations: Vec<PendingAmmOperation>,
+    total_bytes: usize,
+}
+
+impl BoundedAmmMempool {
+    fn len(&self) -> usize {
+        self.operations.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.operations.is_empty()
+    }
+
+    fn ordered_operations(&self) -> Vec<AmmSignedOperation> {
+        self.operations
+            .iter()
+            .map(|entry| entry.operation.clone())
+            .collect()
+    }
+
+    fn contains_id(&self, id: &[u8; 32]) -> bool {
+        self.operations.iter().any(|entry| &entry.id == id)
+    }
+
+    fn insert(
+        &mut self,
+        id: [u8; 32],
+        wire: Vec<u8>,
+        operation: AmmSignedOperation,
+    ) -> AmmIngressStatus {
+        if self.contains_id(&id) {
+            return AmmIngressStatus::Duplicate;
+        }
+        if self.operations.len() >= MAX_AMM_OPERATIONS_PER_BLOCK
+            || self.total_bytes.saturating_add(wire.len()) > MAX_AMM_MEMPOOL_BYTES
+        {
+            return AmmIngressStatus::PoolFull;
+        }
+        self.total_bytes = self.total_bytes.saturating_add(wire.len());
+        self.operations.push(PendingAmmOperation {
+            id,
+            wire,
+            operation,
+        });
+        AmmIngressStatus::Accepted
+    }
+
+    fn remove_included(&mut self, included: &[AmmSignedOperation]) -> usize {
+        let included_ids: BTreeSet<[u8; 32]> = included
+            .iter()
+            .filter_map(|operation| operation.encode().ok().map(|wire| amm_operation_id(&wire)))
+            .collect();
+        let before = self.operations.len();
+        self.operations
+            .retain(|entry| !included_ids.contains(&entry.id));
+        self.total_bytes = self.operations.iter().map(|entry| entry.wire.len()).sum();
+        before - self.operations.len()
+    }
+
+    fn retain_ids(&mut self, keep: &BTreeSet<[u8; 32]>) {
+        self.operations.retain(|entry| keep.contains(&entry.id));
+        self.total_bytes = self.operations.iter().map(|entry| entry.wire.len()).sum();
+    }
+}
+
 #[derive(Debug)]
 struct PeerAck {
     status: u8,
@@ -103,8 +221,211 @@ struct PeerAck {
     snapshot: Snapshot,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArchiveSyncRequest {
+    genesis_id: [u8; 32],
+    profile_id: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArchiveSyncHeader {
+    genesis_id: [u8; 32],
+    profile_id: [u8; 32],
+    snapshot: Snapshot,
+    cumulative_chainwork: [u8; 32],
+    envelope_count: usize,
+    total_bytes: usize,
+    archive_digest: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArchivePeerSummary {
+    height: u64,
+    tip: [u8; 32],
+    state_root: [u8; 32],
+    cumulative_chainwork: [u8; 32],
+}
+
+fn reconcile_archive_peer_summaries(
+    summaries: &[ArchivePeerSummary],
+) -> Result<ArchivePeerSummary, String> {
+    let Some(first) = summaries.first().copied() else {
+        return Err("archive recovery requires at least two pinned peer summaries".into());
+    };
+    if summaries.len() < 2 {
+        return Err("archive recovery requires at least two pinned peer summaries".into());
+    }
+    if summaries.iter().any(|summary| *summary != first) {
+        return Err(
+            "pinned archive peers disagree on canonical height/tip/state-root/chainwork".into(),
+        );
+    }
+    Ok(first)
+}
+
+fn encode_archive_sync_request(
+    genesis_id: [u8; 32],
+    profile_id: [u8; 32],
+) -> [u8; ARCHIVE_SYNC_REQUEST_BYTES] {
+    let mut bytes = Vec::with_capacity(ARCHIVE_SYNC_REQUEST_BYTES);
+    bytes.extend_from_slice(ARCHIVE_SYNC_REQUEST_MAGIC);
+    bytes.extend_from_slice(&ARCHIVE_SYNC_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&0u16.to_be_bytes());
+    bytes.extend_from_slice(&genesis_id);
+    bytes.extend_from_slice(&profile_id);
+    bytes.try_into().expect("fixed archive sync request width")
+}
+
+fn decode_archive_sync_request(bytes: &[u8]) -> Result<ArchiveSyncRequest, String> {
+    if bytes.len() != ARCHIVE_SYNC_REQUEST_BYTES || &bytes[..4] != ARCHIVE_SYNC_REQUEST_MAGIC {
+        return Err("QZBE archive-sync request magic or length mismatch".into());
+    }
+    if u16::from_be_bytes([bytes[4], bytes[5]]) != ARCHIVE_SYNC_VERSION
+        || u16::from_be_bytes([bytes[6], bytes[7]]) != 0
+    {
+        return Err("unsupported or noncanonical QZBE archive-sync request version/flags".into());
+    }
+    let genesis_id: [u8; 32] = bytes[8..40]
+        .try_into()
+        .map_err(|_| "archive-sync Genesis width mismatch")?;
+    let profile_id: [u8; 32] = bytes[40..72]
+        .try_into()
+        .map_err(|_| "archive-sync profile width mismatch")?;
+    if genesis_id.iter().all(|byte| *byte == 0) || profile_id.iter().all(|byte| *byte == 0) {
+        return Err("QZBE archive-sync request has a zero Genesis/profile binding".into());
+    }
+    Ok(ArchiveSyncRequest {
+        genesis_id,
+        profile_id,
+    })
+}
+
+fn encode_archive_sync_header(
+    header: &ArchiveSyncHeader,
+) -> Result<[u8; ARCHIVE_SYNC_HEADER_BYTES], String> {
+    if header.genesis_id.iter().all(|byte| *byte == 0)
+        || header.profile_id.iter().all(|byte| *byte == 0)
+        || header.snapshot.tip.iter().all(|byte| *byte == 0)
+        || header.snapshot.state_root.iter().all(|byte| *byte == 0)
+        || header.envelope_count > MAX_ARCHIVE_SYNC_BLOCKS
+        || header.total_bytes > MAX_ARCHIVE_SYNC_BYTES
+        || (header.envelope_count == 0) != (header.total_bytes == 0)
+    {
+        return Err("QZBE archive-sync header has invalid bindings or exceeds caps".into());
+    }
+    let count =
+        u32::try_from(header.envelope_count).map_err(|_| "archive-sync block count overflow")?;
+    let total_bytes =
+        u64::try_from(header.total_bytes).map_err(|_| "archive-sync byte count overflow")?;
+    let mut bytes = Vec::with_capacity(ARCHIVE_SYNC_HEADER_BYTES);
+    bytes.extend_from_slice(ARCHIVE_SYNC_HEADER_MAGIC);
+    bytes.extend_from_slice(&ARCHIVE_SYNC_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&0u16.to_be_bytes());
+    bytes.extend_from_slice(&header.genesis_id);
+    bytes.extend_from_slice(&header.profile_id);
+    bytes.extend_from_slice(&header.snapshot.height.to_be_bytes());
+    bytes.extend_from_slice(&header.snapshot.tip);
+    bytes.extend_from_slice(&header.snapshot.state_root);
+    bytes.extend_from_slice(&header.snapshot.generation.to_be_bytes());
+    bytes.extend_from_slice(&header.cumulative_chainwork);
+    bytes.extend_from_slice(&count.to_be_bytes());
+    bytes.extend_from_slice(&total_bytes.to_be_bytes());
+    bytes.extend_from_slice(&header.archive_digest);
+    bytes
+        .try_into()
+        .map_err(|_| "QZBE archive-sync header width mismatch".into())
+}
+
+fn decode_archive_sync_header(bytes: &[u8]) -> Result<ArchiveSyncHeader, String> {
+    if bytes.len() != ARCHIVE_SYNC_HEADER_BYTES || &bytes[..4] != ARCHIVE_SYNC_HEADER_MAGIC {
+        return Err("QZBE archive-sync header magic or length mismatch".into());
+    }
+    if u16::from_be_bytes([bytes[4], bytes[5]]) != ARCHIVE_SYNC_VERSION
+        || u16::from_be_bytes([bytes[6], bytes[7]]) != 0
+    {
+        return Err("unsupported or noncanonical QZBE archive-sync header version/flags".into());
+    }
+    let genesis_id = bytes[8..40]
+        .try_into()
+        .map_err(|_| "archive-sync Genesis width mismatch")?;
+    let profile_id = bytes[40..72]
+        .try_into()
+        .map_err(|_| "archive-sync profile width mismatch")?;
+    let height = u64::from_be_bytes(
+        bytes[72..80]
+            .try_into()
+            .map_err(|_| "archive-sync height width mismatch")?,
+    );
+    let tip = bytes[80..112]
+        .try_into()
+        .map_err(|_| "archive-sync tip width mismatch")?;
+    let state_root = bytes[112..144]
+        .try_into()
+        .map_err(|_| "archive-sync state-root width mismatch")?;
+    let generation = u64::from_be_bytes(
+        bytes[144..152]
+            .try_into()
+            .map_err(|_| "archive-sync generation width mismatch")?,
+    );
+    let cumulative_chainwork = bytes[152..184]
+        .try_into()
+        .map_err(|_| "archive-sync chainwork width mismatch")?;
+    let envelope_count = u32::from_be_bytes(
+        bytes[184..188]
+            .try_into()
+            .map_err(|_| "archive-sync block count width mismatch")?,
+    ) as usize;
+    let total_bytes_u64 = u64::from_be_bytes(
+        bytes[188..196]
+            .try_into()
+            .map_err(|_| "archive-sync byte count width mismatch")?,
+    );
+    let total_bytes = usize::try_from(total_bytes_u64)
+        .map_err(|_| "archive-sync byte count does not fit memory size")?;
+    let archive_digest = bytes[196..228]
+        .try_into()
+        .map_err(|_| "archive-sync digest width mismatch")?;
+    let header = ArchiveSyncHeader {
+        genesis_id,
+        profile_id,
+        snapshot: Snapshot {
+            height,
+            tip,
+            state_root,
+            generation,
+        },
+        cumulative_chainwork,
+        envelope_count,
+        total_bytes,
+        archive_digest,
+    };
+    if header.genesis_id.iter().all(|byte| *byte == 0)
+        || header.profile_id.iter().all(|byte| *byte == 0)
+        || header.snapshot.tip.iter().all(|byte| *byte == 0)
+        || header.snapshot.state_root.iter().all(|byte| *byte == 0)
+        || header.envelope_count > MAX_ARCHIVE_SYNC_BLOCKS
+        || header.total_bytes > MAX_ARCHIVE_SYNC_BYTES
+        || (header.envelope_count == 0) != (header.total_bytes == 0)
+    {
+        return Err("QZBE archive-sync response has invalid bindings or exceeds caps".into());
+    }
+    Ok(header)
+}
+
+fn archive_sync_digest(envelopes: &[Vec<u8>]) -> Result<[u8; 32], String> {
+    let mut hash = Sha256::new();
+    hash.update(ARCHIVE_SYNC_DIGEST_DOMAIN);
+    for envelope in envelopes {
+        let len =
+            u32::try_from(envelope.len()).map_err(|_| "archive-sync envelope length overflow")?;
+        hash.update(len.to_be_bytes());
+        hash.update(envelope);
+    }
+    Ok(hash.finalize().into())
+}
+
 fn usage() -> &'static str {
-    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --tx-public-key-hex HEX64 --observe-account-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 [--trusted-peer-key-hex HEX64 ...] --initial-subsidy-atoms U128 --blocks-per-halving U64 [--tx-recipient-id HEX64 --tx-nonce U64 --tx-amount-atoms U64 --tx-fee-atoms U64 --tx-expires-at U64 --tx-signature-hex HEX128] [--probe-invalid-signature-first] [--test-easy-pow] [--peer 127.0.0.1:PORT ...] [--mine-blocks N] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2 runtime candidate with statically pinned multi-peer loopback connections. Each --peer is paired by order with the corresponding --trusted-peer-key-hex; additional trusted keys may authorize inbound peers. Canonical v0.4 Argon2id is the default. --test-easy-pow is for isolated loopback tests only. No public bind or Mainnet activation."
+    "Usage: qzbe_v04_peer_node --network-id HEX64 --owner-id HEX64 --miner-id HEX64 --tx-public-key-hex HEX64 --observe-account-id HEX64 --data-dir ABS_PATH --listen 127.0.0.1:PORT [--tx-listen 127.0.0.1:PORT] [--amm-listen 127.0.0.1:PORT] [--rpc-listen 127.0.0.1:PORT] --noise-static-private-key-dpapi-file PATH --trusted-peer-key-hex HEX64 [--trusted-peer-key-hex HEX64 ...] --initial-subsidy-atoms U128 --blocks-per-halving U64 [--tx-recipient-id HEX64 --tx-nonce U64 --tx-amount-atoms U64 --tx-fee-atoms U64 --tx-expires-at U64 --tx-signature-hex HEX128_OR_HEX192] [--probe-invalid-signature-first] [--test-easy-pow --public-testnet-p2p [--public-testnet-tx-ingress] [--public-testnet-amm-ingress]] [--sync-from-peers] [--peer IP:PORT ...] [--mine-blocks N | --mine-forever] [--run-seconds N] [--stop-after-height N] [--exit-after-mining]\nQZBE v2/v3 runtime candidate with statically pinned Noise peers. QZB4 v3 carries signed canonical AMM operations; QZAS/1 AMM ingress and legacy transaction ingress default to loopback. Public AMM ingress is available only for an explicit zero-value testnet using --test-easy-pow --public-testnet-p2p --public-testnet-amm-ingress. Each --peer is paired by order with --trusted-peer-key-hex; additional trusted keys authorize inbound peers. Canonical v0.4 Argon2id is the default. --mine-forever continuously mines and broadcasts until interrupted or --stop-after-height is reached; it requires a pinned peer and cannot be combined with --mine-blocks or --exit-after-mining. External P2P bind is available only with BOTH --test-easy-pow and --public-testnet-p2p; all inbound peers still require a configured Noise static-key pin. Public transaction and AMM ingress are unaudited, easy-PoW zero-value testnet only and carry no real-value guarantee; they are not Mainnet activation. Read-only RPC remains loopback-only."
 }
 
 fn parse_hex32(value: &str, name: &str) -> Result<[u8; 32], String> {
@@ -119,6 +440,16 @@ fn parse_hex32(value: &str, name: &str) -> Result<[u8; 32], String> {
             .map_err(|_| format!("{name} contains a non-hexadecimal character"))?;
     }
     Ok(output)
+}
+
+fn parse_transaction_signature(value: &str, name: &str) -> Result<Vec<u8>, String> {
+    match value.len() {
+        128 => parse_hex_bytes(value, name, 64),
+        192 => parse_hex_bytes(value, name, 96),
+        _ => Err(format!(
+            "{name} must be exactly 128 or 192 ASCII hexadecimal characters (registered or self-contained Ed25519)"
+        )),
+    }
 }
 
 fn parse_hex_bytes(value: &str, name: &str, expected_bytes: usize) -> Result<Vec<u8>, String> {
@@ -147,6 +478,98 @@ fn ensure_loopback_address(address: SocketAddr, role: &str) -> Result<(), String
         ))
     }
 }
+fn ensure_tx_listen_address(
+    address: SocketAddr,
+    public_testnet_tx_ingress: bool,
+    public_testnet_p2p: bool,
+    test_easy_pow: bool,
+) -> Result<(), String> {
+    if address.ip().is_loopback() {
+        return Ok(());
+    }
+    if !public_testnet_tx_ingress {
+        return Err(
+            "non-loopback transaction ingress requires explicit --public-testnet-tx-ingress".into(),
+        );
+    }
+    if !public_testnet_p2p || !test_easy_pow {
+        return Err("--public-testnet-tx-ingress requires both --test-easy-pow and --public-testnet-p2p; it is zero-value testnet only".into());
+    }
+    if address.port() == 0 || address.ip().is_multicast() {
+        return Err(
+            "public testnet transaction ingress requires a nonzero port and non-multicast bind"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn ensure_amm_listen_address(
+    address: SocketAddr,
+    public_testnet_amm_ingress: bool,
+    public_testnet_p2p: bool,
+    test_easy_pow: bool,
+) -> Result<(), String> {
+    if address.ip().is_loopback() {
+        return Ok(());
+    }
+    if !public_testnet_amm_ingress {
+        return Err(
+            "non-loopback AMM ingress requires explicit --public-testnet-amm-ingress".into(),
+        );
+    }
+    if !public_testnet_p2p || !test_easy_pow {
+        return Err("--public-testnet-amm-ingress requires both --test-easy-pow and --public-testnet-p2p; it is zero-value testnet only".into());
+    }
+    if address.port() == 0 || address.ip().is_multicast() {
+        return Err(
+            "public testnet AMM ingress requires a nonzero port and non-multicast bind".into(),
+        );
+    }
+    Ok(())
+}
+
+fn ensure_peer_listen_address(
+    address: SocketAddr,
+    public_testnet_p2p: bool,
+    test_easy_pow: bool,
+) -> Result<(), String> {
+    if address.ip().is_loopback() {
+        return Ok(());
+    }
+    if !public_testnet_p2p || !test_easy_pow {
+        return Err(
+            "non-loopback QZBE P2P bind requires both --test-easy-pow and --public-testnet-p2p"
+                .into(),
+        );
+    }
+    if address.port() == 0 || address.ip().is_multicast() {
+        return Err(
+            "public candidate P2P bind requires a nonzero port and a non-multicast address".into(),
+        );
+    }
+    Ok(())
+}
+
+fn ensure_peer_target_address(
+    address: SocketAddr,
+    public_testnet_p2p: bool,
+    test_easy_pow: bool,
+) -> Result<(), String> {
+    if address.ip().is_loopback() {
+        return Ok(());
+    }
+    if !public_testnet_p2p || !test_easy_pow {
+        return Err(
+            "non-loopback QZBE peer requires both --test-easy-pow and --public-testnet-p2p".into(),
+        );
+    }
+    if address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast() {
+        return Err("public candidate peers require a concrete unicast IP and nonzero port".into());
+    }
+    Ok(())
+}
+
 fn parse_args() -> Result<Option<Args>, String> {
     parse_args_from(env::args().skip(1).collect())
 }
@@ -162,8 +585,14 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
     let mut peer_values = Vec::<String>::new();
     let mut trusted_peer_values = Vec::<String>::new();
     let mut exit_after_mining = false;
+    let mut mine_forever = false;
+    let mut defer_configured_transaction = false;
     let mut probe_invalid_signature_first = false;
     let mut test_easy_pow = false;
+    let mut public_testnet_p2p = false;
+    let mut public_testnet_tx_ingress = false;
+    let mut public_testnet_amm_ingress = false;
+    let mut sync_from_peers = false;
     let mut i = 0usize;
     while i < tokens.len() {
         let key = tokens[i].as_str();
@@ -172,6 +601,22 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
                 return Err("duplicate option: --exit-after-mining".into());
             }
             exit_after_mining = true;
+            i += 1;
+            continue;
+        }
+        if key == "--mine-forever" {
+            if mine_forever {
+                return Err("duplicate option: --mine-forever".into());
+            }
+            mine_forever = true;
+            i += 1;
+            continue;
+        }
+        if key == "--defer-configured-transaction" {
+            if defer_configured_transaction {
+                return Err("duplicate option: --defer-configured-transaction".into());
+            }
+            defer_configured_transaction = true;
             i += 1;
             continue;
         }
@@ -188,6 +633,38 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
                 return Err("duplicate option: --test-easy-pow".into());
             }
             test_easy_pow = true;
+            i += 1;
+            continue;
+        }
+        if key == "--public-testnet-p2p" {
+            if public_testnet_p2p {
+                return Err("duplicate option: --public-testnet-p2p".into());
+            }
+            public_testnet_p2p = true;
+            i += 1;
+            continue;
+        }
+        if key == "--public-testnet-tx-ingress" {
+            if public_testnet_tx_ingress {
+                return Err("duplicate option: --public-testnet-tx-ingress".into());
+            }
+            public_testnet_tx_ingress = true;
+            i += 1;
+            continue;
+        }
+        if key == "--public-testnet-amm-ingress" {
+            if public_testnet_amm_ingress {
+                return Err("duplicate option: --public-testnet-amm-ingress".into());
+            }
+            public_testnet_amm_ingress = true;
+            i += 1;
+            continue;
+        }
+        if key == "--sync-from-peers" {
+            if sync_from_peers {
+                return Err("duplicate option: --sync-from-peers".into());
+            }
+            sync_from_peers = true;
             i += 1;
             continue;
         }
@@ -221,6 +698,10 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
                 | "--tx-signature-hex"
                 | "--data-dir"
                 | "--listen"
+                | "--tx-listen"
+                | "--amm-listen"
+                | "--rpc-listen"
+                | "--wait-for-transaction-ms"
                 | "--noise-static-private-key-dpapi-file"
                 | "--initial-subsidy-atoms"
                 | "--blocks-per-halving"
@@ -255,7 +736,65 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
         .parse::<SocketAddr>()
         .map_err(|_| "--listen is not a valid socket address".to_string())?;
 
-    ensure_loopback_address(listen, "listen addresses")?;
+    ensure_peer_listen_address(listen, public_testnet_p2p, test_easy_pow)?;
+    let tx_listen = values
+        .get("--tx-listen")
+        .map(|value| {
+            value
+                .parse::<SocketAddr>()
+                .map_err(|_| "--tx-listen is not a valid socket address".to_string())
+        })
+        .transpose()?;
+    if let Some(address) = tx_listen {
+        ensure_tx_listen_address(
+            address,
+            public_testnet_tx_ingress,
+            public_testnet_p2p,
+            test_easy_pow,
+        )?;
+        if address == listen {
+            return Err("--tx-listen must use a different socket from --listen".into());
+        }
+    }
+    let amm_listen = values
+        .get("--amm-listen")
+        .map(|value| {
+            value
+                .parse::<SocketAddr>()
+                .map_err(|_| "--amm-listen is not a valid socket address".to_string())
+        })
+        .transpose()?;
+    if let Some(address) = amm_listen {
+        ensure_amm_listen_address(
+            address,
+            public_testnet_amm_ingress,
+            public_testnet_p2p,
+            test_easy_pow,
+        )?;
+        if address == listen || Some(address) == tx_listen {
+            return Err(
+                "--amm-listen must use a distinct socket from peer and transaction listeners"
+                    .into(),
+            );
+        }
+    }
+    let rpc_listen = values
+        .get("--rpc-listen")
+        .map(|value| {
+            value
+                .parse::<SocketAddr>()
+                .map_err(|_| "--rpc-listen is not a valid socket address".to_string())
+        })
+        .transpose()?;
+    if let Some(address) = rpc_listen {
+        ensure_loopback_address(address, "read-only RPC listen addresses")?;
+        if address == listen || Some(address) == tx_listen || Some(address) == amm_listen {
+            return Err(
+                "--rpc-listen must use a distinct socket from peer, transaction and AMM listeners"
+                    .into(),
+            );
+        }
+    }
 
     let peers = peer_values
         .iter()
@@ -266,9 +805,15 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     for (index, address) in peers.iter().enumerate() {
-        ensure_loopback_address(*address, "peers")?;
+        ensure_peer_target_address(*address, public_testnet_p2p, test_easy_pow)?;
         if *address == listen {
             return Err("--peer cannot refer to this node's own listener".into());
+        }
+        if Some(*address) == tx_listen {
+            return Err("--peer cannot refer to this node's transaction-ingress listener".into());
+        }
+        if Some(*address) == rpc_listen {
+            return Err("--peer cannot refer to this node's read-only RPC listener".into());
         }
         if peers[..index].contains(address) {
             return Err("duplicate --peer address".into());
@@ -276,6 +821,28 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
     }
     if peers.len() > 16 {
         return Err("at most 16 statically pinned outbound --peer entries are allowed".into());
+    }
+    if public_testnet_p2p && !test_easy_pow {
+        return Err("--public-testnet-p2p is test-only and requires --test-easy-pow".into());
+    }
+    if public_testnet_tx_ingress && !(test_easy_pow && public_testnet_p2p) {
+        return Err(
+            "--public-testnet-tx-ingress requires both --test-easy-pow and --public-testnet-p2p"
+                .into(),
+        );
+    }
+    if public_testnet_tx_ingress && tx_listen.is_none() {
+        return Err("--public-testnet-tx-ingress requires --tx-listen".into());
+    }
+    if public_testnet_amm_ingress && !(test_easy_pow && public_testnet_p2p && amm_listen.is_some())
+    {
+        return Err("--public-testnet-amm-ingress requires --amm-listen, --test-easy-pow and --public-testnet-p2p; it is zero-value testnet only".into());
+    }
+    if sync_from_peers && !(public_testnet_p2p && test_easy_pow) {
+        return Err("--sync-from-peers is restricted to the explicit zero-value test profile (--test-easy-pow --public-testnet-p2p)".into());
+    }
+    if sync_from_peers && peers.len() < 2 {
+        return Err("--sync-from-peers requires at least two statically pinned --peer entries for history agreement".into());
     }
     let network_id = parse_hex32(&take("--network-id")?, "--network-id")?;
     let owner_id = parse_hex32(&take("--owner-id")?, "--owner-id")?;
@@ -350,7 +917,7 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
             let amount = values["--tx-amount-atoms"].parse::<u64>().map_err(|_| "--tx-amount-atoms must be u64".to_string())?;
             let fee = values["--tx-fee-atoms"].parse::<u64>().map_err(|_| "--tx-fee-atoms must be u64".to_string())?;
             let expires_at = values["--tx-expires-at"].parse::<u64>().map_err(|_| "--tx-expires-at must be u64".to_string())?;
-            let signature = parse_hex_bytes(&values["--tx-signature-hex"], "--tx-signature-hex", 64)?;
+            let signature = parse_transaction_signature(&values["--tx-signature-hex"], "--tx-signature-hex")?;
             if recipient.iter().all(|byte| *byte == 0) || recipient == owner_id {
                 return Err("transaction recipient must be nonzero and distinct from the owner account".into());
             }
@@ -364,6 +931,18 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
         }
         _ => return Err("transaction requires all six fields: recipient, nonce, amount, fee, expiry and signature".into()),
     };
+    let wait_for_transaction_ms = values
+        .get("--wait-for-transaction-ms")
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| "--wait-for-transaction-ms must be an unsigned u64".to_string())
+        })
+        .transpose()?
+        .unwrap_or(0);
+    if wait_for_transaction_ms > 30_000 {
+        return Err("--wait-for-transaction-ms is capped at 30000 ms".into());
+    }
     let mine_blocks = values
         .get("--mine-blocks")
         .map(|value| {
@@ -393,10 +972,19 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
     if initial_subsidy_atoms == 0 || blocks_per_halving == 0 {
         return Err("issuance schedule values must be explicit and greater than zero".into());
     }
-    if mine_blocks > MAX_MINE_BLOCKS {
+    if mine_blocks > MAX_MINE_BLOCKS && !mine_forever {
         return Err(format!(
             "--mine-blocks exceeds local candidate cap {MAX_MINE_BLOCKS}"
         ));
+    }
+    if mine_forever && mine_blocks > 0 {
+        return Err("--mine-forever cannot be combined with --mine-blocks".into());
+    }
+    if mine_forever && exit_after_mining {
+        return Err("--mine-forever cannot be combined with --exit-after-mining".into());
+    }
+    if mine_forever && values.contains_key("--run-seconds") {
+        return Err("--mine-forever has no time limit; use --stop-after-height for a controlled stop instead of --run-seconds".into());
     }
     if !(1..=3600).contains(&run_seconds) {
         return Err("--run-seconds must be between 1 and 3600".into());
@@ -404,10 +992,22 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
     if stop_after_height == Some(0) {
         return Err("--stop-after-height must be greater than zero".into());
     }
-    if mine_blocks > 0 && peers.is_empty() {
+    if (mine_blocks > 0 || mine_forever) && peers.is_empty() {
         return Err(
             "mining requires at least one --peer so each candidate is peer-acknowledged".into(),
         );
+    }
+    if defer_configured_transaction
+        && (transaction.is_none()
+            || tx_listen.is_none()
+            || !test_easy_pow
+            || mine_blocks == 0
+            || wait_for_transaction_ms == 0)
+    {
+        return Err("--defer-configured-transaction requires a configured transaction, --tx-listen, --test-easy-pow, --mine-blocks > 0 and a positive --wait-for-transaction-ms".into());
+    }
+    if wait_for_transaction_ms > 0 && !defer_configured_transaction {
+        return Err("--wait-for-transaction-ms requires --defer-configured-transaction".into());
     }
     if probe_invalid_signature_first
         && (transaction.is_none() || mine_blocks == 0 || peers.is_empty())
@@ -426,6 +1026,9 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
     Ok(Some(Args {
         data_dir,
         listen,
+        tx_listen,
+        amm_listen,
+        rpc_listen,
         peers,
         network_id,
         owner_id,
@@ -433,16 +1036,23 @@ fn parse_args_from(tokens: Vec<String>) -> Result<Option<Args>, String> {
         tx_public_key,
         observe_account_id,
         transaction,
+        defer_configured_transaction,
+        wait_for_transaction_ms,
         probe_invalid_signature_first,
         trusted_peer_keys,
         noise_key_path,
         initial_subsidy_atoms,
         blocks_per_halving,
         mine_blocks,
+        mine_forever,
         run_seconds,
         stop_after_height,
         exit_after_mining,
         test_easy_pow,
+        public_testnet_p2p,
+        public_testnet_tx_ingress,
+        public_testnet_amm_ingress,
+        sync_from_peers,
     }))
 }
 
@@ -920,6 +1530,283 @@ fn observed_balance(store: &V04ExecutionCheckpointForkStoreCandidate, account: &
         .unwrap_or(0)
 }
 
+fn send_transaction_gossip(
+    address: SocketAddr,
+    local_key: &[u8; 32],
+    peer_key: &[u8; 32],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    transaction_wire: &[u8],
+    expected_txid: [u8; 32],
+) -> Result<TxIngressAck, String> {
+    let frame = encode_gossip_frame(profile_id, transaction_wire)
+        .map_err(|error| format!("encode bounded QZTG/1 transaction frame: {error:?}"))?;
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
+        .map_err(|error| format!("connect to pinned transaction-gossip peer {address}: {error}"))?;
+    stream
+        .set_nodelay(true)
+        .map_err(|error| format!("configure QZTG/1 peer TCP_NODELAY: {error}"))?;
+    let mut session = DevnetNoiseSession::connect(&mut stream, local_key, peer_key, network_id)
+        .map_err(|error| format!("authenticate outbound QZTG/1 Noise session: {error}"))?;
+    session
+        .write_record(&mut stream, &frame)
+        .map_err(|error| format!("send encrypted QZTG/1 transaction frame: {error}"))?;
+    let response = session
+        .read_record(&mut stream)
+        .map_err(|error| format!("read encrypted QZTA/1 transaction ACK: {error}"))?;
+    let ack = decode_tx_ingress_ack(&response)
+        .map_err(|error| format!("decode QZTA/1 transaction ACK: {error:?}"))?;
+    if ack.transaction_id != expected_txid {
+        return Err("QZTA/1 transaction ID does not match the relayed transaction".into());
+    }
+    if ack.status == TxIngressStatus::Rejected {
+        return Err("authenticated peer rejected the QZTG/1 transaction".into());
+    }
+    Ok(ack)
+}
+
+/// Fan a newly admitted transaction out to statically pinned peers. Failures are isolated per peer;
+/// `skip_peer_key` prevents immediate echo to the authenticated sender and Duplicate ACKs stop loops.
+fn relay_transaction_to_peers(
+    transaction_wire: &[u8],
+    txid: [u8; 32],
+    local_key: &[u8; 32],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    peers: &[SocketAddr],
+    peer_keys: &[[u8; 32]],
+    skip_peer_key: Option<&[u8; 32]>,
+    relayed_count: &mut u64,
+    origin: &str,
+) {
+    for (index, address) in peers.iter().enumerate() {
+        let peer_key = &peer_keys[index];
+        if skip_peer_key.is_some_and(|skip| skip == peer_key) {
+            continue;
+        }
+        match send_transaction_gossip(
+            *address,
+            local_key,
+            peer_key,
+            network_id,
+            profile_id,
+            transaction_wire,
+            txid,
+        ) {
+            Ok(ack) => {
+                *relayed_count = relayed_count.saturating_add(1);
+                eprintln!("event=qzbe_v04_tx_gossip_sent origin={} peer={} txid={} peer_status={:?} peer_mempool_count={} relayed_count={}", origin, address, hex(&txid), ack.status, ack.mempool_count, relayed_count);
+            }
+            Err(error) => {
+                eprintln!(
+                    "event=qzbe_v04_tx_gossip_peer_failed origin={} peer={} txid={} error={}",
+                    origin,
+                    address,
+                    hex(&txid),
+                    error
+                );
+            }
+        }
+    }
+}
+
+fn write_peer_tx_ack(
+    session: &mut DevnetNoiseSession,
+    stream: &mut TcpStream,
+    status: TxIngressStatus,
+    mempool: &BoundedMempool,
+    txid: [u8; 32],
+) -> Result<(), String> {
+    let count = u32::try_from(mempool.len()).unwrap_or(u32::MAX);
+    let ack = encode_tx_ingress_ack(TxIngressAck {
+        status,
+        mempool_count: count,
+        transaction_id: txid,
+    });
+    session
+        .write_record(stream, &ack)
+        .map_err(|error| format!("send encrypted QZTA/1 transaction ACK: {error}"))
+}
+
+fn ordered_archive_envelopes(
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    context: &QzbeCheckpointValidationContext<'_>,
+) -> Result<Vec<Vec<u8>>, String> {
+    let envelopes = store
+        .fork_choice()
+        .archive_envelopes_bounded(MAX_ARCHIVE_SYNC_BLOCKS, MAX_ARCHIVE_SYNC_BYTES)
+        .map_err(|error| format!("QZBE archive-sync export refused: {error}"))?;
+    let mut ordered = Vec::with_capacity(envelopes.len());
+    let mut total_bytes = 0usize;
+    for bytes in envelopes {
+        total_bytes = total_bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| "QZBE archive-sync byte count overflow".to_string())?;
+        if total_bytes > MAX_ARCHIVE_SYNC_BYTES {
+            return Err("QZBE archive-sync export exceeds its byte cap".into());
+        }
+        let envelope = V04ExecutionPowEnvelope::decode(&bytes, context.profile, context.params)
+            .map_err(|error| format!("decode archived QZBE envelope: {error}"))?;
+        let digest = qzbe_pow_digest(&envelope.header, &envelope.block, context.params)
+            .map_err(|error| format!("digest archived QZBE envelope: {error}"))?;
+        ordered.push((envelope.header.height, digest, bytes));
+    }
+    ordered.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    Ok(ordered.into_iter().map(|(_, _, bytes)| bytes).collect())
+}
+
+fn serve_archive_sync(
+    session: &mut DevnetNoiseSession,
+    stream: &mut TcpStream,
+    request_bytes: &[u8],
+    profile_id: &[u8; 32],
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    context: &QzbeCheckpointValidationContext<'_>,
+) -> Result<(), String> {
+    let request = decode_archive_sync_request(request_bytes)?;
+    let genesis_id = context
+        .manifest
+        .manifest_hash()
+        .map_err(|error| format!("hash archive-sync Genesis: {error:?}"))?;
+    if request.genesis_id != genesis_id || &request.profile_id != profile_id {
+        return Err("QZBE archive-sync request Genesis/profile mismatch".into());
+    }
+    let envelopes = ordered_archive_envelopes(store, context)?;
+    let total_bytes = envelopes
+        .iter()
+        .try_fold(0usize, |sum, envelope| sum.checked_add(envelope.len()))
+        .ok_or_else(|| "QZBE archive-sync total-byte overflow".to_string())?;
+    let header = ArchiveSyncHeader {
+        genesis_id,
+        profile_id: *profile_id,
+        snapshot: snapshot(store)?,
+        cumulative_chainwork: store
+            .fork_choice()
+            .canonical_cumulative_work()
+            .to_be_bytes(),
+        envelope_count: envelopes.len(),
+        total_bytes,
+        archive_digest: archive_sync_digest(&envelopes)?,
+    };
+    let header_bytes = encode_archive_sync_header(&header)?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .map_err(|error| format!("set QZBE archive-sync write timeout: {error}"))?;
+    session
+        .write_record(stream, &header_bytes)
+        .map_err(|error| format!("send QZBE archive-sync header: {error}"))?;
+    for envelope in &envelopes {
+        session
+            .write_record(stream, envelope)
+            .map_err(|error| format!("send QZBE archived envelope: {error}"))?;
+    }
+    eprintln!("event=qzbe_v04_archive_sync_served height={} tip={} root={} envelopes={} bytes={} digest={}",
+        header.snapshot.height, hex(&header.snapshot.tip), hex(&header.snapshot.state_root),
+        header.envelope_count, header.total_bytes, hex(&header.archive_digest));
+    Ok(())
+}
+
+fn sync_archive_from_peer(
+    address: SocketAddr,
+    local_key: &[u8; 32],
+    peer_key: &[u8; 32],
+    network_id: &[u8; 32],
+    genesis_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    store: &mut V04ExecutionCheckpointForkStoreCandidate,
+    context: &QzbeCheckpointValidationContext<'_>,
+    authenticator: &Ed25519TransactionAuthenticator,
+) -> Result<ArchivePeerSummary, String> {
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(10))
+        .map_err(|error| format!("connect to pinned QZBE archive peer {address}: {error}"))?;
+    stream
+        .set_nodelay(true)
+        .map_err(|error| format!("configure archive peer TCP_NODELAY: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .map_err(|error| format!("set archive-sync read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .map_err(|error| format!("set archive-sync write timeout: {error}"))?;
+    let mut session = DevnetNoiseSession::connect(&mut stream, local_key, peer_key, network_id)
+        .map_err(|error| format!("authenticate archive-sync Noise session: {error}"))?;
+    let request = encode_archive_sync_request(*genesis_id, *profile_id);
+    session
+        .write_record(&mut stream, &request)
+        .map_err(|error| format!("send QZBE archive-sync request: {error}"))?;
+    let header_bytes = session
+        .read_record(&mut stream)
+        .map_err(|error| format!("read QZBE archive-sync header: {error}"))?;
+    let header = decode_archive_sync_header(&header_bytes)?;
+    if &header.genesis_id != genesis_id || &header.profile_id != profile_id {
+        return Err("pinned peer returned a different QZBE Genesis/profile".into());
+    }
+
+    let mut envelopes = Vec::with_capacity(header.envelope_count);
+    let mut total_bytes = 0usize;
+    let mut previous_key: Option<(u64, [u8; 32])> = None;
+    for _ in 0..header.envelope_count {
+        let bytes = session
+            .read_record(&mut stream)
+            .map_err(|error| format!("read QZBE archive-sync envelope: {error}"))?;
+        if bytes.len() > MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES {
+            return Err("QZBE archive-sync peer sent an oversized block".into());
+        }
+        total_bytes = total_bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| "QZBE archive-sync received-byte overflow".to_string())?;
+        if total_bytes > MAX_ARCHIVE_SYNC_BYTES {
+            return Err("QZBE archive-sync response exceeds its byte cap".into());
+        }
+        let decoded = V04ExecutionPowEnvelope::decode(&bytes, context.profile, context.params)
+            .map_err(|error| format!("decode peer-supplied archived block: {error}"))?;
+        let digest = qzbe_pow_digest(&decoded.header, &decoded.block, context.params)
+            .map_err(|error| format!("digest peer-supplied archived block: {error}"))?;
+        let key = (decoded.header.height, digest);
+        if previous_key.is_some_and(|previous| key < previous) {
+            return Err("QZBE archive-sync blocks are not in canonical height/digest order".into());
+        }
+        previous_key = Some(key);
+        envelopes.push(bytes);
+    }
+    if total_bytes != header.total_bytes
+        || archive_sync_digest(&envelopes)? != header.archive_digest
+    {
+        return Err("QZBE archive-sync byte count or digest mismatch".into());
+    }
+
+    for bytes in &envelopes {
+        store
+            .submit(bytes, context, authenticator)
+            .map_err(|error| format!("validate/import QZBE archive-sync block: {error}"))?;
+    }
+    let actual = snapshot(store)?;
+    let actual_work = store
+        .fork_choice()
+        .canonical_cumulative_work()
+        .to_be_bytes();
+    if actual.height != header.snapshot.height
+        || actual.tip != header.snapshot.tip
+        || actual.state_root != header.snapshot.state_root
+        || actual_work != header.cumulative_chainwork
+    {
+        return Err(format!(
+            "QZBE archive-sync did not converge to pinned peer {}: local height/tip/root/work={}/{}/{}/{} peer={}/{}/{}/{}",
+            address, actual.height, hex(&actual.tip), hex(&actual.state_root), hex(&actual_work),
+            header.snapshot.height, hex(&header.snapshot.tip), hex(&header.snapshot.state_root), hex(&header.cumulative_chainwork)
+        ));
+    }
+    eprintln!("event=qzbe_v04_archive_sync_complete peer={} height={} tip={} root={} imported_or_seen={} bytes={} work={} generation={}",
+        address, actual.height, hex(&actual.tip), hex(&actual.state_root), envelopes.len(),
+        total_bytes, hex(&actual_work), actual.generation);
+    Ok(ArchivePeerSummary {
+        height: actual.height,
+        tip: actual.tip,
+        state_root: actual.state_root,
+        cumulative_chainwork: actual_work,
+    })
+}
+
 fn serve_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
@@ -930,11 +1817,22 @@ fn serve_connection(
     store: &mut V04ExecutionCheckpointForkStoreCandidate,
     checkpoint_context: &QzbeCheckpointValidationContext<'_>,
     authenticator: &Ed25519TransactionAuthenticator,
+    mempool: &mut BoundedMempool,
+    peers: &[SocketAddr],
+    outbound_peer_keys: &[[u8; 32]],
+    relayed_tx_count: &mut u64,
     accepted_count: &mut u64,
+    allow_archive_sync: bool,
 ) -> Result<(), String> {
     stream
         .set_nodelay(true)
         .map_err(|error| format!("set inbound TCP_NODELAY: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|error| format!("set bounded inbound Noise read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .map_err(|error| format!("set bounded inbound Noise write timeout: {error}"))?;
     let mut session =
         DevnetNoiseSession::accept(&mut stream, &local_key.0, trusted_peer_keys, network_id)
             .map_err(|error| format!("authenticate inbound peer {peer_addr}: {error}"))?;
@@ -943,9 +1841,121 @@ fn serve_connection(
             "authenticated peer static key is not present in the configured trust set".into(),
         );
     }
+    let remote_peer_key = *session.remote_static_public_key();
     let candidate = session
         .read_record(&mut stream)
-        .map_err(|error| format!("read encrypted QZBE candidate: {error}"))?;
+        .map_err(|error| format!("read encrypted QZBE/QZTG/QZSR peer frame: {error}"))?;
+    if candidate.starts_with(ARCHIVE_SYNC_REQUEST_MAGIC) {
+        if !allow_archive_sync {
+            return Err(
+                "QZBE archive sync is available only in explicit zero-value public-testnet mode"
+                    .into(),
+            );
+        }
+        return serve_archive_sync(
+            &mut session,
+            &mut stream,
+            &candidate,
+            profile,
+            store,
+            checkpoint_context,
+        );
+    }
+    if candidate.starts_with(GOSSIP_MAGIC) {
+        let transaction_wire = match decode_gossip_frame(profile, &candidate) {
+            Ok(wire) => wire,
+            Err(error) => {
+                write_peer_tx_ack(
+                    &mut session,
+                    &mut stream,
+                    TxIngressStatus::Rejected,
+                    mempool,
+                    [0; 32],
+                )?;
+                eprintln!("event=qzbe_v04_tx_gossip_rejected peer={} reason=invalid_qztg_frame error={:?} rejected_atomically=true", peer_addr, error);
+                return Ok(());
+            }
+        };
+        let transaction = match decode_transaction(transaction_wire) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                write_peer_tx_ack(
+                    &mut session,
+                    &mut stream,
+                    TxIngressStatus::Rejected,
+                    mempool,
+                    [0; 32],
+                )?;
+                eprintln!("event=qzbe_v04_tx_gossip_rejected peer={} reason=invalid_txn2 error={:?} rejected_atomically=true", peer_addr, error);
+                return Ok(());
+            }
+        };
+        let txid = match transaction_id(&transaction) {
+            Ok(txid) => txid,
+            Err(error) => {
+                write_peer_tx_ack(
+                    &mut session,
+                    &mut stream,
+                    TxIngressStatus::Rejected,
+                    mempool,
+                    [0; 32],
+                )?;
+                eprintln!("event=qzbe_v04_tx_gossip_rejected peer={} reason=invalid_transaction_id error={:?} rejected_atomically=true", peer_addr, error);
+                return Ok(());
+            }
+        };
+        let admission = {
+            let ledger = store.fork_choice().canonical_state().ledger();
+            let candidate_timestamp =
+                next_block_timestamp(ledger.last_timestamp(), SystemTime::now())?;
+            mempool.submit(transaction, ledger, authenticator, candidate_timestamp)
+        };
+        match admission {
+            Ok(admitted_id) => {
+                write_peer_tx_ack(
+                    &mut session,
+                    &mut stream,
+                    TxIngressStatus::Accepted,
+                    mempool,
+                    admitted_id,
+                )?;
+                eprintln!("event=qzbe_v04_tx_gossip_admitted peer={} txid={} mempool_count={} signature_verified=true profile_bound=true", peer_addr, hex(&admitted_id), mempool.len());
+                relay_transaction_to_peers(
+                    transaction_wire,
+                    admitted_id,
+                    &local_key.0,
+                    network_id,
+                    profile,
+                    peers,
+                    outbound_peer_keys,
+                    Some(&remote_peer_key),
+                    relayed_tx_count,
+                    "peer",
+                );
+            }
+            Err(MempoolError::Duplicate) => {
+                write_peer_tx_ack(
+                    &mut session,
+                    &mut stream,
+                    TxIngressStatus::Duplicate,
+                    mempool,
+                    txid,
+                )?;
+                eprintln!("event=qzbe_v04_tx_gossip_duplicate peer={} txid={} mempool_count={} relay_suppressed=true", peer_addr, hex(&txid), mempool.len());
+            }
+            Err(error) => {
+                write_peer_tx_ack(
+                    &mut session,
+                    &mut stream,
+                    TxIngressStatus::Rejected,
+                    mempool,
+                    [0; 32],
+                )?;
+                eprintln!("event=qzbe_v04_tx_gossip_rejected peer={} txid={} reason={:?} mempool_count={} rejected_atomically=true", peer_addr, hex(&txid), error, mempool.len());
+            }
+        }
+        return Ok(());
+    }
     let (status, digest) = match store.submit(&candidate, checkpoint_context, authenticator) {
         Ok(outcome) => (0u8, outcome.block_digest),
         Err(error) => {
@@ -969,6 +1979,618 @@ fn serve_connection(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RpcCommand {
+    Status,
+    Balance(AccountId),
+    Transaction([u8; 32]),
+    AmmSwapBlocks {
+        before_height: Option<u64>,
+        min_confirmations: u64,
+        limit_blocks: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TransactionLookup {
+    Confirmed {
+        block_height: u64,
+        confirmations: u64,
+    },
+    Pending {
+        mempool_count: usize,
+    },
+    NotFoundInRetainedSuffix {
+        search_floor_height: u64,
+    },
+}
+
+fn parse_amm_swap_rpc_command(raw_path: &str) -> Result<RpcCommand, String> {
+    let (path, query) = raw_path.split_once('?').unwrap_or((raw_path, ""));
+    if path != "/v1/amm/swaps" {
+        return Err("unknown read-only RPC path".into());
+    }
+    let mut before_height = None;
+    let mut min_confirmations = 6u64;
+    let mut limit_blocks = 8usize;
+    let mut seen = BTreeSet::new();
+    if !query.is_empty() {
+        for field in query.split('&') {
+            let (key, value) = field
+                .split_once('=')
+                .ok_or_else(|| "AMM swap query must use key=value".to_string())?;
+            if !seen.insert(key) {
+                return Err("duplicate AMM swap query parameter".into());
+            }
+            match key {
+                "before_height" => {
+                    before_height =
+                        Some(value.parse::<u64>().map_err(|_| {
+                            "before_height must be a non-negative integer".to_string()
+                        })?);
+                }
+                "min_confirmations" => {
+                    min_confirmations = value.parse::<u64>().map_err(|_| {
+                        "min_confirmations must be a non-negative integer".to_string()
+                    })?;
+                }
+                "limit_blocks" => {
+                    limit_blocks = value
+                        .parse::<usize>()
+                        .map_err(|_| "limit_blocks must be a positive integer".to_string())?;
+                }
+                _ => return Err("unknown AMM swap query parameter".into()),
+            }
+        }
+    } else if raw_path.ends_with('?') {
+        return Err("empty AMM swap query is not allowed".into());
+    }
+    if !(1..=1024).contains(&min_confirmations) {
+        return Err("min_confirmations must be between 1 and 1024".into());
+    }
+    if !(1..=8).contains(&limit_blocks) {
+        return Err("limit_blocks must be between 1 and 8".into());
+    }
+    Ok(RpcCommand::AmmSwapBlocks {
+        before_height,
+        min_confirmations,
+        limit_blocks,
+    })
+}
+
+fn parse_rpc_command(request: &[u8]) -> Result<RpcCommand, String> {
+    if request.is_empty() || request.len() > MAX_RPC_REQUEST_BYTES {
+        return Err("RPC request is empty or too large".into());
+    }
+    let header_end = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| "RPC request has no complete HTTP header".to_string())?;
+    if header_end + 4 != request.len() {
+        return Err("RPC request body or pipelined bytes are not allowed".into());
+    }
+    let text = std::str::from_utf8(&request[..header_end])
+        .map_err(|_| "RPC request is not ASCII/UTF-8".to_string())?;
+    if !text.is_ascii() {
+        return Err("RPC request must be ASCII".into());
+    }
+    let mut lines = text.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or_else(|| "RPC request line missing".to_string())?;
+    let fields = request_line.split_ascii_whitespace().collect::<Vec<_>>();
+    if fields.len() != 3 || fields[0] != "GET" || !matches!(fields[2], "HTTP/1.0" | "HTTP/1.1") {
+        return Err("RPC permits only GET HTTP/1.0 or HTTP/1.1".into());
+    }
+    let headers = lines.collect::<Vec<_>>();
+    if fields[2] == "HTTP/1.1"
+        && !headers
+            .iter()
+            .any(|line| line.to_ascii_lowercase().starts_with("host:"))
+    {
+        return Err("HTTP/1.1 RPC request requires Host".into());
+    }
+    for line in headers {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("content-length:") && lower.trim() != "content-length: 0" {
+            return Err("RPC request body is not allowed".into());
+        }
+        if lower.starts_with("transfer-encoding:") {
+            return Err("RPC transfer encoding is not allowed".into());
+        }
+    }
+    let raw_path = fields[1];
+    if raw_path == "/v1/amm/swaps" || raw_path.starts_with("/v1/amm/swaps?") {
+        return parse_amm_swap_rpc_command(raw_path);
+    }
+    if raw_path.contains('?') {
+        return Err("query parameters are only supported by /v1/amm/swaps".into());
+    }
+    match raw_path {
+        "/v1/status" => Ok(RpcCommand::Status),
+        path if path.starts_with("/v1/balance/") => {
+            let account = &path["/v1/balance/".len()..];
+            if account.len() != 64
+                || account.contains('/')
+                || account.contains('?')
+                || account.contains('#')
+            {
+                return Err("balance path must contain exactly one 32-byte hex account ID".into());
+            }
+            Ok(RpcCommand::Balance(parse_hex32(account, "RPC account ID")?))
+        }
+        path if path.starts_with("/v1/transaction/") => {
+            let txid = &path["/v1/transaction/".len()..];
+            if txid.len() != 64 || txid.contains('/') || txid.contains('?') || txid.contains('#') {
+                return Err("transaction path must contain exactly one 32-byte hex TXID".into());
+            }
+            Ok(RpcCommand::Transaction(parse_hex32(
+                txid,
+                "RPC transaction ID",
+            )?))
+        }
+        _ => Err("unknown read-only RPC path".into()),
+    }
+}
+
+fn write_rpc_response(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    body: &str,
+) -> Result<(), String> {
+    let header = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(header.as_bytes())
+        .map_err(|error| format!("write QZBE RPC headers: {error}"))?;
+    stream
+        .write_all(body.as_bytes())
+        .map_err(|error| format!("write QZBE RPC JSON body: {error}"))?;
+    Ok(())
+}
+
+fn lookup_transaction(
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    mempool: &BoundedMempool,
+    params: &ConsensusParameters,
+    target_txid: [u8; 32],
+) -> Result<TransactionLookup, String> {
+    let fork = store.fork_choice();
+    let canonical_height = fork.canonical_height();
+    let base_tip = fork.base_tip();
+    let base_height = fork
+        .branch_state(&base_tip)
+        .map(|state| state.ledger().height())
+        .ok_or_else(|| "QZBE RPC cannot resolve the trusted base checkpoint".to_string())?;
+
+    // Build digest-indexed, validated envelopes, then traverse only the canonical ancestry.
+    // Searching every archived branch would falsely describe orphaned-fork transactions as confirmed.
+    let mut envelopes = BTreeMap::new();
+    for bytes in fork.archive_envelopes() {
+        let envelope = V04ExecutionPowEnvelope::decode(&bytes, fork.profile(), params)
+            .map_err(|error| format!("decode retained QZBE envelope for TXID query: {error}"))?;
+        let digest = qzbe_pow_digest(&envelope.header, &envelope.block, params)
+            .map_err(|error| format!("derive retained QZBE digest for TXID query: {error}"))?;
+        if envelopes.insert(digest, envelope).is_some() {
+            return Err(
+                "duplicate QZBE digest encountered while resolving transaction ancestry".into(),
+            );
+        }
+    }
+
+    let mut tip = fork.canonical_tip();
+    let mut height = canonical_height;
+    let mut remaining = envelopes.len().saturating_add(1);
+    while tip != base_tip && remaining > 0 {
+        remaining -= 1;
+        let envelope = envelopes
+            .get(&tip)
+            .ok_or_else(|| "canonical QZBE ancestry is missing a retained envelope".to_string())?;
+        if envelope.header.height != height {
+            return Err("canonical QZBE ancestry height does not match envelope".into());
+        }
+        for transaction in &envelope.block.transactions {
+            let id = transaction_id(transaction).map_err(|error| {
+                format!("derive transaction ID from canonical block: {error:?}")
+            })?;
+            if id == target_txid {
+                return Ok(TransactionLookup::Confirmed {
+                    block_height: height,
+                    confirmations: canonical_height
+                        .checked_sub(height)
+                        .and_then(|depth| depth.checked_add(1))
+                        .ok_or_else(|| {
+                            "QZBE transaction confirmation count overflow".to_string()
+                        })?,
+                });
+            }
+        }
+        tip = envelope.header.previous_consensus_hash;
+        height = height
+            .checked_sub(1)
+            .ok_or_else(|| "QZBE canonical ancestry height underflow".to_string())?;
+    }
+    if tip != base_tip {
+        return Err("canonical QZBE ancestry exceeds its bounded retained suffix".into());
+    }
+
+    for transaction in mempool.ordered_transactions() {
+        let id = transaction_id(&transaction)
+            .map_err(|error| format!("derive pending QZBE transaction ID: {error:?}"))?;
+        if id == target_txid {
+            return Ok(TransactionLookup::Pending {
+                mempool_count: mempool.len(),
+            });
+        }
+    }
+    Ok(TransactionLookup::NotFoundInRetainedSuffix {
+        search_floor_height: base_height,
+    })
+}
+
+fn network_surface_fields(
+    peer_listen: SocketAddr,
+    tx_listen: Option<SocketAddr>,
+    rpc_listen: Option<SocketAddr>,
+    public_testnet_p2p: bool,
+    public_testnet_tx_ingress: bool,
+) -> (&'static str, bool) {
+    let local_only = peer_listen.ip().is_loopback()
+        && tx_listen.is_none_or(|address| address.ip().is_loopback())
+        && rpc_listen.is_none_or(|address| address.ip().is_loopback());
+    let surface = if !peer_listen.ip().is_loopback() {
+        "explicit_testnet_public_p2p_noise_pinned"
+    } else if public_testnet_tx_ingress {
+        "loopback_peer_listener_public_zero_value_tx_ingress"
+    } else if public_testnet_p2p {
+        "outbound_testnet_p2p_loopback_listener"
+    } else {
+        "loopback_only"
+    };
+    (surface, local_only)
+}
+
+fn recovery_readiness_fields(readiness: RecoveryReadiness) -> (&'static str, &'static str) {
+    match readiness {
+        RecoveryReadiness::Ready => ("READY", "all_recovery_checks_valid"),
+        RecoveryReadiness::Syncing(check) => (
+            "SYNCING",
+            match check {
+                RecoveryCheck::NetworkProfile => "network_profile_pending",
+                RecoveryCheck::GenesisManifest => "genesis_manifest_pending",
+                RecoveryCheck::FullHistoryReplay => "full_history_replay_pending",
+                RecoveryCheck::PeerReconciliation => "peer_reconciliation_pending",
+                RecoveryCheck::StateRootAgreement => "state_root_agreement_pending",
+                RecoveryCheck::CumulativeChainworkAgreement => {
+                    "cumulative_chainwork_agreement_pending"
+                }
+            },
+        ),
+        RecoveryReadiness::Quarantined(fault) => (
+            "QUARANTINED",
+            match fault {
+                RecoveryFault::NetworkProfileMismatch => "network_profile_mismatch",
+                RecoveryFault::GenesisManifestMismatch => "genesis_manifest_mismatch",
+                RecoveryFault::InvalidHistoricalBlockOrReplay => {
+                    "invalid_historical_block_or_replay"
+                }
+                RecoveryFault::ConflictingPeerHistory => "conflicting_peer_history",
+                RecoveryFault::CanonicalStateRootMismatch => "canonical_state_root_mismatch",
+                RecoveryFault::CumulativeChainworkMismatch => "cumulative_chainwork_mismatch",
+            },
+        ),
+    }
+}
+
+/// Re-execute the canonical path from Genesis in bounded segments and compare its resulting
+/// tip, state root and cumulative work with the opened store. This is stronger than checking only
+/// parent links; it remains bounded by the store's currently retained archive until durable
+/// multi-segment history retention is integrated.
+fn canonical_history_complete_from_genesis(
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    context: &QzbeCheckpointValidationContext<'_>,
+    params: &ConsensusParameters,
+    authenticator: &Ed25519TransactionAuthenticator,
+) -> Result<bool, String> {
+    let fork = store.fork_choice();
+    let base_tip = fork.base_tip();
+    let base_state = fork
+        .branch_state(&base_tip)
+        .ok_or_else(|| "QZBE recovery gate cannot resolve its base checkpoint".to_string())?;
+    let base_height = base_state.ledger().height();
+    if base_height != 0 {
+        return Ok(false);
+    }
+
+    let mut envelopes: BTreeMap<[u8; 32], (V04ExecutionPowEnvelope, Vec<u8>)> = BTreeMap::new();
+    for bytes in fork.archive_envelopes() {
+        let envelope = V04ExecutionPowEnvelope::decode(&bytes, context.profile, params)
+            .map_err(|error| format!("decode QZBE archive for recovery readiness: {error}"))?;
+        let digest =
+            qzbe_pow_digest(&envelope.header, &envelope.block, params).map_err(|error| {
+                format!("derive QZBE archive digest for recovery readiness: {error}")
+            })?;
+        if envelopes.insert(digest, (envelope, bytes)).is_some() {
+            return Err("duplicate QZBE archive digest during recovery readiness check".into());
+        }
+    }
+
+    let mut tip = fork.canonical_tip();
+    let mut height = fork.canonical_height();
+    let mut visited = 0usize;
+    let mut canonical_envelopes = Vec::with_capacity(height.saturating_sub(base_height) as usize);
+    while tip != base_tip {
+        if visited >= envelopes.len() {
+            return Ok(false);
+        }
+        let Some((envelope, bytes)) = envelopes.get(&tip) else {
+            return Ok(false);
+        };
+        if envelope.header.height != height {
+            return Ok(false);
+        }
+        canonical_envelopes.push(bytes.clone());
+        tip = envelope.header.previous_consensus_hash;
+        height = height
+            .checked_sub(1)
+            .ok_or_else(|| "QZBE recovery ancestry height underflow".to_string())?;
+        visited += 1;
+    }
+    if height != base_height {
+        return Ok(false);
+    }
+    canonical_envelopes.reverse();
+
+    let replay = replay_canonical_history_from_genesis(
+        context,
+        params,
+        canonical_envelopes.iter().map(Vec::as_slice),
+        authenticator,
+        MAX_V04_EXECUTION_FORK_ARCHIVE_HEIGHT,
+    )
+    .map_err(|error| format!("QZBE Genesis-rooted segmented replay failed: {error}"))?;
+    let store_state_root = store
+        .canonical_state_root()
+        .map_err(|error| format!("read QZBE canonical state root: {error}"))?;
+    Ok(replay.height == fork.canonical_height()
+        && replay.tip == fork.canonical_tip()
+        && replay.state_root == store_state_root
+        && replay.cumulative_chainwork == fork.canonical_cumulative_work()
+        && replay.blocks_replayed == fork.canonical_height().saturating_sub(base_height))
+}
+
+fn serve_rpc_connection(
+    mut stream: TcpStream,
+    peer_addr: SocketAddr,
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    mempool: &BoundedMempool,
+    params: &ConsensusParameters,
+    network_id: &[u8; 32],
+    genesis_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    recovery_readiness: RecoveryReadiness,
+) -> Result<(), String> {
+    if !peer_addr.ip().is_loopback() {
+        return Err("read-only RPC accepts loopback clients only".into());
+    }
+    // Listener polling is nonblocking; accepted sockets must be restored to blocking mode
+    // before reading HTTP headers, otherwise fragmented requests can spuriously time out on Windows.
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("set QZBE RPC blocking mode: {error}"))?;
+    stream
+        .set_nodelay(true)
+        .map_err(|error| format!("set QZBE RPC TCP_NODELAY: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("set bounded QZBE RPC read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(1)))
+        .map_err(|error| format!("set QZBE RPC write timeout: {error}"))?;
+    let mut request = Vec::with_capacity(512);
+    let mut chunk = [0u8; 512];
+    loop {
+        let count = match stream.read(&mut chunk) {
+            Ok(count) => count,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+                return Err("QZBE RPC request read timed out before complete headers".into());
+            }
+            Err(error) => return Err(format!("read bounded QZBE RPC request: {error}")),
+        };
+        if count == 0 {
+            break;
+        }
+        if request.len().saturating_add(count) > MAX_RPC_REQUEST_BYTES {
+            let _ = write_rpc_response(
+                &mut stream,
+                413,
+                "Payload Too Large",
+                "{\"ok\":false,\"error\":\"request_too_large\"}",
+            );
+            return Ok(());
+        }
+        request.extend_from_slice(&chunk[..count]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let command = match parse_rpc_command(&request) {
+        Ok(command) => command,
+        Err(_) => {
+            write_rpc_response(
+                &mut stream,
+                400,
+                "Bad Request",
+                "{\"ok\":false,\"error\":\"bad_request\"}",
+            )?;
+            return Ok(());
+        }
+    };
+    let current = match snapshot(store) {
+        Ok(value) => value,
+        Err(_) => {
+            write_rpc_response(
+                &mut stream,
+                503,
+                "Service Unavailable",
+                "{\"ok\":false,\"error\":\"state_unavailable\"}",
+            )?;
+            return Ok(());
+        }
+    };
+    let body = match command {
+        RpcCommand::Status => {
+            let (recovery_status, recovery_detail) = recovery_readiness_fields(recovery_readiness);
+            format!(
+                "{{\"ok\":true,\"network_id\":\"{}\",\"genesis_id\":\"{}\",\"profile_id\":\"{}\",\"height\":{},\"tip\":\"{}\",\"state_root\":\"{}\",\"generation\":{},\"recovery_readiness_at_startup\":\"{}\",\"recovery_detail_at_startup\":\"{}\",\"mainnet\":false,\"public_launch_approved\":false,\"read_only\":true}}",
+                hex(network_id), hex(genesis_id), hex(profile_id), current.height, hex(&current.tip), hex(&current.state_root), current.generation, recovery_status, recovery_detail
+            )
+        },
+        RpcCommand::Balance(account) => format!(
+            "{{\"ok\":true,\"network_id\":\"{}\",\"genesis_id\":\"{}\",\"profile_id\":\"{}\",\"account_id\":\"{}\",\"balance_atoms\":{},\"height\":{},\"tip\":\"{}\",\"state_root\":\"{}\",\"generation\":{},\"mainnet\":false,\"read_only\":true}}",
+            hex(network_id), hex(genesis_id), hex(profile_id), hex(&account), observed_balance(store, &account), current.height, hex(&current.tip), hex(&current.state_root), current.generation
+        ),
+        RpcCommand::Transaction(txid) => {
+            match lookup_transaction(store, mempool, params, txid) {
+                Ok(TransactionLookup::Confirmed { block_height, confirmations }) => format!(
+                    "{{\"ok\":true,\"network_id\":\"{}\",\"genesis_id\":\"{}\",\"profile_id\":\"{}\",\"txid\":\"{}\",\"status\":\"confirmed\",\"block_height\":{},\"confirmations\":{},\"height\":{},\"tip\":\"{}\",\"state_root\":\"{}\",\"generation\":{},\"mainnet\":false,\"read_only\":true}}",
+                    hex(network_id), hex(genesis_id), hex(profile_id), hex(&txid), block_height, confirmations, current.height, hex(&current.tip), hex(&current.state_root), current.generation
+                ),
+                Ok(TransactionLookup::Pending { mempool_count }) => format!(
+                    "{{\"ok\":true,\"network_id\":\"{}\",\"genesis_id\":\"{}\",\"profile_id\":\"{}\",\"txid\":\"{}\",\"status\":\"pending\",\"block_height\":null,\"confirmations\":0,\"mempool_count\":{},\"height\":{},\"tip\":\"{}\",\"state_root\":\"{}\",\"generation\":{},\"mainnet\":false,\"read_only\":true}}",
+                    hex(network_id), hex(genesis_id), hex(profile_id), hex(&txid), mempool_count, current.height, hex(&current.tip), hex(&current.state_root), current.generation
+                ),
+                Ok(TransactionLookup::NotFoundInRetainedSuffix { search_floor_height }) => format!(
+                    "{{\"ok\":true,\"network_id\":\"{}\",\"genesis_id\":\"{}\",\"profile_id\":\"{}\",\"txid\":\"{}\",\"status\":\"not_found_in_retained_suffix\",\"block_height\":null,\"confirmations\":0,\"search_floor_height\":{},\"height\":{},\"tip\":\"{}\",\"state_root\":\"{}\",\"generation\":{},\"mainnet\":false,\"read_only\":true}}",
+                    hex(network_id), hex(genesis_id), hex(profile_id), hex(&txid), search_floor_height, current.height, hex(&current.tip), hex(&current.state_root), current.generation
+                ),
+                Err(_) => return write_rpc_response(
+                    &mut stream, 503, "Service Unavailable",
+                    "{{\"ok\":false,\"error\":\"transaction_state_unavailable\"}}",
+                ),
+            }
+        }
+        RpcCommand::AmmSwapBlocks {
+            before_height,
+            min_confirmations,
+            limit_blocks,
+        } => {
+            let fork = store.fork_choice();
+            let blocks = match fork.canonical_swap_blocks(
+                before_height,
+                min_confirmations,
+                limit_blocks,
+            ) {
+                Ok(blocks) => blocks,
+                Err(_) => {
+                    return write_rpc_response(
+                        &mut stream,
+                        503,
+                        "Service Unavailable",
+                        "{\"ok\":false,\"error\":\"amm_event_history_unavailable\"}",
+                    )
+                }
+            };
+            let mut body = format!(
+                "{{\"ok\":true,\"network_id\":\"{}\",\"genesis_id\":\"{}\",\"profile_id\":\"{}\",\"height\":{},\"tip\":\"{}\",\"retained_base_height\":{},\"reorg_count\":{},\"min_confirmations\":{},\"finality_model\":\"probabilistic_pow_confirmations\",\"mainnet\":false,\"public_launch_approved\":false,\"read_only\":true,\"blocks\":[",
+                hex(network_id),
+                hex(genesis_id),
+                hex(profile_id),
+                current.height,
+                hex(&current.tip),
+                fork.retained_base_height(),
+                fork.reorg_count(),
+                min_confirmations,
+            );
+            for (block_index, block) in blocks.iter().enumerate() {
+                if block_index != 0 {
+                    body.push(',');
+                }
+                body.push_str(&format!(
+                    "{{\"height\":{},\"block_hash\":\"{}\",\"timestamp\":{},\"confirmations\":{},\"canonical\":true,\"swaps\":[",
+                    block.height,
+                    hex(&block.block_hash),
+                    block.timestamp,
+                    block.confirmations,
+                ));
+                for (swap_index, event) in block.swaps.iter().enumerate() {
+                    if swap_index != 0 {
+                        body.push(',');
+                    }
+                    let receipt = &event.receipt;
+                    body.push_str(&format!(
+                        "{{\"operation_index\":{},\"pair_id\":\"{}\",\"token_in\":\"{}\",\"token_out\":\"{}\",\"amount_in_atoms\":\"{}\",\"amount_out_atoms\":\"{}\",\"fee_atoms\":\"{}\",\"reserve0_after_atoms\":\"{}\",\"reserve1_after_atoms\":\"{}\"}}",
+                        event.operation_index,
+                        hex(&receipt.pair_id),
+                        hex(&receipt.token_in),
+                        hex(&receipt.token_out),
+                        receipt.amount_in,
+                        receipt.amount_out,
+                        receipt.fee_atoms,
+                        receipt.reserve0_after,
+                        receipt.reserve1_after,
+                    ));
+                }
+                body.push_str("]}");
+            }
+            body.push_str("]}");
+            body
+        }
+    };
+    write_rpc_response(&mut stream, 200, "OK", &body)
+}
+
+fn poll_rpc_connections(
+    listener: Option<&TcpListener>,
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    mempool: &BoundedMempool,
+    params: &ConsensusParameters,
+    network_id: &[u8; 32],
+    genesis_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    recovery_readiness: RecoveryReadiness,
+) -> Result<(), String> {
+    let Some(listener) = listener else {
+        return Ok(());
+    };
+    for _ in 0..MAX_RPC_CONNECTIONS_PER_POLL {
+        match listener.accept() {
+            Ok((stream, peer_addr)) => {
+                if let Err(error) = serve_rpc_connection(
+                    stream,
+                    peer_addr,
+                    store,
+                    mempool,
+                    params,
+                    network_id,
+                    genesis_id,
+                    profile_id,
+                    recovery_readiness,
+                ) {
+                    eprintln!(
+                        "event=qzbe_v04_rpc_request_rejected peer={} reason={}",
+                        peer_addr, error
+                    );
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(format!("accept loopback QZBE RPC connection: {error}")),
+        }
+    }
+    Ok(())
+}
+
 fn poll_connections(
     listener: &TcpListener,
     local_key: &SecretKey,
@@ -978,8 +2600,13 @@ fn poll_connections(
     store: &mut V04ExecutionCheckpointForkStoreCandidate,
     checkpoint_context: &QzbeCheckpointValidationContext<'_>,
     authenticator: &Ed25519TransactionAuthenticator,
+    mempool: &mut BoundedMempool,
+    peers: &[SocketAddr],
+    outbound_peer_keys: &[[u8; 32]],
+    relayed_tx_count: &mut u64,
     accepted_count: &mut u64,
     message_count: &mut u64,
+    allow_archive_sync: bool,
 ) -> Result<(), String> {
     loop {
         match listener.accept() {
@@ -998,7 +2625,12 @@ fn poll_connections(
                     store,
                     checkpoint_context,
                     authenticator,
+                    mempool,
+                    peers,
+                    outbound_peer_keys,
+                    relayed_tx_count,
                     accepted_count,
+                    allow_archive_sync,
                 ) {
                     eprintln!(
                         "event=qzbe_v04_peer_connection_rejected peer={} reason={}",
@@ -1011,6 +2643,553 @@ fn poll_connections(
         }
     }
 }
+fn tx_ingress_ack(
+    stream: &mut TcpStream,
+    status: TxIngressStatus,
+    mempool: &BoundedMempool,
+    transaction_id: [u8; 32],
+) -> Result<(), String> {
+    let count = u32::try_from(mempool.len()).unwrap_or(u32::MAX);
+    let bytes = encode_tx_ingress_ack(TxIngressAck {
+        status,
+        mempool_count: count,
+        transaction_id,
+    });
+    stream
+        .write_all(&bytes)
+        .map_err(|error| format!("write QZTS/1 transaction acknowledgement: {error}"))
+}
+
+fn serve_tx_connection(
+    mut stream: TcpStream,
+    peer_addr: SocketAddr,
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    authenticator: &Ed25519TransactionAuthenticator,
+    mempool: &mut BoundedMempool,
+    local_key: &SecretKey,
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    peers: &[SocketAddr],
+    outbound_peer_keys: &[[u8; 32]],
+    relayed_tx_count: &mut u64,
+    allow_public_testnet_tx_ingress: bool,
+) -> Result<(), String> {
+    if !peer_addr.ip().is_loopback() && !allow_public_testnet_tx_ingress {
+        return Err(
+            "QZBE transaction ingress only accepts loopback clients unless explicit public testnet ingress is enabled".into(),
+        );
+    }
+    // The listener is polled nonblocking. Explicitly restore blocking mode on the
+    // accepted stream before read_exact so fragmented QZTS/1 writes cannot fail
+    // spuriously with WSAEWOULDBLOCK (10035) on Windows.
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("set TXN2 ingress blocking mode: {error}"))?;
+    stream
+        .set_nodelay(true)
+        .map_err(|error| format!("set TXN2 ingress TCP_NODELAY: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("set TXN2 ingress read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("set TXN2 ingress write timeout: {error}"))?;
+
+    let mut header = [0u8; REQUEST_HEADER_BYTES];
+    stream
+        .read_exact(&mut header)
+        .map_err(|error| format!("read QZTS/1 request header: {error}"))?;
+    let transaction_len = match decode_request_header(&header) {
+        Ok(length) => length,
+        Err(error) => {
+            tx_ingress_ack(&mut stream, TxIngressStatus::Rejected, mempool, [0; 32])?;
+            return Err(format!("invalid QZTS/1 request header: {error:?}"));
+        }
+    };
+    if transaction_len > MAX_TRANSACTION_BYTES {
+        tx_ingress_ack(&mut stream, TxIngressStatus::Rejected, mempool, [0; 32])?;
+        return Err("QZTS/1 transaction exceeds the canonical TXN2 byte cap".into());
+    }
+    let mut transaction_wire = vec![0u8; transaction_len];
+    stream
+        .read_exact(&mut transaction_wire)
+        .map_err(|error| format!("read bounded QZTS/1 TXN2 payload: {error}"))?;
+    let transaction = match decode_transaction(&transaction_wire) {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            tx_ingress_ack(&mut stream, TxIngressStatus::Rejected, mempool, [0; 32])?;
+            eprintln!("event=qzbe_v04_tx_rejected peer={} reason=malformed_txn2 error={:?} mempool_count={}", peer_addr, error, mempool.len());
+            return Ok(());
+        }
+    };
+    let txid = match transaction_id(&transaction) {
+        Ok(id) => id,
+        Err(error) => {
+            tx_ingress_ack(&mut stream, TxIngressStatus::Rejected, mempool, [0; 32])?;
+            eprintln!("event=qzbe_v04_tx_rejected peer={} reason=transaction_id error={:?} mempool_count={}", peer_addr, error, mempool.len());
+            return Ok(());
+        }
+    };
+    let admission = {
+        let ledger = store.fork_choice().canonical_state().ledger();
+        let candidate_timestamp = next_block_timestamp(ledger.last_timestamp(), SystemTime::now())?;
+        mempool.submit(transaction, ledger, authenticator, candidate_timestamp)
+    };
+    match admission {
+        Ok(admitted_id) => {
+            tx_ingress_ack(&mut stream, TxIngressStatus::Accepted, mempool, admitted_id)?;
+            eprintln!("event=qzbe_v04_tx_admitted peer={} txid={} mempool_count={} bounded=true signature_policy=self_contained_or_registered_ed25519", peer_addr, hex(&admitted_id), mempool.len());
+            relay_transaction_to_peers(
+                &transaction_wire,
+                admitted_id,
+                &local_key.0,
+                network_id,
+                profile_id,
+                peers,
+                outbound_peer_keys,
+                None,
+                relayed_tx_count,
+                "wallet",
+            );
+        }
+        Err(MempoolError::Duplicate) => {
+            tx_ingress_ack(&mut stream, TxIngressStatus::Duplicate, mempool, txid)?;
+            eprintln!(
+                "event=qzbe_v04_tx_duplicate peer={} txid={} mempool_count={}",
+                peer_addr,
+                hex(&txid),
+                mempool.len()
+            );
+        }
+        Err(error) => {
+            tx_ingress_ack(&mut stream, TxIngressStatus::Rejected, mempool, [0; 32])?;
+            eprintln!("event=qzbe_v04_tx_rejected peer={} txid={} reason={:?} mempool_count={} rejected_atomically=true", peer_addr, hex(&txid), error, mempool.len());
+        }
+    }
+    Ok(())
+}
+
+fn accept_one_tx_connection_for_mining_interrupt(
+    listener: Option<&TcpListener>,
+    pending: &mut VecDeque<(TcpStream, SocketAddr)>,
+) -> Result<bool, String> {
+    let Some(listener) = listener else {
+        return Ok(false);
+    };
+    match listener.accept() {
+        Ok((stream, peer_addr)) => {
+            pending.push_back((stream, peer_addr));
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(format!(
+            "accept QZBE transaction ingress during PoW: {error}"
+        )),
+    }
+}
+
+fn poll_tx_connections(
+    listener: Option<&TcpListener>,
+    pending: &mut VecDeque<(TcpStream, SocketAddr)>,
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    authenticator: &Ed25519TransactionAuthenticator,
+    mempool: &mut BoundedMempool,
+    submission_count: &mut u64,
+    local_key: &SecretKey,
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    peers: &[SocketAddr],
+    outbound_peer_keys: &[[u8; 32]],
+    relayed_tx_count: &mut u64,
+    allow_public_testnet_tx_ingress: bool,
+) -> Result<(), String> {
+    while let Some((mut stream, peer_addr)) = pending.pop_front() {
+        *submission_count = submission_count.saturating_add(1);
+        if *submission_count > MAX_TX_SUBMISSIONS {
+            let _ = tx_ingress_ack(&mut stream, TxIngressStatus::Rejected, mempool, [0; 32]);
+            eprintln!(
+                "event=qzbe_v04_tx_rejected peer={} reason=bounded_submission_budget_exhausted",
+                peer_addr
+            );
+            continue;
+        }
+        if let Err(error) = serve_tx_connection(
+            stream,
+            peer_addr,
+            store,
+            authenticator,
+            mempool,
+            local_key,
+            network_id,
+            profile_id,
+            peers,
+            outbound_peer_keys,
+            relayed_tx_count,
+            allow_public_testnet_tx_ingress,
+        ) {
+            eprintln!(
+                "event=qzbe_v04_tx_connection_rejected peer={} reason={}",
+                peer_addr, error
+            );
+        }
+    }
+    let Some(listener) = listener else {
+        return Ok(());
+    };
+    for _ in 0..MAX_TX_SUBMISSIONS_PER_POLL {
+        match listener.accept() {
+            Ok((mut stream, peer_addr)) => {
+                *submission_count = submission_count.saturating_add(1);
+                if *submission_count > MAX_TX_SUBMISSIONS {
+                    let _ =
+                        tx_ingress_ack(&mut stream, TxIngressStatus::Rejected, mempool, [0; 32]);
+                    eprintln!("event=qzbe_v04_tx_rejected peer={} reason=bounded_submission_budget_exhausted", peer_addr);
+                    continue;
+                }
+                if let Err(error) = serve_tx_connection(
+                    stream,
+                    peer_addr,
+                    store,
+                    authenticator,
+                    mempool,
+                    local_key,
+                    network_id,
+                    profile_id,
+                    peers,
+                    outbound_peer_keys,
+                    relayed_tx_count,
+                    allow_public_testnet_tx_ingress,
+                ) {
+                    eprintln!(
+                        "event=qzbe_v04_tx_connection_rejected peer={} reason={}",
+                        peer_addr, error
+                    );
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(format!("accept QZBE transaction ingress: {error}")),
+        }
+    }
+    Ok(())
+}
+
+fn amm_ingress_ack(
+    stream: &mut TcpStream,
+    status: AmmIngressStatus,
+    mempool: &BoundedAmmMempool,
+    operation_id: [u8; 32],
+) -> Result<(), String> {
+    let ack = encode_amm_ingress_ack(&AmmIngressAck {
+        status,
+        mempool_count: u32::try_from(mempool.len()).unwrap_or(u32::MAX),
+        operation_id,
+    });
+    stream
+        .write_all(&ack)
+        .map_err(|error| format!("write QZAS/1 AMM acknowledgement: {error}"))
+}
+
+fn preview_amm_operation_batch(
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    authenticator: &Ed25519TransactionAuthenticator,
+    mempool: &BoundedMempool,
+    operations: &[AmmSignedOperation],
+    miner_id: [u8; 32],
+) -> Result<(), String> {
+    if operations.len() > MAX_AMM_OPERATIONS_PER_BLOCK {
+        return Err("AMM operation batch exceeds the per-block count cap".into());
+    }
+    if operations.is_empty() {
+        return Ok(());
+    }
+    let fork_choice = store.fork_choice();
+    let ledger = fork_choice.canonical_state().ledger();
+    let timestamp = next_block_timestamp(ledger.last_timestamp(), SystemTime::now())?;
+    let next_height = fork_choice
+        .canonical_height()
+        .checked_add(1)
+        .ok_or_else(|| "QZBE height overflow while validating AMM ingress".to_string())?;
+    // This constructs and validates the full candidate transition (signature, account nonce,
+    // expiry, balances, pair state, state root and snapshot invariants) without claiming PoW.
+    fork_choice
+        .build_candidate_on_with_amm(
+            fork_choice.canonical_tip(),
+            timestamp,
+            miner_id,
+            mempool.ordered_transactions(),
+            operations.to_vec(),
+            next_height,
+            authenticator,
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            format!("AMM operation batch failed canonical transition preview: {error}")
+        })
+}
+
+fn serve_amm_connection(
+    mut stream: TcpStream,
+    peer_addr: SocketAddr,
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    authenticator: &Ed25519TransactionAuthenticator,
+    mempool: &BoundedMempool,
+    amm_mempool: &mut BoundedAmmMempool,
+    miner_id: [u8; 32],
+    allow_public_testnet_amm_ingress: bool,
+) -> Result<(), String> {
+    if !peer_addr.ip().is_loopback() && !allow_public_testnet_amm_ingress {
+        return Err(
+            "QZBE AMM ingress only accepts loopback clients unless explicit zero-value public testnet AMM ingress is enabled".into(),
+        );
+    }
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("set AMM ingress blocking mode: {error}"))?;
+    stream
+        .set_nodelay(true)
+        .map_err(|error| format!("configure AMM ingress TCP_NODELAY: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("set AMM ingress read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("set AMM ingress write timeout: {error}"))?;
+
+    let mut header = [0u8; AMM_INGRESS_REQUEST_HEADER_BYTES];
+    stream
+        .read_exact(&mut header)
+        .map_err(|error| format!("read QZAS/1 request header: {error}"))?;
+    let payload_len = match decode_amm_request_header(&header) {
+        Ok(length) => length,
+        Err(error) => {
+            amm_ingress_ack(
+                &mut stream,
+                AmmIngressStatus::Rejected,
+                amm_mempool,
+                [0; 32],
+            )?;
+            return Err(format!("invalid QZAS/1 request header: {error}"));
+        }
+    };
+    if payload_len > MAX_AMM_SIGNED_OPERATION_BYTES {
+        amm_ingress_ack(
+            &mut stream,
+            AmmIngressStatus::Rejected,
+            amm_mempool,
+            [0; 32],
+        )?;
+        return Err("QZAS/1 AMM operation exceeds canonical QAX1 byte cap".into());
+    }
+    let mut wire = vec![0u8; payload_len];
+    stream
+        .read_exact(&mut wire)
+        .map_err(|error| format!("read bounded QAX1 operation: {error}"))?;
+    let operation = match AmmSignedOperation::decode(&wire) {
+        Ok(operation) => operation,
+        Err(error) => {
+            amm_ingress_ack(
+                &mut stream,
+                AmmIngressStatus::Rejected,
+                amm_mempool,
+                [0; 32],
+            )?;
+            eprintln!(
+                "event=qzbe_v04_amm_rejected peer={} reason=malformed_qax1 error={:?}",
+                peer_addr, error
+            );
+            return Ok(());
+        }
+    };
+    let canonical_wire = match operation.encode() {
+        Ok(bytes) if bytes == wire => bytes,
+        _ => {
+            amm_ingress_ack(
+                &mut stream,
+                AmmIngressStatus::Rejected,
+                amm_mempool,
+                [0; 32],
+            )?;
+            return Ok(());
+        }
+    };
+    let id = amm_operation_id(&canonical_wire);
+    if amm_mempool.contains_id(&id) {
+        amm_ingress_ack(&mut stream, AmmIngressStatus::Duplicate, amm_mempool, id)?;
+        return Ok(());
+    }
+    let mut candidate_operations = amm_mempool.ordered_operations();
+    candidate_operations.push(operation.clone());
+    if let Err(error) = preview_amm_operation_batch(
+        store,
+        authenticator,
+        mempool,
+        &candidate_operations,
+        miner_id,
+    ) {
+        amm_ingress_ack(&mut stream, AmmIngressStatus::Rejected, amm_mempool, id)?;
+        eprintln!(
+            "event=qzbe_v04_amm_rejected peer={} operation_id={} reason={}",
+            peer_addr,
+            hex(&id),
+            error
+        );
+        return Ok(());
+    }
+    let status = amm_mempool.insert(id, canonical_wire, operation);
+    amm_ingress_ack(&mut stream, status, amm_mempool, id)?;
+    eprintln!(
+        "event=qzbe_v04_amm_admission peer={} operation_id={} status={:?} amm_mempool_count={} bounded=true mainnet=false public_launch_approved=false",
+        peer_addr, hex(&id), status, amm_mempool.len()
+    );
+    Ok(())
+}
+
+fn accept_one_amm_connection_for_mining_interrupt(
+    listener: Option<&TcpListener>,
+    pending: &mut VecDeque<(TcpStream, SocketAddr)>,
+) -> Result<bool, String> {
+    let Some(listener) = listener else {
+        return Ok(false);
+    };
+    match listener.accept() {
+        Ok((stream, peer_addr)) => {
+            pending.push_back((stream, peer_addr));
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(format!("accept QZBE AMM ingress during PoW: {error}")),
+    }
+}
+
+fn poll_amm_connections(
+    listener: Option<&TcpListener>,
+    pending: &mut VecDeque<(TcpStream, SocketAddr)>,
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    authenticator: &Ed25519TransactionAuthenticator,
+    mempool: &BoundedMempool,
+    amm_mempool: &mut BoundedAmmMempool,
+    miner_id: [u8; 32],
+    submission_count: &mut u64,
+    allow_public_testnet_amm_ingress: bool,
+) -> Result<(), String> {
+    while let Some((stream, peer_addr)) = pending.pop_front() {
+        *submission_count = submission_count.saturating_add(1);
+        if *submission_count > MAX_TX_SUBMISSIONS {
+            let mut stream = stream;
+            let _ = amm_ingress_ack(
+                &mut stream,
+                AmmIngressStatus::Rejected,
+                amm_mempool,
+                [0; 32],
+            );
+            eprintln!(
+                "event=qzbe_v04_amm_rejected peer={} reason=bounded_submission_budget_exhausted",
+                peer_addr
+            );
+            continue;
+        }
+        if let Err(error) = serve_amm_connection(
+            stream,
+            peer_addr,
+            store,
+            authenticator,
+            mempool,
+            amm_mempool,
+            miner_id,
+            allow_public_testnet_amm_ingress,
+        ) {
+            eprintln!(
+                "event=qzbe_v04_amm_connection_rejected peer={} reason={}",
+                peer_addr, error
+            );
+        }
+    }
+
+    let Some(listener) = listener else {
+        return Ok(());
+    };
+    for _ in 0..MAX_TX_SUBMISSIONS_PER_POLL {
+        match listener.accept() {
+            Ok((stream, peer_addr)) => {
+                *submission_count = submission_count.saturating_add(1);
+                if *submission_count > MAX_TX_SUBMISSIONS {
+                    let mut stream = stream;
+                    let _ = amm_ingress_ack(
+                        &mut stream,
+                        AmmIngressStatus::Rejected,
+                        amm_mempool,
+                        [0; 32],
+                    );
+                    continue;
+                }
+                if let Err(error) = serve_amm_connection(
+                    stream,
+                    peer_addr,
+                    store,
+                    authenticator,
+                    mempool,
+                    amm_mempool,
+                    miner_id,
+                    allow_public_testnet_amm_ingress,
+                ) {
+                    eprintln!(
+                        "event=qzbe_v04_amm_connection_rejected peer={} reason={}",
+                        peer_addr, error
+                    );
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(format!("accept QZBE AMM ingress connection: {error}")),
+        }
+    }
+    Ok(())
+}
+
+fn reconcile_pending_amm_mempool(
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    authenticator: &Ed25519TransactionAuthenticator,
+    mempool: &BoundedMempool,
+    amm_mempool: &mut BoundedAmmMempool,
+    miner_id: [u8; 32],
+) -> Result<(), String> {
+    if amm_mempool.is_empty() {
+        return Ok(());
+    }
+    let mut retained = Vec::new();
+    let existing = amm_mempool.operations.clone();
+    let mut retained_ids = BTreeSet::new();
+    for entry in existing {
+        let mut trial = retained.clone();
+        trial.push(entry.operation.clone());
+        if preview_amm_operation_batch(store, authenticator, mempool, &trial, miner_id).is_ok() {
+            retained.push(entry.operation);
+            retained_ids.insert(entry.id);
+        } else {
+            eprintln!(
+                "event=qzbe_v04_amm_dropped operation_id={} reason=canonical_state_changed",
+                hex(&entry.id)
+            );
+        }
+    }
+    amm_mempool.retain_ids(&retained_ids);
+    Ok(())
+}
+
+fn reconcile_pending_mempool(
+    store: &V04ExecutionCheckpointForkStoreCandidate,
+    authenticator: &Ed25519TransactionAuthenticator,
+    mempool: &mut BoundedMempool,
+) -> Result<(), String> {
+    let ledger = store.fork_choice().canonical_state().ledger();
+    let candidate_timestamp = next_block_timestamp(ledger.last_timestamp(), SystemTime::now())?;
+    let summary =
+        mempool.reconcile_after_reorg(ledger, authenticator, candidate_timestamp, &[], &[]);
+    if summary.dropped_expired > 0 || summary.dropped_invalid > 0 {
+        eprintln!("event=qzbe_v04_mempool_reconciled kept={} dropped_expired={} dropped_invalid={} mempool_count={}", summary.kept, summary.dropped_expired, summary.dropped_invalid, mempool.len());
+    }
+    Ok(())
+}
+
 fn run(args: Args) -> Result<(), String> {
     let authenticator = configured_authenticator(&args)?;
     let (manifest, profile, genesis, params) = prepare_profile(&args)?;
@@ -1055,28 +3234,195 @@ fn run(args: Args) -> Result<(), String> {
         &authenticator,
     )
     .map_err(|error| format!("open checkpoint-rooted local QZBE store: {error}"))?;
+    let mut peer_summaries = Vec::new();
+    if args.sync_from_peers {
+        for (index, peer) in args.peers.iter().enumerate() {
+            eprintln!(
+                "event=qzbe_v04_archive_sync_started peer={} mode=explicit_testnet_only",
+                peer
+            );
+            let summary = sync_archive_from_peer(
+                *peer,
+                &secret.0,
+                &args.trusted_peer_keys[index],
+                &args.network_id,
+                &genesis_id,
+                &profile_id,
+                &mut store,
+                &checkpoint_context,
+                &authenticator,
+            )?;
+            peer_summaries.push(summary);
+        }
+    }
+    let reconciled_peer_summary = if args.sync_from_peers {
+        let summary = reconcile_archive_peer_summaries(&peer_summaries)?;
+        eprintln!(
+            "event=qzbe_v04_archive_peers_converged peers={} height={} tip={} root={} work={}",
+            peer_summaries.len(),
+            summary.height,
+            hex(&summary.tip),
+            hex(&summary.state_root),
+            hex(&summary.cumulative_chainwork)
+        );
+        Some(summary)
+    } else {
+        None
+    };
+    let peers_reconciled = reconciled_peer_summary.is_some();
+    let full_history_replayed = canonical_history_complete_from_genesis(
+        &store,
+        &checkpoint_context,
+        &params,
+        &authenticator,
+    )?;
+    let recovery_evidence = RecoveryEvidence {
+        network_profile: EvidenceStatus::Valid,
+        genesis_manifest: EvidenceStatus::Valid,
+        full_history_replay: if full_history_replayed {
+            EvidenceStatus::Valid
+        } else {
+            EvidenceStatus::Invalid
+        },
+        peer_reconciliation: if peers_reconciled {
+            EvidenceStatus::Valid
+        } else {
+            EvidenceStatus::Pending
+        },
+        state_root_agreement: if peers_reconciled {
+            EvidenceStatus::Valid
+        } else {
+            EvidenceStatus::Pending
+        },
+        cumulative_chainwork_agreement: if peers_reconciled {
+            EvidenceStatus::Valid
+        } else {
+            EvidenceStatus::Pending
+        },
+        conflicting_peer_history: false,
+    };
+    let recovery_readiness = recovery_evidence.evaluate();
+    if matches!(recovery_readiness, RecoveryReadiness::Quarantined(_)) {
+        let (_, detail) = recovery_readiness_fields(recovery_readiness);
+        return Err(format!(
+            "QZBE recovery gate quarantined node startup: {detail}"
+        ));
+    }
+    let (recovery_status, recovery_detail) = recovery_readiness_fields(recovery_readiness);
+    eprintln!(
+        "event=qzbe_v04_recovery_readiness_at_startup status={} detail={} full_history_replayed={} pinned_peer_reconciliation={} independent_operator_attestation=false mainnet=false public_launch_approved=false",
+        recovery_status, recovery_detail, full_history_replayed, peers_reconciled
+    );
+
     let initial = snapshot(&store)?;
+    let mut mempool = BoundedMempool::new(MempoolLimits::default())
+        .map_err(|error| format!("configure bounded QZBE transaction mempool: {error:?}"))?;
+    let mut amm_mempool = BoundedAmmMempool::default();
+    let mut pending_tx_connections: VecDeque<(TcpStream, SocketAddr)> = VecDeque::new();
+    let mut pending_amm_connections: VecDeque<(TcpStream, SocketAddr)> = VecDeque::new();
+    if let Some(transaction) = args.transaction.clone() {
+        if !args.defer_configured_transaction {
+            let ledger = store.fork_choice().canonical_state().ledger();
+            let candidate_timestamp =
+                next_block_timestamp(ledger.last_timestamp(), SystemTime::now())?;
+            mempool
+                .submit(transaction, ledger, &authenticator, candidate_timestamp)
+                .map_err(|error| {
+                    format!("admit configured legacy-fixture TXN2 to bounded mempool: {error:?}")
+                })?;
+        }
+    }
     let listener = TcpListener::bind(args.listen)
         .map_err(|error| format!("bind loopback QZBE listener {}: {error}", args.listen))?;
     listener
         .set_nonblocking(true)
         .map_err(|error| format!("set QZBE listener nonblocking: {error}"))?;
+    let tx_listener = if let Some(address) = args.tx_listen {
+        let tx_listener = TcpListener::bind(address)
+            .map_err(|error| format!("bind QZBE transaction ingress {address}: {error}"))?;
+        tx_listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("set QZBE transaction ingress nonblocking: {error}"))?;
+        Some(tx_listener)
+    } else {
+        None
+    };
+    let amm_listener = if let Some(address) = args.amm_listen {
+        let listener = TcpListener::bind(address)
+            .map_err(|error| format!("bind QZBE AMM ingress {address}: {error}"))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("set QZBE AMM ingress nonblocking: {error}"))?;
+        Some(listener)
+    } else {
+        None
+    };
+    let rpc_listener = if let Some(address) = args.rpc_listen {
+        let rpc = TcpListener::bind(address)
+            .map_err(|error| format!("bind loopback read-only QZBE RPC {address}: {error}"))?;
+        rpc.set_nonblocking(true)
+            .map_err(|error| format!("set QZBE RPC listener nonblocking: {error}"))?;
+        Some(rpc)
+    } else {
+        None
+    };
+    let tx_listener_address = tx_listener
+        .as_ref()
+        .map(|value| value.local_addr())
+        .transpose()
+        .map_err(|error| format!("read transaction-ingress listen address: {error}"))?;
+    let amm_listener_address = amm_listener
+        .as_ref()
+        .map(|value| value.local_addr())
+        .transpose()
+        .map_err(|error| format!("read AMM-ingress listen address: {error}"))?;
+    let rpc_listener_address = rpc_listener
+        .as_ref()
+        .map(|value| value.local_addr())
+        .transpose()
+        .map_err(|error| format!("read QZBE RPC listen address: {error}"))?;
     let mut accepted_count = 0u64;
     let mut message_count = 0u64;
+    let mut tx_submission_count = 0u64;
+    let mut amm_submission_count = 0u64;
+    let mut relayed_tx_count = 0u64;
     let mut sent_count = 0u64;
     let pow_profile = if args.test_easy_pow {
-        "EXPLICIT_LOCAL_TEST_EASY_POW_8MIB"
+        if args.public_testnet_p2p {
+            "EXPLICIT_PUBLIC_TESTNET_CANDIDATE_EASY_POW_8MIB"
+        } else {
+            "EXPLICIT_LOCAL_TEST_EASY_POW_8MIB"
+        }
     } else {
         "QZXB_V04_ARGON2ID_64MIB"
     };
-    eprintln!("event=qzbe_v04_peer_smoke_ready network_id={} genesis={} profile={} listen={} peer={} height={} root={} tip={} store=QZBE ack=QZA4 noise=Noise_XX_25519_ChaChaPoly_SHA256 pow_profile={} tx_policy=Ed25519V1_single_explicit_key local_only=true public_launch_approved=false",
+    let (network_surface, local_only) = network_surface_fields(
+        args.listen,
+        tx_listener_address,
+        rpc_listener_address,
+        args.public_testnet_p2p,
+        args.public_testnet_tx_ingress,
+    );
+    eprintln!("event=qzbe_v04_peer_smoke_ready network_id={} genesis={} profile={} listen={} tx_listen={} amm_listen={} rpc_listen={} rpc_read_only=true peer={} height={} root={} tip={} store=QZBE ack=QZA4 tx_ingress=QZTS/1 amm_ingress=QZAS/1 amm_ingress_surface={} tx_ingress_surface={} rpc_loopback_only=true mempool_max_count={} mempool_max_bytes={} amm_mempool_max_count={} amm_mempool_max_bytes={} noise=Noise_XX_25519_ChaChaPoly_SHA256 pow_profile={} mining_mode={} tx_policy=registered_or_self_contained_ed25519 mainnet=false network_surface={} local_only={} public_launch_approved=false",
         hex(&args.network_id), hex(&genesis_id), hex(&profile_id), args.listen,
+        tx_listener_address.map(|address| address.to_string()).unwrap_or_else(|| "disabled".to_string()),
+        amm_listener_address.map(|address| address.to_string()).unwrap_or_else(|| "disabled".to_string()),
+        rpc_listener_address.map(|address| address.to_string()).unwrap_or_else(|| "disabled".to_string()),
         if args.peers.is_empty() {
             "inbound_only".to_string()
         } else {
             args.peers.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
         },
-        initial.height, hex(&initial.state_root), hex(&initial.tip), pow_profile);
+        initial.height, hex(&initial.state_root), hex(&initial.tip),
+        if args.public_testnet_amm_ingress { "public_zero_value_testnet_only" } else if amm_listener_address.is_some() { "loopback_only" } else { "disabled" },
+        if args.public_testnet_tx_ingress { "public_zero_value_testnet_only" } else { "loopback_only" },
+        mempool.limits().max_transactions,
+        mempool.limits().max_bytes,
+        MAX_AMM_OPERATIONS_PER_BLOCK,
+        MAX_AMM_MEMPOOL_BYTES,
+        pow_profile,
+        if args.mine_forever { "continuous" } else { "bounded" },
+        network_surface, local_only);
 
     if args.probe_invalid_signature_first {
         let peer = *args
@@ -1117,7 +3463,99 @@ fn run(args: Args) -> Result<(), String> {
         )?;
     }
 
-    for block_index in 0..args.mine_blocks {
+    if args.defer_configured_transaction {
+        let deadline = Instant::now() + Duration::from_millis(args.wait_for_transaction_ms);
+        loop {
+            poll_connections(
+                &listener,
+                &secret,
+                &args.trusted_peer_keys,
+                &args.network_id,
+                &profile_id,
+                &mut store,
+                &checkpoint_context,
+                &authenticator,
+                &mut mempool,
+                &args.peers,
+                &args.trusted_peer_keys,
+                &mut relayed_tx_count,
+                &mut accepted_count,
+                &mut message_count,
+                args.public_testnet_p2p && args.test_easy_pow,
+            )?;
+            poll_tx_connections(
+                tx_listener.as_ref(),
+                &mut pending_tx_connections,
+                &store,
+                &authenticator,
+                &mut mempool,
+                &mut tx_submission_count,
+                &secret,
+                &args.network_id,
+                &profile_id,
+                &args.peers,
+                &args.trusted_peer_keys,
+                &mut relayed_tx_count,
+                args.public_testnet_tx_ingress,
+            )?;
+            poll_amm_connections(
+                amm_listener.as_ref(),
+                &mut pending_amm_connections,
+                &store,
+                &authenticator,
+                &mempool,
+                &mut amm_mempool,
+                args.miner_id,
+                &mut amm_submission_count,
+                args.public_testnet_amm_ingress,
+            )?;
+            reconcile_pending_amm_mempool(
+                &store,
+                &authenticator,
+                &mempool,
+                &mut amm_mempool,
+                args.miner_id,
+            )?;
+            poll_rpc_connections(
+                rpc_listener.as_ref(),
+                &store,
+                &mempool,
+                &params,
+                &args.network_id,
+                &genesis_id,
+                &profile_id,
+                recovery_readiness,
+            )?;
+            reconcile_pending_mempool(&store, &authenticator, &mut mempool)?;
+            if !mempool.is_empty() {
+                eprintln!(
+                    "event=qzbe_v04_test_wallet_transaction_admitted mempool_count={} tx_submissions={} status=accepted_then_mined",
+                    mempool.len(), tx_submission_count
+                );
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(
+                    "timed out waiting for the explicit test-wallet transaction ingress".into(),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    let mine_limit = if args.mine_forever {
+        u64::MAX
+    } else {
+        args.mine_blocks
+    };
+    let mut mined_blocks = 0u64;
+    while mined_blocks < mine_limit {
+        if args
+            .stop_after_height
+            .is_some_and(|height| store.canonical_height() >= height)
+        {
+            break;
+        }
         poll_connections(
             &listener,
             &secret,
@@ -1127,8 +3565,47 @@ fn run(args: Args) -> Result<(), String> {
             &mut store,
             &checkpoint_context,
             &authenticator,
+            &mut mempool,
+            &args.peers,
+            &args.trusted_peer_keys,
+            &mut relayed_tx_count,
             &mut accepted_count,
             &mut message_count,
+            args.public_testnet_p2p && args.test_easy_pow,
+        )?;
+        poll_tx_connections(
+            tx_listener.as_ref(),
+            &mut pending_tx_connections,
+            &store,
+            &authenticator,
+            &mut mempool,
+            &mut tx_submission_count,
+            &secret,
+            &args.network_id,
+            &profile_id,
+            &args.peers,
+            &args.trusted_peer_keys,
+            &mut relayed_tx_count,
+            args.public_testnet_tx_ingress,
+        )?;
+        poll_amm_connections(
+            amm_listener.as_ref(),
+            &mut pending_amm_connections,
+            &store,
+            &authenticator,
+            &mempool,
+            &mut amm_mempool,
+            args.miner_id,
+            &mut amm_submission_count,
+            args.public_testnet_amm_ingress,
+        )?;
+        reconcile_pending_mempool(&store, &authenticator, &mut mempool)?;
+        reconcile_pending_amm_mempool(
+            &store,
+            &authenticator,
+            &mempool,
+            &mut amm_mempool,
+            args.miner_id,
         )?;
         let parent_tip = store.canonical_tip();
         let next_height = store
@@ -1140,23 +3617,104 @@ fn run(args: Args) -> Result<(), String> {
             .canonical_timestamp()
             .map_err(|error| format!("read canonical QZBE timestamp: {error}"))?;
         let timestamp = next_block_timestamp(previous_timestamp, SystemTime::now())?;
-        let encoded = store
-            .fork_choice()
-            .mine_candidate_on(
-                parent_tip,
-                timestamp,
-                args.miner_id,
-                if block_index == 0 {
-                    args.transaction.clone().into_iter().collect()
-                } else {
-                    Vec::new()
-                },
-                next_height,
-                MAX_QZBE_MINING_ATTEMPTS,
-                &authenticator,
-                || false,
-            )
-            .map_err(|error| format!("mine bounded QZBE block at height {next_height}: {error}"))?;
+        let block_transactions = mempool.ordered_transactions();
+        let block_amm_operations = amm_mempool.ordered_operations();
+        let mut mining_ingress_error = None;
+        let mut mining_amm_ingress_error = None;
+        let mut mining_rpc_error = None;
+        let mining_result = store.fork_choice().mine_candidate_on_with_amm(
+            parent_tip,
+            timestamp,
+            args.miner_id,
+            block_transactions.clone(),
+            block_amm_operations.clone(),
+            next_height,
+            MAX_QZBE_MINING_ATTEMPTS,
+            &authenticator,
+            || {
+                if let Err(error) = poll_rpc_connections(
+                    rpc_listener.as_ref(),
+                    &store,
+                    &mempool,
+                    &params,
+                    &args.network_id,
+                    &genesis_id,
+                    &profile_id,
+                    recovery_readiness,
+                ) {
+                    mining_rpc_error = Some(error);
+                    return true;
+                }
+                match accept_one_tx_connection_for_mining_interrupt(
+                    tx_listener.as_ref(),
+                    &mut pending_tx_connections,
+                ) {
+                    Ok(true) => return true,
+                    Ok(false) => {}
+                    Err(error) => {
+                        mining_ingress_error = Some(error);
+                        return true;
+                    }
+                }
+                match accept_one_amm_connection_for_mining_interrupt(
+                    amm_listener.as_ref(),
+                    &mut pending_amm_connections,
+                ) {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        mining_amm_ingress_error = Some(error);
+                        true
+                    }
+                }
+            },
+        );
+        if let Some(error) = mining_rpc_error {
+            return Err(error);
+        }
+        if let Some(error) = mining_ingress_error {
+            return Err(error);
+        }
+        if let Some(error) = mining_amm_ingress_error {
+            return Err(error);
+        }
+        let encoded = match mining_result {
+            Ok(encoded) => encoded,
+            Err(ai_native_l1_pow_bench::monetary_pow_v04_candidate::V04ExecutionPowError::MiningCancelled)
+                if !pending_tx_connections.is_empty() || !pending_amm_connections.is_empty() =>
+            {
+                eprintln!("event=qzbe_v04_mining_yielded_to_transaction_ingress height={} pending_connections={}", next_height, pending_tx_connections.len());
+                poll_tx_connections(
+                    tx_listener.as_ref(),
+                    &mut pending_tx_connections,
+                    &store,
+                    &authenticator,
+                    &mut mempool,
+                    &mut tx_submission_count,
+                    &secret,
+                    &args.network_id,
+                    &profile_id,
+                    &args.peers,
+                    &args.trusted_peer_keys,
+                    &mut relayed_tx_count,
+                args.public_testnet_tx_ingress,
+                )?;
+                poll_amm_connections(
+                    amm_listener.as_ref(),
+                    &mut pending_amm_connections,
+                    &store,
+                    &authenticator,
+                    &mempool,
+                    &mut amm_mempool,
+                    args.miner_id,
+                    &mut amm_submission_count,
+                    args.public_testnet_amm_ingress,
+                )?;
+                reconcile_pending_mempool(&store, &authenticator, &mut mempool)?;
+                reconcile_pending_amm_mempool(&store, &authenticator, &mempool, &mut amm_mempool, args.miner_id)?;
+                continue;
+            }
+            Err(error) => return Err(format!("mine bounded QZBE block at height {next_height}: {error}")),
+        };
         let outcome: V04ExecutionForkChoiceOutcome = store
             .submit(&encoded, &checkpoint_context, &authenticator)
             .map_err(|error| format!("submit locally mined QZBE block: {error}"))?;
@@ -1166,6 +3724,15 @@ fn run(args: Args) -> Result<(), String> {
                 hex(&parent_tip)
             ));
         }
+        let removed_transactions = mempool.remove_included(&block_transactions);
+        if removed_transactions != block_transactions.len() {
+            return Err(format!("QZBE mempool inclusion accounting mismatch: selected={} removed={removed_transactions}", block_transactions.len()));
+        }
+        let removed_amm_operations = amm_mempool.remove_included(&block_amm_operations);
+        if removed_amm_operations != block_amm_operations.len() {
+            return Err(format!("QZBE AMM mempool inclusion accounting mismatch: selected={} removed={removed_amm_operations}", block_amm_operations.len()));
+        }
+        mined_blocks = mined_blocks.saturating_add(1);
         let current = snapshot(&store)?;
         for (index, peer) in args.peers.iter().enumerate() {
             send_candidate(
@@ -1184,7 +3751,7 @@ fn run(args: Args) -> Result<(), String> {
         }
     }
 
-    if !args.exit_after_mining {
+    if !args.exit_after_mining && !args.mine_forever {
         let deadline = Instant::now() + Duration::from_secs(args.run_seconds);
         loop {
             poll_connections(
@@ -1196,8 +3763,57 @@ fn run(args: Args) -> Result<(), String> {
                 &mut store,
                 &checkpoint_context,
                 &authenticator,
+                &mut mempool,
+                &args.peers,
+                &args.trusted_peer_keys,
+                &mut relayed_tx_count,
                 &mut accepted_count,
                 &mut message_count,
+                args.public_testnet_p2p && args.test_easy_pow,
+            )?;
+            poll_tx_connections(
+                tx_listener.as_ref(),
+                &mut pending_tx_connections,
+                &store,
+                &authenticator,
+                &mut mempool,
+                &mut tx_submission_count,
+                &secret,
+                &args.network_id,
+                &profile_id,
+                &args.peers,
+                &args.trusted_peer_keys,
+                &mut relayed_tx_count,
+                args.public_testnet_tx_ingress,
+            )?;
+            poll_amm_connections(
+                amm_listener.as_ref(),
+                &mut pending_amm_connections,
+                &store,
+                &authenticator,
+                &mempool,
+                &mut amm_mempool,
+                args.miner_id,
+                &mut amm_submission_count,
+                args.public_testnet_amm_ingress,
+            )?;
+            poll_rpc_connections(
+                rpc_listener.as_ref(),
+                &store,
+                &mempool,
+                &params,
+                &args.network_id,
+                &genesis_id,
+                &profile_id,
+                recovery_readiness,
+            )?;
+            reconcile_pending_mempool(&store, &authenticator, &mut mempool)?;
+            reconcile_pending_amm_mempool(
+                &store,
+                &authenticator,
+                &mempool,
+                &mut amm_mempool,
+                args.miner_id,
             )?;
             if args
                 .stop_after_height
@@ -1233,9 +3849,11 @@ fn run(args: Args) -> Result<(), String> {
     }
     let recipient_balance = observed_balance(&replayed, &args.observe_account_id);
     let total_mined_atoms = replayed.fork_choice().canonical_state().total_mined_atoms();
-    eprintln!("event=qzbe_v04_peer_smoke_stopped network_id={} profile={} height={} state_root={} tip={} generation={} total_mined_atoms={} observed_account={} observed_balance_atoms={} accepted_peer_blocks={} sent_peer_blocks={} replay=matched local_only=true public_launch_approved=false",
+    eprintln!("event=qzbe_v04_peer_smoke_stopped network_id={} profile={} height={} state_root={} tip={} generation={} total_mined_atoms={} observed_account={} observed_balance_atoms={} accepted_peer_blocks={} sent_peer_blocks={} tx_submissions={} mempool_count={} amm_submissions={} amm_mempool_count={} replay=matched tx_rpc_loopback_only=true mainnet=false network_surface={} local_only={} public_launch_approved=false",
         hex(&args.network_id), hex(&profile_id), final_snapshot.height, hex(&final_snapshot.state_root),
-        hex(&final_snapshot.tip), final_snapshot.generation, total_mined_atoms, hex(&args.observe_account_id), recipient_balance, accepted_count, sent_count);
+        hex(&final_snapshot.tip), final_snapshot.generation, total_mined_atoms, hex(&args.observe_account_id), recipient_balance, accepted_count, sent_count, tx_submission_count, mempool.len(), amm_submission_count, amm_mempool.len(),
+        if args.public_testnet_p2p { "explicit_testnet_public_p2p_noise_pinned" } else { "loopback_only" },
+        !args.public_testnet_p2p);
     if final_snapshot.height < initial.height || final_snapshot.tip.iter().all(|byte| *byte == 0) {
         return Err("QZBE replay returned an invalid canonical snapshot".into());
     }
@@ -1268,8 +3886,10 @@ fn main() {
     match parse_args() {
         Ok(None) => println!("{}", usage()),
         Ok(Some(args)) => {
-            if let Err(error) = run(args) {
-                eprintln!("event=qzbe_v04_peer_smoke_failed reason={error} local_only=true public_launch_approved=false");
+            if let Err(error) = run(args.clone()) {
+                eprintln!("event=qzbe_v04_peer_smoke_failed reason={error} tx_rpc_loopback_only=true mainnet=false network_surface={} local_only={} public_launch_approved=false",
+                    if args.public_testnet_p2p { "explicit_testnet_public_p2p_noise_pinned" } else { "loopback_only" },
+                    !args.public_testnet_p2p);
                 process::exit(1);
             }
         }
@@ -1311,6 +3931,9 @@ mod tests {
         Args {
             data_dir: temp_profile_root(),
             listen: "127.0.0.1:49331".parse().unwrap(),
+            tx_listen: None,
+            amm_listen: None,
+            rpc_listen: None,
             peers: Vec::new(),
             network_id: [0x31; 32],
             owner_id: [0xA7; 32],
@@ -1318,16 +3941,23 @@ mod tests {
             tx_public_key: [0xD1; 32],
             observe_account_id: [0xB2; 32],
             transaction: None,
+            defer_configured_transaction: false,
+            wait_for_transaction_ms: 0,
             probe_invalid_signature_first: false,
             trusted_peer_keys: vec![[0xE6; 32]],
             noise_key_path: env::temp_dir().join("unused-qzbe-test-noise-key"),
             initial_subsidy_atoms,
             blocks_per_halving,
             mine_blocks: 0,
+            mine_forever: false,
             run_seconds: 1,
             stop_after_height: None,
             exit_after_mining: true,
             test_easy_pow: false,
+            public_testnet_p2p: false,
+            public_testnet_tx_ingress: false,
+            public_testnet_amm_ingress: false,
+            sync_from_peers: false,
         }
     }
 
@@ -1432,6 +4062,251 @@ mod tests {
         assert!(parse_args_from(missing_pin)
             .unwrap_err()
             .contains("corresponding --trusted-peer-key-hex"));
+    }
+
+    #[test]
+    fn archive_sync_flag_is_test_only_and_requires_a_pinned_peer() {
+        let mut non_test = parser_fixture_tokens(&[]);
+        non_test.extend([
+            "--trusted-peer-key-hex".into(),
+            "e6".repeat(32),
+            "--sync-from-peers".into(),
+        ]);
+        assert!(parse_args_from(non_test)
+            .unwrap_err()
+            .contains("restricted to the explicit zero-value test profile"));
+
+        let mut no_peer = parser_fixture_tokens(&[]);
+        no_peer.extend([
+            "--trusted-peer-key-hex".into(),
+            "e6".repeat(32),
+            "--test-easy-pow".into(),
+            "--public-testnet-p2p".into(),
+            "--sync-from-peers".into(),
+        ]);
+        assert!(parse_args_from(no_peer)
+            .unwrap_err()
+            .contains("--sync-from-peers requires at least two statically pinned --peer entries"));
+
+        let mut one_peer = parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        one_peer.extend([
+            "--test-easy-pow".into(),
+            "--public-testnet-p2p".into(),
+            "--sync-from-peers".into(),
+        ]);
+        assert!(parse_args_from(one_peer)
+            .unwrap_err()
+            .contains("--sync-from-peers requires at least two statically pinned --peer entries"));
+
+        let mut valid = parser_fixture_tokens(&[
+            ("127.0.0.1:49332", &"e6".repeat(32)),
+            ("127.0.0.1:49335", &"f7".repeat(32)),
+        ]);
+        valid.extend([
+            "--test-easy-pow".into(),
+            "--public-testnet-p2p".into(),
+            "--sync-from-peers".into(),
+        ]);
+        let parsed = parse_args_from(valid).unwrap().unwrap();
+        assert!(parsed.sync_from_peers);
+        assert!(parsed.test_easy_pow && parsed.public_testnet_p2p);
+        assert_eq!(
+            parsed.peers,
+            vec![
+                "127.0.0.1:49332".parse::<SocketAddr>().unwrap(),
+                "127.0.0.1:49335".parse::<SocketAddr>().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn transaction_ingress_listener_is_optional_loopback_only_and_distinct() {
+        let mut valid = parser_fixture_tokens(&[]);
+        valid.extend([
+            "--trusted-peer-key-hex".into(),
+            "e6".repeat(32),
+            "--tx-listen".into(),
+            "127.0.0.1:49334".into(),
+        ]);
+        let parsed = parse_args_from(valid).unwrap().unwrap();
+        assert_eq!(parsed.tx_listen, Some("127.0.0.1:49334".parse().unwrap()));
+
+        let mut non_loopback = parser_fixture_tokens(&[]);
+        non_loopback.extend([
+            "--trusted-peer-key-hex".into(),
+            "e6".repeat(32),
+            "--tx-listen".into(),
+            "0.0.0.0:49334".into(),
+        ]);
+        assert!(parse_args_from(non_loopback)
+            .unwrap_err()
+            .contains("explicit --public-testnet-tx-ingress"));
+
+        let mut same_socket = parser_fixture_tokens(&[]);
+        same_socket.extend([
+            "--trusted-peer-key-hex".into(),
+            "e6".repeat(32),
+            "--tx-listen".into(),
+            "127.0.0.1:49331".into(),
+        ]);
+        assert!(parse_args_from(same_socket)
+            .unwrap_err()
+            .contains("must use a different socket"));
+
+        let mut collides_with_peer =
+            parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        collides_with_peer.extend(["--tx-listen".into(), "127.0.0.1:49332".into()]);
+        assert!(parse_args_from(collides_with_peer)
+            .unwrap_err()
+            .contains("cannot refer to this node's transaction-ingress listener"));
+    }
+
+    #[test]
+    fn amm_mempool_deduplicates_and_enforces_per_block_capacity() {
+        let mut pool = BoundedAmmMempool::default();
+        let mut operations = Vec::new();
+        for nonce in 1..=MAX_AMM_OPERATIONS_PER_BLOCK as u64 {
+            let operation = AmmSignedOperation {
+                network_id: [0x31; 32],
+                sender: [0x41; 32],
+                nonce,
+                expires_at: 1_000,
+                operation:
+                    ai_native_l1_pow_bench::qzxb_amm_candidate::AmmOperation::RegisterAsset {
+                        asset_id: [nonce as u8; 32],
+                    },
+                signature: vec![0xA5; 64],
+            };
+            let wire = operation.encode().unwrap();
+            let id = amm_operation_id(&wire);
+            assert_eq!(
+                pool.insert(id, wire, operation.clone()),
+                AmmIngressStatus::Accepted
+            );
+            operations.push(operation);
+        }
+        assert_eq!(pool.len(), MAX_AMM_OPERATIONS_PER_BLOCK);
+        let duplicate = operations[0].clone();
+        let duplicate_wire = duplicate.encode().unwrap();
+        assert_eq!(
+            pool.insert(amm_operation_id(&duplicate_wire), duplicate_wire, duplicate),
+            AmmIngressStatus::Duplicate
+        );
+        let overflow = AmmSignedOperation {
+            network_id: [0x31; 32],
+            sender: [0x41; 32],
+            nonce: MAX_AMM_OPERATIONS_PER_BLOCK as u64 + 1,
+            expires_at: 1_000,
+            operation: ai_native_l1_pow_bench::qzxb_amm_candidate::AmmOperation::RegisterAsset {
+                asset_id: [0xFE; 32],
+            },
+            signature: vec![0xA5; 64],
+        };
+        let overflow_wire = overflow.encode().unwrap();
+        assert_eq!(
+            pool.insert(amm_operation_id(&overflow_wire), overflow_wire, overflow),
+            AmmIngressStatus::PoolFull
+        );
+        assert_eq!(
+            pool.remove_included(&operations),
+            MAX_AMM_OPERATIONS_PER_BLOCK
+        );
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn parser_bounds_amm_ingress_to_distinct_loopback_or_explicit_zero_value_testnet() {
+        let mut valid = parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        valid.extend(["--amm-listen".into(), "127.0.0.1:49335".into()]);
+        let args = parse_args_from(valid).unwrap().unwrap();
+        assert_eq!(args.amm_listen, Some("127.0.0.1:49335".parse().unwrap()));
+        assert!(!args.public_testnet_amm_ingress);
+
+        let mut external_without_gate =
+            parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        external_without_gate.extend(["--amm-listen".into(), "0.0.0.0:49335".into()]);
+        assert!(parse_args_from(external_without_gate)
+            .unwrap_err()
+            .contains("explicit --public-testnet-amm-ingress"));
+
+        let mut public_without_test_mode =
+            parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        public_without_test_mode.extend([
+            "--amm-listen".into(),
+            "0.0.0.0:49335".into(),
+            "--public-testnet-amm-ingress".into(),
+        ]);
+        assert!(parse_args_from(public_without_test_mode)
+            .unwrap_err()
+            .contains("--test-easy-pow and --public-testnet-p2p"));
+
+        let mut public_missing_listener =
+            parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        public_missing_listener.extend([
+            "--test-easy-pow".into(),
+            "--public-testnet-p2p".into(),
+            "--public-testnet-amm-ingress".into(),
+        ]);
+        assert!(parse_args_from(public_missing_listener)
+            .unwrap_err()
+            .contains("requires --amm-listen"));
+
+        let mut colliding = parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        colliding.extend([
+            "--tx-listen".into(),
+            "127.0.0.1:49334".into(),
+            "--amm-listen".into(),
+            "127.0.0.1:49334".into(),
+        ]);
+        assert!(parse_args_from(colliding)
+            .unwrap_err()
+            .contains("distinct socket"));
+
+        let mut missing_public_flag =
+            parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        missing_public_flag.extend([
+            "--test-easy-pow".into(),
+            "--public-testnet-p2p".into(),
+            "--amm-listen".into(),
+            "0.0.0.0:49335".into(),
+        ]);
+        assert!(parse_args_from(missing_public_flag)
+            .unwrap_err()
+            .contains("explicit --public-testnet-amm-ingress"));
+    }
+
+    #[test]
+    fn continuous_mining_is_unbounded_but_requires_explicit_pinned_peers_and_exclusive_options() {
+        let mut valid = parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        valid.push("--mine-forever".into());
+        let args = parse_args_from(valid).unwrap().unwrap();
+        assert!(args.mine_forever);
+        assert_eq!(args.mine_blocks, 0);
+
+        let mut no_peer = parser_fixture_tokens(&[]);
+        no_peer.extend(["--trusted-peer-key-hex".into(), "e6".repeat(32)]);
+        no_peer.push("--mine-forever".into());
+        assert!(parse_args_from(no_peer)
+            .unwrap_err()
+            .contains("mining requires at least one --peer"));
+
+        let mut with_blocks = parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        with_blocks.extend(["--mine-forever".into(), "--mine-blocks".into(), "1".into()]);
+        assert!(parse_args_from(with_blocks)
+            .unwrap_err()
+            .contains("cannot be combined with --mine-blocks"));
+
+        let mut with_deadline = parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        with_deadline.extend(["--mine-forever".into(), "--run-seconds".into(), "30".into()]);
+        assert!(parse_args_from(with_deadline)
+            .unwrap_err()
+            .contains("has no time limit"));
+
+        let mut duplicate = parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        duplicate.extend(["--mine-forever".into(), "--mine-forever".into()]);
+        assert!(parse_args_from(duplicate)
+            .unwrap_err()
+            .contains("duplicate option: --mine-forever"));
     }
 
     #[test]
@@ -1590,6 +4465,117 @@ mod tests {
     }
 
     #[test]
+    fn archive_sync_request_and_header_roundtrip_with_fixed_widths() {
+        let genesis_id = [0x31; 32];
+        let profile_id = [0x42; 32];
+        let request = encode_archive_sync_request(genesis_id, profile_id);
+        assert_eq!(request.len(), ARCHIVE_SYNC_REQUEST_BYTES);
+        assert_eq!(
+            decode_archive_sync_request(&request).unwrap(),
+            ArchiveSyncRequest {
+                genesis_id,
+                profile_id
+            }
+        );
+
+        let header = ArchiveSyncHeader {
+            genesis_id,
+            profile_id,
+            snapshot: Snapshot {
+                height: 7,
+                tip: [0x53; 32],
+                state_root: [0x64; 32],
+                generation: 9,
+            },
+            cumulative_chainwork: [0x75; 32],
+            envelope_count: 2,
+            total_bytes: 1234,
+            archive_digest: [0x86; 32],
+        };
+        let encoded = encode_archive_sync_header(&header).unwrap();
+        assert_eq!(encoded.len(), ARCHIVE_SYNC_HEADER_BYTES);
+        assert_eq!(decode_archive_sync_header(&encoded).unwrap(), header);
+    }
+
+    #[test]
+    fn archive_sync_rejects_wrong_versions_flags_trailing_bytes_and_zero_bindings() {
+        let genesis_id = [0x31; 32];
+        let profile_id = [0x42; 32];
+        let request = encode_archive_sync_request(genesis_id, profile_id);
+        let mut wrong_version = request;
+        wrong_version[5] = 2;
+        assert!(decode_archive_sync_request(&wrong_version).is_err());
+        let mut nonzero_flags = request;
+        nonzero_flags[7] = 1;
+        assert!(decode_archive_sync_request(&nonzero_flags).is_err());
+        assert!(decode_archive_sync_request(&request[..request.len() - 1]).is_err());
+        assert!(
+            decode_archive_sync_request(&encode_archive_sync_request([0; 32], profile_id)).is_err()
+        );
+
+        let header = ArchiveSyncHeader {
+            genesis_id,
+            profile_id,
+            snapshot: Snapshot {
+                height: 0,
+                tip: [0x53; 32],
+                state_root: [0x64; 32],
+                generation: 0,
+            },
+            cumulative_chainwork: [0; 32],
+            envelope_count: 0,
+            total_bytes: 0,
+            archive_digest: archive_sync_digest(&[]).unwrap(),
+        };
+        let mut encoded = encode_archive_sync_header(&header).unwrap();
+        encoded[5] = 2;
+        assert!(decode_archive_sync_header(&encoded).is_err());
+        let mut encoded = encode_archive_sync_header(&header).unwrap();
+        encoded[7] = 1;
+        assert!(decode_archive_sync_header(&encoded).is_err());
+        let mut encoded = encode_archive_sync_header(&header).unwrap().to_vec();
+        encoded.push(0);
+        assert!(decode_archive_sync_header(&encoded).is_err());
+    }
+
+    #[test]
+    fn archive_sync_digest_binds_order_and_bytes() {
+        let a = vec![vec![1, 2, 3], vec![4, 5]];
+        let b = vec![vec![4, 5], vec![1, 2, 3]];
+        let c = vec![vec![1, 2, 4], vec![4, 5]];
+        assert_ne!(
+            archive_sync_digest(&a).unwrap(),
+            archive_sync_digest(&b).unwrap()
+        );
+        assert_ne!(
+            archive_sync_digest(&a).unwrap(),
+            archive_sync_digest(&c).unwrap()
+        );
+    }
+
+    #[test]
+    fn archive_sync_header_refuses_unbounded_count_or_bytes() {
+        let mut header = ArchiveSyncHeader {
+            genesis_id: [0x31; 32],
+            profile_id: [0x42; 32],
+            snapshot: Snapshot {
+                height: 0,
+                tip: [0x53; 32],
+                state_root: [0x64; 32],
+                generation: 0,
+            },
+            cumulative_chainwork: [0; 32],
+            envelope_count: MAX_ARCHIVE_SYNC_BLOCKS + 1,
+            total_bytes: 1,
+            archive_digest: [0x86; 32],
+        };
+        assert!(encode_archive_sync_header(&header).is_err());
+        header.envelope_count = 1;
+        header.total_bytes = MAX_ARCHIVE_SYNC_BYTES + 1;
+        assert!(encode_archive_sync_header(&header).is_err());
+    }
+
+    #[test]
     fn qzbe_ack_has_a_fixed_canonical_width_and_binds_profile() {
         let current = Snapshot {
             height: 3,
@@ -1609,6 +4595,338 @@ mod tests {
     }
 
     #[test]
+    fn pinned_archive_peers_must_agree_on_canonical_tip_root_and_chainwork() {
+        let first = ArchivePeerSummary {
+            height: 5,
+            tip: [0x11; 32],
+            state_root: [0x22; 32],
+            cumulative_chainwork: [0x33; 32],
+        };
+        assert_eq!(reconcile_archive_peer_summaries(&[first, first]), Ok(first));
+        let conflicting = ArchivePeerSummary {
+            tip: [0x44; 32],
+            ..first
+        };
+        assert!(reconcile_archive_peer_summaries(&[first, conflicting])
+            .unwrap_err()
+            .contains("disagree"));
+        assert!(reconcile_archive_peer_summaries(&[first])
+            .unwrap_err()
+            .contains("at least two"));
+    }
+
+    #[test]
+    fn recovery_readiness_rpc_labels_are_explicit_and_fail_closed() {
+        assert_eq!(
+            recovery_readiness_fields(RecoveryReadiness::Syncing(
+                RecoveryCheck::PeerReconciliation
+            )),
+            ("SYNCING", "peer_reconciliation_pending")
+        );
+        assert_eq!(
+            recovery_readiness_fields(RecoveryReadiness::Ready),
+            ("READY", "all_recovery_checks_valid")
+        );
+        assert_eq!(
+            recovery_readiness_fields(RecoveryReadiness::Quarantined(
+                RecoveryFault::ConflictingPeerHistory
+            )),
+            ("QUARANTINED", "conflicting_peer_history")
+        );
+    }
+
+    #[test]
+    fn read_only_rpc_accepts_bounded_status_and_balance_queries_only() {
+        let status = b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        assert_eq!(parse_rpc_command(status), Ok(RpcCommand::Status));
+        let balance = format!(
+            "GET /v1/balance/{} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "11".repeat(32)
+        );
+        assert_eq!(
+            parse_rpc_command(balance.as_bytes()),
+            Ok(RpcCommand::Balance([0x11; 32]))
+        );
+        let txid = format!(
+            "GET /v1/transaction/{} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "22".repeat(32)
+        );
+        assert_eq!(
+            parse_rpc_command(txid.as_bytes()),
+            Ok(RpcCommand::Transaction([0x22; 32]))
+        );
+        assert!(parse_rpc_command(
+            format!(
+                "GET /v1/transaction/{} HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n",
+                "xy".repeat(32)
+            )
+            .as_bytes()
+        )
+        .is_err());
+        assert!(parse_rpc_command(
+            b"POST /v1/status HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+        )
+        .is_err());
+        assert!(
+            parse_rpc_command(b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\n\r\nbody").is_err()
+        );
+        assert!(parse_rpc_command(
+            format!(
+                "GET /v1/balance/{} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                "zz".repeat(32)
+            )
+            .as_bytes()
+        )
+        .is_err());
+        assert!(parse_rpc_command(&vec![65u8; MAX_RPC_REQUEST_BYTES + 1]).is_err());
+
+        let swaps = b"GET /v1/amm/swaps HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        assert_eq!(
+            parse_rpc_command(swaps),
+            Ok(RpcCommand::AmmSwapBlocks {
+                before_height: None,
+                min_confirmations: 6,
+                limit_blocks: 8,
+            })
+        );
+        let paged_swaps = b"GET /v1/amm/swaps?before_height=120&min_confirmations=12&limit_blocks=8 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        assert_eq!(
+            parse_rpc_command(paged_swaps),
+            Ok(RpcCommand::AmmSwapBlocks {
+                before_height: Some(120),
+                min_confirmations: 12,
+                limit_blocks: 8,
+            })
+        );
+        for invalid in [
+            "GET /v1/amm/swaps?min_confirmations=0 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET /v1/amm/swaps?limit_blocks=65 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET /v1/amm/swaps?before_height=3&before_height=4 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET /v1/amm/swaps?unknown=1 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        ] {
+            assert!(parse_rpc_command(invalid.as_bytes()).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn rpc_listener_is_optional_loopback_only_and_distinct() {
+        let mut valid = parser_fixture_tokens(&[]);
+        valid.extend([
+            "--trusted-peer-key-hex".into(),
+            "e6".repeat(32),
+            "--rpc-listen".into(),
+            "127.0.0.1:49339".into(),
+        ]);
+        let parsed = parse_args_from(valid).unwrap().unwrap();
+        assert_eq!(parsed.rpc_listen, Some("127.0.0.1:49339".parse().unwrap()));
+
+        let mut non_loopback = parser_fixture_tokens(&[]);
+        non_loopback.extend([
+            "--trusted-peer-key-hex".into(),
+            "e6".repeat(32),
+            "--rpc-listen".into(),
+            "0.0.0.0:49339".into(),
+        ]);
+        assert!(parse_args_from(non_loopback)
+            .unwrap_err()
+            .contains("refuses all non-loopback read-only RPC listen addresses"));
+
+        let mut same_socket = parser_fixture_tokens(&[]);
+        same_socket.extend([
+            "--trusted-peer-key-hex".into(),
+            "e6".repeat(32),
+            "--rpc-listen".into(),
+            "127.0.0.1:49331".into(),
+        ]);
+        assert!(parse_args_from(same_socket)
+            .unwrap_err()
+            .contains("distinct socket"));
+
+        let collides_with_peer = parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        let mut collides_with_peer = collides_with_peer;
+        collides_with_peer.extend(["--rpc-listen".into(), "127.0.0.1:49332".into()]);
+        assert!(parse_args_from(collides_with_peer)
+            .unwrap_err()
+            .contains("read-only RPC listener"));
+    }
+
+    #[test]
+    fn transaction_signature_parser_accepts_only_registered_or_self_contained_ed25519() {
+        assert_eq!(
+            parse_transaction_signature(&"55".repeat(64), "sig")
+                .unwrap()
+                .len(),
+            64
+        );
+        assert_eq!(
+            parse_transaction_signature(&"66".repeat(96), "sig")
+                .unwrap()
+                .len(),
+            96
+        );
+        assert!(parse_transaction_signature(&"55".repeat(63), "sig").is_err());
+        assert!(parse_transaction_signature(&"55".repeat(95), "sig").is_err());
+    }
+
+    #[test]
+    fn deferred_wallet_transaction_requires_explicit_test_pow_and_bounded_wait() {
+        let mut base = parser_fixture_tokens(&[("127.0.0.1:49332", &"e6".repeat(32))]);
+        let observe_index = base
+            .iter()
+            .position(|item| item == "--observe-account-id")
+            .unwrap();
+        base[observe_index + 1] = "44".repeat(32);
+        base.extend([
+            "--tx-recipient-id".into(),
+            "44".repeat(32),
+            "--tx-nonce".into(),
+            "1".into(),
+            "--tx-amount-atoms".into(),
+            "2500".into(),
+            "--tx-fee-atoms".into(),
+            "7".into(),
+            "--tx-expires-at".into(),
+            "4102444800".into(),
+            "--tx-signature-hex".into(),
+            "55".repeat(96),
+            "--tx-listen".into(),
+            "127.0.0.1:49334".into(),
+            "--defer-configured-transaction".into(),
+            "--wait-for-transaction-ms".into(),
+            "5000".into(),
+            "--test-easy-pow".into(),
+            "--mine-blocks".into(),
+            "2".into(),
+        ]);
+        assert!(parse_args_from(base.clone()).is_ok());
+
+        let mut no_easy_pow = base.clone();
+        no_easy_pow.retain(|item| item != "--test-easy-pow");
+        assert!(parse_args_from(no_easy_pow)
+            .unwrap_err()
+            .contains("--test-easy-pow"));
+
+        let mut over_limit = base.clone();
+        let index = over_limit
+            .iter()
+            .position(|item| item == "--wait-for-transaction-ms")
+            .unwrap();
+        over_limit[index + 1] = "30001".into();
+        assert!(parse_args_from(over_limit)
+            .unwrap_err()
+            .contains("capped at 30000 ms"));
+
+        let mut no_listener = base;
+        let index = no_listener
+            .iter()
+            .position(|item| item == "--tx-listen")
+            .unwrap();
+        no_listener.drain(index..index + 2);
+        assert!(parse_args_from(no_listener)
+            .unwrap_err()
+            .contains("--tx-listen"));
+    }
+
+    #[test]
+    fn public_candidate_tx_ingress_requires_explicit_zero_value_testnet_flag() {
+        let mut allowed = parser_fixture_tokens(&[("198.51.100.9:49332", &"e6".repeat(32))]);
+        let listen_index = allowed.iter().position(|item| item == "--listen").unwrap();
+        allowed[listen_index + 1] = "0.0.0.0:49331".into();
+        allowed.extend(["--test-easy-pow".into(), "--public-testnet-p2p".into()]);
+        let parsed = parse_args_from(allowed.clone()).unwrap().unwrap();
+        assert_eq!(parsed.listen, "0.0.0.0:49331".parse().unwrap());
+        assert_eq!(parsed.peers, vec!["198.51.100.9:49332".parse().unwrap()]);
+        assert!(parsed.test_easy_pow);
+        assert!(parsed.public_testnet_p2p);
+        assert!(parsed.tx_listen.is_none());
+        assert!(parsed.rpc_listen.is_none());
+
+        let mut no_easy_pow = allowed.clone();
+        no_easy_pow.retain(|value| value != "--test-easy-pow");
+        assert!(parse_args_from(no_easy_pow)
+            .unwrap_err()
+            .contains("requires both --test-easy-pow and --public-testnet-p2p"));
+
+        let mut public_peer_without_flag =
+            parser_fixture_tokens(&[("198.51.100.9:49332", &"e6".repeat(32))]);
+        public_peer_without_flag.push("--test-easy-pow".into());
+        assert!(parse_args_from(public_peer_without_flag)
+            .unwrap_err()
+            .contains("requires both --test-easy-pow and --public-testnet-p2p"));
+
+        let mut external_tx_ingress = allowed.clone();
+        external_tx_ingress.extend(["--tx-listen".into(), "0.0.0.0:49333".into()]);
+        assert!(parse_args_from(external_tx_ingress.clone())
+            .unwrap_err()
+            .contains("explicit --public-testnet-tx-ingress"));
+
+        external_tx_ingress.push("--public-testnet-tx-ingress".into());
+        let public_tx = parse_args_from(external_tx_ingress.clone())
+            .unwrap()
+            .unwrap();
+        assert!(public_tx.public_testnet_tx_ingress);
+        assert_eq!(public_tx.tx_listen, Some("0.0.0.0:49333".parse().unwrap()));
+
+        let mut public_tx_without_tx_listener = allowed.clone();
+        public_tx_without_tx_listener.push("--public-testnet-tx-ingress".into());
+        assert!(parse_args_from(public_tx_without_tx_listener)
+            .unwrap_err()
+            .contains("requires --tx-listen"));
+
+        let mut public_tx_without_easy_pow = external_tx_ingress.clone();
+        public_tx_without_easy_pow.retain(|value| value != "--test-easy-pow");
+        assert!(parse_args_from(public_tx_without_easy_pow)
+            .unwrap_err()
+            .contains("requires both --test-easy-pow and --public-testnet-p2p"));
+
+        let mut external_rpc = allowed.clone();
+        external_rpc.extend(["--rpc-listen".into(), "0.0.0.0:49334".into()]);
+        assert!(parse_args_from(external_rpc)
+            .unwrap_err()
+            .contains("refuses all non-loopback read-only RPC listen addresses"));
+
+        let mut unspecified_peer = parser_fixture_tokens(&[("0.0.0.0:49332", &"e6".repeat(32))]);
+        unspecified_peer.extend(["--test-easy-pow".into(), "--public-testnet-p2p".into()]);
+        assert!(parse_args_from(unspecified_peer)
+            .unwrap_err()
+            .contains("concrete unicast IP"));
+    }
+
+    #[test]
+    fn network_surface_telemetry_matches_actual_listener_addresses() {
+        let loopback = "127.0.0.1:49331".parse::<SocketAddr>().unwrap();
+        let wildcard = "0.0.0.0:49331".parse::<SocketAddr>().unwrap();
+        assert_eq!(
+            network_surface_fields(loopback, None, None, false, false),
+            ("loopback_only", true)
+        );
+        assert_eq!(
+            network_surface_fields(loopback, Some(wildcard), None, true, true),
+            ("loopback_peer_listener_public_zero_value_tx_ingress", false)
+        );
+        assert_eq!(
+            network_surface_fields(wildcard, None, None, true, false),
+            ("explicit_testnet_public_p2p_noise_pinned", false)
+        );
+        assert_eq!(
+            network_surface_fields(loopback, None, None, true, false),
+            ("outbound_testnet_p2p_loopback_listener", true)
+        );
+    }
+
+    #[test]
+    fn public_tx_ingress_bind_is_explicit_testnet_only() {
+        let loopback = "127.0.0.1:49333".parse::<SocketAddr>().unwrap();
+        let wildcard = "0.0.0.0:49333".parse::<SocketAddr>().unwrap();
+        assert!(ensure_tx_listen_address(loopback, false, false, false).is_ok());
+        assert!(ensure_tx_listen_address(wildcard, false, true, true).is_err());
+        assert!(ensure_tx_listen_address(wildcard, true, false, true).is_err());
+        assert!(ensure_tx_listen_address(wildcard, true, true, false).is_err());
+        assert!(ensure_tx_listen_address(wildcard, true, true, true).is_ok());
+        assert!(ensure_tx_listen_address("0.0.0.0:0".parse().unwrap(), true, true, true).is_err());
+    }
+
+    #[test]
     fn cli_rejects_non_loopback_addresses_before_startup() {
         let loopback = "127.0.0.1:49331".parse::<SocketAddr>().unwrap();
         let unspecified = "0.0.0.0:49331".parse::<SocketAddr>().unwrap();
@@ -1622,5 +4940,12 @@ mod tests {
             ensure_loopback_address(public, "peers"),
             Err("QZBE runtime candidate refuses all non-loopback peers".into())
         );
+
+        assert!(ensure_peer_listen_address(unspecified, true, true).is_ok());
+        assert!(ensure_peer_listen_address(public, false, true).is_err());
+        assert!(ensure_peer_listen_address(public, true, false).is_err());
+        assert!(ensure_peer_target_address(public, true, true).is_ok());
+        assert!(ensure_peer_target_address(unspecified, true, true).is_err());
+        assert!(ensure_peer_target_address(public, false, true).is_err());
     }
 }

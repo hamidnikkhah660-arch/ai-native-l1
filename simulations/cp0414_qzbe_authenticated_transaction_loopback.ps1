@@ -1,15 +1,16 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 $manifest = '.\src\native\pow_bench\Cargo.toml'
-$null = cargo +stable build --release --manifest-path $manifest --bin qzbe_v04_peer_node --bin noise_key_provisioner --bin qzbe_v04_test_tx_signer --quiet
+$null = cargo +stable build --release --manifest-path $manifest --bin qzbe_v04_peer_node --bin noise_key_provisioner --bin qzbe_v04_test_tx_signer --bin qzxb_wallet --quiet
 if ($LASTEXITCODE -ne 0) { throw 'CP-0414 QZBE authenticated transaction runtime release build failed' }
 
 $nodeExe = (Resolve-Path '.\src\native\pow_bench\target\release\qzbe_v04_peer_node.exe').Path
 $keyExe = (Resolve-Path '.\src\native\pow_bench\target\release\noise_key_provisioner.exe').Path
 $txSignerExe = (Resolve-Path '.\src\native\pow_bench\target\release\qzbe_v04_test_tx_signer.exe').Path
+$walletExe = (Resolve-Path '.\src\native\pow_bench\target\release\qzxb_wallet.exe').Path
 $root = Join-Path $env:TEMP ("ain1_cp0413_qzbe_runtime_" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root | Out-Null
 
@@ -32,25 +33,62 @@ function Wait-Pattern([string]$Path, [string]$Pattern, [int]$Millis = 15000) {
     }
     return $false
 }
-function Make-Signed-TestTransaction([string]$SeedPath, [string]$Network, [string]$Recipient) {
-    $seed = New-Object byte[] 32
-    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    try { $rng.GetBytes($seed) } finally { $rng.Dispose() }
-    [IO.File]::WriteAllBytes($SeedPath, $seed)
-    [Array]::Clear($seed, 0, $seed.Length)
-    try {
-        $out = @(& $txSignerExe --seed-file $SeedPath --network-id-hex $Network --recipient-id-hex $Recipient --nonce 1 --amount-atoms 2500 --fee-atoms 7 --expires-at 4102444800 2>&1)
-        $signerExit = $LASTEXITCODE
-        if ($signerExit -ne 0) { throw ("CP-0414 transaction signing helper failed: " + ($out -join [Environment]::NewLine)) }
-        $all = $out -join [Environment]::NewLine
-        $pub = [regex]::Match($all, 'tx_public_key_hex=([0-9a-f]{64})')
-        $account = [regex]::Match($all, 'tx_sender_account_id_hex=([0-9a-f]{64})')
-        $signature = [regex]::Match($all, 'tx_signature_hex=([0-9a-f]{128})')
-        if (-not ($pub.Success -and $account.Success -and $signature.Success)) { throw ("CP-0414 signed transaction material missing: " + $all) }
-        return @{ PublicKey = $pub.Groups[1].Value; Sender = $account.Groups[1].Value; Signature = $signature.Groups[1].Value }
+function Get-QzbeRpc([int]$Port, [string]$Path) {
+    # Loopback RPC is read-only and idempotent. Windows CI can briefly abort a
+    # local socket while the listener thread is being scheduled; retry this GET
+    # with bounded backoff rather than failing a valid candidate transaction.
+    $uri = ("http://127.0.0.1:{0}{1}" -f $Port, $Path)
+    $lastError = $null
+    for ($attempt = 1; $attempt -le 6; $attempt++) {
+        try {
+            return Invoke-RestMethod -Uri $uri -Method Get -TimeoutSec 3
+        } catch {
+            $lastError = $_
+            if ($attempt -lt 6) {
+                $delayMs = [int][Math]::Min(400, 50 * [Math]::Pow(2, [Math]::Min($attempt - 1, 3)))
+                Start-Sleep -Milliseconds $delayMs
+            }
+        }
     }
-    finally {
-        Remove-Item -LiteralPath $SeedPath -Force -ErrorAction SilentlyContinue
+    throw ("QZBE candidate RPC GET failed after 6 attempts for {0}: {1}" -f $uri, $lastError.Exception.Message)
+}
+function New-SignedWalletTransaction([string]$WalletPath, [string]$Network, [string]$Recipient) {
+    $createOutput = @(& $walletExe create --output $WalletPath 2>&1)
+    $createExit = $LASTEXITCODE
+    $createText = $createOutput -join [Environment]::NewLine
+    if ($createExit -ne 0) { throw ("CP-0414 native wallet create failed: " + $createText) }
+    $walletPublic = [regex]::Match($createText, 'public_key_hex=([0-9a-f]{64})')
+    $walletAccount = [regex]::Match($createText, 'account_id_hex=([0-9a-f]{64})')
+    if (-not ($walletPublic.Success -and $walletAccount.Success) -or
+        $createText -notmatch 'wallet_format=QZKW1_Windows_CurrentUser_DPAPI' -or
+        $createText -notmatch 'mainnet_balance=not_created') {
+        throw ("CP-0414 native wallet creation identity/format mismatch: " + $createText)
+    }
+
+    $signArgs = @('sign-transfer','--wallet',$WalletPath,'--network-id-hex',$Network,
+        '--recipient-id-hex',$Recipient,'--nonce','1','--amount-atoms','2500',
+        '--fee-atoms','7','--expires-at','4102444800','--signature-mode','self-contained')
+    $signedOutput = @(& $walletExe @signArgs 2>&1)
+    $signedExit = $LASTEXITCODE
+    $signedText = $signedOutput -join [Environment]::NewLine
+    if ($signedExit -ne 0) { throw ("CP-0414 native wallet signing failed: " + $signedText) }
+    $pub = [regex]::Match($signedText, 'tx_sender_public_key_hex=([0-9a-f]{64})')
+    $account = [regex]::Match($signedText, 'tx_sender_account_id_hex=([0-9a-f]{64})')
+    $signature = [regex]::Match($signedText, 'tx_signature_hex=([0-9a-f]{192})')
+    $txid = [regex]::Match($signedText, 'tx_id_hex=([0-9a-f]{64})')
+    if (-not ($pub.Success -and $account.Success -and $signature.Success -and $txid.Success)) {
+        throw ("CP-0414 native wallet signed transaction/TXID missing: " + $signedText)
+    }
+    if ($pub.Groups[1].Value -ne $walletPublic.Groups[1].Value -or
+        $account.Groups[1].Value -ne $walletAccount.Groups[1].Value) {
+        throw 'CP-0414 native wallet signing identity differs from its protected wallet file'
+    }
+    return @{
+        WalletPath = $WalletPath
+        PublicKey = $pub.Groups[1].Value
+        Sender = $account.Groups[1].Value
+        Signature = $signature.Groups[1].Value
+        TransactionId = $txid.Groups[1].Value
     }
 }
 function Provision-Key([string]$Path, [string]$Network) {
@@ -63,8 +101,8 @@ function Provision-Key([string]$Path, [string]$Network) {
 
 $network = 'c5' * 32
 $recipient = '44' * 32
-$txSeedFile = Join-Path $env:TEMP ("ain1_cp0414_tx_seed_" + [guid]::NewGuid().ToString('N') + '.bin')
-$tx = Make-Signed-TestTransaction $txSeedFile $network $recipient
+$txWalletPath = Join-Path $root 'candidate-test-wallet.qzw1'
+$tx = New-SignedWalletTransaction $txWalletPath $network $recipient
 $owner = $tx.Sender
 $txPublicKey = $tx.PublicKey
 $txSignature = $tx.Signature
@@ -84,7 +122,11 @@ $logB = Join-Path $root 'node-b.err.log'
 $stdB = Join-Path $root 'node-b.out.log'
 $portA = Get-FreePort
 $portB = Get-FreePort
+$txPort = Get-FreePort
+$rpcPort = Get-FreePort
 while ($portA -eq $portB) { $portB = Get-FreePort }
+while ($txPort -eq $portA -or $txPort -eq $portB) { $txPort = Get-FreePort }
+while ($rpcPort -eq $portA -or $rpcPort -eq $portB -or $rpcPort -eq $txPort) { $rpcPort = Get-FreePort }
 $nodeA = $null
 $nodeB = $null
 try {
@@ -94,13 +136,14 @@ try {
     $bindOutput = @(& $nodeExe --data-dir (Join-Path $root 'invalid-bind') --listen '0.0.0.0:49331' 2>&1)
     $bindExitCode = $LASTEXITCODE
     $ErrorActionPreference = $savedErrorPreference
-    if ($bindExitCode -ne 2 -or (($bindOutput -join [Environment]::NewLine) -notmatch 'refuses all non-loopback listen addresses')) {
+    if ($bindExitCode -ne 2 -or (($bindOutput -join [Environment]::NewLine) -notmatch 'requires both --test-easy-pow and --public-testnet-p2p')) {
         throw ("CP-0414 public-bind guard did not fail closed (exit=$bindExitCode): " + ($bindOutput -join [Environment]::NewLine))
     }
     Write-Host 'CP-0414 PUBLIC_BIND_GUARD_PASS'
 
     $argsB = @(
         '--test-easy-pow',
+        '--public-testnet-p2p',
         '--network-id', $network,
         '--owner-id', $owner,
         '--miner-id', $miner,
@@ -109,17 +152,29 @@ try {
         '--initial-subsidy-atoms', $subsidy,
         '--blocks-per-halving', $halving,
         '--data-dir', $dataB,
-        '--listen', "127.0.0.1:$portB",
+        '--listen', "0.0.0.0:$portB",
+        '--rpc-listen', "127.0.0.1:$rpcPort",
         '--noise-static-private-key-dpapi-file', $keyB,
         '--trusted-peer-key-hex', $pubA,
         '--mine-blocks', '0',
-        '--run-seconds', '30',
-        '--stop-after-height', '2'
+        '--run-seconds', '60'
     )
     $nodeB = Start-Process -FilePath $nodeExe -ArgumentList $argsB -RedirectStandardOutput $stdB -RedirectStandardError $logB -PassThru
-    if (-not (Wait-Pattern $logB 'event=qzbe_v04_peer_smoke_ready .*height=0 .*local_only=true public_launch_approved=false' 20000)) {
-        throw ("CP-0414 receiver node B did not become ready: " + (Get-Text $stdB) + (Get-Text $logB))
+    if (-not (Wait-Pattern $logB 'event=qzbe_v04_peer_smoke_ready .*height=0 .*network_surface=explicit_testnet_public_p2p_noise_pinned local_only=false public_launch_approved=false' 20000)) {
+        throw ("CP-0434 receiver node B did not become ready in explicit public candidate P2P mode: " + (Get-Text $stdB) + (Get-Text $logB))
     }
+    if ((Get-Text $logB) -notmatch 'tx_ingress_surface=loopback_only rpc_loopback_only=true') {
+        throw ("CP-0434 public P2P mode did not explicitly retain loopback-only transaction/RPC listeners: " + (Get-Text $logB))
+    }
+    Write-Host 'CP-0434 PUBLIC_CANDIDATE_P2P_NOISE_PINNED_BIND_PASS'
+    $rpcGenesisStatus = Get-QzbeRpc $rpcPort '/v1/status'
+    $rpcGenesisBalance = Get-QzbeRpc $rpcPort ("/v1/balance/{0}" -f $recipient)
+    if ($rpcGenesisStatus.height -ne 0 -or $rpcGenesisStatus.mainnet -ne $false -or
+        $rpcGenesisStatus.read_only -ne $true -or $rpcGenesisBalance.balance_atoms -ne 0) {
+        throw ("CP-0414 read-only RPC Genesis response mismatch: status=" + ($rpcGenesisStatus | ConvertTo-Json -Compress) +
+            " balance=" + ($rpcGenesisBalance | ConvertTo-Json -Compress))
+    }
+    Write-Host 'CP-0414 READ_ONLY_RPC_GENESIS_PASS'
 
     $argsA = @(
         '--test-easy-pow',
@@ -132,6 +187,7 @@ try {
         '--blocks-per-halving', $halving,
         '--data-dir', $dataA,
         '--listen', "127.0.0.1:$portA",
+        '--tx-listen', "127.0.0.1:$txPort",
         '--peer', "127.0.0.1:$portB",
         '--noise-static-private-key-dpapi-file', $keyA,
         '--trusted-peer-key-hex', $pubB,
@@ -142,11 +198,40 @@ try {
         '--tx-expires-at', '4102444800',
         '--tx-signature-hex', $txSignature,
         '--probe-invalid-signature-first',
+        '--defer-configured-transaction',
+        '--wait-for-transaction-ms', '10000',
         '--mine-blocks', '2',
         '--run-seconds', '30',
         '--exit-after-mining'
     )
     $nodeA = Start-Process -FilePath $nodeExe -ArgumentList $argsA -RedirectStandardOutput $stdA -RedirectStandardError $logA -PassThru
+    if (-not (Wait-Pattern $logA ("event=qzbe_v04_peer_smoke_ready .*tx_listen=127\.0\.0\.1:{0} .*local_only=true public_launch_approved=false" -f $txPort) 20000)) {
+        throw ("CP-0433 sender transaction-ingress listener did not become ready: " + (Get-Text $stdA) + (Get-Text $logA))
+    }
+    if ($nodeA.HasExited) {
+        throw ("CP-0433 sender exited after readiness before wallet submission: " + (Get-Text $stdA) + (Get-Text $logA))
+    }
+
+    # Submit the actual DPAPI-backed native wallet's signed transaction over QZTS/1.
+    # The node deliberately waits for ingress; the configured transaction is only the
+    # source for the invalid-signature probe and is not preloaded into its mempool.
+    $submitArgs = @('sign-transfer','--wallet',$tx.WalletPath,'--network-id-hex',$network,
+        '--recipient-id-hex',$recipient,'--nonce','1','--amount-atoms','2500',
+        '--fee-atoms','7','--expires-at','4102444800','--signature-mode','self-contained',
+        '--submit-to',"127.0.0.1:$txPort")
+    $savedSubmitErrorPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $walletSubmit = @(& $walletExe @submitArgs 2>&1)
+    $walletSubmitExit = $LASTEXITCODE
+    $ErrorActionPreference = $savedSubmitErrorPreference
+    $walletSubmitText = $walletSubmit -join [Environment]::NewLine
+    if ($walletSubmitExit -ne 0 -or
+        $walletSubmitText -notmatch ('tx_id_hex=' + $tx.TransactionId) -or
+        $walletSubmitText -notmatch 'tx_submit_status=accepted' -or
+        $walletSubmitText -notmatch ('tx_submit_transaction_id_hex=' + $tx.TransactionId)) {
+        throw ("CP-0414 native wallet submission/ACK TXID binding failed: " + $walletSubmitText + (Get-Text $logA))
+    }
+    Write-Host ("CP-0433 NATIVE_WALLET_SIGN_AND_QZTS_SUBMIT_PASS txid=" + $tx.TransactionId + " status=accepted")
 
     if (-not (Wait-Pattern $logA 'event=qzbe_v04_invalid_signature_probe_rejected height=0 .*rejected_atomically=true' 20000)) {
         throw ("CP-0414 sender did not verify atomic rejection of tampered signature: " + (Get-Text $logA) + (Get-Text $logB))
@@ -160,16 +245,67 @@ try {
     if (-not (Wait-Pattern $logB 'event=qzbe_v04_peer_block_accepted .*height=2 .*accepted_count=2' 15000)) {
         throw ("CP-0414 receiver B did not accept both QZBE blocks: " + (Get-Text $logB))
     }
+    if ($nodeB.HasExited) { throw ("CP-0414 receiver B exited before canonical state queries: " + (Get-Text $logB)) }
+    $rpcFinalStatus = Get-QzbeRpc $rpcPort '/v1/status'
+    $rpcFinalBalance = Get-QzbeRpc $rpcPort ("/v1/balance/{0}" -f $recipient)
+    if ($rpcFinalStatus.height -ne 2 -or $rpcFinalBalance.height -ne 2 -or
+        $rpcFinalStatus.tip -ne $rpcFinalBalance.tip -or
+        $rpcFinalStatus.state_root -ne $rpcFinalBalance.state_root -or
+        $rpcFinalStatus.mainnet -ne $false -or $rpcFinalBalance.read_only -ne $true -or
+        $rpcFinalBalance.balance_atoms -ne 2500) {
+        throw ("CP-0414 read-only RPC settled-state mismatch: status=" + ($rpcFinalStatus | ConvertTo-Json -Compress) +
+            " balance=" + ($rpcFinalBalance | ConvertTo-Json -Compress))
+    }
+    Write-Host ("CP-0414 READ_ONLY_RPC_SETTLED_STATE_PASS height=2 balance_atoms=" + $rpcFinalBalance.balance_atoms)
+    $rpcReceipt = Get-QzbeRpc $rpcPort ("/v1/transaction/{0}" -f $tx.TransactionId)
+    if ($rpcReceipt.txid -ne $tx.TransactionId -or $rpcReceipt.status -ne 'confirmed' -or
+        $rpcReceipt.block_height -lt 1 -or $rpcReceipt.block_height -gt $rpcFinalStatus.height -or
+        $rpcReceipt.confirmations -ne ($rpcFinalStatus.height - $rpcReceipt.block_height + 1) -or
+        $rpcReceipt.tip -ne $rpcFinalStatus.tip -or $rpcReceipt.state_root -ne $rpcFinalStatus.state_root -or
+        $rpcReceipt.mainnet -ne $false -or $rpcReceipt.read_only -ne $true) {
+        throw ("CP-0414 read-only transaction receipt mismatch: " + ($rpcReceipt | ConvertTo-Json -Compress))
+    }
+    Write-Host ("CP-0414 READ_ONLY_RPC_CANONICAL_TXID_RECEIPT_PASS txid=" + $rpcReceipt.txid +
+        " block_height=" + $rpcReceipt.block_height + " confirmations=" + $rpcReceipt.confirmations)
+
+    $walletStatus = @(& $walletExe rpc-status --rpc "127.0.0.1:$rpcPort" 2>&1)
+    $walletStatusExit = $LASTEXITCODE
+    $walletStatusText = $walletStatus -join [Environment]::NewLine
+    if ($walletStatusExit -ne 0 -or $walletStatusText -notmatch 'height=2' -or
+        $walletStatusText -notmatch 'network_class=candidate_not_mainnet' -or
+        $walletStatusText -notmatch 'state_root_hex=' -or $walletStatusText -notmatch 'wallet_rpc_status=ok') {
+        throw ("CP-0414 native wallet rpc-status query failed: " + $walletStatusText)
+    }
+    $walletBalance = @(& $walletExe balance --rpc "127.0.0.1:$rpcPort" --account-id-hex $recipient 2>&1)
+    $walletBalanceExit = $LASTEXITCODE
+    $walletBalanceText = $walletBalance -join [Environment]::NewLine
+    if ($walletBalanceExit -ne 0 -or $walletBalanceText -notmatch 'wallet_rpc_balance_status=ok' -or
+        $walletBalanceText -notmatch 'balance_atoms=2500' -or $walletBalanceText -notmatch 'height=2') {
+        throw ("CP-0414 native wallet balance query failed: " + $walletBalanceText)
+    }
+    $walletTxStatus = @(& $walletExe tx-status --rpc "127.0.0.1:$rpcPort" --txid-hex $tx.TransactionId 2>&1)
+    $walletTxStatusExit = $LASTEXITCODE
+    $walletTxStatusText = $walletTxStatus -join [Environment]::NewLine
+    if ($walletTxStatusExit -ne 0 -or $walletTxStatusText -notmatch 'wallet_tx_status=confirmed' -or
+        $walletTxStatusText -notmatch ('txid_hex=' + $tx.TransactionId) -or
+        $walletTxStatusText -notmatch ('confirmations=' + $rpcReceipt.confirmations) -or
+        $walletTxStatusText -notmatch 'finality=probabilistic_candidate_chain_reorg_possible' -or
+        $walletTxStatusText -notmatch 'network_class=candidate_not_mainnet') {
+        throw ("CP-0414 native wallet TXID query failed: " + $walletTxStatusText)
+    }
+    Write-Host ("CP-0432 NATIVE_WALLET_READ_ONLY_RPC_PASS height=2 balance_atoms=2500 txid=" +
+        $tx.TransactionId + " confirmations=" + $rpcReceipt.confirmations + " mainnet=false")
     if (-not $nodeA.WaitForExit(30000)) { throw 'CP-0414 sending node A did not stop after its bounded mining run' }
-    if (-not $nodeB.WaitForExit(35000)) { throw 'CP-0414 receiver node B did not stop after reaching height 2' }
+    if (-not $nodeB.WaitForExit(70000)) { throw 'CP-0414 receiver node B did not stop after its bounded 60-second observer run' }
     $textA = Get-Text $logA
     $textB = Get-Text $logB
     if ($textA -match 'event=qzbe_v04_peer_smoke_failed') { throw ("CP-0414 node A reported runtime failure: " + $textA) }
     if ($textB -match 'event=qzbe_v04_peer_smoke_failed') { throw ("CP-0414 node B reported runtime failure: " + $textB) }
 
-    $pattern = 'event=qzbe_v04_peer_smoke_stopped .*height=2 state_root=([0-9a-f]{64}) tip=([0-9a-f]{64}) generation=2 total_mined_atoms=' + $expectedMinedAtoms + ' observed_account=' + $recipient + ' observed_balance_atoms=2500 accepted_peer_blocks=\d+ sent_peer_blocks=\d+ replay=matched local_only=true public_launch_approved=false'
-    $finalA = [regex]::Match((Get-Text $logA), $pattern)
-    $finalB = [regex]::Match((Get-Text $logB), $pattern)
+    $patternA = 'event=qzbe_v04_peer_smoke_stopped .*height=2 state_root=([0-9a-f]{64}) tip=([0-9a-f]{64}) generation=2 total_mined_atoms=' + $expectedMinedAtoms + ' observed_account=' + $recipient + ' observed_balance_atoms=2500 accepted_peer_blocks=[0-9]+ sent_peer_blocks=[0-9]+ tx_submissions=[0-9]+ mempool_count=[0-9]+(?: amm_submissions=[0-9]+ amm_mempool_count=[0-9]+)? replay=matched tx_rpc_loopback_only=true mainnet=false network_surface=loopback_only local_only=true public_launch_approved=false'
+    $patternB = 'event=qzbe_v04_peer_smoke_stopped .*height=2 state_root=([0-9a-f]{64}) tip=([0-9a-f]{64}) generation=2 total_mined_atoms=' + $expectedMinedAtoms + ' observed_account=' + $recipient + ' observed_balance_atoms=2500 accepted_peer_blocks=[0-9]+ sent_peer_blocks=[0-9]+ tx_submissions=[0-9]+ mempool_count=[0-9]+(?: amm_submissions=[0-9]+ amm_mempool_count=[0-9]+)? replay=matched tx_rpc_loopback_only=true mainnet=false network_surface=explicit_testnet_public_p2p_noise_pinned local_only=false public_launch_approved=false'
+    $finalA = [regex]::Match((Get-Text $logA), $patternA)
+    $finalB = [regex]::Match((Get-Text $logB), $patternB)
     if (-not ($finalA.Success -and $finalB.Success)) {
         throw ("CP-0414 restart/replay summaries missing: " + (Get-Text $logA) + (Get-Text $logB))
     }

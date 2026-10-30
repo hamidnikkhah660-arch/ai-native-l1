@@ -1,9 +1,9 @@
 //! Separate zero-value Devnet runtime candidate.
 //!
-//! The default entrypoint retains the existing PTB2/PFS2 Devnet runtime. QZBE v2 is an explicit,
-//! opt-in diagnostic subcommand (`--qzbe-v04-peer-smoke`) which uses a dedicated QZBE store and
-//! loopback-only Noise peer harness; it does not reinterpret the default chain profile or migrate
-//! existing stores. That subcommand remains a test candidate, not a public Mainnet runtime.
+//! The default PTB2/PFS2 runtime is loopback-only unless the explicit `--public-devnet` switch
+//! enables authenticated static-peer transport for the zero-value candidate. This transport mode
+//! does not provide transactions, a faucet, peer discovery, or Mainnet consensus. QZBE v2 remains
+//! a separate opt-in loopback diagnostic subcommand and never migrates legacy stores.
 
 #[path = "private_testnet_node.rs"]
 mod private_testnet_node;

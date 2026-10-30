@@ -42,10 +42,12 @@ name = "ai_native_l1_pow_bench"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "bip39",
  "ed25519-dalek",
  "getrandom 0.2.16",
  "hmac",
  "libcrux-ml-dsa",
+ "serde_json",
  "sha2",
  "snow",
 ]
@@ -73,6 +75,26 @@ name = "base64ct"
 version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8c3c1a368f70d6cf7302d78f8f7093da241fb8e8807c05cc9e51a125895a6d5b"
+
+[[package]]
+name = "bip39"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33415e24172c1b7d6066f6d999545375ab8e1d95421d6784bdfff9496f292387"
+dependencies = [
+ "bitcoin_hashes",
+ "serde",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "bitcoin_hashes"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "446819536d8121575eeb7e89efdbadb3f055e87e4bb66c6679a6d5cc2f4b64fd"
+dependencies = [
+ "hex-conservative",
+]
 
 [[package]]
 name = "blake2"
@@ -377,6 +399,12 @@ dependencies = [
  "serde_json",
  "uuid",
 ]
+
+[[package]]
+name = "hex-conservative"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "212ab92002354b4819390025006c897e8140934349e8635c9b077f47b4dcbd20"
 
 [[package]]
 name = "hmac"
@@ -839,6 +867,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -849,6 +883,15 @@ name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c5713f0fc4b5db668a2ac63cdb7bb4469d8c9fed047b1d0292cc7b0ce2ba921"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "universal-hash"

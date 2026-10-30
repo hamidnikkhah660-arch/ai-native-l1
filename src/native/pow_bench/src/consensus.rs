@@ -280,6 +280,37 @@ impl ConsensusParameters {
         })
     }
 
+    /// Measured QRun v0.5 parameter candidate. Its initial target is derived from the lowest
+    /// observed 64 MiB throughput across the current local + CI runner measurements. This is
+    /// deliberately separate from candidate_testnet()'s easy smoke-test target and is not a
+    /// frozen Mainnet profile; the caller must not enable public listeners based on this method.
+    pub fn qrun_v05_calibrated_candidate() -> Result<Self, ConsensusError> {
+        let mut params = Self::candidate_testnet()?;
+        params.protocol_version = 5;
+        params.target_block_time_secs = PROVISIONAL_TARGET_BLOCK_TIME_SECS;
+        params.difficulty_window_blocks = PROVISIONAL_DIFFICULTY_WINDOW_BLOCKS;
+        params.difficulty_min_ratio_divisor = 4;
+        params.difficulty_max_ratio = 4;
+        params.pow_limit = Uint256::MAX;
+        params.initial_target = Uint256::from_be_bytes([
+            0x00, 0xc3, 0x4a, 0xaf, 0x0f, 0x8c, 0x0b, 0xa8, 0x0e, 0xc4, 0xd9, 0x14, 0x37, 0x3b,
+            0x1f, 0x1b, 0xff, 0x34, 0xe5, 0x87, 0x60, 0x78, 0x97, 0xb7, 0x9e, 0xb8, 0x65, 0xea,
+            0xf9, 0xc2, 0x83, 0x7c,
+        ]);
+        params.pow = PowParameters {
+            algorithm: PowAlgorithm::Argon2id,
+            memory_kib: 64 * 1024,
+            iterations: 1,
+            lanes: 1,
+            output_bytes: POW_OUTPUT_BYTES as u8,
+        };
+        params.issuance =
+            IssuanceParameters::fee_only(PROVISIONAL_MAX_SUPPLY_COINS * ATOMS_PER_COIN)
+                .map_err(ConsensusError::Issuance)?;
+        params.validate()?;
+        Ok(params)
+    }
+
     pub fn validate(&self) -> Result<(), ConsensusError> {
         if self.protocol_version == 0 {
             return Err(ConsensusError::InvalidProtocolVersion);
@@ -737,6 +768,56 @@ mod tests {
             ]
         );
         assert!(Uint256::from_be_bytes(digest) > params.initial_target);
+    }
+
+    #[test]
+    fn qrun_v05_calibrated_candidate_matches_multi_runner_profile_and_zero_issuance() {
+        let params = ConsensusParameters::qrun_v05_calibrated_candidate().unwrap();
+        assert_eq!(params.protocol_version, 5);
+        assert_eq!(params.target_block_time_secs, 30);
+        assert_eq!(params.difficulty_window_blocks, 2_016);
+        assert_eq!(params.difficulty_min_ratio_divisor, 4);
+        assert_eq!(params.difficulty_max_ratio, 4);
+        assert_eq!(params.pow_limit, Uint256::MAX);
+        assert_eq!(
+            params.initial_target.to_be_bytes(),
+            [
+                0x00, 0xc3, 0x4a, 0xaf, 0x0f, 0x8c, 0x0b, 0xa8, 0x0e, 0xc4, 0xd9, 0x14, 0x37, 0x3b,
+                0x1f, 0x1b, 0xff, 0x34, 0xe5, 0x87, 0x60, 0x78, 0x97, 0xb7, 0x9e, 0xb8, 0x65, 0xea,
+                0xf9, 0xc2, 0x83, 0x7c,
+            ]
+        );
+        assert_eq!(params.pow.algorithm, PowAlgorithm::Argon2id);
+        assert_eq!(params.pow.memory_kib, 64 * 1024);
+        assert_eq!(params.pow.iterations, 1);
+        assert_eq!(params.pow.lanes, 1);
+        assert_eq!(params.pow.output_bytes as usize, POW_OUTPUT_BYTES);
+        assert_eq!(
+            params.issuance.maximum_supply(),
+            10_000_000_000u128 * ATOMS_PER_COIN
+        );
+        assert_eq!(params.issuance.initial_subsidy(), 0);
+        assert_eq!(
+            params
+                .issuance
+                .reward_for_block(1, params.issuance.maximum_supply()),
+            Ok(0)
+        );
+        assert_eq!(
+            params.issuance.cumulative_issuance_after_blocks(u64::MAX),
+            0
+        );
+        assert_ne!(
+            params.initial_target,
+            ConsensusParameters::candidate_testnet()
+                .unwrap()
+                .initial_target
+        );
+
+        let expected_window = params.target_block_time_secs * params.difficulty_window_blocks;
+        let easier = retarget_target(params.initial_target, expected_window * 2, &params).unwrap();
+        assert_eq!(easier, params.initial_target.mul_div_u64(2, 1).unwrap());
+        assert!(easier <= params.pow_limit);
     }
 
     #[test]

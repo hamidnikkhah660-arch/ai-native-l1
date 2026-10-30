@@ -1,9 +1,9 @@
-//! Loopback-only multi-process private-testnet harness for candidate PTB2 blocks.
+//! Multi-process private-testnet harness for candidate PTB2 blocks.
 //!
-//! This is a disposable integration harness, not a public P2P node or mainnet client.
-//! It deliberately uses a trivial maximum PoW target and empty blocks so process/wire/import/
-//! restart behavior can be exercised quickly. Consensus economics, reorg selection, tx relay,
-//! public peer discovery, and production key custody are not implemented here.
+//! Default binds remain loopback-only. An explicit `--public-devnet` mode exposes only the
+//! zero-value PTB2/PFS2 candidate over authenticated Noise static/signed peer identities; it does
+//! not enable monetary profiles, transactions, a faucet, peer discovery, or a value-bearing chain.
+//! This remains a Devnet transport candidate, not a public Mainnet client.
 
 use ai_native_l1_pow_bench::{
     chain_admission::SystemClockReferenceTime,
@@ -116,8 +116,8 @@ const MAX_CONFIGURED_PEERS: usize = 8;
 const MAX_ARCHIVE_SYNC_BRANCHES: usize = 512;
 const MAX_ARCHIVE_SYNC_BYTES: usize = 32 * 1024 * 1024;
 const ARCHIVE_SYNC_RETRY_DELAY: Duration = Duration::from_millis(250);
-// Fixed ceilings for loopback-testnet socket ownership. These do not imply a
-// public-network DDoS or authenticated-peer policy.
+// Fixed ceilings for the diagnostic and zero-value Devnet socket ownership paths. These are
+// basic resource bounds, not a complete public-network DDoS or production operational policy.
 const SOCKET_READER_WORKERS: usize = 4;
 const SOCKET_READER_QUEUE_CAPACITY: usize = 8;
 const SOCKET_READER_EVENT_POLL: Duration = Duration::from_millis(5);
@@ -127,6 +127,8 @@ const TXN4_HTTP_DEADLINE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 struct Config {
+    public_devnet: bool,
+    test_easy_pow: bool,
     listen: SocketAddr,
     status_listen: Option<SocketAddr>,
     transaction_listen: Option<SocketAddr>,
@@ -184,6 +186,8 @@ fn parse_hex32(value: &str, field: &str) -> Result<[u8; 32], String> {
 
 fn parse_args() -> Result<Config, String> {
     let args: Vec<String> = env::args().skip(1).collect();
+    let mut public_devnet = false;
+    let mut test_easy_pow = false;
     let mut listen = "127.0.0.1:49301"
         .parse::<SocketAddr>()
         .expect("static default socket address");
@@ -232,7 +236,23 @@ fn parse_args() -> Result<Config, String> {
         let flag = args[i].as_str();
         match flag {
             "--help" | "-h" => {
-                return Err("usage: devnet_node --network-id HEX64 --data-dir PATH [--listen 127.0.0.1:PORT] [--status-listen 127.0.0.1:PORT] [--transaction-listen 127.0.0.1:PORT --v4-founder-ed25519-public-key-hex HEX64 --v4-founder-mldsa65-public-key-file PATH] [--peer 127.0.0.1:PORT ... --noise-static-private-key-dpapi-file PATH (--trusted-peer-key-hex HEX64 ... | --trusted-peer-identity-file PATH ... --deployment-config-file PATH --deployment-authority-key-hex HEX64 --deployment-config-min-sequence N --issuer-registry-file PATH --peer-identity-issuer-id N)] [--archive-range-max-page-items 1..16] [--archive-range-post-commit-delay-ms 0..5000] [--mine-blocks N] [--run-seconds N] [--monetary-candidate-local-smoke | --monetary-v4-hybrid-local-smoke | --monetary-v4-hybrid-peer-smoke [--monetary-v4-hybrid-archive-range-sync] [--test-crash-after-monetary-v4-import] [--test-reorg-after-first-archive-range-page] [--test-reorg-after-second-archive-range-page] | --monetary-candidate-peer-smoke [--monetary-candidate-archive-range-sync]]".into());
+                return Err("usage: devnet_node [--public-devnet] [--test-easy-pow] --network-id HEX64 --data-dir PATH [--listen IP:PORT] [--status-listen 127.0.0.1:PORT] [--transaction-listen 127.0.0.1:PORT --v4-founder-ed25519-public-key-hex HEX64 --v4-founder-mldsa65-public-key-file PATH] [--peer 127.0.0.1:PORT ... --noise-static-private-key-dpapi-file PATH (--trusted-peer-key-hex HEX64 ... | --trusted-peer-identity-file PATH ... --deployment-config-file PATH --deployment-authority-key-hex HEX64 --deployment-config-min-sequence N --issuer-registry-file PATH --peer-identity-issuer-id N)] [--archive-range-max-page-items 1..16] [--archive-range-post-commit-delay-ms 0..5000] [--mine-blocks N] [--run-seconds N] [--monetary-candidate-local-smoke | --monetary-v4-hybrid-local-smoke | --monetary-v4-hybrid-peer-smoke [--monetary-v4-hybrid-archive-range-sync] [--test-crash-after-monetary-v4-import] [--test-reorg-after-first-archive-range-page] [--test-reorg-after-second-archive-range-page] | --monetary-candidate-peer-smoke [--monetary-candidate-archive-range-sync]]".into());
+            }
+            "--public-devnet" => {
+                if public_devnet {
+                    return Err("--public-devnet may be specified only once".into());
+                }
+                public_devnet = true;
+                i += 1;
+                continue;
+            }
+            "--test-easy-pow" => {
+                if test_easy_pow {
+                    return Err("--test-easy-pow may be specified only once".into());
+                }
+                test_easy_pow = true;
+                i += 1;
+                continue;
             }
             "--test-transactions" => {
                 test_transactions = true;
@@ -519,15 +539,6 @@ fn parse_args() -> Result<Config, String> {
     if network_id.iter().all(|byte| *byte == 0) {
         return Err("--network-id cannot be all zero".into());
     }
-    if !listen.ip().is_loopback() {
-        return Err("this private-testnet harness only binds loopback addresses".into());
-    }
-    if status_listen.is_some_and(|address| !address.ip().is_loopback()) {
-        return Err("status_api_only_binds_loopback_addresses".into());
-    }
-    if status_listen == Some(listen) {
-        return Err("--status-listen must differ from --listen".into());
-    }
     if trusted_peer_keys.len() > 64 || trusted_peer_identity_files.len() > 64 {
         return Err("peer trust entries exceed the maximum of 64".into());
     }
@@ -584,9 +595,6 @@ fn parse_args() -> Result<Config, String> {
         ));
     }
 
-    if peers.iter().any(|peer| !peer.ip().is_loopback()) {
-        return Err("this private-testnet harness only connects to loopback peers".into());
-    }
     if peers.contains(&listen) {
         return Err("--peer cannot point to this node's own listen address".into());
     }
@@ -696,6 +704,8 @@ fn parse_args() -> Result<Config, String> {
     }
 
     Ok(Config {
+        public_devnet,
+        test_easy_pow,
         listen,
         status_listen,
         transaction_listen,
@@ -1457,6 +1467,11 @@ fn import_payload(
 ) -> Result<(u8, u64, [u8; 32]), ImportFailure> {
     let candidate = decode_candidate_network_block(payload)
         .map_err(|error| ImportFailure::Rejected(format!("decode candidate envelope: {error}")))?;
+    if candidate.fee_block.is_some() {
+        return Err(ImportFailure::Rejected(
+            "legacy PTB2 node refuses QFP5; use the profile-locked QRun path".into(),
+        ));
+    }
     let height = candidate.header.height;
     let digest = pow_digest(&candidate.header, params.pow)
         .map_err(|error| ImportFailure::Rejected(format!("calculate candidate digest: {error}")))?;
@@ -2121,7 +2136,11 @@ fn build_next_candidate(
         let digest = pow_digest(&header, params.pow)
             .map_err(|error| format!("calculate candidate PoW digest: {error}"))?;
         if Uint256::from_be_bytes(digest) <= target {
-            return Ok(CandidateNetworkBlock { header, block });
+            return Ok(CandidateNetworkBlock {
+                header,
+                block,
+                fee_block: None,
+            });
         }
     }
     Err("nonce search exhausted".into())
@@ -2190,6 +2209,9 @@ fn ordered_archive_envelopes(
     for bytes in envelopes {
         let candidate = decode_candidate_network_block(&bytes)
             .map_err(|error| format!("decode archived PTB2 candidate: {error}"))?;
+        if candidate.fee_block.is_some() {
+            return Err("legacy PTB2 archive contains a QFP5 envelope".into());
+        }
         let digest = pow_digest(&candidate.header, params.pow)
             .map_err(|error| format!("hash archived PTB2 candidate: {error}"))?;
         ordered.push((bytes, candidate.header.height, digest));
@@ -6618,6 +6640,70 @@ impl NodeRuntimeProfile {
     }
 }
 
+fn inbound_peer_address_allowed(public_devnet: bool, peer: SocketAddr) -> bool {
+    public_devnet || peer.ip().is_loopback()
+}
+
+/// Keep ordinary diagnostic nodes loopback-only. The explicit public-devnet switch exposes only
+/// the zero-value, non-monetary PTB2 devnet candidate and still requires authenticated Noise
+/// identities; it is not a Mainnet or value-bearing runtime.
+fn validate_network_surface(
+    config: &Config,
+    runtime_profile: NodeRuntimeProfile,
+) -> Result<(), String> {
+    if !config.public_devnet {
+        if !config.listen.ip().is_loopback() {
+            return Err(
+                "non-loopback listen addresses require the explicit --public-devnet mode".into(),
+            );
+        }
+        if config.peers.iter().any(|peer| !peer.ip().is_loopback()) {
+            return Err("non-loopback peers require the explicit --public-devnet mode".into());
+        }
+    }
+    if config
+        .status_listen
+        .is_some_and(|address| !address.ip().is_loopback())
+    {
+        return Err("status_api_only_binds_loopback_addresses".into());
+    }
+    if config.status_listen == Some(config.listen) {
+        return Err("--status-listen must differ from --listen".into());
+    }
+    if config.test_easy_pow && !config.public_devnet {
+        return Err(
+            "--test-easy-pow requires the explicit --public-devnet zero-value-only mode".into(),
+        );
+    }
+    if !config.public_devnet {
+        return Ok(());
+    }
+    if runtime_profile != NodeRuntimeProfile::ZeroValueDevnet {
+        return Err(
+            "--public-devnet is available only through the zero-value devnet_node runtime".into(),
+        );
+    }
+    if config.monetary_candidate_local_smoke
+        || config.monetary_v4_hybrid_local_smoke
+        || config.monetary_v4_hybrid_peer_smoke
+        || config.monetary_candidate_peer_smoke
+        || config.transaction_listen.is_some()
+        || config.test_transactions
+        || config.test_seed_file.is_some()
+    {
+        return Err("--public-devnet refuses monetary candidate profiles and all transaction/test-funding modes".into());
+    }
+    if config.noise_static_private_key_dpapi_file.is_none() {
+        return Err("--public-devnet requires an authenticated Noise static identity".into());
+    }
+    if config.trusted_peer_keys.is_empty() && config.trusted_peer_identity_files.is_empty() {
+        return Err(
+            "--public-devnet requires at least one pinned peer key or signed peer identity".into(),
+        );
+    }
+    Ok(())
+}
+
 const QZBE_RUNTIME_PROFILE_FILE: &str = "qzbe-runtime.profile";
 const QZBE_STORE_LOCK_FILE: &str = "qzbe-store.lock";
 const QZBE_PENDING_MANIFEST_FILE: &str = ".qzbe-manifest.pending-cas";
@@ -6651,6 +6737,7 @@ fn reject_qzbe_locked_data_directory(data_dir: &Path) -> Result<(), String> {
 
 fn run_with_runtime_profile(runtime_profile: NodeRuntimeProfile) -> Result<(), String> {
     let config = parse_args()?;
+    validate_network_surface(&config, runtime_profile)?;
     reject_qzbe_locked_data_directory(&config.data_dir)?;
     if config.transaction_listen.is_some() && !config.monetary_v4_hybrid_peer_smoke {
         return Err("--transaction-listen requires --monetary-v4-hybrid-peer-smoke".into());
@@ -6751,8 +6838,12 @@ fn run_with_runtime_profile(runtime_profile: NodeRuntimeProfile) -> Result<(), S
     });
     let devnet_profile = if runtime_profile == NodeRuntimeProfile::ZeroValueDevnet {
         Some(
-            DevnetProfileCandidate::new(config.network_id)
-                .map_err(|error| format!("devnet profile rejected: {error}"))?,
+            (if config.test_easy_pow {
+                DevnetProfileCandidate::new_test_pow(config.network_id)
+            } else {
+                DevnetProfileCandidate::new(config.network_id)
+            })
+            .map_err(|error| format!("devnet profile rejected: {error}"))?,
         )
     } else {
         None
@@ -6856,14 +6947,16 @@ fn run_with_runtime_profile(runtime_profile: NodeRuntimeProfile) -> Result<(), S
     {
         let canonical = store.archive().canonical_chain();
         eprintln!(
-            "event={} listen={} height={} state_root={} consensus_tip={} archive_branches={} profile={} initial_target={} pow_memory_kib={} tx_auth={} reader_workers={} reader_queue_capacity={}",
+            "event={} listen={} height={} state_root={} consensus_tip={} archive_branches={} profile={} network_surface={} public_devnet_mode={} peer_auth=Noise_static_pins_or_signed_identity initial_target={} pow_memory_kib={} tx_auth={} reader_workers={} reader_queue_capacity={} mainnet=false public_launch_approved=false",
             runtime_profile.ready_event(),
             config.listen,
             canonical.state().height(),
             hex(&canonical.state().state_root()),
             hex(&canonical.chain_tip().tip_hash),
             store.archive().archive_len(),
-            runtime_profile.name(),
+            if config.public_devnet { "PTB2_PFS2_PUBLIC_ZERO_VALUE_DEVNET_CANDIDATE" } else { runtime_profile.name() },
+            if config.public_devnet { "external_bind_allowed_with_authenticated_peers" } else { "loopback_only" },
+            config.public_devnet,
             if params.initial_target == Uint256::MAX { "max" } else { "candidate" },
             params.pow.memory_kib,
             if config.test_transactions { "ed25519_test_fixture" } else { "reject_all_transactions" },
@@ -6947,9 +7040,9 @@ fn run_with_runtime_profile(runtime_profile: NodeRuntimeProfile) -> Result<(), S
                 // The accept loop never waits for frame bytes. Only the fixed reader pool
                 // owns accepted sockets; saturated queues fail closed rather than spawning
                 // one unbounded thread per connection. Frame deadlines begin at accept.
-                if !peer.ip().is_loopback() {
+                if !inbound_peer_address_allowed(config.public_devnet, peer) {
                     eprintln!(
-                        "event=private_testnet_peer_rejected reason=non_loopback peer={peer}"
+                        "event=private_testnet_peer_rejected reason=non_loopback_without_public_devnet_mode peer={peer}"
                     );
                 } else if runtime_profile == NodeRuntimeProfile::ZeroValueDevnet
                     && noise_inbound.is_none()
@@ -7737,6 +7830,8 @@ mod signed_identity_runtime_tests {
         let issuer = issuer_key();
         write_trust_bootstrap(root, network, authority, &issuer, 1, 1);
         Config {
+            public_devnet: false,
+            test_easy_pow: false,
             listen: "127.0.0.1:0".parse().unwrap(),
             status_listen: None,
             transaction_listen: None,
@@ -7780,8 +7875,108 @@ mod signed_identity_runtime_tests {
         }
     }
 
+    #[test]
+    fn public_zero_value_devnet_surface_is_explicit_and_authenticated() {
+        let root = root();
+        let network = [0x7a; 32];
+        let authority = deployment_authority_key();
+        let mut config = runtime_config(&root, network, &authority);
+        config.public_devnet = true;
+        config.listen = "0.0.0.0:49301".parse().unwrap();
+        config.peers = vec!["192.0.2.9:49302".parse().unwrap()];
+        config.noise_static_private_key_dpapi_file = Some(root.join("node.npk1"));
+
+        assert!(validate_network_surface(&config, NodeRuntimeProfile::ZeroValueDevnet).is_ok());
+
+        let mut default_mode = config.clone();
+        default_mode.public_devnet = false;
+        assert!(
+            validate_network_surface(&default_mode, NodeRuntimeProfile::ZeroValueDevnet)
+                .unwrap_err()
+                .contains("--public-devnet")
+        );
+
+        let mut test_pow_without_public_mode = config.clone();
+        test_pow_without_public_mode.public_devnet = false;
+        test_pow_without_public_mode.test_easy_pow = true;
+        test_pow_without_public_mode.listen = "127.0.0.1:49301".parse().unwrap();
+        test_pow_without_public_mode.peers = vec!["127.0.0.1:49302".parse().unwrap()];
+        assert!(validate_network_surface(
+            &test_pow_without_public_mode,
+            NodeRuntimeProfile::ZeroValueDevnet
+        )
+        .unwrap_err()
+        .contains("requires the explicit --public-devnet"));
+
+        let mut test_pow_with_public_mode = config.clone();
+        test_pow_with_public_mode.test_easy_pow = true;
+        assert!(validate_network_surface(
+            &test_pow_with_public_mode,
+            NodeRuntimeProfile::ZeroValueDevnet
+        )
+        .is_ok());
+
+        let mut missing_noise = config.clone();
+        missing_noise.noise_static_private_key_dpapi_file = None;
+        assert!(
+            validate_network_surface(&missing_noise, NodeRuntimeProfile::ZeroValueDevnet)
+                .unwrap_err()
+                .contains("Noise")
+        );
+
+        let mut missing_trust = config.clone();
+        missing_trust.trusted_peer_identity_files.clear();
+        assert!(
+            validate_network_surface(&missing_trust, NodeRuntimeProfile::ZeroValueDevnet)
+                .unwrap_err()
+                .contains("pinned peer key")
+        );
+
+        let private_profile = config.clone();
+        assert!(
+            validate_network_surface(&private_profile, NodeRuntimeProfile::PrivateSmoke)
+                .unwrap_err()
+                .contains("zero-value devnet_node")
+        );
+
+        let mut monetary_mode = config.clone();
+        monetary_mode.monetary_v4_hybrid_peer_smoke = true;
+        assert!(
+            validate_network_surface(&monetary_mode, NodeRuntimeProfile::ZeroValueDevnet)
+                .unwrap_err()
+                .contains("monetary candidate")
+        );
+
+        let mut tx_mode = config.clone();
+        tx_mode.test_transactions = true;
+        assert!(
+            validate_network_surface(&tx_mode, NodeRuntimeProfile::ZeroValueDevnet)
+                .unwrap_err()
+                .contains("transaction/test-funding")
+        );
+
+        let mut external_status = config;
+        external_status.status_listen = Some("0.0.0.0:49303".parse().unwrap());
+        assert!(
+            validate_network_surface(&external_status, NodeRuntimeProfile::ZeroValueDevnet)
+                .unwrap_err()
+                .contains("status_api_only_binds_loopback")
+        );
+    }
+
+    #[test]
+    fn inbound_remote_peer_address_requires_public_devnet_mode() {
+        let local = "127.0.0.1:49301".parse().unwrap();
+        let remote = "192.0.2.13:49301".parse().unwrap();
+        assert!(inbound_peer_address_allowed(false, local));
+        assert!(!inbound_peer_address_allowed(false, remote));
+        assert!(inbound_peer_address_allowed(true, remote));
+    }
+
     fn local_monetary_config(root: &Path, network: [u8; 32]) -> Config {
         Config {
+            public_devnet: false,
+            test_easy_pow: false,
             listen: "127.0.0.1:49301".parse().unwrap(),
             status_listen: None,
             transaction_listen: None,

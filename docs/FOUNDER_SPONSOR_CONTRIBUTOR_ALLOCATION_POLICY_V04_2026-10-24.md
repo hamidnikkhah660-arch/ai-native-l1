@@ -1,5 +1,7 @@
 # QuantumZXB Tokenomics and Distribution Policy v0.4
 
+> **Superseded for the future QRun Mainnet target by CP-0437 (2026-10-28).** This document preserves the prior v0.4 decision for audit/history; it is not the current Genesis target.
+
 **Date:** 2026-10-24
 **Status:** Owner-directed allocation policy; not yet encoded in canonical production Genesis/runtime, not an on-chain balance statement, and not a market or investment promise. This policy supersedes the former 40% / 30% / 30% framework for current planning. The v0.3 policy and CP-0343 sponsor calculator are historical only. The binding owner decision and migration requirements are recorded in [CP-0422](CP-0422_CANONICAL_TOKENOMICS_DECISION_2026-10-26.md).
 

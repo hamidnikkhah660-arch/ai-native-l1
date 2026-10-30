@@ -1,7 +1,7 @@
 # Liquidity, Market-Data Platforms and Public-Launch Readiness — v0.1
 
-Date: 2026-10-21
-Status: Engineering/commercial readiness assessment. No native market, liquidity pool, production listing or listing approval is claimed.
+Date: 2026-10-27
+Status: Engineering/commercial readiness assessment reconciled to the CP-0422 v0.4 allocation decision. No native market, liquidity pool, production listing or listing approval is claimed.
 
 ## Executive view
 
@@ -9,7 +9,7 @@ QuantumZXB already has a public project site, curated source repository, technic
 
 **The proposed native QZXB coin and the QX ERC-20 experiment on Ethereum Sepolia are different assets.** Never submit the Sepolia QX contract as the native QZXB coin. No native Mainnet, native explorer, live native market price, trading pair, liquidity, confirmed sponsor, independent security audit, or verified project revenue is established in the current public evidence.
 
-The current design uses a 10,000,000,000-coin supply cap with 4B founder / 3B mining-security / 3B public-goods allocation envelopes. The current four-year halving profile is candidate arithmetic only; Gate 2 remains open. The proposed sponsor allocation is carved out of the founder's allocation and is not cash, issued market liquidity, or a guaranteed payment.
+The current owner-directed v0.4 policy uses a 10,000,000,000-QZXB design cap with eight exclusive allocation ceilings: 3B mining/network security (30%) and seven 1B categories (10% each)—community airdrop, exchange/market-integration/liquidity partnerships, marketing/promotional partners, developers/security contributors, financial/strategic supporters, protocol burn reserve, and founder. The founder ceiling is 1B QZXB (10%), as recorded in [CP-0422](CP-0422_CANONICAL_TOKENOMICS_DECISION_2026-10-26.md); the former 4B/3B/3B split is historical v0.3 only. These are ceilings, not minted balances, current circulating supply, sponsor awards or liquidity. The v0.4 Genesis candidate currently credits only the 1B owner allocation; mining subsidy and all other category releases require deterministic canonical runtime rules and independent conformance evidence. Gate 2 remains OPEN. Any sponsor/contributor award must stay within an approved v0.4 category cap and is not cash, issued market liquidity, or a guaranteed payment.
 
 ## 1. Platform requirements and present gap
 
@@ -105,3 +105,8 @@ Every chart must display its data source, network, measurement window, version/c
 7. Then request CMC/CoinGecko review and pursue data-provider/exchange integration for TradingView; treat outcomes and timelines as decisions of the platforms, not project-controlled milestones.
 
 **Bottom line:** the nearest monetisation path is a funded engineering milestone or scoped AI/ML/Rust integration engagement. The nearest credibility milestone is canonical issuance plus a multi-operator devnet. A native price chart and tracked listings follow a real, verifiable market; they are not prerequisites to earning the first project revenue from engineering services.
+### CP-0438 — confirmed-swap candle engine candidate (2026-10-27)
+
+The market-data candidate now lives in `tools/qzxb-market/`. `candles.mjs` computes `1h`, `1d`, Monday-UTC `1w`, and calendar-month `1M` OHLC bars from confirmed pool-swap events with integer price normalization and atomic-unit volume. `indexer.mjs` queries a Uniswap-V2-compatible pair through two differently originated JSON-RPC endpoints, checks chain IDs, pair/factory bytecode, exact base/quote and factory `getPair` mapping, token decimals, bounded logs and confirmation depth, and requires both providers to agree on Swap logs and canonical block hashes/timestamps. Nineteen deterministic Node tests cover price orientation, token decimals, interval boundaries, wrong-chain/token/factory rejection, RPC disagreement, canonicality and bounded RPC ranges; both test files are wired into Linux and Windows CI.
+
+This is a tested **data-processing component**, not a deployed market, node RPC adapter, token bridge, liquidity pool or live price feed. No QZXB/USDT price series is emitted until an actual correctly identified pair has reserves and confirmed trades, and a chain adapter supplies independently checked canonical logs. The existing Sepolia QX token remains a different test asset from native QZXB.

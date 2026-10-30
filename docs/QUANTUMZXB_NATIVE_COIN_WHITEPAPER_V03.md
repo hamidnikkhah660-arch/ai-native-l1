@@ -1,6 +1,8 @@
-> **Current-policy note (2026-10-26):** allocation wording follows policy v0.4 and the founder-directed CP-0422 decision: 10B QZXB design cap, 1B / 10% founder allocation, and seven other category ceilings. No production Genesis, mainnet, or liquid native-coin market is represented as launched. Historical engineering/test claims retain their original review dates.
+> **Current identity update (2026-10-29, CP-0464):** the current brand is **QRun (کیوران)**, the native coin ticker is **QZXB**, and the network name is **QRun Blockchain**. QZXB expands to **Quantum Zeta eXecution Blockchain**. This v0.3 white paper is retained as a historical version; its former QuantumZXB identity and CP-0422 allocation text are superseded. The latest monetary direction is CP-0437: 10B QZXB credited to the owner at Genesis, with zero subsequent minting and zero block subsidy. No production Mainnet or liquid native-coin market is represented as launched.
 
-# QuantumZXB - AI-Native L1 Native Coin and Ecosystem White Paper
+> **Superseded for the future QRun Mainnet target by CP-0437 (2026-10-28).** This document preserves the prior v0.4 decision for audit/history; it is not the current Genesis target.
+
+# QRun (QZXB) — Native Layer-1 Coin and Ecosystem White Paper v0.3 (Historical Version)
 ## Version 0.3 - Public Technical Engineering White Paper and Allocation Addendum
 
 Date: 26 October 2026
@@ -8,9 +10,9 @@ Document status: Public engineering white paper describing architecture, test ev
 
 ## Abstract
 
-QuantumZXB is the current working identity for an independently developed native Layer-1 project. Its engineering programme combines a Rust-based native ledger and proof-of-work research, deterministic state and chain-selection candidates, authenticated peer transport, durable-storage and recovery experiments, a post-quantum signature research path, and a separate EVM-compatibility laboratory for smart-contract execution.
+QRun is the current brand for the independently developed native Layer-1 project; this paragraph is part of the retained v0.3 white paper and is superseded by the CP-0464 naming decision. Its engineering programme combines a Rust-based native ledger and proof-of-work research, deterministic state and chain-selection candidates, authenticated peer transport, durable-storage and recovery experiments, a post-quantum signature research path, and a separate EVM-compatibility laboratory for smart-contract execution.
 
-The native asset is a coin of its own network, distinct from the Ethereum Sepolia ERC-20 experiment. The current owner-directed design proposes a 10,000,000,000-coin maximum: 30% mining/network security and seven 10% buckets for community airdrop, exchange/market-integration and liquidity partnerships, major marketing partners, developers/security contributors, financial/strategic supporters, protocol burn reserve and owner allocation. These remain design terms, not active Mainnet rules. The canonical production Genesis, issuance path and all-bucket invariants must be frozen and integrated before launch. See allocation policy v0.4.
+The native asset is a coin of its own network, distinct from the Ethereum Sepolia ERC-20 experiment. At the time this v0.3 paper was drafted, the former monetary proposal described a 10,000,000,000-coin maximum split into an eight-bucket allocation model. That model has been superseded for the current QRun Genesis direction by CP-0437: the full 10B QZXB supply is allocated to the owner at Genesis, with zero subsequent minting and zero block subsidy. The production Genesis and consensus path are not yet activated; this version remains historical documentation.
 
 The project has substantial code and testing infrastructure. The maintainer's complete working checkout passed a full Rust regression with 736 library tests and no failures; the locked/offline all-target build check and format check also passed. The full working checkout is larger than this curated public tree, so this test count is tied to that review scope. The separate EVM launch-asset package's local test suite also passed. These are reproducible engineering signals, not substitutes for production-network qualification or an independent protocol audit.
 
@@ -22,19 +24,23 @@ The name "AI-Native" expresses the project's intended product direction. It does
 
 ## 2. Native coin identity and supply design
 
-- **Network/project identity:** QuantumZXB is the current working brand.
-- **Proposed native coin ticker:** QZXB; it remains a proposal rather than a frozen production network identifier or verified listing symbol.
+- **Current brand:** QRun (کیوران).
+- **Native coin ticker:** QZXB (technical symbol; not a verified exchange listing).
+- **Network name:** QRun Blockchain.
+- **Acronym expansion:** Quantum Zeta eXecution Blockchain.
+- **Monetary policy version boundary:** this v0.3 document's earlier allocation text is historical; see CP-0437 for the newer 10B-at-Genesis, zero-future-issuance direction.
 - **Maximum supply design:** 10,000,000,000 native coins.
 - **Atomic-unit design:** eight decimal places; the candidate representation uses up to 10^18 atomic units across the full design cap.
-- **Current planned allocation:** 3B mining/network security (30%) and seven 1B buckets (10% each): community airdrop, exchange/market integrations and liquidity partnerships, major marketing partners, developers/security contributors, financial/strategic supporters, burn reserve and owner allocation. See tokenomics policy v0.4.
+- **Historical v0.4 allocation model (superseded):** this earlier version recorded 3B mining/network security (30%) and seven 1B buckets (10% each). It is not the current QRun Genesis policy.
+- **Current policy reference:** CP-0437 specifies all 10B QZXB at Genesis, with zero subsequent minting and zero block subsidy.
 
-The 10B cap and 30/10/10/10/10/10/10/10 allocation are design-level monetary decisions, not live supply or circulating-balance facts. They must become one versioned production monetary profile enforced in canonical production, validation/import, fork-choice/reorg, persistence, replay and snapshot/state-root paths before a native public Mainnet can rely on them.
+The current 10B-at-Genesis policy is still a design/candidate identity, not a public live supply or circulating-balance fact. It must be enforced in the same versioned production profile across canonical production, validation/import, fork-choice/reorg, persistence, replay and snapshot/state-root paths before a native public Mainnet can rely on it.
 
-### 2.1 Owner, sponsor and contributor allocation framework
+### 2.1 Historical owner, sponsor and contributor allocation framework (superseded)
 
-Under owner-directed policy v0.4 and the CP-0422 decision dated 26 October 2026, the founder allocation is fixed at 1B coins (10% of the 10B cap), with no protocol lock or time vesting under the latest owner direction. Separate 1B allocations are planned for financial/strategic supporters and developers/security contributors; neither is a sub-allocation of the founder bucket. The exchange/market-integration and major-marketing buckets are also separate. Awards remain conditional on written terms and verified milestones. This plan does not create an on-chain balance, cash raised or market liquidity. The decision is not activated in production Genesis or canonical runtime until Gate 2 closes. See [CP-0422 — Canonical Tokenomics Decision](CP-0422_CANONICAL_TOKENOMICS_DECISION_2026-10-26.md) and the [v0.4 Tokenomics Policy](FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V04_2026-10-24.md).
+This subsection records the former CP-0422/v0.4 proposal for audit continuity only: it described a 1B / 10% founder allocation and separate category ceilings for supporters, contributors, marketing and market integration. CP-0437 superseded that allocation model for the current QRun Genesis direction. These historical amounts must not be presented as current QRun Genesis balances, entitlements, sponsor commitments, cash raised or market liquidity.
 
-No sponsor is currently confirmed, no entitlement under this proposal is already granted, and no production balance is created merely by describing the allocation. Sponsor and contributor quantities are internal proposal terms until an actual agreement, milestone evidence and final Genesis/issuance design exist. Coin allocation is not, by itself, company equity, revenue share, a redemption right or a promise of financial return. See `FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V04_2026-10-24.md`.
+No sponsor is confirmed by this historical proposal, no entitlement is granted, and no production balance is created merely by describing an allocation. The active QRun direction remains 10B QZXB at Genesis with zero post-Genesis minting and zero block subsidy; it is not a promise of market value or financial return.
 
 ## 3. Architecture overview
 
@@ -69,7 +75,7 @@ The project separately has a fixed-supply Solidity ERC-20 candidate and a browse
 - Network: Ethereum Sepolia, chain ID 11155111.
 - Contract name/symbol: `Qanvoryx Launch Candidate` / `QX`.
 
-This is an EVM testnet experiment and a separate asset. It is not the QuantumZXB native coin, not a native-L1 contract deployment, and not a production market. Its 10B supply and 4B/3B/3B balances are transferable; the contract does not enforce a lock or vesting schedule.
+This is an EVM testnet experiment and a separate asset. It is not the QRun native coin, not a native-L1 contract deployment, and not a production market. Its 10B supply and 4B/3B/3B balances are transferable; the contract does not enforce a lock or vesting schedule.
 
 ### 4.2 Native smart-contract roadmap
 

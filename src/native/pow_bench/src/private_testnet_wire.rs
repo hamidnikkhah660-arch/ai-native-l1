@@ -7,13 +7,24 @@
 
 use crate::{
     consensus::{PowHeader, Uint256},
-    state_machine::{decode_block, encode_block, Block, StateError, MAX_ENCODED_BLOCK_BYTES},
+    qrun_v05_fee_pow_wire_candidate::{
+        decode_qrun_v05_fee_pow_block, QRunV05FeePowWireError, MAX_QRUN_V05_FEE_POW_ENVELOPE_BYTES,
+    },
+    state_machine::{
+        decode_block, encode_block, Block, QRunV05FeeBlock, StateError, MAX_ENCODED_BLOCK_BYTES,
+    },
 };
 
 const MAGIC: &[u8; 4] = b"PTB2";
 pub const PRIVATE_TESTNET_WIRE_VERSION: u16 = 2;
 const ENVELOPE_HEADER_LEN: usize = 196;
 pub const MAX_PRIVATE_TESTNET_ENVELOPE_BYTES: usize = ENVELOPE_HEADER_LEN + MAX_ENCODED_BLOCK_BYTES;
+pub const MAX_CANDIDATE_NETWORK_ENVELOPE_BYTES: usize =
+    if MAX_PRIVATE_TESTNET_ENVELOPE_BYTES > MAX_QRUN_V05_FEE_POW_ENVELOPE_BYTES {
+        MAX_PRIVATE_TESTNET_ENVELOPE_BYTES
+    } else {
+        MAX_QRUN_V05_FEE_POW_ENVELOPE_BYTES
+    };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrivateTestnetWireError {
@@ -24,6 +35,7 @@ pub enum PrivateTestnetWireError {
     InvalidNetworkId,
     InvalidProtocolVersion,
     InvalidBlockEncoding,
+    QRunFeePowWire(QRunV05FeePowWireError),
     HeaderBodyMismatch(&'static str),
 }
 
@@ -44,6 +56,7 @@ impl std::fmt::Display for PrivateTestnetWireError {
                 write!(f, "private-testnet header protocol version cannot be zero")
             }
             Self::InvalidBlockEncoding => write!(f, "private-testnet block body is not canonical"),
+            Self::QRunFeePowWire(error) => write!(f, "QRun QFP5 envelope rejected: {error}"),
             Self::HeaderBodyMismatch(field) => {
                 write!(
                     f,
@@ -59,7 +72,10 @@ impl std::error::Error for PrivateTestnetWireError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateNetworkBlock {
     pub header: PowHeader,
+    /// Body view retained for PTB2-compatible callers. QFP5 callers must use fee_block.
     pub block: Block,
+    /// Present only when the input used QFP5/QFB5. Execution mode must be bound by fork choice.
+    pub fee_block: Option<QRunV05FeeBlock>,
 }
 
 fn check_header_body_binding(
@@ -127,7 +143,7 @@ pub fn encode_candidate_network_block(
 
 /// Strictly decode a PTB2 envelope; rejects unsupported versions, non-canonical bodies,
 /// truncated or trailing bytes, and detached-header/body mismatches.
-pub fn decode_candidate_network_block(
+fn decode_ptb2_candidate_network_block(
     bytes: &[u8],
 ) -> Result<CandidateNetworkBlock, PrivateTestnetWireError> {
     if bytes.len() > MAX_PRIVATE_TESTNET_ENVELOPE_BYTES {
@@ -179,7 +195,28 @@ pub fn decode_candidate_network_block(
     Ok(CandidateNetworkBlock {
         header,
         block: body,
+        fee_block: None,
     })
+}
+
+/// Decode only known canonical candidate formats. Consumers must still bind the decoded
+/// execution variant to their immutable chain profile before admission.
+pub fn decode_candidate_network_block(
+    bytes: &[u8],
+) -> Result<CandidateNetworkBlock, PrivateTestnetWireError> {
+    if bytes.len() >= 4 && &bytes[..4] == b"QFP5" {
+        if bytes.len() > MAX_CANDIDATE_NETWORK_ENVELOPE_BYTES {
+            return Err(PrivateTestnetWireError::Oversize);
+        }
+        let decoded = decode_qrun_v05_fee_pow_block(bytes)
+            .map_err(PrivateTestnetWireError::QRunFeePowWire)?;
+        return Ok(CandidateNetworkBlock {
+            header: decoded.header,
+            block: decoded.block.body.clone(),
+            fee_block: Some(decoded.block),
+        });
+    }
+    decode_ptb2_candidate_network_block(bytes)
 }
 
 fn take_slice<'a>(
