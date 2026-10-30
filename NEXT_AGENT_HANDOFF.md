@@ -37,7 +37,7 @@ At last verification:
 
 ## Current work in progress — 2026-10-30
 
-- Working feature branch: feat/qrun-qvap-offline-prototype-20261030, created from docs branch head 9f7b9bb4804a3db0f7d26c56be07cf93c16edbf3. At this handoff update the feature work is local and not yet committed/pushed; check git status and exact HEAD before acting.
+- Working feature branch: feat/qrun-qvap-offline-prototype-20261030, created from docs branch head 9f7b9bb4804a3db0f7d26c56be07cf93c16edbf3. Candidate implementation commit 9810bfbf224b9de5e5180f60c95865764272d69a is pushed to origin; the subsequent handoff-only commit may advance HEAD, so verify the exact SHA and working tree before acting.
 - New isolated offline candidate modules:
   - src/native/pow_bench/src/qrun_verifiable_asset_passport_candidate.rs
   - src/native/pow_bench/src/qrun_verifiable_agentic_settlement_candidate.rs
@@ -45,7 +45,8 @@ At last verification:
 - Focused verification on current code: QVAP 15/15 tests passed; QVAAC 16/16 passed; cargo +stable check --all-targets --locked --offline passed; git diff --check passed. Existing unrelated repository warnings remain.
 - A previous full library test run yielded 962 passed / 1 failed due to a Windows multi-process reward-pool writer file-I/O error (Access Denied / path not found); the one test passed when rerun in isolation. Do not claim the full library suite is entirely green.
 - QVAAC also enforces distinct buyer/agent/seller/evaluator identities and rejects future-dated delivery attestations. Both test suites use deliberately non-cryptographic test-only verifiers. No production AAP, ERC-8004, QVAP attestor, evaluator or ML-DSA agent-commerce verifier is connected. No trusted clock, persisted global grant revocation/sequence registry, real escrow, real payments, production API/explorer, independent-node replay or deployment exists.
-- PR #92 remains a documentation-only Draft PR, all 5 observed CI checks passed: https://github.com/hamidnikkhah660-arch/ai-native-l1/pull/92. It is stacked on PR #91. PR #93 for the candidate code has not yet been created.
+- PR #92 remains a documentation-only Draft PR, all 5 observed CI checks passed: https://github.com/hamidnikkhah660-arch/ai-native-l1/pull/92. It is stacked on PR #91.
+- PR #93 is OPEN / Draft: https://github.com/hamidnikkhah660-arch/ai-native-l1/pull/93. Head: feat/qrun-qvap-offline-prototype-20261030 at 9810bfbf224b9de5e5180f60c95865764272d69a. Its base is work/qrun-qvap-ci-base-20261030, a CI-filter alias branch pointing exactly to docs commit 9f7b9bb4804a3db0f7d26c56be07cf93c16edbf3. The alias exists because .github/workflows/rust-ci.yml only runs pull_request checks for base branches main/work/**; it has the same tree as docs/qrun-quantum-resilient-vision-20261030 and is not a feature/integration branch. Before any eventual merge, retarget/rebase PR93 to the intended parent after PR92's docs commit is integrated. Do not merge the alias branch itself.
 - The feature work is a separate experiment and must not block QRun v0.5 public release work. Keep it Draft, isolated and reversible. Before commit/push, rerun format, both focused test suites, all-target check and git diff --check on the exact HEAD.
 
 ## Current technical truth
