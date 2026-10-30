@@ -1271,8 +1271,10 @@ where
         self.store.archive()
     }
 
+    /// Return the original height-zero wallet-bound Genesis identity, not the checkpoint
+    /// state used as the bounded suffix store's replay base.
     pub fn genesis_state(&self) -> &LedgerState {
-        self.store.genesis_state()
+        &self.genesis_identity
     }
 
     pub fn is_qrun_v05_fee_only(&self) -> bool {
@@ -1284,8 +1286,30 @@ where
         genesis: &LedgerState,
         params: &ConsensusParameters,
     ) -> bool {
-        self.store
-            .matches_qrun_v05_genesis_and_profile(genesis, params)
+        if genesis != &self.genesis_identity
+            || params.protocol_version != 5
+            || validate_wallet_bound_external_cas_genesis(genesis, self.owner_account, &self.pin)
+                .is_err()
+        {
+            return false;
+        }
+
+        match self.store.profile {
+            ForkStoreProfile::QRunV05FeeOnly => self
+                .store
+                .matches_qrun_v05_genesis_and_profile(genesis, params),
+            ForkStoreProfile::QRunV05FeeCheckpoint(checkpoint_commitment, genesis_commitment) => {
+                genesis_commitment == self.pin.genesis_digest
+                    && qrun_v05_fee_checkpoint_profile_fingerprint(
+                        &self.store.genesis,
+                        params,
+                        checkpoint_commitment,
+                    )
+                    .map(|fingerprint| fingerprint == self.store.profile_fingerprint)
+                    .unwrap_or(false)
+            }
+            ForkStoreProfile::LegacyPtb2 => false,
+        }
     }
 
     pub fn canonical_height(&self) -> u64 {
