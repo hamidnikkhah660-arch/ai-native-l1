@@ -13,6 +13,7 @@ use crate::{
         ExternalCasClientError, ExternalCasPin, ExternalCasProviderTransport, ExternalCasRecord,
         ExternalCasWriteRequest, VerifiedExternalCasClient, EXTERNAL_CAS_RECORD_BYTES,
     },
+    external_cas_floor_store_candidate::{ExternalCasFloorError, ExternalCasFloorStore},
     private_testnet_fork_choice::{
         ForkChoiceError, ForkChoiceOutcome, PrivateTestnetForkChoice, MAX_FORK_ARCHIVE_BLOCKS,
     },
@@ -80,6 +81,7 @@ pub enum ForkStoreError {
     DuplicateManifestDigest,
     ProfileEncodingInvalid,
     ExternalCasClient(ExternalCasClientError),
+    ExternalCasFloor(ExternalCasFloorError),
     ExternalCasContract(crate::external_cas_anchor_candidate::ExternalCasError),
     PendingAnchorMalformed,
     PendingRecoveryRequired,
@@ -134,6 +136,7 @@ impl std::fmt::Display for ForkStoreError {
                 write!(f, "fork-store consensus profile cannot be encoded")
             }
             Self::ExternalCasClient(error) => write!(f, "QRun external CAS rejected: {error}"),
+            Self::ExternalCasFloor(error) => write!(f, "QRun external-CAS floor rejected: {error}"),
             Self::ExternalCasContract(error) => write!(f, "QRun external CAS contract rejected: {error}"),
             Self::PendingAnchorMalformed => write!(f, "QRun external-CAS pending commit is malformed or inconsistent"),
             Self::PendingRecoveryRequired => write!(f, "QRun external-CAS commit recovery is required; reopen the store before writing again"),
@@ -224,6 +227,8 @@ pub struct QRunV05ExternalCasForkStore<P, V> {
     owner_account: AccountId,
     trusted_record: ExternalCasRecord,
     minimum_object_generation: u64,
+    floor: Option<ExternalCasFloorStore>,
+    floor_write_blocked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -931,7 +936,47 @@ where
             owner_account,
             trusted_record: observed,
             minimum_object_generation: object_generation,
+            floor: None,
+            floor_write_blocked: false,
         })
+    }
+
+    /// Open using an independently stored floor. The floor supplies the trusted ECR1 record and
+    /// object-generation minimum; after startup recovery, only the same record or one exact
+    /// provider successor may be reconciled into the floor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_for_owner_genesis_with_floor<A: TransactionAuthenticator>(
+        directory: impl AsRef<Path>,
+        genesis: LedgerState,
+        owner_account: AccountId,
+        params: ConsensusParameters,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+        pin: ExternalCasPin,
+        client: VerifiedExternalCasClient<P, V>,
+        floor: ExternalCasFloorStore,
+    ) -> Result<Self, ForkStoreError> {
+        if floor.pin() != &pin {
+            return Err(ForkStoreError::ExternalAnchorMismatch);
+        }
+        let snapshot = floor.snapshot().map_err(ForkStoreError::ExternalCasFloor)?;
+        let mut store = Self::open_for_owner_genesis(
+            directory,
+            genesis,
+            owner_account,
+            params,
+            authenticator,
+            clock,
+            pin,
+            client,
+            snapshot.trusted_record,
+            snapshot.minimum_object_generation,
+        )?;
+        floor
+            .reconcile_verified_observation(&store.trusted_record, store.minimum_object_generation)
+            .map_err(ForkStoreError::ExternalCasFloor)?;
+        store.floor = Some(floor);
+        Ok(store)
     }
 
     /// Strict checkpoint rollover entry point. Validate the exact parent link before touching
@@ -1169,7 +1214,57 @@ where
             owner_account,
             trusted_record: observed,
             minimum_object_generation: object_generation,
+            floor: None,
+            floor_write_blocked: false,
         })
+    }
+
+    /// Wallet-bound checkpoint open using the independent external-CAS floor. The QRCP parent
+    /// is checked by the strict checkpoint constructor; the floor separately prevents provider
+    /// generation rollback and node-archive rollback while its own storage remains intact.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_from_checkpoint_with_parent_for_owner_genesis_and_floor<
+        A: TransactionAuthenticator,
+    >(
+        directory: impl AsRef<Path>,
+        genesis: LedgerState,
+        owner_account: AccountId,
+        params: ConsensusParameters,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+        checkpoint_bytes: &[u8],
+        expected_checkpoint_commitment: [u8; 32],
+        minimum_checkpoint_height: u64,
+        expected_parent_checkpoint_commitment: [u8; 32],
+        pin: ExternalCasPin,
+        client: VerifiedExternalCasClient<P, V>,
+        floor: ExternalCasFloorStore,
+    ) -> Result<Self, ForkStoreError> {
+        if floor.pin() != &pin {
+            return Err(ForkStoreError::ExternalAnchorMismatch);
+        }
+        let snapshot = floor.snapshot().map_err(ForkStoreError::ExternalCasFloor)?;
+        let mut store = Self::open_from_checkpoint_with_parent_for_owner_genesis(
+            directory,
+            genesis,
+            owner_account,
+            params,
+            authenticator,
+            clock,
+            checkpoint_bytes,
+            expected_checkpoint_commitment,
+            minimum_checkpoint_height,
+            expected_parent_checkpoint_commitment,
+            pin,
+            client,
+            snapshot.trusted_record,
+            snapshot.minimum_object_generation,
+        )?;
+        floor
+            .reconcile_verified_observation(&store.trusted_record, store.minimum_object_generation)
+            .map_err(ForkStoreError::ExternalCasFloor)?;
+        store.floor = Some(floor);
+        Ok(store)
     }
 
     pub fn archive(&self) -> &PrivateTestnetForkChoice {
@@ -1233,6 +1328,9 @@ where
     ) -> Result<ForkChoiceOutcome, ForkStoreError> {
         if !self.store.profile.is_qrun_fee_only() {
             return Err(ForkStoreError::ManifestProfileMismatch);
+        }
+        if self.floor_write_blocked {
+            return Err(ForkStoreError::PendingRecoveryRequired);
         }
         if self.store.directory.join(QRUN_PENDING_NAME).exists() {
             return Err(ForkStoreError::PendingRecoveryRequired);
@@ -1342,7 +1440,21 @@ where
 
         match self.client.compare_and_swap(&request) {
             Ok(receipt) => {
-                // The provider has signed the exact successor, so local publication can now proceed.
+                // Advance the separate high-water floor after the verified remote commit but
+                // before local manifest publication. If floor persistence fails, leave QAP1 in
+                // place and block this store instance; reopen can reconcile the exact successor.
+                if let Some(floor) = &self.floor {
+                    if let Err(error) = floor.advance(
+                        &pending.previous_record,
+                        request.expected_object_generation,
+                        &next_record,
+                        receipt.object_generation,
+                    ) {
+                        self.floor_write_blocked = true;
+                        return Err(ForkStoreError::ExternalCasFloor(error));
+                    }
+                }
+                // The provider and independent floor have signed/pinned the exact successor.
                 write_manifest_atomic(&self.store.directory.join(MANIFEST_NAME), &manifest)?;
                 self.store.archive = candidate_archive;
                 self.trusted_record = next_record;
@@ -1371,6 +1483,17 @@ where
                         Err(ForkStoreError::ExternalCasClient(cas_error))
                     }
                     Ok(PendingRecoveryOutcome::Committed(record, generation)) => {
+                        if let Some(floor) = &self.floor {
+                            if let Err(error) = floor.advance(
+                                &pending.previous_record,
+                                self.minimum_object_generation,
+                                &record,
+                                generation,
+                            ) {
+                                self.floor_write_blocked = true;
+                                return Err(ForkStoreError::ExternalCasFloor(error));
+                            }
+                        }
                         self.store.archive = candidate_archive;
                         self.trusted_record = record;
                         self.minimum_object_generation = generation;
@@ -2685,6 +2808,15 @@ mod tests {
             request_digest: [0xA4; 32],
         };
 
+        let floor_dir = TestDir::new();
+        let floor = ExternalCasFloorStore::initialize(
+            &floor_dir.0,
+            pin.clone(),
+            previous_record.clone(),
+            1,
+        )
+        .unwrap();
+
         // Simulate the state after the external provider committed but before the local manifest
         // was replaced: the new QFP5 branch and QAP1 pending record are durable, manifest is old.
         let envelope = qrun_fee_envelope(&genesis, &params);
@@ -2763,6 +2895,10 @@ mod tests {
             lose_next_commit_response: false,
             reject_next_commit_before_apply: false,
         }));
+
+        // Model a crash after provider CAS and independent floor advance but before local
+        // manifest publication. The QAP1 pending marker remains the only allowed recovery proof.
+        floor.advance(&previous_record, 1, &next_record, 2).unwrap();
         let sign_key = signing_key.clone();
         let provider = make_memory_cas_provider(pin.clone(), shared.clone(), move |mut receipt| {
             let digest = receipt.signing_digest().unwrap();
@@ -2774,16 +2910,16 @@ mod tests {
         let client =
             VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
                 .unwrap();
-        let reopened = QRunV05ExternalCasForkStore::open(
+        let reopened = QRunV05ExternalCasForkStore::open_for_owner_genesis_with_floor(
             &dir.0,
             genesis,
+            crate::qrun_v05_profile_identity_candidate::PROPOSED_OWNER_ACCOUNT_ID,
             params,
             &EmptyAuthenticator,
             &FixedClock,
-            pin,
+            pin.clone(),
             client,
-            previous_record,
-            1,
+            floor,
         )
         .unwrap();
 
@@ -2793,6 +2929,12 @@ mod tests {
             crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS
         );
         assert_eq!(reopened.trusted_record(), &next_record);
+        let floor_after_recovery = ExternalCasFloorStore::open(&floor_dir.0, pin)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(floor_after_recovery.trusted_record, next_record);
+        assert_eq!(floor_after_recovery.minimum_object_generation, 2);
         assert!(!dir.0.join(QRUN_PENDING_NAME).exists());
         assert_eq!(
             manifest_anchor_commitment(
@@ -3189,6 +3331,12 @@ mod tests {
             operation_id: [0x93; 32],
             request_digest: [0x94; 32],
         };
+        // The high-water floor is stored outside the mutable PFS2 node archive.
+        let floor_dir = TestDir::new();
+        let floor =
+            ExternalCasFloorStore::initialize(&floor_dir.0, pin.clone(), bootstrap.clone(), 1)
+                .unwrap();
+
         let shared = Arc::new(Mutex::new(MemoryCasState {
             record: bootstrap.clone(),
             object_generation: 1,
@@ -3206,7 +3354,7 @@ mod tests {
         let client =
             VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
                 .unwrap();
-        let store = QRunV05ExternalCasForkStore::open_for_owner_genesis(
+        let store = QRunV05ExternalCasForkStore::open_for_owner_genesis_with_floor(
             &dir.0,
             genesis.clone(),
             WALLET_BOUND_OWNER,
@@ -3215,8 +3363,7 @@ mod tests {
             &FixedClock,
             pin.clone(),
             client,
-            bootstrap,
-            1,
+            floor,
         )
         .unwrap();
 
@@ -3243,6 +3390,12 @@ mod tests {
         let store = runtime.into_store();
         assert_eq!(store.trusted_record().generation, 1);
         assert_eq!(store.minimum_object_generation(), 2);
+        let floor_snapshot = ExternalCasFloorStore::open(&floor_dir.0, pin.clone())
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(floor_snapshot.trusted_record, *store.trusted_record());
+        assert_eq!(floor_snapshot.minimum_object_generation, 2);
         assert!(!dir.0.join(QRUN_PENDING_NAME).exists());
         {
             let state = shared.lock().unwrap();
@@ -3250,11 +3403,53 @@ mod tests {
             assert_eq!(state.object_generation, 2);
             assert!(!state.lose_next_commit_response);
         }
-        let trusted = store.trusted_record().clone();
-        let minimum_object_generation = store.minimum_object_generation();
+        // Replaying an old PFS2 archive while the independent floor is at generation two fails.
+        let rolled_back_dir = TestDir::new();
+        let old_local = PrivateTestnetForkStore::open_qrun_v05_fee_only(
+            &rolled_back_dir.0,
+            genesis.clone(),
+            params.clone(),
+            &EmptyAuthenticator,
+            &FixedClock,
+        )
+        .unwrap();
+        assert_eq!(old_local.canonical_height(), 0);
+        drop(old_local);
+
+        let floor_for_rollback = ExternalCasFloorStore::open(&floor_dir.0, pin.clone()).unwrap();
+        let rollback_key = signing_key.clone();
+        let rollback_provider =
+            make_memory_cas_provider(pin.clone(), shared.clone(), move |mut receipt| {
+                let digest = receipt.signing_digest().unwrap();
+                receipt.signature = *portable::sign(&rollback_key, &digest, &[], [0x73u8; 32])
+                    .unwrap()
+                    .as_ref();
+                receipt
+            });
+        let rollback_client = VerifiedExternalCasClient::new(
+            pin.clone(),
+            rollback_provider,
+            LibcruxMlDsa65VerifierCandidate,
+        )
+        .unwrap();
+        assert!(matches!(
+            QRunV05ExternalCasForkStore::open_for_owner_genesis_with_floor(
+                &rolled_back_dir.0,
+                genesis.clone(),
+                WALLET_BOUND_OWNER,
+                params.clone(),
+                &EmptyAuthenticator,
+                &FixedClock,
+                pin.clone(),
+                rollback_client,
+                floor_for_rollback,
+            ),
+            Err(ForkStoreError::ExternalAnchorMismatch)
+        ));
+
         drop(store);
 
-        // Reopen only with the same wallet-bound identity and independently retained signed record.
+        // Reopen only with the same wallet-bound identity and the separate persisted floor.
         let sign_key_2 = signing_key.clone();
         let provider = make_memory_cas_provider(pin.clone(), shared.clone(), move |mut receipt| {
             let digest = receipt.signing_digest().unwrap();
@@ -3266,7 +3461,8 @@ mod tests {
         let client =
             VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
                 .unwrap();
-        let reopened = QRunV05ExternalCasForkStore::open_for_owner_genesis(
+        let floor = ExternalCasFloorStore::open(&floor_dir.0, pin.clone()).unwrap();
+        let reopened = QRunV05ExternalCasForkStore::open_for_owner_genesis_with_floor(
             &dir.0,
             genesis,
             WALLET_BOUND_OWNER,
@@ -3275,8 +3471,7 @@ mod tests {
             &FixedClock,
             pin,
             client,
-            trusted,
-            minimum_object_generation,
+            floor,
         )
         .unwrap();
         assert_eq!(reopened.canonical_height(), 1);
