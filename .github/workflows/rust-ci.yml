@@ -2,9 +2,9 @@ name: Rust validation
 
 on:
   push:
-    branches: [main, "ci/**", "public/**", "work/qzbe-v04-persistent-mining-20261026"]
+    branches: [main, "ci/**", "public/**", "work/**", "fix/**"]
   pull_request:
-    branches: [main]
+    branches: [main, "work/**"]
   workflow_dispatch:
 
 permissions:
