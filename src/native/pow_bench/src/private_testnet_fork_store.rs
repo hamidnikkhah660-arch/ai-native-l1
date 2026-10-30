@@ -20,7 +20,8 @@ use crate::{
         decode_candidate_network_block, PrivateTestnetWireError,
         MAX_CANDIDATE_NETWORK_ENVELOPE_BYTES,
     },
-    state_machine::{LedgerState, StateError, TransactionAuthenticator},
+    qrun_v05_genesis_candidate::QRunGenesisV05,
+    state_machine::{AccountId, LedgerState, StateError, TransactionAuthenticator},
     store_writer_lock::StoreWriterLock,
     v4_fat1_trust_candidate::MlDsa65Verifier,
 };
@@ -733,18 +734,68 @@ impl PrivateTestnetForkStore {
     }
 }
 
+fn validate_wallet_bound_external_cas_genesis(
+    genesis: &LedgerState,
+    owner_account: AccountId,
+    pin: &ExternalCasPin,
+) -> Result<(), ForkStoreError> {
+    pin.validate()?;
+    let expected_genesis = QRunGenesisV05::new(genesis.network_id(), owner_account)
+        .map_err(|_| ForkStoreError::ExternalAnchorMismatch)?;
+    if pin.network_id != genesis.network_id()
+        || pin.genesis_digest != expected_genesis.commitment()
+        || expected_genesis.state_root() != genesis.state_root()
+        || genesis.total_value().ok() != Some(crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS)
+    {
+        return Err(ForkStoreError::ExternalAnchorMismatch);
+    }
+    Ok(())
+}
+
 impl<P, V> QRunV05ExternalCasForkStore<P, V>
 where
     P: ExternalCasProviderTransport,
     V: MlDsa65Verifier,
 {
-    /// Open the QRun PFS2 store only when its current manifest is linked to the caller's
-    /// independently retained signed-CAS record. The transport must target an independently
-    /// administered provider with atomic server-side CAS; the local implementation cannot prove
-    /// that operational-independence requirement for the caller.
+    /// Compatibility shorthand for the historical CP-0450 proposed identity. Current
+    /// wallet-bound deployments must call open_for_owner_genesis with their exact owner account.
+    /// The provider transport must still target an independently administered atomic-CAS service.
     pub fn open<A: TransactionAuthenticator>(
         directory: impl AsRef<Path>,
         genesis: LedgerState,
+        params: ConsensusParameters,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+        pin: ExternalCasPin,
+        client: VerifiedExternalCasClient<P, V>,
+        trusted_record: ExternalCasRecord,
+        minimum_object_generation: u64,
+    ) -> Result<Self, ForkStoreError> {
+        Self::open_for_owner_genesis(
+            directory,
+            genesis,
+            crate::qrun_v05_profile_identity_candidate::PROPOSED_OWNER_ACCOUNT_ID,
+            params,
+            authenticator,
+            clock,
+            pin,
+            client,
+            trusted_record,
+            minimum_object_generation,
+        )
+    }
+
+    /// Open a QRun QFP5 store for an explicitly supplied Genesis owner.
+    ///
+    /// This method binds the provider pin to the caller-supplied wallet-bound identity by
+    /// recomputing the exact Genesis from the network and owner account. The provider ID,
+    /// receipt key, bootstrap record and durable generation floor must still be provisioned
+    /// independently; this method does not create a provider.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_for_owner_genesis<A: TransactionAuthenticator>(
+        directory: impl AsRef<Path>,
+        genesis: LedgerState,
+        owner_account: AccountId,
         params: ConsensusParameters,
         authenticator: &A,
         clock: &dyn ReferenceTimeProvider,
@@ -753,26 +804,14 @@ where
         trusted_record: ExternalCasRecord,
         minimum_object_generation: u64,
     ) -> Result<Self, ForkStoreError> {
-        pin.validate()?;
+        validate_wallet_bound_external_cas_genesis(&genesis, owner_account, &pin)?;
         trusted_record.validate_shape()?;
-        if minimum_object_generation == 0
+        if params.protocol_version != 5
+            || minimum_object_generation == 0
             || !client.is_pinned_to(&pin)
-            || pin.network_id != genesis.network_id()
-            || pin.network_id
-                != crate::qrun_v05_profile_identity_candidate::PROPOSED_QRUN_V05_NETWORK_ID
-            || pin.genesis_digest
-                != crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT
             || trusted_record.provider_id != pin.provider_id
             || trusted_record.network_id != pin.network_id
             || trusted_record.genesis_digest != pin.genesis_digest
-        {
-            return Err(ForkStoreError::ExternalAnchorMismatch);
-        }
-        let frozen_genesis = crate::qrun_v05_profile_identity_candidate::build_candidate_genesis()
-            .map_err(|_| ForkStoreError::ExternalAnchorMismatch)?;
-        if frozen_genesis.state_root() != genesis.state_root()
-            || frozen_genesis.commitment()
-                != crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT
         {
             return Err(ForkStoreError::ExternalAnchorMismatch);
         }
@@ -3878,5 +3917,78 @@ mod tests {
         assert_eq!(store.archive().archive_len(), 0);
         assert_eq!(store.canonical_height(), 0);
         assert!(!orphan.exists());
+    }
+}
+
+#[cfg(test)]
+mod qrun_wallet_bound_external_cas_identity_tests {
+    use super::*;
+    use crate::external_cas_anchor_candidate::ExternalCasPin;
+
+    const WALLET_BOUND_NETWORK_ID: [u8; 32] = [
+        0x8b, 0x5d, 0x16, 0x92, 0x05, 0xac, 0x49, 0xcb, 0x98, 0x66, 0xa9, 0xd2, 0x7f, 0xf1, 0xa6,
+        0xc3, 0xc2, 0x57, 0x1f, 0xca, 0x65, 0xf6, 0x34, 0x85, 0x4c, 0x41, 0xc1, 0x12, 0xe5, 0x06,
+        0xae, 0xbb,
+    ];
+    const WALLET_BOUND_OWNER: AccountId = [
+        0xa1, 0x4d, 0x67, 0xbd, 0x19, 0x5c, 0x6a, 0x00, 0x44, 0xbe, 0xda, 0xc8, 0x53, 0x2e, 0x74,
+        0x28, 0x11, 0xf9, 0x25, 0x01, 0x63, 0x07, 0x64, 0xd7, 0x3a, 0x98, 0xb2, 0xf0, 0xcc, 0x33,
+        0x5f, 0xdd,
+    ];
+
+    #[test]
+    fn wallet_bound_genesis_identity_matches_external_cas_pin_domain() {
+        let genesis = QRunGenesisV05::new(WALLET_BOUND_NETWORK_ID, WALLET_BOUND_OWNER).unwrap();
+        assert_eq!(
+            genesis.commitment(),
+            [
+                0x91, 0x22, 0x9b, 0x7d, 0x21, 0xb2, 0x3c, 0xee, 0x83, 0xf0, 0x0c, 0xec, 0x53, 0xa5,
+                0x66, 0xef, 0x1b, 0x30, 0xdb, 0x70, 0xc6, 0x44, 0xc1, 0xe9, 0xd0, 0x5a, 0x43, 0x1c,
+                0x1a, 0xcf, 0x4d, 0xbc,
+            ]
+        );
+        assert_eq!(
+            genesis.state_root(),
+            [
+                0xa4, 0x4e, 0x54, 0x5c, 0x2c, 0xd8, 0xfa, 0x4e, 0x56, 0xe2, 0x28, 0xf4, 0xf2, 0x42,
+                0xcb, 0xf5, 0x44, 0x5b, 0x1c, 0xc9, 0x83, 0xc7, 0xb1, 0xf8, 0xfe, 0x89, 0xc5, 0xb4,
+                0x2a, 0xef, 0x88, 0xd7,
+            ]
+        );
+
+        let pin = ExternalCasPin {
+            provider_id: [0x11; 32],
+            network_id: WALLET_BOUND_NETWORK_ID,
+            genesis_digest: genesis.commitment(),
+            receipt_key_id: [0x22; 32],
+            receipt_public_key: [0x33; crate::v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES],
+        };
+
+        let genesis_state = genesis.ledger().clone();
+        pin.validate().unwrap();
+        validate_wallet_bound_external_cas_genesis(&genesis_state, WALLET_BOUND_OWNER, &pin)
+            .unwrap();
+
+        assert!(
+            validate_wallet_bound_external_cas_genesis(&genesis_state, [0x44; 32], &pin).is_err()
+        );
+
+        let mut wrong_network_pin = pin.clone();
+        wrong_network_pin.network_id = [0x55; 32];
+        assert!(validate_wallet_bound_external_cas_genesis(
+            &genesis_state,
+            WALLET_BOUND_OWNER,
+            &wrong_network_pin
+        )
+        .is_err());
+
+        let mut wrong_genesis_pin = pin;
+        wrong_genesis_pin.genesis_digest = [0x66; 32];
+        assert!(validate_wallet_bound_external_cas_genesis(
+            &genesis_state,
+            WALLET_BOUND_OWNER,
+            &wrong_genesis_pin
+        )
+        .is_err());
     }
 }
