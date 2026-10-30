@@ -94,7 +94,7 @@ const QZXB_MAINNET_STATE_ROOT_HEX: &str =
 const QRUN_MAINNET_RELEASE_APPROVED: bool = false;
 const QRUN_MAINNET_RELEASE_BLOCKERS: &[&str] = &[
     "production consensus profile is not frozen and proven by at least three independent operators",
-    "full-history validation/recovery and independently verifiable checkpoint rollover are not integrated",
+    "provider-backed checkpoint manifest rollover/rebase and full-history validation/recovery are not integrated",
     "adversarial multi-host restart/reorg/partition/transaction-relay tests and independent security review are incomplete",
     "external Mainnet P2P reachability, independent public operations, and monitored recovery have not been verified",
 ];
@@ -209,6 +209,29 @@ fn read_exact_regular_file(
     Ok(bytes)
 }
 
+fn read_bounded_regular_file(
+    path: &std::path::Path,
+    maximum_len: usize,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| format!("inspect {label}: {error}"))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > maximum_len as u64
+    {
+        return Err(format!(
+            "{label} must be a regular non-symlink file between 1 and {maximum_len} bytes"
+        ));
+    }
+    let bytes = fs::read(path).map_err(|error| format!("read {label}: {error}"))?;
+    if bytes.len() as u64 != metadata.len() || bytes.len() > maximum_len {
+        return Err(format!("{label} changed size while being read"));
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 fn open_local_node_runtime<A: TransactionAuthenticator>(
     directory: &std::path::Path,
@@ -266,6 +289,29 @@ fn open_node_runtime<A: TransactionAuthenticator>(
         return Err("external-CAS Genesis pin differs from the node's wallet-bound Genesis".into());
     }
 
+    // Authenticate the exact checkpoint and its parent before initializing the independent floor,
+    // opening local storage, or making any provider request.
+    let checkpoint_bytes = if let Some(checkpoint) = &external.checkpoint {
+        let bytes = read_bounded_regular_file(
+            &checkpoint.record_file,
+            ai_native_l1_pow_bench::qrun_v05_checkpoint_candidate::MAX_QRCP_BYTES,
+            "external-CAS QRCP checkpoint",
+        )?;
+        ai_native_l1_pow_bench::qrun_v05_checkpoint_candidate::QRunV05PowCheckpoint::decode_anchored_with_parent(
+            &bytes,
+            &network_id,
+            &external.genesis_commitment,
+            &params,
+            checkpoint.expected_commitment,
+            checkpoint.minimum_height,
+            checkpoint.expected_parent_commitment,
+        )
+        .map_err(|error| format!("validate independently anchored QRCP checkpoint: {error}"))?;
+        Some(bytes)
+    } else {
+        None
+    };
+
     let receipt_key_bytes = read_exact_regular_file(
         &external.receipt_public_key_file,
         ai_native_l1_pow_bench::v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES,
@@ -305,9 +351,50 @@ fn open_node_runtime<A: TransactionAuthenticator>(
         );
     }
 
+    let floor_directory = &external.floor_directory;
+
+    // Only a first boot without an existing QCF1 floor needs to stage the checkpoint-rooted empty
+    // suffix manifest here. A failed first boot may leave that manifest behind; on retry, ECR1
+    // must still match it before QCF1 is initialized. Once QCF1 exists, leave PFS2 inspection and
+    // any pending CAS recovery to the external-CAS store opener so a crash between remote CAS,
+    // local manifest replacement and floor advancement can be reconciled in its journal.
+    if let (Some(checkpoint), Some(checkpoint_bytes)) =
+        (external.checkpoint.as_ref(), checkpoint_bytes.as_deref())
+    {
+        if !floor_directory.exists() {
+            let expected_manifest_anchor =
+                directory.exists().then_some(bootstrap.next_state_digest);
+            let staged =
+                PrivateTestnetForkStore::open_qrun_v05_fee_only_from_checkpoint_for_owner_genesis(
+                    directory,
+                    genesis.ledger().clone(),
+                    owner_account,
+                    params.clone(),
+                    authenticator,
+                    clock,
+                    checkpoint_bytes,
+                    checkpoint.expected_commitment,
+                    checkpoint.minimum_height,
+                    expected_manifest_anchor,
+                )
+                .map_err(|error| {
+                    format!("stage/open checkpoint-rooted QFP5 manifest: {error:?}")
+                })?;
+            let staged_anchor = staged.manifest_anchor().map_err(|error| {
+                format!("read checkpoint-rooted PFS2 manifest anchor: {error:?}")
+            })?;
+            drop(staged);
+            if bootstrap.next_state_digest != staged_anchor {
+                return Err(
+                    "external-CAS ECR1 bootstrap does not anchor the exact checkpoint-rooted PFS2 manifest"
+                        .into(),
+                );
+            }
+        }
+    }
+
     // The explicit initialize switch is safe to keep enabled across restarts:
     // AlreadyInitialized opens the existing floor; MissingState after initialization stays fatal.
-    let floor_directory = &external.floor_directory;
     let floor = if external.initialize_floor {
         match ExternalCasFloorStore::initialize(&floor_directory, pin.clone(), bootstrap, 1) {
             Ok(floor) => floor,
@@ -338,18 +425,42 @@ fn open_node_runtime<A: TransactionAuthenticator>(
     let client =
         VerifiedExternalCasClient::new(pin.clone(), transport, LibcruxMlDsa65VerifierCandidate)
             .map_err(|error| format!("configure verified external-CAS client: {error:?}"))?;
-    let external_store = QRunV05ExternalCasForkStore::open_for_owner_genesis_with_floor(
-        directory,
-        genesis.ledger().clone(),
-        owner_account,
-        params.clone(),
-        authenticator,
-        clock,
-        pin,
-        client,
-        floor,
-    )
-    .map_err(|error| format!("open QRun external-CAS fork store: {error:?}"))?;
+    let external_store = if let Some(checkpoint) = &external.checkpoint {
+        let checkpoint_bytes = checkpoint_bytes
+            .as_deref()
+            .ok_or("checkpoint configuration was not loaded")?;
+        QRunV05ExternalCasForkStore::open_from_checkpoint_with_parent_for_owner_genesis_and_floor(
+            directory,
+            genesis.ledger().clone(),
+            owner_account,
+            params.clone(),
+            authenticator,
+            clock,
+            checkpoint_bytes,
+            checkpoint.expected_commitment,
+            checkpoint.minimum_height,
+            checkpoint.expected_parent_commitment,
+            pin,
+            client,
+            floor,
+        )
+        .map_err(|error| {
+            format!("open checkpoint-rooted QRun external-CAS fork store: {error:?}")
+        })?
+    } else {
+        QRunV05ExternalCasForkStore::open_for_owner_genesis_with_floor(
+            directory,
+            genesis.ledger().clone(),
+            owner_account,
+            params.clone(),
+            authenticator,
+            clock,
+            pin,
+            client,
+            floor,
+        )
+        .map_err(|error| format!("open QRun external-CAS fork store: {error:?}"))?
+    };
     QRunV05PowForkRuntime::from_store(
         network_id,
         owner_account,
@@ -415,6 +526,14 @@ struct Config {
 }
 
 #[derive(Clone, Debug)]
+struct ExternalCasNodeCheckpointConfig {
+    record_file: PathBuf,
+    expected_commitment: [u8; 32],
+    minimum_height: u64,
+    expected_parent_commitment: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
 struct ExternalCasNodeConfig {
     endpoint: SocketAddr,
     provider_id: [u8; 32],
@@ -426,6 +545,7 @@ struct ExternalCasNodeConfig {
     bootstrap_record_file: PathBuf,
     floor_directory: PathBuf,
     initialize_floor: bool,
+    checkpoint: Option<ExternalCasNodeCheckpointConfig>,
 }
 
 fn parse_hex32(value: &str, name: &str) -> Result<[u8; 32], String> {
@@ -455,7 +575,17 @@ fn parse_external_cas_config(
         "--external-cas-bootstrap-record-file",
         "--external-cas-floor-dir",
     ];
+    const CHECKPOINT_REQUIRED: [&str; 4] = [
+        "--external-cas-checkpoint-file",
+        "--external-cas-checkpoint-commitment-hex",
+        "--external-cas-checkpoint-min-height",
+        "--external-cas-checkpoint-parent-commitment-hex",
+    ];
     let present = REQUIRED
+        .iter()
+        .filter(|key| values.contains_key(**key))
+        .count();
+    let checkpoint_present = CHECKPOINT_REQUIRED
         .iter()
         .filter(|key| values.contains_key(**key))
         .count();
@@ -464,6 +594,11 @@ fn parse_external_cas_config(
         if initialize_requested {
             return Err(
                 "--external-cas-initialize-floor requires the complete external-CAS pin set".into(),
+            );
+        }
+        if checkpoint_present != 0 {
+            return Err(
+                "checkpoint bootstrap options require the complete external-CAS pin and floor configuration".into(),
             );
         }
         return Ok(None);
@@ -538,6 +673,49 @@ fn parse_external_cas_config(
         "false" => false,
         _ => return Err("--external-cas-initialize-floor must be exactly true or false".into()),
     };
+    let checkpoint = match checkpoint_present {
+        0 => None,
+        count if count != CHECKPOINT_REQUIRED.len() => {
+            let missing = CHECKPOINT_REQUIRED
+                .iter()
+                .filter(|key| !values.contains_key(**key))
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "checkpoint bootstrap configuration is all-or-none; missing: {missing}"
+            ));
+        }
+        _ => {
+            let expected_commitment = parse_hex32(
+                required("--external-cas-checkpoint-commitment-hex")?,
+                "QRCP checkpoint commitment",
+            )?;
+            let expected_parent_commitment = parse_hex32(
+                required("--external-cas-checkpoint-parent-commitment-hex")?,
+                "QRCP parent checkpoint commitment",
+            )?;
+            let minimum_height = required("--external-cas-checkpoint-min-height")?
+                .parse::<u64>()
+                .map_err(|_| {
+                    "--external-cas-checkpoint-min-height must be an unsigned integer".to_string()
+                })?;
+            if expected_commitment == [0; 32]
+                || expected_parent_commitment == [0; 32]
+                || minimum_height == 0
+            {
+                return Err(
+                    "QRCP commitment, parent commitment and minimum height must be nonzero".into(),
+                );
+            }
+            Some(ExternalCasNodeCheckpointConfig {
+                record_file: absolute_file_path("--external-cas-checkpoint-file")?,
+                expected_commitment,
+                minimum_height,
+                expected_parent_commitment,
+            })
+        }
+    };
     Ok(Some(ExternalCasNodeConfig {
         endpoint,
         provider_id,
@@ -549,6 +727,7 @@ fn parse_external_cas_config(
         bootstrap_record_file: absolute_file_path("--external-cas-bootstrap-record-file")?,
         floor_directory,
         initialize_floor,
+        checkpoint,
     }))
 }
 
@@ -763,7 +942,7 @@ fn parse_config() -> Result<Config, String> {
 Local test: qrun_v05_pow_local_node --local-testnet --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH\n\
 Public alpha: qrun_v05_pow_local_node --public-alpha --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH --noise-private-key-file NPK1\n\
 Mainnet: qrun_v05_pow_local_node --mainnet --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH --noise-private-key-file NPK1 --peer IP:PORT --peer-static-public-key-hex HEX64 --sync-on-start true\n\
-External CAS (QFP5 only): add --external-cas-endpoint IP:PORT --external-cas-provider-id-hex HEX64 --external-cas-genesis-id-hex HEX64 --external-cas-noise-server-static-public-key-hex HEX64 --external-cas-noise-private-key-file NPK1 --external-cas-receipt-key-id-hex HEX64 --external-cas-receipt-public-key-file RAW_MLDSA65_PUBLIC_KEY --external-cas-bootstrap-record-file ECR1_FILE --external-cas-floor-dir ABSOLUTE_SEPARATE_DIRECTORY. Keep the floor directory outside --data-dir and back it up separately. On first install, set --external-cas-initialize-floor true to create the QCF1 floor from the out-of-band generation-zero bootstrap; keep it true on later starts (existing floors are reopened, missing-after-initialization remains fatal). External-CAS options are all-or-none; no local fallback occurs after provider config is supplied.\nMainnet also requires --sync-on-start true, non-loopback pinned peers, and frozen identity checks. RPC/transaction ingress stay loopback-only. IMPORTANT: this candidate build keeps --mainnet blocked until production consensus, full-history recovery, independent-operator validation, and security/release tests are complete."
+External CAS (QFP5 only): add --external-cas-endpoint IP:PORT --external-cas-provider-id-hex HEX64 --external-cas-genesis-id-hex HEX64 --external-cas-noise-server-static-public-key-hex HEX64 --external-cas-noise-private-key-file NPK1 --external-cas-receipt-key-id-hex HEX64 --external-cas-receipt-public-key-file RAW_MLDSA65_PUBLIC_KEY --external-cas-bootstrap-record-file ECR1_FILE --external-cas-floor-dir ABSOLUTE_SEPARATE_DIRECTORY. Keep the floor directory outside --data-dir and back it up separately. On first install, set --external-cas-initialize-floor true to create the QCF1 floor from the out-of-band generation-zero bootstrap; keep it true on later starts (existing floors are reopened, missing-after-initialization remains fatal). External-CAS options are all-or-none; no local fallback occurs after provider config is supplied. Optional checkpoint bootstrap requires all four: --external-cas-checkpoint-file QRCP_FILE --external-cas-checkpoint-commitment-hex HEX64 --external-cas-checkpoint-min-height HEIGHT --external-cas-checkpoint-parent-commitment-hex HEX64. The ECR1 bootstrap must already anchor the exact checkpoint-rooted PFS2 manifest; this does not perform a live CAS manifest rebase/rollover.\nMainnet also requires --sync-on-start true, non-loopback pinned peers, and frozen identity checks. RPC/transaction ingress stay loopback-only. IMPORTANT: this candidate build keeps --mainnet blocked until production consensus, full-history recovery, independent-operator validation, and security/release tests are complete."
         );
         return Err("__help__".into());
     }
@@ -842,6 +1021,10 @@ External CAS (QFP5 only): add --external-cas-endpoint IP:PORT --external-cas-pro
         "--external-cas-bootstrap-record-file",
         "--external-cas-floor-dir",
         "--external-cas-initialize-floor",
+        "--external-cas-checkpoint-file",
+        "--external-cas-checkpoint-commitment-hex",
+        "--external-cas-checkpoint-min-height",
+        "--external-cas-checkpoint-parent-commitment-hex",
     ];
     if let Some(key) = values.keys().find(|key| !allowed.contains(&key.as_str())) {
         return Err(format!("unknown option {key}"));
@@ -2487,6 +2670,56 @@ mod tests {
     }
 
     #[test]
+    fn external_cas_checkpoint_cli_requires_the_complete_independent_trust_tuple() {
+        let mut values = external_cas_cli_values();
+        let temp = std::env::temp_dir();
+        values.insert(
+            "--external-cas-checkpoint-file".into(),
+            temp.join("qrun-checkpoint.qrcp")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        values.insert(
+            "--external-cas-checkpoint-commitment-hex".into(),
+            "55".repeat(32),
+        );
+        values.insert("--external-cas-checkpoint-min-height".into(), "2048".into());
+        values.insert(
+            "--external-cas-checkpoint-parent-commitment-hex".into(),
+            "66".repeat(32),
+        );
+
+        let config = parse_external_cas_config(&values, false).unwrap().unwrap();
+        let checkpoint = config.checkpoint.unwrap();
+        assert_eq!(checkpoint.expected_commitment, [0x55; 32]);
+        assert_eq!(checkpoint.minimum_height, 2048);
+        assert_eq!(checkpoint.expected_parent_commitment, [0x66; 32]);
+        assert_eq!(checkpoint.record_file, temp.join("qrun-checkpoint.qrcp"));
+
+        let mut partial = values.clone();
+        partial.remove("--external-cas-checkpoint-parent-commitment-hex");
+        assert!(parse_external_cas_config(&partial, false)
+            .unwrap_err()
+            .contains("checkpoint bootstrap configuration is all-or-none"));
+
+        let mut zero_height = values.clone();
+        zero_height.insert("--external-cas-checkpoint-min-height".into(), "0".into());
+        assert!(parse_external_cas_config(&zero_height, false)
+            .unwrap_err()
+            .contains("must be nonzero"));
+
+        let mut checkpoint_without_cas = BTreeMap::new();
+        checkpoint_without_cas.extend(
+            values
+                .into_iter()
+                .filter(|(key, _)| key.starts_with("--external-cas-checkpoint-")),
+        );
+        assert!(parse_external_cas_config(&checkpoint_without_cas, false)
+            .unwrap_err()
+            .contains("complete external-CAS pin and floor configuration"));
+    }
+
+    #[test]
     fn external_cas_cli_config_rejects_zero_pins_public_endpoint_in_local_mode_and_bad_boolean() {
         let mut zero_pin = external_cas_cli_values();
         zero_pin.insert("--external-cas-provider-id-hex".into(), "00".repeat(32));
@@ -2559,17 +2792,73 @@ mod tests {
         params.protocol_version = 5;
         let genesis = QRunGenesisV05::new(network, owner).unwrap();
 
-        // The provider bootstrap must name the exact empty QFP5 PFS2 manifest for this identity.
-        let initial_anchor = PrivateTestnetForkStore::open_qrun_v05_fee_only(
-            &local_anchor_dir,
-            genesis.ledger().clone(),
+        // Build a parent-linked height-one checkpoint, then derive the exact empty PFS2 suffix
+        // manifest that the independently initialized provider is expected to anchor.
+        let genesis_archive =
+            ai_native_l1_pow_bench::private_testnet_fork_choice::PrivateTestnetForkChoice::new_qrun_v05_fee_only(
+                genesis.ledger().clone(),
+                params.clone(),
+            )
+            .unwrap();
+        let genesis_checkpoint =
+            ai_native_l1_pow_bench::qrun_v05_checkpoint_candidate::QRunV05PowCheckpoint::capture(
+                network,
+                genesis.commitment(),
+                &params,
+                genesis_archive.canonical_chain(),
+                [0; 32],
+            )
+            .unwrap();
+        let genesis_checkpoint_commitment = genesis_checkpoint.commitment(&params).unwrap();
+
+        let mut checkpoint_builder = QRunV05PowForkRuntime::open(
+            dir.0.join("checkpoint-builder"),
+            network,
+            owner,
             params.clone(),
             &authenticator,
             &clock,
         )
-        .unwrap()
-        .manifest_anchor()
         .unwrap();
+        checkpoint_builder.set_producer_account(owner).unwrap();
+        let bootstrap_envelope = checkpoint_builder
+            .mine_candidate(now_unix().unwrap() + 5, Vec::new(), &authenticator, 1)
+            .unwrap();
+        checkpoint_builder
+            .submit_block(&bootstrap_envelope, &authenticator, &clock)
+            .unwrap();
+        let checkpoint_builder_store = checkpoint_builder.into_store();
+        let checkpoint =
+            ai_native_l1_pow_bench::qrun_v05_checkpoint_candidate::QRunV05PowCheckpoint::capture(
+                network,
+                genesis.commitment(),
+                &params,
+                checkpoint_builder_store.archive().canonical_chain(),
+                genesis_checkpoint_commitment,
+            )
+            .unwrap();
+        let checkpoint_bytes = checkpoint.encode(&params).unwrap();
+        let checkpoint_commitment = checkpoint.commitment(&params).unwrap();
+        assert_eq!(checkpoint_builder_store.canonical_height(), 1);
+
+        let initial_anchor =
+            PrivateTestnetForkStore::open_qrun_v05_fee_only_from_checkpoint_for_owner_genesis(
+                &local_anchor_dir,
+                genesis.ledger().clone(),
+                owner,
+                params.clone(),
+                &authenticator,
+                &clock,
+                &checkpoint_bytes,
+                checkpoint_commitment,
+                1,
+                None,
+            )
+            .unwrap()
+            .manifest_anchor()
+            .unwrap();
+        let checkpoint_record_file = dir.0.join("trusted-height-one.qrcp");
+        fs::write(&checkpoint_record_file, &checkpoint_bytes).unwrap();
 
         let receipt_keys = portable::generate_key_pair([0x73; 32]);
         let receipt_signing_key = Arc::new(receipt_keys.signing_key);
@@ -2684,13 +2973,111 @@ mod tests {
             bootstrap_record_file,
             floor_directory: floor_dir.clone(),
             initialize_floor: true,
+            checkpoint: Some(ExternalCasNodeCheckpointConfig {
+                record_file: checkpoint_record_file,
+                expected_commitment: checkpoint_commitment,
+                minimum_height: 1,
+                expected_parent_commitment: genesis_checkpoint_commitment,
+            }),
         };
+
+        // A wrong parent link must be rejected before QCF1 initialization or provider access.
+        let mut wrong_parent = external.clone();
+        wrong_parent
+            .checkpoint
+            .as_mut()
+            .unwrap()
+            .expected_parent_commitment = [0xFE; 32];
+        let rejection = match open_node_runtime(
+            &node_data_dir.join("qrun-v05-qfp5-store"),
+            network,
+            owner,
+            params.clone(),
+            &authenticator,
+            &clock,
+            Some(&wrong_parent),
+        ) {
+            Ok(_) => panic!("node startup accepted a checkpoint with the wrong parent"),
+            Err(error) => error,
+        };
+        assert!(rejection.contains("validate independently anchored QRCP checkpoint"));
+        assert!(!floor_dir.exists());
+        assert!(!node_data_dir.join("qrun-v05-qfp5-store").exists());
+
+        // A wrong checkpoint commitment is also rejected before any mutable node/floor state is
+        // created, even when the supplied checkpoint file and parent link are otherwise valid.
+        let mut wrong_checkpoint_commitment = external.clone();
+        wrong_checkpoint_commitment
+            .checkpoint
+            .as_mut()
+            .unwrap()
+            .expected_commitment = [0xAD; 32];
+        let rejection = match open_node_runtime(
+            &node_data_dir.join("qrun-v05-qfp5-store"),
+            network,
+            owner,
+            params.clone(),
+            &authenticator,
+            &clock,
+            Some(&wrong_checkpoint_commitment),
+        ) {
+            Ok(_) => panic!("node startup accepted an incorrect QRCP commitment"),
+            Err(error) => error,
+        };
+        assert!(rejection.contains("validate independently anchored QRCP checkpoint"));
+        assert!(!floor_dir.exists());
+        assert!(!node_data_dir.join("qrun-v05-qfp5-store").exists());
+
+        // ECR1 must bind the deterministic checkpoint-rooted empty PFS2 manifest. A mismatch
+        // may leave the validated empty local manifest for diagnosis, but must not initialize the
+        // independent QCF1 floor or contact the provider.
+        let original_bootstrap_bytes = fs::read(&external.bootstrap_record_file).unwrap();
+        let mut wrong_bootstrap = ExternalCasRecord::decode(&original_bootstrap_bytes).unwrap();
+        wrong_bootstrap.next_state_digest = [0xFD; 32];
+        fs::write(
+            &external.bootstrap_record_file,
+            wrong_bootstrap.encode().unwrap(),
+        )
+        .unwrap();
+        let rejection = match open_node_runtime(
+            &node_data_dir.join("qrun-v05-qfp5-store"),
+            network,
+            owner,
+            params.clone(),
+            &authenticator,
+            &clock,
+            Some(&external),
+        ) {
+            Ok(_) => panic!("node startup accepted an ECR1 record for another PFS2 manifest"),
+            Err(error) => error,
+        };
+        assert!(rejection
+            .contains("ECR1 bootstrap does not anchor the exact checkpoint-rooted PFS2 manifest"));
+        assert!(!floor_dir.exists());
+
+        // Repeating the same bad first-boot request must verify the already staged manifest again
+        // and must not initialize QCF1 from the mismatched ECR1 bootstrap on a retry.
+        let retry_rejection = match open_node_runtime(
+            &node_data_dir.join("qrun-v05-qfp5-store"),
+            network,
+            owner,
+            params.clone(),
+            &authenticator,
+            &clock,
+            Some(&external),
+        ) {
+            Ok(_) => panic!("retry accepted the same mismatched ECR1 checkpoint bootstrap"),
+            Err(error) => error,
+        };
+        assert!(retry_rejection.contains("ManifestAnchorMismatch"));
+        assert!(!floor_dir.exists());
+        fs::write(&external.bootstrap_record_file, original_bootstrap_bytes).unwrap();
 
         let opened = open_node_runtime(
             &node_data_dir.join("qrun-v05-qfp5-store"),
             network,
             owner,
-            params,
+            params.clone(),
             &authenticator,
             &clock,
             Some(&external),
@@ -2704,14 +3091,16 @@ mod tests {
             }
         };
         runtime.set_producer_account(owner).unwrap();
-        assert_eq!(runtime.canonical_height(), 0);
+        assert_eq!(runtime.canonical_height(), 1);
         let envelope = runtime
-            .mine_candidate(now_unix().unwrap() + 5, Vec::new(), &authenticator, 1)
+            .mine_candidate(now_unix().unwrap() + 15, Vec::new(), &authenticator, 1)
             .unwrap();
         runtime
             .submit_block(&envelope, &authenticator, &clock)
             .unwrap();
-        assert_eq!(runtime.canonical_height(), 1);
+        assert_eq!(runtime.canonical_height(), 2);
+        let local_manifest_tip = runtime.canonical_tip();
+        let local_state_root = runtime.canonical_state_root();
 
         let store = runtime.into_store();
         let local_manifest_anchor = store.manifest_anchor().unwrap();
@@ -2726,6 +3115,24 @@ mod tests {
             local_manifest_anchor
         );
         assert!(node_data_dir.exists());
+        drop(store);
+
+        // Restart must reopen the same checkpoint-rooted suffix with the already advanced CAS
+        // record and QCF1 floor; the initialization switch must not reset either anchor.
+        let reopened = open_node_runtime(
+            &node_data_dir.join("qrun-v05-qfp5-store"),
+            network,
+            owner,
+            params,
+            &authenticator,
+            &clock,
+            Some(&external),
+        )
+        .unwrap();
+        assert_eq!(reopened.canonical_height(), 2);
+        assert_eq!(reopened.canonical_tip(), local_manifest_tip);
+        assert_eq!(reopened.canonical_state_root(), local_state_root);
+        drop(reopened);
 
         server_stop.store(true, Ordering::Release);
         server.join().unwrap().unwrap();

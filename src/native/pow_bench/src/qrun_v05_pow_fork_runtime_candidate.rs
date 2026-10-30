@@ -1757,4 +1757,232 @@ mod tests {
             MAX_TOTAL_SUPPLY_ATOMS
         );
     }
+
+    #[test]
+    fn qrun_v05_retarget_window_survives_two_checkpoint_rollovers_and_restart() {
+        fn fee_envelope(
+            chain: &PrivateTestnetChain,
+            params: &ConsensusParameters,
+            producer: AccountId,
+            timestamp: u64,
+            max_attempts: u64,
+        ) -> Vec<u8> {
+            let mut fee_block = QRunV05FeeBlock {
+                body: Block {
+                    height: chain.state().height() + 1,
+                    timestamp,
+                    parent_hash: chain.state().tip_hash(),
+                    state_root: [0; 32],
+                    transactions: Vec::new(),
+                },
+                producer,
+            };
+            fee_block.body.state_root = chain
+                .state()
+                .preview_qrun_v05_fee_state_root_after(&fee_block, &EmptyAuthenticator)
+                .unwrap();
+            let mut header = PowHeader {
+                protocol_version: params.protocol_version,
+                network_id: chain.state().network_id(),
+                height: fee_block.body.height,
+                timestamp,
+                parent_hash: fee_block.body.parent_hash,
+                previous_consensus_hash: chain.chain_tip().tip_hash,
+                state_root: qrun_v05_fee_pow_state_commitment(&fee_block).unwrap(),
+                target: chain.expected_target(None).unwrap(),
+                nonce: 0,
+            };
+            for nonce in 0..max_attempts {
+                header.nonce = nonce;
+                let digest = pow_digest(&header, params.pow).unwrap();
+                if Uint256::from_be_bytes(digest) <= header.target {
+                    return encode_qrun_v05_fee_pow_block(&header, &fee_block).unwrap();
+                }
+            }
+            panic!("test PoW attempts exhausted at height {}", header.height);
+        }
+
+        let suffix_dir = TestDir::new();
+        let network = PROPOSED_QRUN_V05_NETWORK_ID;
+        let owner = PROPOSED_OWNER_ACCOUNT_ID;
+        let genesis = QRunGenesisV05::new(network, owner).unwrap();
+        let mut params = params();
+        params.protocol_version = 5;
+        params.difficulty_window_blocks = 2_016;
+        params.pow.memory_kib = 8;
+        params.pow.iterations = 1;
+        params.pow.lanes = 1;
+        assert_eq!(params.initial_target, Uint256::MAX);
+        assert_eq!(params.pow_limit, Uint256::MAX);
+
+        // Exercise the 1,024-height bounded fork archive in memory. The small PoW
+        // parameters are test-only; production profile values are not changed.
+        let mut archive = PrivateTestnetForkChoice::new_qrun_v05_fee_only(
+            genesis.ledger().clone(),
+            params.clone(),
+        )
+        .unwrap();
+        let genesis_checkpoint = QRunV05PowCheckpoint::capture(
+            network,
+            genesis.commitment(),
+            &params,
+            archive.canonical_chain(),
+            [0; 32],
+        )
+        .unwrap();
+        let genesis_checkpoint_bytes = genesis_checkpoint.encode(&params).unwrap();
+        let genesis_checkpoint_commitment =
+            QRunV05PowCheckpoint::commitment_for_bytes(&genesis_checkpoint_bytes);
+
+        for height in 1..=1_024u64 {
+            let envelope = fee_envelope(archive.canonical_chain(), &params, owner, height * 15, 1);
+            archive
+                .insert_encoded(&envelope, &EmptyAuthenticator, &FixedClock)
+                .unwrap();
+        }
+        assert_eq!(archive.canonical_chain().state().height(), 1_024);
+        assert_eq!(archive.archive_len(), 1_024);
+
+        let first_checkpoint = QRunV05PowCheckpoint::capture(
+            network,
+            genesis.commitment(),
+            &params,
+            archive.canonical_chain(),
+            genesis_checkpoint_commitment,
+        )
+        .unwrap();
+        let first_checkpoint_bytes = first_checkpoint.encode(&params).unwrap();
+        let first_checkpoint_commitment =
+            QRunV05PowCheckpoint::commitment_for_bytes(&first_checkpoint_bytes);
+
+        let mut first_base = QRunV05PowCheckpoint::restore_chain_anchored(
+            &first_checkpoint_bytes,
+            &network,
+            &genesis.commitment(),
+            &params,
+            first_checkpoint_commitment,
+            1_024,
+        )
+        .unwrap();
+        first_base
+            .enable_qrun_v05_fee_only_execution_for_genesis(genesis.commitment())
+            .unwrap();
+        archive = PrivateTestnetForkChoice::new_qrun_v05_fee_only_from_checkpoint_for_genesis(
+            first_base.state().clone(),
+            params.clone(),
+            first_base,
+            first_checkpoint_commitment,
+            genesis.commitment(),
+        )
+        .unwrap();
+
+        // Roll the archive forward once more, retaining the complete 2,016-block
+        // retarget window across the checkpoint boundary.
+        for height in 1_025..=2_016u64 {
+            let envelope = fee_envelope(archive.canonical_chain(), &params, owner, height * 15, 1);
+            archive
+                .insert_encoded(&envelope, &EmptyAuthenticator, &FixedClock)
+                .unwrap();
+        }
+        assert_eq!(archive.canonical_chain().state().height(), 2_016);
+        assert_eq!(archive.archive_len(), 992);
+
+        let second_checkpoint = QRunV05PowCheckpoint::capture(
+            network,
+            genesis.commitment(),
+            &params,
+            archive.canonical_chain(),
+            first_checkpoint_commitment,
+        )
+        .unwrap();
+        let second_checkpoint_bytes = second_checkpoint.encode(&params).unwrap();
+        let second_checkpoint_commitment =
+            QRunV05PowCheckpoint::commitment_for_bytes(&second_checkpoint_bytes);
+
+        let mut second_base = QRunV05PowCheckpoint::restore_chain_anchored(
+            &second_checkpoint_bytes,
+            &network,
+            &genesis.commitment(),
+            &params,
+            second_checkpoint_commitment,
+            2_016,
+        )
+        .unwrap();
+        second_base
+            .enable_qrun_v05_fee_only_execution_for_genesis(genesis.commitment())
+            .unwrap();
+
+        // Verify the checkpoint retained all timestamps needed for the first retarget.
+        let observed_elapsed = (2_016 - 1) * 15 + params.target_block_time_secs;
+        let expected_target =
+            crate::consensus::retarget_target(Uint256::MAX, observed_elapsed, &params).unwrap();
+        assert!(expected_target < Uint256::MAX);
+        assert_eq!(second_base.expected_target(None).unwrap(), expected_target);
+
+        // Exercise the durable QFP5 suffix store only for the retarget block and restart;
+        // this keeps the regression fast while testing real checkpoint-rooted persistence.
+        let mut suffix = QRunV05PowForkRuntime::open_from_checkpoint_with_parent(
+            &suffix_dir.0,
+            network,
+            owner,
+            params.clone(),
+            &EmptyAuthenticator,
+            &FixedClock,
+            &second_checkpoint_bytes,
+            second_checkpoint_commitment,
+            2_016,
+            first_checkpoint_commitment,
+            None,
+        )
+        .unwrap();
+        assert_eq!(suffix.archive_base_height(), 2_016);
+        let retarget_envelope = suffix
+            .mine_candidate(2_017 * 15, Vec::new(), &EmptyAuthenticator, 1_024)
+            .unwrap();
+        let decoded = decode_candidate_network_block(&retarget_envelope).unwrap();
+        assert_eq!(decoded.header.height, 2_017);
+        assert_eq!(decoded.header.target, expected_target);
+        suffix
+            .submit_block(&retarget_envelope, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+        assert_eq!(suffix.canonical_height(), 2_017);
+
+        let expected_root = suffix.canonical_state_root();
+        let expected_tip = suffix.canonical_tip();
+        let expected_manifest_anchor = suffix.manifest_anchor().unwrap();
+        drop(suffix);
+
+        assert!(QRunV05PowForkRuntime::open_from_checkpoint_with_parent(
+            &suffix_dir.0,
+            network,
+            owner,
+            params.clone(),
+            &EmptyAuthenticator,
+            &FixedClock,
+            &second_checkpoint_bytes,
+            second_checkpoint_commitment,
+            2_016,
+            first_checkpoint_commitment,
+            None,
+        )
+        .is_err());
+
+        let reopened = QRunV05PowForkRuntime::open_from_checkpoint_with_parent(
+            &suffix_dir.0,
+            network,
+            owner,
+            params,
+            &EmptyAuthenticator,
+            &FixedClock,
+            &second_checkpoint_bytes,
+            second_checkpoint_commitment,
+            2_016,
+            first_checkpoint_commitment,
+            Some(expected_manifest_anchor),
+        )
+        .unwrap();
+        assert_eq!(reopened.canonical_height(), 2_017);
+        assert_eq!(reopened.canonical_state_root(), expected_root);
+        assert_eq!(reopened.canonical_tip(), expected_tip);
+    }
 }
