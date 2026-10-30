@@ -42,6 +42,8 @@ The Windows integration test exercises:
 
 The shared QFP5 external-CAS store regression separately simulates a crash after the provider CAS and QCF1 floor have advanced but before the local PFS2 manifest is published. The QAP1 journal installs only its exact signed successor, the independent floor reconciles to that record, and reopening exposes the recovered canonical state.
 
+The wallet-bound checkpoint-specific regression also simulates a later CAS successor committed at the provider while QCF1 and PFS2 still name the predecessor. Restart accepts only the exact QAP1 successor linked to the independent floor, installs its manifest, reconciles QCF1, and reopens at the recovered canonical height and state root.
+
 The CLI parser test verifies the four checkpoint flags are all-or-none, have nonzero/positive values, and cannot be supplied without the full external-CAS pin configuration.
 
 ## Explicit limitations
