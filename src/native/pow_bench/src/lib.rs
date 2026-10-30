@@ -31,6 +31,8 @@ pub mod devnet_signed_peer_identity_candidate;
 pub mod difficulty_adjustment_candidates;
 /// CP-0313 canonical external append-only CAS record and ML-DSA receipt candidate; no provider runtime or consensus callsite.
 pub mod external_cas_anchor_candidate;
+/// AWS KMS-backed ML-DSA-65 receipt signer; deployment adapter candidate.
+pub mod external_cas_aws_kms_signer_candidate;
 pub mod external_cas_disk_provider_candidate;
 pub mod external_cas_floor_store_candidate;
 pub mod external_cas_noise_transport_candidate;

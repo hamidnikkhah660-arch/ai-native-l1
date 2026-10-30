@@ -166,3 +166,7 @@ jobs:
       - name: Run QRun external-CAS DPAPI startup and floor integration tests
         shell: pwsh
         run: cargo +stable test --manifest-path src/native/pow_bench/Cargo.toml --locked --bin qrun_v05_pow_local_node -- --test-threads=1
+
+      - name: Run independent QRun external-CAS provider and DPAPI credential tests
+        shell: pwsh
+        run: cargo +stable test --manifest-path src/native/pow_bench/Cargo.toml --locked --bin qrun_v05_external_cas_provider -- --test-threads=1

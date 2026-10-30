@@ -13,6 +13,7 @@ devnet-wal-fault-injection = []
 [dependencies]
 # Pinned for the current Cargo 1.82.0 toolchain; candidate only, not consensus code.
 argon2 = "=0.5.3"
+base64 = "=0.22.1"
 # Standard audited primitives for the research authenticated-transport prototype.
 hmac = "=0.12.1"
 sha2 = "=0.10.8"
