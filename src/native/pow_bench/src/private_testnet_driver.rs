@@ -639,12 +639,28 @@ impl PrivateTestnetChain {
     pub(crate) fn uses_qrun_v05_fee_only_execution(&self) -> bool {
         matches!(self.execution_mode, ChainExecutionMode::QRunV05FeeOnly)
     }
+    /// Historical CP-0450 compatibility shorthand. Wallet-bound checkpoint restoration must
+    /// call enable_qrun_v05_fee_only_execution_for_genesis after validating the QRCP bytes against
+    /// the exact owner-bound Genesis commitment.
     pub(crate) fn enable_qrun_v05_fee_only_execution(&mut self) -> Result<(), String> {
-        if self.execution_mode != ChainExecutionMode::Legacy
+        self.enable_qrun_v05_fee_only_execution_for_genesis(
+            crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT,
+        )
+    }
+
+    /// Enable QFP5 only after the caller has authenticated this checkpoint chain against the
+    /// supplied original Genesis commitment. The checkpoint state is height N, so it cannot
+    /// independently reproduce the height-zero Genesis commitment; that binding is checked by
+    /// QRunV05PowCheckpoint::restore_chain_anchored before this method is called.
+    pub(crate) fn enable_qrun_v05_fee_only_execution_for_genesis(
+        &mut self,
+        genesis_commitment: [u8; 32],
+    ) -> Result<(), String> {
+        if genesis_commitment.iter().all(|byte| *byte == 0)
+            || self.execution_mode != ChainExecutionMode::Legacy
             || self.monetary_state.is_some()
             || self.state.height() == 0
-            || self.state.network_id()
-                != crate::qrun_v05_profile_identity_candidate::PROPOSED_QRUN_V05_NETWORK_ID
+            || self.state.network_id().iter().all(|byte| *byte == 0)
             || self.state.total_value().ok() != Some(crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS)
         {
             return Err("checkpoint chain does not match the QRun v0.5 fee-only profile".into());

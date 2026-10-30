@@ -174,31 +174,44 @@ impl PrivateTestnetForkChoice {
 
     /// Restore a QFP5 suffix only from a previously decoded QRCP checkpoint. The caller must
     /// authenticate the QRCP bytes/commitment against an independent anchor before using this API.
+    /// Historical CP-0450 shorthand. Wallet-bound checkpoint callers must supply the
+    /// independently authenticated Genesis commitment through the explicit constructor below.
     pub fn new_qrun_v05_fee_only_from_checkpoint(
         base_state: LedgerState,
         params: ConsensusParameters,
         base_chain: PrivateTestnetChain,
         checkpoint_commitment: [u8; 32],
     ) -> Result<Self, ForkChoiceError> {
+        Self::new_qrun_v05_fee_only_from_checkpoint_for_genesis(
+            base_state,
+            params,
+            base_chain,
+            checkpoint_commitment,
+            crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT,
+        )
+    }
+
+    /// Restore a QFP5 suffix from a checkpoint whose QRCP bytes and Genesis commitment have
+    /// already been authenticated by the caller against an independent anchor.
+    pub fn new_qrun_v05_fee_only_from_checkpoint_for_genesis(
+        base_state: LedgerState,
+        params: ConsensusParameters,
+        base_chain: PrivateTestnetChain,
+        checkpoint_commitment: [u8; 32],
+        genesis_commitment: [u8; 32],
+    ) -> Result<Self, ForkChoiceError> {
         if params.protocol_version != 5 {
             return Err(ForkChoiceError::ConsensusProfileMismatch);
         }
         if checkpoint_commitment == [0; 32]
-            || base_state.network_id()
-                != crate::qrun_v05_profile_identity_candidate::PROPOSED_QRUN_V05_NETWORK_ID
+            || genesis_commitment == [0; 32]
+            || base_state.network_id().iter().all(|byte| *byte == 0)
             || base_chain.state() != &base_state
             || base_state.height() == 0
             || base_state.total_value().ok() != Some(crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS)
             || !base_chain.uses_qrun_v05_fee_only_execution()
             || crate::qrun_v05_checkpoint_candidate::qrun_consensus_profile_fingerprint(&params)
                 .is_err()
-        {
-            return Err(ForkChoiceError::GenesisProfileMismatch);
-        }
-        let frozen = crate::qrun_v05_profile_identity_candidate::build_candidate_genesis()
-            .map_err(|_| ForkChoiceError::GenesisProfileMismatch)?;
-        if frozen.commitment()
-            != crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT
         {
             return Err(ForkChoiceError::GenesisProfileMismatch);
         }
@@ -597,11 +610,35 @@ impl PrivateTestnetForkChoice {
     }
 
     /// Rebuild an externally anchored QRun QRCP checkpoint suffix with QFP5 fee-only replay.
+    /// Historical CP-0450 shorthand for checkpoint archive replay.
     pub fn rebuild_qrun_v05_fee_from_checkpoint<A: TransactionAuthenticator>(
         base_state: LedgerState,
         params: ConsensusParameters,
         base_chain: PrivateTestnetChain,
         checkpoint_commitment: [u8; 32],
+        envelopes: impl IntoIterator<Item = Vec<u8>>,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+    ) -> Result<Self, ForkChoiceError> {
+        Self::rebuild_qrun_v05_fee_from_checkpoint_for_genesis(
+            base_state,
+            params,
+            base_chain,
+            checkpoint_commitment,
+            crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT,
+            envelopes,
+            authenticator,
+            clock,
+        )
+    }
+
+    /// Replay a checkpoint suffix after the caller has authenticated its exact Genesis domain.
+    pub fn rebuild_qrun_v05_fee_from_checkpoint_for_genesis<A: TransactionAuthenticator>(
+        base_state: LedgerState,
+        params: ConsensusParameters,
+        base_chain: PrivateTestnetChain,
+        checkpoint_commitment: [u8; 32],
+        genesis_commitment: [u8; 32],
         envelopes: impl IntoIterator<Item = Vec<u8>>,
         authenticator: &A,
         clock: &dyn ReferenceTimeProvider,
@@ -619,11 +656,12 @@ impl PrivateTestnetForkChoice {
         }
         ordered.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
         let expected_count = ordered.len();
-        let mut archive = Self::new_qrun_v05_fee_only_from_checkpoint(
+        let mut archive = Self::new_qrun_v05_fee_only_from_checkpoint_for_genesis(
             base_state,
             params,
             base_chain,
             checkpoint_commitment,
+            genesis_commitment,
         )?;
         for (_, _, envelope) in ordered {
             archive.insert_encoded_internal(&envelope, authenticator, clock, true)?;
@@ -634,7 +672,6 @@ impl PrivateTestnetForkChoice {
         Ok(archive)
     }
 
-    /// Rebuild a checkpoint-rooted suffix archive in deterministic height/digest order.
     pub fn rebuild_from_base_chain<A: TransactionAuthenticator>(
         base_state: LedgerState,
         params: ConsensusParameters,
