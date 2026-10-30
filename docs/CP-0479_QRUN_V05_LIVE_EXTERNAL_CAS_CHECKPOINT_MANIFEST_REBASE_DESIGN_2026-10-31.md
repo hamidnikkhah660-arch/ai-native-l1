@@ -55,7 +55,8 @@ The QRM1 record must bind at least:
 - The exact next ECR1 successor record, including operation ID and request digest.
 - The previous and next provider object generations.
 - The exact old PFS2 manifest bytes or an equally strong exact commitment, and the exact new checkpoint-rooted PFS2 manifest bytes.
-- The QRCP commitment, parent-checkpoint commitment, height, consensus tip digest, ledger tip hash, state root, cumulative work and checkpoint profile fingerprint.
+- The exact QRCP bytes, bounded by MAX_QRCP_BYTES, so recovery does not depend on a mutable operator path remaining unchanged; also bind its commitment, parent-checkpoint commitment, minimum accepted height, checkpoint height, consensus tip digest, ledger tip hash, state root, supply, cumulative work, base consensus-profile fingerprint and derived checkpoint-store profile fingerprint.
+- A hard QRM1 total-size bound derived from the maximum QRCP and the two maximum PFS2 manifest sizes, plus fixed metadata; all variable lengths must be checked before allocation.
 - The old-history archive commitment and deterministic archive identifier.
 - The unchanged provider, Network ID, original Genesis commitment, receipt-key pin domain and owner identity needed to recompute the expected QRun Genesis.
 - A format version, bounded lengths and canonical field ordering.
