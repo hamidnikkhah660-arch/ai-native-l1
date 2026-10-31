@@ -792,7 +792,7 @@ impl QRunCheckpointMigrationJournal {
         Ok(journal)
     }
 
-    fn decode_without_archive(
+    pub(crate) fn decode_without_archive(
         bytes: &[u8],
         pin: &ExternalCasPin,
         params: &ConsensusParameters,
