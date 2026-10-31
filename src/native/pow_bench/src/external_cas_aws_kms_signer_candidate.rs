@@ -11,6 +11,9 @@
 use crate::{
     external_cas_anchor_candidate::ExternalCasPin,
     external_cas_disk_provider_candidate::ReceiptSignature,
+    external_cas_offhost_anchor_protocol_candidate::{
+        ExternalCasOffhostAnchorPin, OffhostAnchorReceiptSigner,
+    },
     v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -100,6 +103,23 @@ impl AwsKmsCliReceiptSigner {
     ) -> Result<Self, AwsKmsReceiptSignerError> {
         pin.validate()
             .map_err(|error| AwsKmsReceiptSignerError::Pin(error.to_string()))?;
+        let challenge = Self::self_test_challenge(pin);
+        Self::connect_pinned(
+            aws_cli,
+            region,
+            key_arn,
+            &pin.receipt_public_key,
+            &challenge,
+        )
+    }
+
+    fn connect_pinned(
+        aws_cli: impl AsRef<Path>,
+        region: impl Into<String>,
+        key_arn: impl Into<String>,
+        expected_public_key: &[u8; ML_DSA_65_PUBLIC_KEY_BYTES],
+        challenge: &[u8; 32],
+    ) -> Result<Self, AwsKmsReceiptSignerError> {
         let region = region.into();
         let key_arn = key_arn.into();
         if region.is_empty()
@@ -115,14 +135,13 @@ impl AwsKmsCliReceiptSigner {
             aws_cli: aws_cli.as_ref().to_path_buf(),
             region,
             key_arn,
-            verification_key: MLDSA65VerificationKey::new(pin.receipt_public_key),
+            verification_key: MLDSA65VerificationKey::new(*expected_public_key),
         };
 
-        signer.verify_kms_key_metadata_and_public_key(&pin.receipt_public_key)?;
-        let challenge = Self::self_test_challenge(pin);
-        let signature = signer.sign_digest(&challenge)?;
+        signer.verify_kms_key_metadata_and_public_key(expected_public_key)?;
+        let signature = signer.sign_digest(challenge)?;
         let signature = MLDSA65Signature::new(signature);
-        portable::verify(&signer.verification_key, &challenge, &[], &signature)
+        portable::verify(&signer.verification_key, challenge, &[], &signature)
             .map_err(|_| AwsKmsReceiptSignerError::SelfTestFailed)?;
 
         Ok(signer)
@@ -269,6 +288,80 @@ impl AwsKmsCliReceiptSigner {
     }
 }
 
+const OFFHOST_ANCHOR_KMS_SELF_TEST_DOMAIN: &[u8] = b"QRUN-OFFHOST-ANCHOR-KMS-SELF-TEST-V1\0";
+
+/// AWS KMS signer for the independently pinned off-host Anchor receipt key.
+///
+/// This wrapper never accepts the Provider receipt pin as its key source. The Anchor pin is
+/// validated against the Provider domain, then its distinct ML-DSA-65 public key is checked
+/// against KMS metadata/SPKI and a dedicated Anchor-domain startup challenge.
+#[derive(Debug)]
+pub struct AwsKmsCliOffhostAnchorReceiptSigner {
+    inner: AwsKmsCliReceiptSigner,
+}
+impl AwsKmsCliOffhostAnchorReceiptSigner {
+    pub fn connect(
+        aws_cli: impl AsRef<Path>,
+        region: impl Into<String>,
+        key_arn: impl Into<String>,
+        anchor_pin: &ExternalCasOffhostAnchorPin,
+        provider_pin: &ExternalCasPin,
+    ) -> Result<Self, AwsKmsReceiptSignerError> {
+        anchor_pin
+            .validate(provider_pin)
+            .map_err(|error| AwsKmsReceiptSignerError::Pin(error.to_string()))?;
+        let challenge = offhost_anchor_kms_self_test_challenge(anchor_pin, provider_pin);
+        let inner = AwsKmsCliReceiptSigner::connect_pinned(
+            aws_cli,
+            region,
+            key_arn,
+            &anchor_pin.receipt_public_key,
+            &challenge,
+        )?;
+        Ok(Self { inner })
+    }
+
+    pub fn from_path(
+        region: impl Into<String>,
+        key_arn: impl Into<String>,
+        anchor_pin: &ExternalCasOffhostAnchorPin,
+        provider_pin: &ExternalCasPin,
+    ) -> Result<Self, AwsKmsReceiptSignerError> {
+        Self::connect("aws", region, key_arn, anchor_pin, provider_pin)
+    }
+
+    pub fn sign_digest(
+        &self,
+        digest: &[u8; 32],
+    ) -> Result<ReceiptSignature, AwsKmsReceiptSignerError> {
+        self.inner.sign_digest(digest)
+    }
+}
+
+impl OffhostAnchorReceiptSigner for AwsKmsCliOffhostAnchorReceiptSigner {
+    fn sign_digest(&self, digest: &[u8; 32]) -> Result<ReceiptSignature, String> {
+        AwsKmsCliOffhostAnchorReceiptSigner::sign_digest(self, digest)
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn offhost_anchor_kms_self_test_challenge(
+    anchor: &ExternalCasOffhostAnchorPin,
+    provider: &ExternalCasPin,
+) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(OFFHOST_ANCHOR_KMS_SELF_TEST_DOMAIN);
+    hash.update(anchor.anchor_id);
+    hash.update(anchor.provider_id);
+    hash.update(anchor.network_id);
+    hash.update(anchor.genesis_digest);
+    hash.update(provider.receipt_key_id);
+    hash.update(Sha256::digest(provider.receipt_public_key));
+    hash.update(anchor.receipt_key_id);
+    hash.update(Sha256::digest(anchor.receipt_public_key));
+    hash.finalize().into()
+}
+
 /// Extract the raw 1952-byte ML-DSA-65 public key from an X.509 SubjectPublicKeyInfo DER object.
 fn extract_mldsa65_spki_public_key(
     der: &[u8],
@@ -362,6 +455,57 @@ mod tests {
         spki.extend_from_slice(&der_tlv(0x03, &bit_string));
         let encoded = der_tlv(0x30, &spki);
         assert_eq!(extract_mldsa65_spki_public_key(&encoded).unwrap(), expected);
+    }
+
+    fn anchor_kms_fixture() -> (ExternalCasOffhostAnchorPin, ExternalCasPin) {
+        let provider = ExternalCasPin {
+            provider_id: [0x11; 32],
+            network_id: [0x22; 32],
+            genesis_digest: [0x33; 32],
+            receipt_key_id: [0x44; 32],
+            receipt_public_key: [0x45; ML_DSA_65_PUBLIC_KEY_BYTES],
+        };
+        let anchor = ExternalCasOffhostAnchorPin {
+            anchor_id: [0x91; 32],
+            provider_id: provider.provider_id,
+            network_id: provider.network_id,
+            genesis_digest: provider.genesis_digest,
+            receipt_key_id: [0x92; 32],
+            receipt_public_key: [0x93; ML_DSA_65_PUBLIC_KEY_BYTES],
+        };
+        (anchor, provider)
+    }
+
+    #[test]
+    fn offhost_anchor_kms_self_test_is_domain_and_both_key_bound() {
+        let (anchor, provider) = anchor_kms_fixture();
+        anchor.validate(&provider).unwrap();
+        let baseline = offhost_anchor_kms_self_test_challenge(&anchor, &provider);
+
+        let mut changed_anchor_id = anchor.clone();
+        changed_anchor_id.anchor_id[0] ^= 1;
+        assert_ne!(
+            baseline,
+            offhost_anchor_kms_self_test_challenge(&changed_anchor_id, &provider)
+        );
+
+        let mut changed_anchor_key = anchor.clone();
+        changed_anchor_key.receipt_public_key[0] ^= 1;
+        assert_ne!(
+            baseline,
+            offhost_anchor_kms_self_test_challenge(&changed_anchor_key, &provider)
+        );
+
+        let mut changed_provider_key = provider.clone();
+        changed_provider_key.receipt_public_key[0] ^= 1;
+        assert_ne!(
+            baseline,
+            offhost_anchor_kms_self_test_challenge(&anchor, &changed_provider_key)
+        );
+
+        let mut wrong_provider_domain = provider.clone();
+        wrong_provider_domain.network_id[0] ^= 1;
+        assert!(anchor.validate(&wrong_provider_domain).is_err());
     }
 
     #[test]
