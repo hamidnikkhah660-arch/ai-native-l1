@@ -24,8 +24,10 @@ production deployment. Nothing binds a listener until a caller explicitly invoke
 
 ## Key and identity handling
 
-The Noise static private key is redacted from Debug and held by a shared wrapper that overwrites its
-key bytes when the last worker/daemon reference is dropped. The Anchor and Provider pins must validate
+The Noise static private key is redacted from Debug. The configuration zeroizes its key buffer
+when dropped, including validation and bind failures. After binding, the key is moved out of the
+configuration and held by a shared wrapper that uses `zeroize` when the last worker/daemon reference
+is dropped. The Anchor and Provider pins must validate
 as one domain, the server key must be nonzero, and trusted client keys must be distinct and nonzero.
 Before the listener is bound, the daemon compares the complete Anchor and Provider pin values against
 the exact pins held by the injected `ExternalCasOffhostAnchorMemoryModel`. Anchor ID, Provider ID,
@@ -59,6 +61,10 @@ redaction in both config and daemon Debug output, and injected worker panic prop
 Each active connection is managed by an RAII guard. Normal success marks the request completed;
 ordinary errors and unwinding both decrement the active-connection counter and record one failed
 request. Worker panics are joined and surfaced as a daemon error instead of being hidden.
+
+Secret cleanup uses the pinned direct `zeroize` dependency. Dropping an unbound configuration (or
+any validation/bind failure) zeroizes its key buffer; successful bind transfers the key out of the
+configuration and into a shared `SecretNoiseKey`, which zeroizes on its final drop.
 
 Windows local validation for the lifecycle expansion (package `src/native/pow_bench`):
 - `cargo test --lib --locked --offline`: 1,023 passed, 0 failed.

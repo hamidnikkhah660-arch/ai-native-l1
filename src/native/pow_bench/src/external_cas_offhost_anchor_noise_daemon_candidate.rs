@@ -26,6 +26,7 @@ use std::{
     thread,
     time::Duration,
 };
+use zeroize::Zeroize;
 
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MIN_WORKERS: usize = 1;
@@ -37,8 +38,9 @@ const MAX_TRUSTED_CLIENTS: usize = 256;
 
 /// Explicit configuration for a single Anchor daemon listener.
 ///
-/// The Noise static private key is intentionally omitted from Debug output and is zeroed when the
-/// daemon's final shared reference is dropped. Constructing this value does not bind a socket.
+/// The Noise static private key is intentionally omitted from Debug output and is zeroized when
+/// this configuration is dropped if it is not bound, or when the daemon's final shared key
+/// reference is dropped. Constructing this value does not bind a socket.
 pub struct OffhostAnchorNoiseDaemonConfig {
     pub bind_address: SocketAddr,
     pub local_static_private_key: [u8; 32],
@@ -71,11 +73,17 @@ impl fmt::Debug for OffhostAnchorNoiseDaemonConfig {
     }
 }
 
+impl Drop for OffhostAnchorNoiseDaemonConfig {
+    fn drop(&mut self) {
+        self.local_static_private_key.zeroize();
+    }
+}
+
 struct SecretNoiseKey([u8; 32]);
 
 impl Drop for SecretNoiseKey {
     fn drop(&mut self) {
-        self.0.fill(0);
+        self.0.zeroize();
     }
 }
 
@@ -217,30 +225,27 @@ where
             && config.anchor_pin.validate(&config.provider_pin).is_ok()
             && model.matches_pins(&config.anchor_pin, &config.provider_pin);
         if !valid {
-            config.local_static_private_key.fill(0);
             return Err(OffhostAnchorNoiseError::InvalidConfiguration);
         }
 
         let listener = match TcpListener::bind(config.bind_address) {
             Ok(listener) => listener,
-            Err(error) => {
-                config.local_static_private_key.fill(0);
-                return Err(OffhostAnchorNoiseError::Io(error.to_string()));
-            }
+            Err(error) => return Err(OffhostAnchorNoiseError::Io(error.to_string())),
         };
         if let Err(error) = listener.set_nonblocking(true) {
-            config.local_static_private_key.fill(0);
             return Err(OffhostAnchorNoiseError::Io(error.to_string()));
         }
 
-        let secret = Arc::new(SecretNoiseKey(config.local_static_private_key));
-        config.local_static_private_key.fill(0);
+        let secret_key = std::mem::replace(&mut config.local_static_private_key, [0; 32]);
+        let secret = Arc::new(SecretNoiseKey(secret_key));
         Ok(Self {
             listener,
             local_static_private_key: secret,
-            trusted_client_static_public_keys: Arc::new(config.trusted_client_static_public_keys),
-            anchor_pin: Arc::new(config.anchor_pin),
-            provider_pin: Arc::new(config.provider_pin),
+            trusted_client_static_public_keys: Arc::new(std::mem::take(
+                &mut config.trusted_client_static_public_keys,
+            )),
+            anchor_pin: Arc::new(config.anchor_pin.clone()),
+            provider_pin: Arc::new(config.provider_pin.clone()),
             model,
             provider_verifier,
             anchor_signer,
