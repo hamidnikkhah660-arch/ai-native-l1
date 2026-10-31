@@ -16,6 +16,7 @@ use crate::{
     },
     qrun_v05_checkpoint_candidate::{QRunCheckpointError, QRunV05PowCheckpoint, MAX_QRCP_BYTES},
     qrun_v05_genesis_candidate::QRunGenesisV05,
+    qrun_v05_history_archive_candidate::QRunHistoryArchiveSummary,
     state_machine::MAX_TOTAL_SUPPLY_ATOMS,
 };
 use sha2::{Digest, Sha256};
@@ -41,7 +42,7 @@ const FIXED_BYTES: usize = 4
     + QRM1_CHECKSUM_BYTES;
 
 /// Bound includes the exact QRCP bytes, old PFS2 manifest and new PFS2 manifest.
-/// The history archive itself is kept outside QRM1 and is verified by its commitment.
+/// QRM1 encode/decode additionally require an opaque, fully verified QRA1 archive summary.
 pub const MAX_QRM1_BYTES: usize = FIXED_BYTES + MAX_QRCP_BYTES + (MAX_MANIFEST_BYTES * 2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,8 +112,9 @@ impl QRunCheckpointMigrationJournal {
     }
 
     /// Validate all self-contained QRM1 bindings against an independently configured CAS pin
-    /// and the selected QRun v0.5 consensus parameters.
-    pub fn validate(
+    /// and the selected QRun v0.5 consensus parameters. This lower-level check deliberately does
+    /// not establish that the referenced QRA1 archive exists or matches the claimed commitment.
+    fn validate_without_archive(
         &self,
         pin: &ExternalCasPin,
         params: &ConsensusParameters,
@@ -255,14 +257,58 @@ impl QRunCheckpointMigrationJournal {
         Ok(())
     }
 
-    /// Encode a canonical, bounded QRM1 record. Context validation runs before any bytes are
-    /// emitted, so malformed records cannot be persisted as migration intents.
+    /// Bind this journal to a QRA1 summary returned by the archive create/verify APIs. The summary
+    /// carries an unforgeable verification seal and immutable bindings; a caller cannot substitute
+    /// a hand-built or edited set of archive metadata.
+    pub fn validate(
+        &self,
+        pin: &ExternalCasPin,
+        params: &ConsensusParameters,
+        archive: &QRunHistoryArchiveSummary,
+    ) -> Result<(), QRunCheckpointMigrationError> {
+        self.validate_without_archive(pin, params)?;
+        self.validate_archive_binding(archive)
+    }
+
+    fn validate_archive_binding(
+        &self,
+        archive: &QRunHistoryArchiveSummary,
+    ) -> Result<(), QRunCheckpointMigrationError> {
+        let old_manifest = decode_manifest(&self.previous_manifest)
+            .map_err(|_| QRunCheckpointMigrationError::ManifestBindingMismatch)?;
+        if archive.archive_id != self.archive_id
+            || archive.archive_commitment != self.archive_commitment
+            || archive.previous_manifest_anchor
+                != manifest_anchor_commitment(&self.previous_manifest)
+            || archive.network_id != old_manifest.network_id
+            || archive.profile_fingerprint != old_manifest.profile_fingerprint
+            || archive.genesis_tip != old_manifest.genesis_tip
+            || archive.canonical_tip != old_manifest.canonical_tip
+            || archive.branch_count as usize != old_manifest.digests.len()
+        {
+            return Err(QRunCheckpointMigrationError::ArchiveBindingMismatch);
+        }
+        Ok(())
+    }
+
+    /// Encode a canonical, bounded QRM1 record only after the referenced QRA1 archive has been
+    /// independently verified and its opaque summary has been bound to this journal.
     pub fn encode(
         &self,
         pin: &ExternalCasPin,
         params: &ConsensusParameters,
+        archive: &QRunHistoryArchiveSummary,
     ) -> Result<Vec<u8>, QRunCheckpointMigrationError> {
-        self.validate(pin, params)?;
+        self.validate(pin, params, archive)?;
+        self.encode_without_archive(pin, params)
+    }
+
+    fn encode_without_archive(
+        &self,
+        pin: &ExternalCasPin,
+        params: &ConsensusParameters,
+    ) -> Result<Vec<u8>, QRunCheckpointMigrationError> {
+        self.validate_without_archive(pin, params)?;
 
         let previous = self.previous_record.encode()?;
         let next = self.next_record.encode()?;
@@ -311,9 +357,20 @@ impl QRunCheckpointMigrationJournal {
         Ok(bytes)
     }
 
-    /// Decode only a complete canonical QRM1 journal that validates against the pinned provider,
-    /// receipt key, wallet-bound Genesis, QRCP parent and QRun v0.5 profile.
+    /// Decode a complete canonical QRM1 journal and require its archive commitment to match a
+    /// separately verified QRA1 archive. The opaque summary must come from QRA1 create/verify.
     pub fn decode(
+        bytes: &[u8],
+        pin: &ExternalCasPin,
+        params: &ConsensusParameters,
+        archive: &QRunHistoryArchiveSummary,
+    ) -> Result<Self, QRunCheckpointMigrationError> {
+        let journal = Self::decode_without_archive(bytes, pin, params)?;
+        journal.validate_archive_binding(archive)?;
+        Ok(journal)
+    }
+
+    fn decode_without_archive(
         bytes: &[u8],
         pin: &ExternalCasPin,
         params: &ConsensusParameters,
@@ -412,8 +469,8 @@ impl QRunCheckpointMigrationJournal {
             archive_id,
             archive_commitment,
         };
-        journal.validate(pin, params)?;
-        let canonical = journal.encode(pin, params)?;
+        journal.validate_without_archive(pin, params)?;
+        let canonical = journal.encode_without_archive(pin, params)?;
         if canonical.as_slice() != bytes {
             return Err(QRunCheckpointMigrationError::Malformed);
         }
@@ -471,7 +528,7 @@ fn take_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, QRunCheckpointMigra
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         consensus::Uint256,
@@ -514,7 +571,7 @@ mod tests {
         params
     }
 
-    fn fixture() -> (
+    pub(crate) fn fixture() -> (
         QRunCheckpointMigrationJournal,
         ExternalCasPin,
         ConsensusParameters,
@@ -676,9 +733,10 @@ mod tests {
     #[test]
     fn qrm1_roundtrips_exact_checkpoint_manifest_and_cas_successor() {
         let (journal, pin, params) = fixture();
-        let bytes = journal.encode(&pin, &params).unwrap();
+        let bytes = journal.encode_without_archive(&pin, &params).unwrap();
         assert!(bytes.len() <= MAX_QRM1_BYTES);
-        let decoded = QRunCheckpointMigrationJournal::decode(&bytes, &pin, &params).unwrap();
+        let decoded =
+            QRunCheckpointMigrationJournal::decode_without_archive(&bytes, &pin, &params).unwrap();
         assert_eq!(decoded, journal);
         assert_eq!(decoded.previous_record.generation, 7);
         assert_eq!(decoded.next_record.generation, 8);
@@ -692,21 +750,21 @@ mod tests {
         let mut wrong_pin = pin.clone();
         wrong_pin.receipt_key_id[0] ^= 1;
         assert!(matches!(
-            journal.encode(&wrong_pin, &params),
+            journal.encode_without_archive(&wrong_pin, &params),
             Err(QRunCheckpointMigrationError::InvalidBinding)
         ));
 
         let mut wrong_key = pin.clone();
         wrong_key.receipt_public_key[0] ^= 1;
         assert!(matches!(
-            journal.encode(&wrong_key, &params),
+            journal.encode_without_archive(&wrong_key, &params),
             Err(QRunCheckpointMigrationError::InvalidBinding)
         ));
 
         let mut wrong_archive = journal.clone();
         wrong_archive.archive_id[0] ^= 1;
         assert!(matches!(
-            wrong_archive.encode(&pin, &params),
+            wrong_archive.encode_without_archive(&pin, &params),
             Err(QRunCheckpointMigrationError::ManifestBindingMismatch)
         ));
     }
@@ -732,7 +790,7 @@ mod tests {
             QRunCheckpointMigrationJournal::archive_id_for_previous_manifest(rebound_anchor);
 
         assert!(matches!(
-            journal.encode(&pin, &params),
+            journal.encode_without_archive(&pin, &params),
             Err(QRunCheckpointMigrationError::ManifestBindingMismatch)
         ));
     }
@@ -743,7 +801,7 @@ mod tests {
         let mut wrong_parent = journal.clone();
         wrong_parent.expected_parent_checkpoint_commitment[0] ^= 1;
         assert!(matches!(
-            wrong_parent.encode(&pin, &params),
+            wrong_parent.encode_without_archive(&pin, &params),
             Err(QRunCheckpointMigrationError::Checkpoint(
                 QRunCheckpointError::ParentCheckpointCommitmentMismatch
             ))
@@ -752,7 +810,7 @@ mod tests {
         let mut wrong_generation = journal;
         wrong_generation.next_record.generation += 1;
         assert!(matches!(
-            wrong_generation.encode(&pin, &params),
+            wrong_generation.encode_without_archive(&pin, &params),
             Err(QRunCheckpointMigrationError::Record(
                 ExternalCasError::NotExactSuccessor
             ))
@@ -762,18 +820,22 @@ mod tests {
     #[test]
     fn qrm1_decoder_rejects_checksum_truncation_and_trailing_bytes() {
         let (journal, pin, params) = fixture();
-        let bytes = journal.encode(&pin, &params).unwrap();
+        let bytes = journal.encode_without_archive(&pin, &params).unwrap();
 
         let mut corrupt = bytes.clone();
         let body_index = corrupt.len() / 2;
         corrupt[body_index] ^= 1;
         assert_eq!(
-            QRunCheckpointMigrationJournal::decode(&corrupt, &pin, &params),
+            QRunCheckpointMigrationJournal::decode_without_archive(&corrupt, &pin, &params),
             Err(QRunCheckpointMigrationError::ChecksumMismatch)
         );
 
         assert!(matches!(
-            QRunCheckpointMigrationJournal::decode(&bytes[..bytes.len() - 1], &pin, &params),
+            QRunCheckpointMigrationJournal::decode_without_archive(
+                &bytes[..bytes.len() - 1],
+                &pin,
+                &params
+            ),
             Err(QRunCheckpointMigrationError::Oversize)
                 | Err(QRunCheckpointMigrationError::ChecksumMismatch)
         ));
@@ -781,7 +843,7 @@ mod tests {
         let mut trailing = bytes;
         trailing.push(0);
         assert!(matches!(
-            QRunCheckpointMigrationJournal::decode(&trailing, &pin, &params),
+            QRunCheckpointMigrationJournal::decode_without_archive(&trailing, &pin, &params),
             Err(QRunCheckpointMigrationError::ChecksumMismatch)
                 | Err(QRunCheckpointMigrationError::Malformed)
         ));

@@ -109,17 +109,62 @@ impl From<crate::consensus::ConsensusError> for QRunHistoryArchiveError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Qra1VerifiedArchiveSeal;
+
+/// This value is an opaque verification witness: callers can inspect it through accessors, but
+/// cannot construct or mutate its bindings. It is returned only after QRA1 creation has published
+/// and re-verified the archive, or after an explicit full archive verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QRunHistoryArchiveSummary {
-    pub archive_id: [u8; 32],
-    pub archive_commitment: [u8; 32],
-    pub previous_manifest_anchor: [u8; 32],
-    pub network_id: [u8; 32],
-    pub profile_fingerprint: [u8; 32],
-    pub genesis_tip: [u8; 32],
-    pub canonical_tip: [u8; 32],
-    pub branch_count: u32,
-    pub total_payload_bytes: u64,
+    pub(crate) archive_id: [u8; 32],
+    pub(crate) archive_commitment: [u8; 32],
+    pub(crate) previous_manifest_anchor: [u8; 32],
+    pub(crate) network_id: [u8; 32],
+    pub(crate) profile_fingerprint: [u8; 32],
+    pub(crate) genesis_tip: [u8; 32],
+    pub(crate) canonical_tip: [u8; 32],
+    pub(crate) branch_count: u32,
+    pub(crate) total_payload_bytes: u64,
+    _verified: Qra1VerifiedArchiveSeal,
+}
+
+impl QRunHistoryArchiveSummary {
+    pub fn archive_id(&self) -> &[u8; 32] {
+        &self.archive_id
+    }
+
+    pub fn archive_commitment(&self) -> &[u8; 32] {
+        &self.archive_commitment
+    }
+
+    pub fn previous_manifest_anchor(&self) -> &[u8; 32] {
+        &self.previous_manifest_anchor
+    }
+
+    pub fn network_id(&self) -> &[u8; 32] {
+        &self.network_id
+    }
+
+    pub fn profile_fingerprint(&self) -> &[u8; 32] {
+        &self.profile_fingerprint
+    }
+
+    pub fn genesis_tip(&self) -> &[u8; 32] {
+        &self.genesis_tip
+    }
+
+    pub fn canonical_tip(&self) -> &[u8; 32] {
+        &self.canonical_tip
+    }
+
+    pub fn branch_count(&self) -> u32 {
+        self.branch_count
+    }
+
+    pub fn total_payload_bytes(&self) -> u64 {
+        self.total_payload_bytes
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -626,6 +671,7 @@ fn verify_qrun_v05_history_archive_inner(
         canonical_tip: manifest.canonical_tip,
         branch_count: descriptor.entries.len() as u32,
         total_payload_bytes,
+        _verified: Qra1VerifiedArchiveSeal,
     })
 }
 
@@ -1123,6 +1169,75 @@ mod tests {
             &fixture.params,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn qra1_summary_binds_exact_qrm1_archive_identity_and_manifest() {
+        let (mut journal, pin, params) =
+            crate::qrun_v05_checkpoint_migration_candidate::tests::fixture();
+        let fixture = fixture();
+        let archive = create(&fixture);
+        // The journal fixture uses a sentinel commitment for codec isolation; replace it with the
+        // commitment from this independently created and re-verified QRA1 archive before invoking
+        // the public strict QRM1 API.
+        journal.archive_id = archive.archive_id;
+        journal.archive_commitment = archive.archive_commitment;
+
+        let old_manifest = decode_manifest(&journal.previous_manifest).unwrap();
+        assert_eq!(archive.archive_id, journal.archive_id);
+        assert_eq!(archive.archive_commitment, journal.archive_commitment);
+        assert_eq!(
+            archive.previous_manifest_anchor,
+            manifest_anchor_commitment(&journal.previous_manifest)
+        );
+        assert_eq!(archive.network_id, pin.network_id);
+        assert_eq!(
+            archive.profile_fingerprint,
+            old_manifest.profile_fingerprint
+        );
+        assert_eq!(archive.genesis_tip, old_manifest.genesis_tip);
+        assert_eq!(archive.canonical_tip, old_manifest.canonical_tip);
+        assert_eq!(archive.branch_count as usize, old_manifest.digests.len());
+
+        let bytes = journal.encode(&pin, &params, &archive).unwrap();
+        let decoded =
+            QRunCheckpointMigrationJournal::decode(&bytes, &pin, &params, &archive).unwrap();
+        assert_eq!(decoded, journal);
+
+        let mut wrong_commitment = journal.clone();
+        wrong_commitment.archive_commitment[0] ^= 1;
+        assert_eq!(
+            wrong_commitment.encode(&pin, &params, &archive),
+            Err(crate::qrun_v05_checkpoint_migration_candidate::QRunCheckpointMigrationError::ArchiveBindingMismatch)
+        );
+
+        let mut wrong_tip = archive.clone();
+        wrong_tip.canonical_tip[0] ^= 1;
+        assert_eq!(
+            QRunCheckpointMigrationJournal::decode(&bytes, &pin, &params, &wrong_tip),
+            Err(crate::qrun_v05_checkpoint_migration_candidate::QRunCheckpointMigrationError::ArchiveBindingMismatch)
+        );
+
+        let mut wrong_profile = archive.clone();
+        wrong_profile.profile_fingerprint[0] ^= 1;
+        assert_eq!(
+            journal.encode(&pin, &params, &wrong_profile),
+            Err(crate::qrun_v05_checkpoint_migration_candidate::QRunCheckpointMigrationError::ArchiveBindingMismatch)
+        );
+
+        let mut wrong_genesis = archive.clone();
+        wrong_genesis.genesis_tip[0] ^= 1;
+        assert_eq!(
+            journal.encode(&pin, &params, &wrong_genesis),
+            Err(crate::qrun_v05_checkpoint_migration_candidate::QRunCheckpointMigrationError::ArchiveBindingMismatch)
+        );
+
+        let mut wrong_branch_count = archive.clone();
+        wrong_branch_count.branch_count += 1;
+        assert_eq!(
+            journal.encode(&pin, &params, &wrong_branch_count),
+            Err(crate::qrun_v05_checkpoint_migration_candidate::QRunCheckpointMigrationError::ArchiveBindingMismatch)
+        );
     }
 
     #[test]
