@@ -2,7 +2,7 @@
 
 Date: 2026-10-31
 
-Status: **Design proposal with candidate implementation progress.** QRM1 v2 codec, QRA1-bound exact-tip preflight, and local durable-intent staging with fail-closed write/startup guards are implemented as candidate code. The live provider migration transaction, QCF1 reconciliation, checkpoint-rooted manifest installation, and complete crash-recovery engine remain not implemented; this is not a Mainnet approval. This document specifies a conservative migration from an already initialized Genesis-rooted QFP5 External-CAS provider manifest to a checkpoint-rooted QFP5 suffix manifest. It deliberately does not claim that current checkpoint bootstrap performs this transition.
+Status: **Design proposal with candidate implementation progress.** QRM1 v2 codec, full QRA1 QFP5 history replay, wallet-bound Genesis commitment verification, byte-exact QRCP reconstruction, exact-tip preflight, pure crash-state classification, and local durable-intent staging with fail-closed write/startup guards are implemented as candidate code. The live provider migration transaction, QCF1 reconciliation, checkpoint-rooted manifest installation, and complete crash-recovery engine remain not implemented; this is not a Mainnet approval. This document specifies a conservative migration from an already initialized Genesis-rooted QFP5 External-CAS provider manifest to a checkpoint-rooted QFP5 suffix manifest. It deliberately does not claim that current checkpoint bootstrap performs this transition.
 
 ## 1. Decision and safety boundary
 
@@ -69,7 +69,7 @@ A QRM1 migration journal and a QAP1 block-commit journal MUST NOT coexist in the
 
 All preparation is performed while the node is stopped or in a strict maintenance state that prevents concurrent writes:
 
-1. Open the existing Genesis-rooted PFS2 store and verify its complete archive using the configured production candidate rules.
+1. Open the existing Genesis-rooted PFS2 store and verify its complete archive using the configured production candidate rules; create QRA1 and independently replay every archived branch from the original wallet-bound Genesis.
 2. Open QCF1 and obtain its exact trusted ECR1 record and minimum provider object generation. Require the local PFS2 manifest anchor to equal that record's state digest.
 3. Perform a fresh signed provider read. Require the provider record and object generation to equal the floor exactly; v1 migration does not reconcile an unobserved provider successor as part of preparation.
 4. Decode the QRCP against the original Network ID, Genesis, consensus profile, expected commitment, minimum height and expected parent commitment. Restore/replay it and compare every field in Section 2 against the current canonical chain.
@@ -88,13 +88,13 @@ The ECR1 generation and provider object generation each advance exactly once for
 
 ## 5A. Candidate implementation boundary (2026-10-31)
 
-The current candidate code can build an exact-tip QRunV05CheckpointMigrationPlan from a replay-validated Genesis-rooted PFS2 store and a verified QRA1 archive. It can durably publish the canonical QRM1 bytes with no-replace semantics, reject a conflicting existing intent, prevent coexistence with QAP1, and block ordinary store open and both local and external-CAS block submission while the migration intent is present. A pre-publication orphan temporary file is removed on ordinary reopen only when no final QRM1 intent exists.
+The current candidate code can fully replay every QRA1 branch from the original wallet-bound QRun Genesis under QFP5 rules, checking the pinned Genesis commitment, exact old-manifest branch catalog, branch payload hashes/PoW, replayed archive count and canonical tip. The opaque replay witness is required by the public exact-tip QRM1 preflight API. The preflight rebuilds QRCP from the replayed canonical chain and requires byte-for-byte equality with the journal checkpoint before returning a plan. The code can durably publish canonical QRM1 bytes with no-replace semantics, reject a conflicting existing intent, prevent coexistence with QAP1, and block ordinary store open and both local and external-CAS block submission while the migration intent is present. A pre-publication orphan temporary file is removed on ordinary reopen only when no final QRM1 intent exists.
 
 This is a prepared-intent and recovery-classification boundary only. Candidate code now includes a pure QRM1 recovery classifier for the four permitted states below and returns quarantine for every other combination. It does not yet perform startup recovery, obtain/verify the signed provider observation, retry the immutable CAS request, advance QCF1, install the checkpoint-rooted PFS2 manifest, open the checkpoint-rooted store under recovery authorization, or clear QRM1 after verified completion. Consequently a final QRM1 intent intentionally makes ordinary startup fail closed until the complete recovery engine is added. Operators must not create such an intent against a live data directory until that recovery implementation is available and tested.
 
 ## 5B. Candidate recovery classifier boundary (2026-10-31)
 
-The candidate QRM1 module now contains a pure classifier over three independently observed values: the freshly signed provider record plus object generation, the QCF1 floor record plus object generation, and the exact active PFS2 manifest bytes. It accepts only the four consistent rows in Section 6 and quarantines every other state. It does not itself read files, contact a provider, advance a floor, or replace a manifest.
+The candidate QRM1 module now contains a pure classifier over three independently observed values: the freshly signed provider record plus object generation, the QCF1 floor record plus object generation, and the exact active PFS2 manifest bytes. It accepts only the four consistent rows in Section 6 and quarantines every other state. QRA1 replay returns an opaque witness bound to the exact wallet Genesis commitment; QRM1 validation reconstructs the checkpoint from that replayed archive and compares exact QRCP bytes. The classifier and replay validator do not themselves read the Provider, advance a floor, or replace a manifest.
 
 An exact-old provider/floor/manifest observation is deliberately **not** treated as proof that a previous CAS was never sent. Recovery must retry the same immutable CAS request from QRM1 (same request nonce, operation ID and request digest) under a provider contract that serializes and deduplicates identical retries. Without that provider guarantee, the only safe response is to keep QRM1 and quarantine startup.
 
