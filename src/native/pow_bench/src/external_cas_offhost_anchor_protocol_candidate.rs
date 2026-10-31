@@ -443,7 +443,7 @@ impl ExternalCasOffhostAnchorReceipt {
     }
 }
 
-fn encode_state(
+pub(crate) fn encode_state(
     state: &ExternalCasOffhostAnchorState,
 ) -> Result<[u8; OFFHOST_ANCHOR_STATE_BYTES], OffhostAnchorProtocolError> {
     let record = state
@@ -462,7 +462,9 @@ fn encode_state(
     out.try_into()
         .map_err(|_| OffhostAnchorProtocolError::StateEncoding)
 }
-fn decode_state(bytes: &[u8]) -> Result<ExternalCasOffhostAnchorState, OffhostAnchorProtocolError> {
+pub(crate) fn decode_state(
+    bytes: &[u8],
+) -> Result<ExternalCasOffhostAnchorState, OffhostAnchorProtocolError> {
     if bytes.len() != OFFHOST_ANCHOR_STATE_BYTES {
         return Err(OffhostAnchorProtocolError::StateEncoding);
     }
@@ -809,7 +811,13 @@ impl ExternalCasOffhostAnchorMemoryModel {
                 receipt.sign(anchor_signer)?;
                 Ok(receipt)
             }
-            ExternalCasOffhostAnchorStoreCasOutcome::Conflict(current) => {
+            ExternalCasOffhostAnchorStoreCasOutcome::Conflict(_adapter_observation) => {
+                // Do not sign the adapter's conflict payload. It may be stale or merely a
+                // transaction-failure snapshot; obtain a fresh authoritative read first.
+                let current = self
+                    .store
+                    .load_consistent()
+                    .map_err(OffhostAnchorProtocolError::Store)?;
                 current.validate(&self.provider_pin)?;
                 // A concurrent exact retry may have won the CAS while this request was in flight.
                 if current.digest()? == request.target_state_digest
@@ -905,6 +913,41 @@ mod tests {
         ) -> Result<ExternalCasOffhostAnchorStoreCasOutcome, ExternalCasOffhostAnchorStoreError>
         {
             Err(ExternalCasOffhostAnchorStoreError::Unavailable)
+        }
+    }
+
+    struct StaleConflictStore {
+        state: Mutex<ExternalCasOffhostAnchorState>,
+        stale_observation: ExternalCasOffhostAnchorState,
+        concurrent_winner: ExternalCasOffhostAnchorState,
+    }
+    impl ExternalCasOffhostAnchorStore for StaleConflictStore {
+        fn load_consistent(
+            &self,
+        ) -> Result<ExternalCasOffhostAnchorState, ExternalCasOffhostAnchorStoreError> {
+            self.state
+                .lock()
+                .map(|state| state.clone())
+                .map_err(|_| ExternalCasOffhostAnchorStoreError::Poisoned)
+        }
+
+        fn compare_and_swap_atomic(
+            &self,
+            _expected_sequence: u64,
+            _expected_state_digest: &Digest32,
+            _next_state: &ExternalCasOffhostAnchorState,
+        ) -> Result<ExternalCasOffhostAnchorStoreCasOutcome, ExternalCasOffhostAnchorStoreError>
+        {
+            // A different writer wins after the service's initial read. The CAS adapter's
+            // attached conflict payload is intentionally stale; the service must re-read.
+            *self
+                .state
+                .lock()
+                .map_err(|_| ExternalCasOffhostAnchorStoreError::Poisoned)? =
+                self.concurrent_winner.clone();
+            Ok(ExternalCasOffhostAnchorStoreCasOutcome::Conflict(
+                self.stale_observation.clone(),
+            ))
         }
     }
 
@@ -1605,6 +1648,72 @@ mod tests {
             ))
         );
         assert_eq!(model.snapshot().unwrap(), f.bootstrap);
+    }
+
+    #[test]
+    fn stale_adapter_conflict_payload_is_never_signed_without_fresh_authoritative_read() {
+        let f = fixture();
+        let (next_a, receipt_a) =
+            provider_proof(&f, 0xA1, 0xA2, 0xA3, ExternalCasReceiptOutcome::Applied);
+        let (next_b, receipt_b) =
+            provider_proof(&f, 0xA4, 0xA5, 0xA6, ExternalCasReceiptOutcome::Applied);
+        let state_b = verify_provider_commit_for_offhost_anchor(
+            &f.provider_pin,
+            &f.bootstrap,
+            &next_b.encode().unwrap(),
+            &receipt_b.encode().unwrap(),
+            &LibcruxMlDsa65VerifierCandidate,
+        )
+        .unwrap()
+        .next_state;
+        let store: Arc<dyn ExternalCasOffhostAnchorStore> = Arc::new(StaleConflictStore {
+            state: Mutex::new(f.bootstrap.clone()),
+            stale_observation: f.bootstrap.clone(),
+            concurrent_winner: state_b.clone(),
+        });
+        let model = ExternalCasOffhostAnchorMemoryModel::with_store(
+            f.anchor_pin.clone(),
+            f.provider_pin.clone(),
+            store,
+        )
+        .unwrap();
+        let state_a = verify_provider_commit_for_offhost_anchor(
+            &f.provider_pin,
+            &f.bootstrap,
+            &next_a.encode().unwrap(),
+            &receipt_a.encode().unwrap(),
+            &LibcruxMlDsa65VerifierCandidate,
+        )
+        .unwrap()
+        .next_state;
+        let request_a = cas_request(
+            &f.bootstrap,
+            0xA2,
+            0xA7,
+            next_a.request_digest,
+            state_a.digest().unwrap(),
+        );
+
+        let response = model
+            .compare_and_swap(
+                &request_a,
+                &next_a.encode().unwrap(),
+                &receipt_a.encode().unwrap(),
+                &LibcruxMlDsa65VerifierCandidate,
+                &anchor_signer(&f),
+            )
+            .unwrap();
+        let verified = response
+            .verify_cas(
+                &f.anchor_pin,
+                &f.provider_pin,
+                &request_a,
+                &LibcruxMlDsa65VerifierCandidate,
+            )
+            .unwrap();
+        assert_eq!(verified.0, ExternalCasOffhostAnchorReceiptOutcome::Conflict);
+        assert_eq!(verified.1, state_b);
+        assert_ne!(verified.1, f.bootstrap);
     }
 
     #[test]
