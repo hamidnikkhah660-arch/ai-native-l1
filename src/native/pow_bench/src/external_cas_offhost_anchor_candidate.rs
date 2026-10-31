@@ -53,6 +53,9 @@ pub struct ExternalCasOffhostAnchorState {
     pub last_request_digest: Digest32,
     /// Digest of the first accepted signed ECS1 commit receipt; retries never replace it.
     pub last_provider_receipt_digest: Digest32,
+    /// Exact Anchor predecessor used by the last successful CAS; retained for retry binding.
+    pub last_expected_anchor_sequence: u64,
+    pub last_expected_anchor_state_digest: Digest32,
 }
 impl ExternalCasOffhostAnchorState {
     /// Explicit provisioning only. A remote service must not call this on first read.
@@ -72,6 +75,8 @@ impl ExternalCasOffhostAnchorState {
             last_operation_id: [0; 32],
             last_request_digest: [0; 32],
             last_provider_receipt_digest: [0; 32],
+            last_expected_anchor_sequence: 0,
+            last_expected_anchor_state_digest: [0; 32],
         };
         state.validate(pin)?;
         Ok(state)
@@ -98,6 +103,8 @@ impl ExternalCasOffhostAnchorState {
             if self.last_operation_id != [0; 32]
                 || self.last_request_digest != [0; 32]
                 || self.last_provider_receipt_digest != [0; 32]
+                || self.last_expected_anchor_sequence != 0
+                || self.last_expected_anchor_state_digest != [0; 32]
             {
                 return Err(ExternalCasOffhostAnchorError::InvalidAnchorState);
             }
@@ -106,6 +113,8 @@ impl ExternalCasOffhostAnchorState {
             || self.last_operation_id == [0; 32]
             || self.last_request_digest == [0; 32]
             || self.last_provider_receipt_digest == [0; 32]
+            || self.last_expected_anchor_sequence.checked_add(1) != Some(self.sequence)
+            || self.last_expected_anchor_state_digest == [0; 32]
         {
             return Err(ExternalCasOffhostAnchorError::InvalidAnchorState);
         }
@@ -123,6 +132,8 @@ impl ExternalCasOffhostAnchorState {
         hasher.update(self.last_operation_id);
         hasher.update(self.last_request_digest);
         hasher.update(self.last_provider_receipt_digest);
+        hasher.update(self.last_expected_anchor_sequence.to_be_bytes());
+        hasher.update(self.last_expected_anchor_state_digest);
         Ok(hasher.finalize().into())
     }
 }
@@ -266,6 +277,8 @@ pub fn verify_provider_commit_for_offhost_anchor<V: MlDsa65Verifier>(
         last_operation_id: receipt.operation_id,
         last_request_digest: receipt.request_digest,
         last_provider_receipt_digest: provider_receipt_digest,
+        last_expected_anchor_sequence: current.sequence,
+        last_expected_anchor_state_digest: current.digest()?,
     };
     next_state.validate(pin)?;
 
@@ -595,8 +608,14 @@ mod tests {
         let mut changed = state.clone();
         changed.last_request_digest[0] ^= 1;
         assert_ne!(baseline, changed.digest().unwrap());
-        let mut changed = state;
+        let mut changed = state.clone();
         changed.last_provider_receipt_digest[0] ^= 1;
+        assert_ne!(baseline, changed.digest().unwrap());
+        let mut changed = state.clone();
+        changed.last_expected_anchor_sequence ^= 1;
+        assert_ne!(baseline, changed.digest().unwrap());
+        let mut changed = state;
+        changed.last_expected_anchor_state_digest[0] ^= 1;
         assert_ne!(baseline, changed.digest().unwrap());
     }
 }
