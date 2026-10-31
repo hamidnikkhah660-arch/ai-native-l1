@@ -441,6 +441,8 @@ pub mod token_forge;
 
 /// CP-0487 opt-in node owner for an already spawned off-host Anchor daemon; disabled by default.
 pub mod external_cas_offhost_anchor_node_lifecycle_candidate;
+/// CP-0488 candidate process-signal bridge for graceful QRun node event-loop shutdown.
+pub mod qrun_node_shutdown_signal_candidate;
 /// QRun canonical checkpoint codec with profile binding and external anti-rollback anchor checks.
 pub mod qrun_v05_checkpoint_candidate;
 /// Candidate-only canonical QRM1 journal codec for live External-CAS checkpoint re-rooting; no migration runtime or provider write callsite.

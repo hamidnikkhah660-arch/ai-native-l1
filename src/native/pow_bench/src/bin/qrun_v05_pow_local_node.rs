@@ -23,6 +23,7 @@ use ai_native_l1_pow_bench::private_testnet_fork_store::{
     ForkStoreError, PrivateTestnetForkStore, QRunV05ExternalCasForkStore,
 };
 use ai_native_l1_pow_bench::private_testnet_wire::decode_candidate_network_block;
+use ai_native_l1_pow_bench::qrun_node_shutdown_signal_candidate::QRunNodeShutdownSignalCandidate;
 use ai_native_l1_pow_bench::qrun_v05_checkpoint_migration_recovery_candidate::recover_qrun_v05_checkpoint_migration;
 use ai_native_l1_pow_bench::qrun_v05_genesis_candidate::QRunGenesisV05;
 use ai_native_l1_pow_bench::qrun_v05_noise_transport_candidate::{
@@ -2648,6 +2649,12 @@ fn run(config: Config) -> Result<(), String> {
     block_listener
         .set_nonblocking(true)
         .map_err(|error| error.to_string())?;
+
+    // Install only once startup sync and all listener binds have completed. The OS callback sets
+    // an atomic flag; the node thread below owns all service shutdown and joins.
+    let shutdown_signal = QRunNodeShutdownSignalCandidate::install()
+        .map_err(|error| format!("install QRun process shutdown handlers: {error}"))?;
+
     if config.mainnet {
         state
             .lock()
@@ -2676,15 +2683,47 @@ fn run(config: Config) -> Result<(), String> {
         config.block_listen, !config.public_alpha
     );
 
-    loop {
-        let mut handled = false;
-        handled |= poll_rpc_listener(&rpc_listener, &state)?;
-        handled |= poll_transaction_listener(&tx_listener, &state)?;
-        handled |= poll_block_listener(&block_listener, &state)?;
-        if !handled {
-            std::thread::sleep(Duration::from_millis(5));
+    let loop_result: Result<(), String> = loop {
+        if shutdown_signal.is_shutdown_requested() {
+            println!("qrun_node_shutdown_requested source=process_signal_or_console_control");
+            break Ok(());
         }
-    }
+
+        let iteration_result = (|| -> Result<bool, String> {
+            let mut handled = false;
+            handled |= poll_rpc_listener(&rpc_listener, &state)?;
+            handled |= poll_transaction_listener(&tx_listener, &state)?;
+            handled |= poll_block_listener(&block_listener, &state)?;
+            Ok(handled)
+        })();
+
+        match iteration_result {
+            Ok(handled) => {
+                if !handled {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            Err(error) => break Err(error),
+        }
+    };
+
+    // Join the optional service explicitly while the signal callback is still installed. Dropping
+    // NodeState afterwards is idempotent and zeroizes its node-local Noise private key.
+    let shutdown_result = state
+        .lock()
+        .map_err(|_| "node state lock poisoned during shutdown".to_string())
+        .and_then(|mut node_state| node_state.shutdown_offhost_anchor_service());
+    drop(state);
+
+    let signal_restore_result = shutdown_signal
+        .uninstall()
+        .map_err(|error| format!("restore QRun process shutdown handlers: {error}"));
+
+    loop_result?;
+    shutdown_result?;
+    signal_restore_result?;
+    println!("qrun_node_lifecycle_cleanup_complete");
+    Ok(())
 }
 
 fn main() {
