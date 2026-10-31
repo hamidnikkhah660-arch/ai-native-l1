@@ -156,8 +156,8 @@ Before production use, implement and test:
 This proposal is **not implemented or deployed**. No AWS account, DynamoDB table, KMS Anchor key, Anchor endpoint or operator separation has been provisioned or verified. There is no claim that an AWS-backed floor exists today.
 
 The next engineering sequence is:
-1. implement a QRun-specific ECR1/ECS1 Anchor protocol contract and adversarial in-memory model;
-2. test the server-side reconstruction and independent verification of Provider commit receipts;
+1. CP-0481 now implements a QRun-specific service-side ECR1/ECS1 Provider-proof validator and focused adversarial tests. It reconstructs the write precondition from the trusted current Anchor state (or exact prior state for an idempotent retry) and verifies the signed Provider receipt.
+2. implement the distinct Anchor receipt format, fresh challenge-bound read/CAS protocol and adversarial in-memory Anchor state machine;
 3. implement the separately deployable service and conditional storage adapter;
 4. provision a disposable, separately administered staging account and verify the actual IAM/KMS/DynamoDB behavior;
 5. integrate the remote anchor into node startup and QAP1/QCF1/PFS2 recovery only after the service passes crash and multi-host tests.
