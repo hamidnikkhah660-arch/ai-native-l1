@@ -15,7 +15,7 @@ It is explicitly registered as a candidate module in \`lib.rs\`. It has no netwo
 
 ## Implemented contract
 
-- \`ExternalCasOffhostAnchorState\` binds an independent Anchor sequence, the exact canonical ECR1 record, Provider object generation, last accepted operation ID, request digest and first accepted signed ECS1 receipt digest.
+- \`ExternalCasOffhostAnchorState\` binds an independent Anchor sequence, the exact canonical ECR1 record, Provider object generation, last accepted operation ID, request digest, first accepted signed ECS1 receipt digest, and the exact predecessor Anchor sequence/state digest used for the accepted CAS.
 - Bootstrap is explicit and accepts only generation-zero ECR1 at Provider object generation one; operation/receipt metadata must be zero only in this bootstrap state.
 - State validation binds Provider ID, Network ID and wallet-bound Genesis digest to the pinned \`ExternalCasPin\`.
 - The Anchor sequence and Provider object generation must both track the exact one-step successor of the ECR1 logical generation. This version intentionally models one anchor sequence increment per Provider CAS.
