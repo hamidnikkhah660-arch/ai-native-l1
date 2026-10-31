@@ -456,3 +456,6 @@ pub mod qrun_v05_pow_fork_runtime_candidate;
 pub mod qrun_v05_profile_identity_candidate;
 /// QRun v0.5 Genesis-bound transfer execution and snapshot candidate; not yet node/P2P wired.
 pub mod qrun_v05_runtime_candidate;
+
+/// Explicit bounded worker/queue daemon candidate for the off-host Anchor Noise transport; not node startup wiring.
+pub mod external_cas_offhost_anchor_noise_daemon_candidate;

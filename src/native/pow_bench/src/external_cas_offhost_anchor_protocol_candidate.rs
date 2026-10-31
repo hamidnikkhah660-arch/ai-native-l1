@@ -674,6 +674,18 @@ impl ExternalCasOffhostAnchorMemoryModel {
         })
     }
 
+    /// Return true only when both complete deployment pins match the model's authority.
+    ///
+    /// This compares every field, including IDs, domain bindings, receipt key IDs, and full
+    /// ML-DSA public keys. A daemon must fail closed before binding a listener on any mismatch.
+    pub fn matches_pins(
+        &self,
+        anchor_pin: &ExternalCasOffhostAnchorPin,
+        provider_pin: &ExternalCasPin,
+    ) -> bool {
+        &self.anchor_pin == anchor_pin && &self.provider_pin == provider_pin
+    }
+
     pub fn read<S: OffhostAnchorReceiptSigner>(
         &self,
         request: &ExternalCasOffhostAnchorReadRequest,
