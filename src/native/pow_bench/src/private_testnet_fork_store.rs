@@ -41,7 +41,7 @@ const MANIFEST_MAGIC: &[u8; 4] = b"PFS2";
 const MANIFEST_VERSION: u16 = 2;
 const MANIFEST_FIXED_PREFIX: usize = 4 + 2 + 32 + 32 + 32 + 32 + 4;
 const MANIFEST_CHECKSUM_BYTES: usize = 32;
-const MAX_MANIFEST_BYTES: usize =
+pub(crate) const MAX_MANIFEST_BYTES: usize =
     MANIFEST_FIXED_PREFIX + MAX_FORK_ARCHIVE_BLOCKS * 32 + MANIFEST_CHECKSUM_BYTES;
 const PROFILE_DOMAIN: &[u8] = b"AIN1-PTB2-STORE-PROFILE-V1\0";
 const QRUN_V05_FEE_PROFILE_DOMAIN: &[u8] = b"QRUN-V05-FEE-ONLY-STORE-PROFILE-V1\0";
@@ -195,12 +195,12 @@ fn acquire_writer_lock(directory: &Path) -> Result<StoreWriterLock, ForkStoreErr
 }
 
 #[derive(Debug)]
-struct ParsedManifest {
-    network_id: [u8; 32],
-    profile_fingerprint: [u8; 32],
-    genesis_tip: [u8; 32],
-    canonical_tip: [u8; 32],
-    digests: Vec<[u8; 32]>,
+pub(crate) struct ParsedManifest {
+    pub(crate) network_id: [u8; 32],
+    pub(crate) profile_fingerprint: [u8; 32],
+    pub(crate) genesis_tip: [u8; 32],
+    pub(crate) canonical_tip: [u8; 32],
+    pub(crate) digests: Vec<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1699,7 +1699,7 @@ fn read_bounded_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, BoundedRe
     Ok(bytes)
 }
 
-fn manifest_anchor_commitment(manifest_bytes: &[u8]) -> [u8; 32] {
+pub(crate) fn manifest_anchor_commitment(manifest_bytes: &[u8]) -> [u8; 32] {
     let mut canonical =
         Vec::with_capacity(b"AIN1-PTB2-MANIFEST-ANCHOR-V1\\0".len() + 8 + manifest_bytes.len());
     canonical.extend_from_slice(b"AIN1-PTB2-MANIFEST-ANCHOR-V1\\0");
@@ -1737,7 +1737,7 @@ fn profile_fingerprint(
     Ok(Sha256::digest(&canonical).into())
 }
 
-fn qrun_v05_fee_profile_fingerprint(
+pub(crate) fn qrun_v05_fee_profile_fingerprint(
     genesis: &LedgerState,
     params: &ConsensusParameters,
 ) -> Result<[u8; 32], ForkStoreError> {
@@ -1748,7 +1748,7 @@ fn qrun_v05_fee_profile_fingerprint(
     Ok(Sha256::digest(&canonical).into())
 }
 
-fn qrun_v05_fee_checkpoint_profile_fingerprint(
+pub(crate) fn qrun_v05_fee_checkpoint_profile_fingerprint(
     base_state: &LedgerState,
     params: &ConsensusParameters,
     checkpoint_commitment: [u8; 32],
@@ -2008,7 +2008,7 @@ where
     ))
 }
 
-fn encode_manifest(
+pub(crate) fn encode_manifest(
     network_id: &[u8; 32],
     profile_fingerprint: &[u8; 32],
     genesis_tip: &[u8; 32],
@@ -2046,7 +2046,7 @@ fn encode_manifest(
     Ok(bytes)
 }
 
-fn decode_manifest(bytes: &[u8]) -> Result<ParsedManifest, ForkStoreError> {
+pub(crate) fn decode_manifest(bytes: &[u8]) -> Result<ParsedManifest, ForkStoreError> {
     if bytes.len() > MAX_MANIFEST_BYTES {
         return Err(ForkStoreError::ManifestTooLarge);
     }

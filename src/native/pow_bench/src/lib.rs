@@ -431,6 +431,8 @@ pub mod token_forge;
 
 /// QRun canonical checkpoint codec with profile binding and external anti-rollback anchor checks.
 pub mod qrun_v05_checkpoint_candidate;
+/// Candidate-only canonical QRM1 journal codec for live External-CAS checkpoint re-rooting; no migration runtime or provider write callsite.
+pub mod qrun_v05_checkpoint_migration_candidate;
 /// Candidate QRun fee-only PoW envelope; payload commitment is not yet wired into fork choice.
 pub mod qrun_v05_fee_pow_wire_candidate;
 pub mod qrun_v05_genesis_candidate;
