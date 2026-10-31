@@ -120,6 +120,7 @@ pub struct QRunHistoryArchiveSummary {
     pub(crate) archive_id: [u8; 32],
     pub(crate) archive_commitment: [u8; 32],
     pub(crate) previous_manifest_anchor: [u8; 32],
+    previous_manifest_bytes: Vec<u8>,
     pub(crate) network_id: [u8; 32],
     pub(crate) profile_fingerprint: [u8; 32],
     pub(crate) genesis_tip: [u8; 32],
@@ -140,6 +141,11 @@ impl QRunHistoryArchiveSummary {
 
     pub fn previous_manifest_anchor(&self) -> &[u8; 32] {
         &self.previous_manifest_anchor
+    }
+
+    /// Exact PFS2 manifest bytes covered by the verified QRA1 descriptor and anchor.
+    pub fn previous_manifest_bytes(&self) -> &[u8] {
+        &self.previous_manifest_bytes
     }
 
     pub fn network_id(&self) -> &[u8; 32] {
@@ -665,6 +671,7 @@ fn verify_qrun_v05_history_archive_inner(
         archive_id: descriptor.archive_id,
         archive_commitment: archive_commitment(&descriptor_bytes),
         previous_manifest_anchor: descriptor.previous_manifest_anchor,
+        previous_manifest_bytes: descriptor.previous_manifest,
         network_id: manifest.network_id,
         profile_fingerprint: manifest.profile_fingerprint,
         genesis_tip: manifest.genesis_tip,
@@ -1238,6 +1245,150 @@ mod tests {
             journal.encode(&pin, &params, &wrong_branch_count),
             Err(crate::qrun_v05_checkpoint_migration_candidate::QRunCheckpointMigrationError::ArchiveBindingMismatch)
         );
+
+        let mut wrong_manifest_bytes = archive.clone();
+        wrong_manifest_bytes.previous_manifest_bytes[138] ^= 1;
+        assert_eq!(
+            journal.encode(&pin, &params, &wrong_manifest_bytes),
+            Err(crate::qrun_v05_checkpoint_migration_candidate::QRunCheckpointMigrationError::ArchiveBindingMismatch)
+        );
+    }
+
+    #[test]
+    fn qrm1_preflight_builds_exact_checkpoint_manifest_and_cas_intent_without_provider_writes() {
+        use crate::{
+            external_cas_anchor_candidate::{ExternalCasPin, ExternalCasRecord},
+            qrun_v05_checkpoint_candidate::QRunV05PowCheckpoint,
+            qrun_v05_checkpoint_migration_candidate::{
+                prepare_qrun_v05_checkpoint_migration, QRunCheckpointMigrationJournal,
+            },
+            v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES,
+        };
+
+        let fixture = fixture();
+        let archive = create(&fixture);
+        let owner = [0x2A; 32];
+        let genesis = QRunGenesisV05::new(fixture.network_id, owner).unwrap();
+        let pin = ExternalCasPin {
+            provider_id: [0x91; 32],
+            network_id: fixture.network_id,
+            genesis_digest: genesis.commitment(),
+            receipt_key_id: [0x92; 32],
+            receipt_public_key: [0x93; ML_DSA_65_PUBLIC_KEY_BYTES],
+        };
+        let previous_record = ExternalCasRecord {
+            generation: 7,
+            provider_id: pin.provider_id,
+            network_id: pin.network_id,
+            genesis_digest: pin.genesis_digest,
+            previous_record_digest: [0x94; 32],
+            previous_state_digest: [0x95; 32],
+            next_state_digest: fixture.manifest_anchor,
+            operation_id: [0x96; 32],
+            request_digest: [0x97; 32],
+        };
+        let expected_parent = [0x98; 32];
+        let plan = prepare_qrun_v05_checkpoint_migration(
+            &fixture.store,
+            &archive,
+            owner,
+            &fixture.params,
+            &pin,
+            previous_record.clone(),
+            8,
+            expected_parent,
+        )
+        .unwrap();
+
+        let journal = plan.journal();
+        assert_eq!(journal.previous_record, previous_record);
+        assert_eq!(journal.previous_manifest, fixture.manifest_bytes);
+        assert_eq!(journal.archive_id, archive.archive_id);
+        assert_eq!(journal.archive_commitment, archive.archive_commitment);
+        assert_eq!(
+            journal.expected_parent_checkpoint_commitment,
+            expected_parent
+        );
+        assert_eq!(
+            journal.minimum_checkpoint_height,
+            fixture.store.canonical_height()
+        );
+        assert_eq!(
+            QRunV05PowCheckpoint::commitment_for_bytes(&journal.checkpoint_bytes),
+            journal.checkpoint_commitment
+        );
+
+        let next_manifest = decode_manifest(&journal.next_manifest).unwrap();
+        assert_eq!(next_manifest.network_id, fixture.network_id);
+        assert_eq!(next_manifest.genesis_tip, fixture.branch_digest);
+        assert_eq!(next_manifest.canonical_tip, fixture.branch_digest);
+        assert!(next_manifest.digests.is_empty());
+        assert_eq!(
+            journal.previous_object_generation,
+            journal.previous_record.generation + 1
+        );
+        assert_eq!(
+            journal.next_object_generation,
+            journal.next_record.generation + 1
+        );
+
+        let request = plan.external_cas_write_request(&pin).unwrap();
+        assert_ne!(request.request_nonce, [0; 32]);
+        assert_ne!(request.operation_id, [0; 32]);
+        assert_eq!(request.expected_generation, previous_record.generation);
+        assert_eq!(request.expected_object_generation, 8);
+        assert_eq!(request.next_record, journal.next_record);
+        assert_eq!(
+            QRunCheckpointMigrationJournal::decode(
+                plan.journal_bytes(),
+                &pin,
+                &fixture.params,
+                &archive
+            )
+            .unwrap(),
+            *journal
+        );
+
+        // The preflight only builds local evidence. The active Genesis-rooted PFS2 remains intact.
+        assert_eq!(
+            fixture.store.manifest_anchor().unwrap(),
+            fixture.manifest_anchor
+        );
+        assert_eq!(fixture.store.canonical_tip(), fixture.branch_digest);
+        assert_eq!(fixture.store.canonical_height(), 1);
+
+        let mut wrong_anchor_record = previous_record;
+        wrong_anchor_record.next_state_digest[0] ^= 1;
+        assert!(matches!(
+            prepare_qrun_v05_checkpoint_migration(
+                &fixture.store,
+                &archive,
+                owner,
+                &fixture.params,
+                &pin,
+                wrong_anchor_record,
+                8,
+                expected_parent
+            ),
+            Err(crate::qrun_v05_checkpoint_migration_candidate::QRunCheckpointMigrationError::InvalidBinding)
+        ));
+
+        let mut wrong_archive = archive.clone();
+        wrong_archive.canonical_tip[0] ^= 1;
+        let correct_record = plan.journal().previous_record.clone();
+        assert!(matches!(
+            prepare_qrun_v05_checkpoint_migration(
+                &fixture.store,
+                &wrong_archive,
+                owner,
+                &fixture.params,
+                &pin,
+                correct_record,
+                8,
+                expected_parent
+            ),
+            Err(crate::qrun_v05_checkpoint_migration_candidate::QRunCheckpointMigrationError::ArchiveBindingMismatch)
+        ));
     }
 
     #[test]
