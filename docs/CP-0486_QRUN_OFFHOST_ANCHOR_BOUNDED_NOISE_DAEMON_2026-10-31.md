@@ -27,8 +27,17 @@ production deployment. Nothing binds a listener until a caller explicitly invoke
 The Noise static private key is redacted from Debug and held by a shared wrapper that overwrites its
 key bytes when the last worker/daemon reference is dropped. The Anchor and Provider pins must validate
 as one domain, the server key must be nonzero, and trusted client keys must be distinct and nonzero.
+Before the listener is bound, the daemon compares the complete Anchor and Provider pin values against
+the exact pins held by the injected `ExternalCasOffhostAnchorMemoryModel`. Anchor ID, Provider ID,
+Network ID, Genesis digest, both receipt key IDs, and both full ML-DSA public keys must match
+byte-for-byte.
 The full Noise profile still binds Anchor ID, Provider ID, Network ID, Genesis digest and both
 receipt-key identities through the existing transport handler.
+Worker threads use scoped lifetimes and observe the caller's shutdown flag directly before starting
+another queued socket. This avoids a propagation race in which a worker could otherwise begin queued
+work after shutdown was requested.
+Runtime stats include the number of worker threads actually started in addition to accepted,
+overload-rejected, completed, and failed counts.
 
 ## Explicit exclusions
 
@@ -40,8 +49,22 @@ Anchor signer. The existing memory model is suitable for local tests only.
 
 ## Validation
 
-The module includes unit tests for worker/queue limits and Noise client allowlist validation.
-Full crate tests, all-target check, rustfmt, and Windows P2P loopback CI must still pass on the PR
-commit before this candidate can be accepted. A real AWS staging deployment, independent-host tests,
-operational key rotation, rate limiting at the network edge, and external security review remain
-separate qualification gates.
+The lifecycle test suite now exercises a real loopback daemon using independent ML-DSA Provider
+and Anchor fixtures, authenticated Noise Read with signature-verified receipt, a provider-proof
+CAS followed by a stale-state conflict, exact config/model pin mismatch rejection before listener
+bind, unpinned client rejection, incorrect server-key pin rejection, handshake timeout followed by
+worker reuse, bounded queue overload, worker-count ceilings, and shutdown/join behavior.
+
+Windows local validation for the lifecycle expansion (package `src/native/pow_bench`):
+- `cargo test --lib --locked --offline`: 1,021 passed, 0 failed.
+- Focused daemon suite: 8 passed, 0 failed.
+- `cargo check --all-targets --locked --offline`: passed.
+- `cargo fmt --all -- --check`: passed.
+- `git diff --check`: passed.
+
+The all-target check reports existing unused/dead-code warnings in unrelated modules and binaries;
+no warnings were emitted from the changed daemon, protocol-pin, or transport files. CI for the
+resulting PR commit and both push and pull_request workflow events must still pass before this
+candidate can be accepted. A real AWS staging deployment, independent-host tests, operational key
+rotation, rate limiting at the network edge, and external security review remain separate
+qualification gates.
