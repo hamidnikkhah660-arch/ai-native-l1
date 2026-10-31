@@ -2,7 +2,7 @@
 
 Date: 2026-10-31
 
-Status: **AWS CLI-backed adapter candidate implemented and compiled. It has not been executed against AWS: AWS CLI is not installed in the current development environment, and no AWS account, DynamoDB table, Anchor KMS key or independent operator has been provisioned.**
+Status: **AWS CLI-backed adapter candidate now includes explicit one-time bootstrap insertion, strongly consistent read-back and conflict classification. It has not been executed against AWS: AWS CLI is not installed in the current development environment, and no AWS account, DynamoDB table, Anchor KMS key or independent operator has been provisioned.**
 
 ## Scope
 
@@ -11,6 +11,7 @@ New module:
 
 Type:
 - \`AwsDynamoDbOffhostAnchorStore\`, implementing \`ExternalCasOffhostAnchorStore\`.
+- \`provision_bootstrap_if_absent\`, a separate administrator-only operation that performs a conditional one-time bootstrap insert; normal reads never initialize an absent anchor.
 
 This is the first concrete cloud-storage adapter candidate for CP-0482's injectable Anchor store contract. It does not create AWS resources or credentials, provision the Anchor public/private key, expose a network service, or wire the node to a remote Anchor.
 
@@ -35,6 +36,12 @@ The returned item is rejected as corrupt unless it matches the configured:
 
 It then decodes the exact base64 QAS1 state wire, validates canonical fixed length/re-encoding and checks that the stored sequence, Provider object generation and state digest equal values recomputed from the complete decoded state. A missing item is corruption/unprovisioned state; it is never silently initialized from a Provider response.
 
+## Explicit one-time bootstrap
+
+`provision_bootstrap_if_absent` accepts only a validated generation-zero ECR1 bootstrap at Anchor sequence one and Provider object generation one. It issues one DynamoDB `PutItem` guarded by `attribute_not_exists(anchor_id)`, so concurrent provisioners cannot replace an existing anchor. A successful insert is followed by a fresh strongly consistent read and exact full-state equality check before returning `Provisioned`. A conditional-write loser performs a new strongly consistent read and returns `AlreadyExists(current)`; the caller must compare that authoritative state with the reviewed ceremony record. Any malformed, missing or unreadable item fails closed. No first-read or first-write fallback is permitted.
+
+This method is a storage primitive, not an authenticated public endpoint. A deployment must expose it only through a separately authorized, audited provisioning ceremony; routine Anchor runtime credentials must not receive table-create, delete, restore or bootstrap-administration authority.
+
 ## Atomic write path
 
 \`compare_and_swap_atomic\` issues one DynamoDB \`PutItem\` with a ConditionExpression equivalent to:
@@ -47,13 +54,19 @@ A ConditionalCheckFailed response triggers a new strongly consistent base-table 
 
 ## Focused tests
 
-Six tests use an injected scripted CLI runner, without AWS network access:
-1. GetItem requests a strongly consistent base-table read and validates configured pins;
-2. missing item fails closed rather than silently bootstrapping;
-3. altered domain, key IDs, public-key hashes or state digest are rejected;
-4. PutItem's condition checks sequence and full-state digest in one server-side write;
-5. conditional-write failure returns a fresh strongly consistent Conflict observation;
-6. nonconditional CLI failure is Unavailable and is never reported as a conflict.
+Twelve tests use an injected scripted CLI runner, without AWS network access:
+1. explicit bootstrap uses `attribute_not_exists(anchor_id)` and an exact strongly consistent read-back;
+2. a concurrent bootstrap loser reads and returns the authoritative existing state;
+3. nonzero-generation bootstrap input is rejected before any AWS call;
+4. nonconditional bootstrap failure is Unavailable;
+5. a successful PutItem with mismatching read-back is rejected;
+6. a conditional bootstrap failure with no valid item fails closed;
+7. GetItem requests a strongly consistent base-table read and validates configured pins;
+8. missing item fails closed rather than silently bootstrapping;
+9. altered domain, key IDs, public-key hashes or state digest are rejected;
+10. PutItem's CAS condition checks sequence and full-state digest in one server-side write;
+11. conditional-write failure returns a fresh strongly consistent Conflict observation;
+12. nonconditional CLI failure is Unavailable and is never reported as a conflict.
 
 The tests validate argument construction and response parsing. They do **not** prove the AWS service's live behavior, IAM policy, account separation, credentials, backup/restore restrictions or network availability.
 
@@ -61,7 +74,7 @@ The tests validate argument construction and response parsing. They do **not** p
 
 - Install and pin a reviewed AWS CLI v2 build in the staging runtime; test actual process execution and error classification.
 - Provision a disposable single-Region DynamoDB table in a separately administered AWS account/recovery domain.
-- Explicitly provision the generation-zero anchor item in a reviewed ceremony; normal GetItem must never bootstrap it.
+- Exercise the conditional generation-zero bootstrap insert under two live concurrent provisioners; verify exactly one insert wins, then compare the strong read-back with the reviewed ceremony record.
 - Verify live strongly consistent reads, conditional PutItem concurrency, read-after-conflict and response-loss behavior.
 - Apply and independently review IAM/SCP policies that separate service runtime from table deletion, backup restore, policy changes, account recovery and key administration.
 - Provision a distinct Anchor ML-DSA-65 KMS key and test sign/verify, rotation, revocation and recovery under a separate security role.
@@ -74,7 +87,7 @@ The AWS adapter candidate plus its scripted tests do not establish an independen
 
 Exact local validation on the branch containing this adapter:
 - \`cargo fmt --all -- --check\`: PASS
-- \`cargo test --lib --locked --offline\`: PASS, 1002 passed, 0 failed
+- \`cargo test --lib --locked --offline\`: PASS, 1008 passed, 0 failed (includes six additional bootstrap tests)
 - \`cargo check --all-targets --locked --offline\`: PASS (existing unused-import/dead-code warnings in unrelated modules remain)
 - \`git diff --check\`: PASS
 

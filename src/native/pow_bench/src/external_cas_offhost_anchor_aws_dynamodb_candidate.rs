@@ -12,7 +12,7 @@ use crate::{
     external_cas_offhost_anchor_protocol_candidate::{
         decode_state, encode_state, ExternalCasOffhostAnchorPin, ExternalCasOffhostAnchorStore,
         ExternalCasOffhostAnchorStoreCasOutcome, ExternalCasOffhostAnchorStoreError,
-        OFFHOST_ANCHOR_STATE_BYTES,
+        ExternalCasOffhostAnchorStoreProvisionOutcome, OFFHOST_ANCHOR_STATE_BYTES,
     },
     v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES,
 };
@@ -324,6 +324,68 @@ impl AwsDynamoDbOffhostAnchorStore {
     }
 }
 impl ExternalCasOffhostAnchorStore for AwsDynamoDbOffhostAnchorStore {
+    fn provision_bootstrap_if_absent(
+        &self,
+        bootstrap: &ExternalCasOffhostAnchorState,
+    ) -> Result<ExternalCasOffhostAnchorStoreProvisionOutcome, ExternalCasOffhostAnchorStoreError>
+    {
+        // A bootstrap is exactly the generation-zero record at Anchor sequence/object generation
+        // one. Validation also requires every operation/receipt/predecessor field to be zero.
+        if bootstrap.provider_record.generation != 0 || bootstrap.sequence != 1 {
+            return Err(ExternalCasOffhostAnchorStoreError::Corrupt);
+        }
+        bootstrap
+            .validate(&self.provider_pin)
+            .map_err(|_| ExternalCasOffhostAnchorStoreError::Corrupt)?;
+
+        let item = self.item_for_state(bootstrap)?;
+        let names = json!({ "#anchor_id": "anchor_id" });
+        let arguments: Vec<OsString> = [
+            "dynamodb",
+            "put-item",
+            "--table-name",
+            &self.table_name,
+            "--item",
+            &json_arg(&item)?,
+            "--condition-expression",
+            "attribute_not_exists(#anchor_id)",
+            "--expression-attribute-names",
+            &json_arg(&names)?,
+            "--no-cli-pager",
+            "--cli-connect-timeout",
+            "5",
+            "--cli-read-timeout",
+            "15",
+            "--region",
+            &self.region,
+            "--output",
+            "json",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
+
+        let output = self.run(&arguments)?;
+        if !output.success {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("ConditionalCheckFailedException") {
+                // Another provisioner won the one-time insert. Read the item authoritatively;
+                // never trust a CLI conflict payload or treat the caller's bootstrap as installed.
+                let current = self.load_consistent()?;
+                return Ok(ExternalCasOffhostAnchorStoreProvisionOutcome::AlreadyExists(current));
+            }
+            return Err(ExternalCasOffhostAnchorStoreError::Unavailable);
+        }
+
+        // PutItem success is not enough for the ceremony: confirm the complete state by a fresh
+        // strongly consistent read before reporting that provisioning completed.
+        let current = self.load_consistent()?;
+        if current != *bootstrap {
+            return Err(ExternalCasOffhostAnchorStoreError::Corrupt);
+        }
+        Ok(ExternalCasOffhostAnchorStoreProvisionOutcome::Provisioned)
+    }
+
     fn load_consistent(
         &self,
     ) -> Result<ExternalCasOffhostAnchorState, ExternalCasOffhostAnchorStoreError> {
@@ -553,6 +615,121 @@ mod tests {
     fn argument_value<'a>(args: &'a [String], flag: &str) -> &'a str {
         let index = args.iter().position(|arg| arg == flag).unwrap();
         &args[index + 1]
+    }
+
+    #[test]
+    fn explicit_bootstrap_uses_absent_key_condition_and_strong_readback() {
+        let f = fixture();
+        let placeholder = store_with(&f, Arc::new(ScriptedRunner::default()));
+        let persisted = item_response(&placeholder, &f.bootstrap);
+        let runner = Arc::new(ScriptedRunner::new(vec![
+            cli_ok(b"{}".to_vec()),
+            cli_ok(persisted),
+        ]));
+        let store = store_with(&f, runner.clone());
+
+        assert_eq!(
+            store.provision_bootstrap_if_absent(&f.bootstrap).unwrap(),
+            ExternalCasOffhostAnchorStoreProvisionOutcome::Provisioned
+        );
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0][1], "put-item");
+        assert_eq!(
+            argument_value(&calls[0], "--condition-expression"),
+            "attribute_not_exists(#anchor_id)"
+        );
+        let names: Value =
+            serde_json::from_str(argument_value(&calls[0], "--expression-attribute-names"))
+                .unwrap();
+        assert_eq!(names["#anchor_id"], "anchor_id");
+        assert_eq!(calls[1][1], "get-item");
+        assert!(calls[1].iter().any(|arg| arg == "--consistent-read"));
+    }
+
+    #[test]
+    fn concurrent_bootstrap_loser_reads_and_returns_existing_authoritative_state() {
+        let f = fixture();
+        let placeholder = store_with(&f, Arc::new(ScriptedRunner::default()));
+        let existing = item_response(&placeholder, &f.bootstrap);
+        let runner = Arc::new(ScriptedRunner::new(vec![
+            cli_error("An error occurred (ConditionalCheckFailedException) when calling the PutItem operation."),
+            cli_ok(existing),
+        ]));
+        let store = store_with(&f, runner.clone());
+
+        assert_eq!(
+            store.provision_bootstrap_if_absent(&f.bootstrap).unwrap(),
+            ExternalCasOffhostAnchorStoreProvisionOutcome::AlreadyExists(f.bootstrap.clone())
+        );
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1][1], "get-item");
+        assert!(calls[1].iter().any(|arg| arg == "--consistent-read"));
+    }
+
+    #[test]
+    fn bootstrap_refuses_nonzero_generation_before_any_aws_call() {
+        let f = fixture();
+        let invalid = next_state(&f);
+        let runner = Arc::new(ScriptedRunner::default());
+        let store = store_with(&f, runner.clone());
+
+        assert_eq!(
+            store.provision_bootstrap_if_absent(&invalid),
+            Err(ExternalCasOffhostAnchorStoreError::Corrupt)
+        );
+        assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn bootstrap_nonconditional_aws_failure_is_unavailable() {
+        let f = fixture();
+        let runner = Arc::new(ScriptedRunner::new(vec![cli_error(
+            "AccessDeniedException",
+        )]));
+        let store = store_with(&f, runner.clone());
+
+        assert_eq!(
+            store.provision_bootstrap_if_absent(&f.bootstrap),
+            Err(ExternalCasOffhostAnchorStoreError::Unavailable)
+        );
+        assert_eq!(runner.calls().len(), 1);
+    }
+
+    #[test]
+    fn bootstrap_success_requires_exact_strong_readback() {
+        let f = fixture();
+        let placeholder = store_with(&f, Arc::new(ScriptedRunner::default()));
+        let conflicting_state = next_state(&f);
+        let response = item_response(&placeholder, &conflicting_state);
+        let runner = Arc::new(ScriptedRunner::new(vec![
+            cli_ok(b"{}".to_vec()),
+            cli_ok(response),
+        ]));
+        let store = store_with(&f, runner.clone());
+
+        assert_eq!(
+            store.provision_bootstrap_if_absent(&f.bootstrap),
+            Err(ExternalCasOffhostAnchorStoreError::Corrupt)
+        );
+        assert_eq!(runner.calls().len(), 2);
+    }
+
+    #[test]
+    fn bootstrap_conditional_failure_without_an_item_fails_closed() {
+        let f = fixture();
+        let runner = Arc::new(ScriptedRunner::new(vec![
+            cli_error("ConditionalCheckFailedException"),
+            cli_ok(br#"{ "Item": {} }"#.to_vec()),
+        ]));
+        let store = store_with(&f, runner.clone());
+
+        assert_eq!(
+            store.provision_bootstrap_if_absent(&f.bootstrap),
+            Err(ExternalCasOffhostAnchorStoreError::Corrupt)
+        );
+        assert_eq!(runner.calls().len(), 2);
     }
 
     #[test]
