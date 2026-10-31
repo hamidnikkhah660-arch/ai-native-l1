@@ -916,7 +916,7 @@ fn reject_symlink_if_present(path: &Path) -> Result<(), QRunHistoryArchiveError>
     }
 }
 
-fn read_regular_file_nofollow(
+pub(crate) fn read_regular_file_nofollow(
     path: &Path,
     max_bytes: usize,
 ) -> Result<Vec<u8>, QRunHistoryArchiveError> {
@@ -1104,7 +1104,7 @@ fn branch_file_name(digest: &[u8; 32]) -> String {
     format!("{BRANCH_PREFIX}{}{BRANCH_SUFFIX}", encode_hex(digest))
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
+pub(crate) fn encode_hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
