@@ -21,6 +21,7 @@ use crate::{
         decode_candidate_network_block, PrivateTestnetWireError,
         MAX_CANDIDATE_NETWORK_ENVELOPE_BYTES,
     },
+    qrun_v05_checkpoint_migration_candidate::{QRunV05CheckpointMigrationPlan, MAX_QRM1_BYTES},
     qrun_v05_genesis_candidate::QRunGenesisV05,
     state_machine::{AccountId, LedgerState, StateError, TransactionAuthenticator},
     store_writer_lock::StoreWriterLock,
@@ -54,6 +55,7 @@ const QRUN_PENDING_CHECKSUM_BYTES: usize = 32;
 const QRUN_PENDING_DOMAIN: &[u8] = b"QRUN-V05-EXTERNAL-CAS-PENDING-V1\0";
 const MAX_QRUN_PENDING_BYTES: usize =
     4 + 2 + EXTERNAL_CAS_RECORD_BYTES * 2 + 4 + MAX_MANIFEST_BYTES + QRUN_PENDING_CHECKSUM_BYTES;
+const QRUN_MIGRATION_INTENT_NAME: &str = "qrun-v05-migration.qrm1";
 const LOCK_NAME: &str = "forkstore.lock";
 const BRANCH_PREFIX: &str = "branch-";
 const BRANCH_SUFFIX: &str = ".ptb2";
@@ -85,6 +87,9 @@ pub enum ForkStoreError {
     ExternalCasContract(crate::external_cas_anchor_candidate::ExternalCasError),
     PendingAnchorMalformed,
     PendingRecoveryRequired,
+    MigrationRecoveryRequired,
+    MigrationIntentConflict,
+    MigrationIntentMalformed,
     ExternalAnchorMismatch,
     RandomnessUnavailable,
 }
@@ -140,6 +145,9 @@ impl std::fmt::Display for ForkStoreError {
             Self::ExternalCasContract(error) => write!(f, "QRun external CAS contract rejected: {error}"),
             Self::PendingAnchorMalformed => write!(f, "QRun external-CAS pending commit is malformed or inconsistent"),
             Self::PendingRecoveryRequired => write!(f, "QRun external-CAS commit recovery is required; reopen the store before writing again"),
+            Self::MigrationRecoveryRequired => write!(f, "QRun checkpoint migration intent is durable; migration recovery is required before opening or writing the active store"),
+            Self::MigrationIntentConflict => write!(f, "a different QRM1 migration intent already exists; refusing to replace it"),
+            Self::MigrationIntentMalformed => write!(f, "QRM1 migration intent is not a bounded regular file"),
             Self::ExternalAnchorMismatch => write!(f, "QRun external anchor does not match the durable manifest or pinned record"),
             Self::RandomnessUnavailable => write!(f, "secure randomness is unavailable for QRun external-CAS operation IDs"),
         }
@@ -493,6 +501,11 @@ impl PrivateTestnetForkStore {
         let directory = directory.as_ref().to_path_buf();
         fs::create_dir_all(&directory)?;
         let writer_lock = acquire_writer_lock(&directory)?;
+        // QRM1 has a dedicated recovery protocol. Ordinary startup must fail closed until
+        // provider + QCF1 + PFS2 reconciliation has been implemented and completed.
+        if qrun_migration_intent_exists(&directory)? {
+            return Err(ForkStoreError::MigrationRecoveryRequired);
+        }
         let mut retained_pending_anchor = None;
         if let Some(recover) = preopen_recovery.as_mut() {
             if let Some((recovered_anchor, retain_pending)) = recover(&directory)? {
@@ -757,6 +770,80 @@ impl PrivateTestnetForkStore {
         Ok(entries)
     }
 
+    /// Durably publish the exact QRM1 bytes prepared from this still-open, replay-validated
+    /// Genesis-rooted store. The held PFS2 writer lock is the maintenance lock for this stage.
+    /// Publication is create-once: an identical retry is idempotent, while any different prior
+    /// intent or an in-flight QAP1 commit is rejected. No provider I/O, QCF1 update, active
+    /// manifest replacement, or archive deletion occurs here.
+    pub(crate) fn persist_qrun_v05_migration_intent(
+        &self,
+        plan: &QRunV05CheckpointMigrationPlan,
+    ) -> Result<(), ForkStoreError> {
+        if self.profile != ForkStoreProfile::QRunV05FeeOnly {
+            return Err(ForkStoreError::ManifestProfileMismatch);
+        }
+        let journal = plan.journal();
+        let bytes = plan.journal_bytes();
+        let old_anchor = manifest_anchor_commitment(&journal.previous_manifest);
+        if bytes.len() > MAX_QRM1_BYTES
+            || !bytes.starts_with(b"QRM1")
+            || journal.previous_manifest.is_empty()
+            || journal.next_manifest.is_empty()
+            || journal.archive_commitment == [0; 32]
+            || journal.archive_id
+                != crate::qrun_v05_checkpoint_migration_candidate::QRunCheckpointMigrationJournal::archive_id_for_previous_manifest(old_anchor)
+        {
+            return Err(ForkStoreError::MigrationIntentMalformed);
+        }
+
+        let current_manifest =
+            read_bounded_file(&self.directory.join(MANIFEST_NAME), MAX_MANIFEST_BYTES).map_err(
+                |error| match error {
+                    BoundedReadError::Io(error) => ForkStoreError::Io(error),
+                    BoundedReadError::TooLarge => ForkStoreError::ManifestTooLarge,
+                },
+            )?;
+        let expected_genesis =
+            qrun_v05_genesis_commitment_for_owner(&self.genesis, journal.owner_account)?;
+        if current_manifest != journal.previous_manifest
+            || old_anchor != journal.previous_record.next_state_digest
+            || journal.previous_record.provider_id != journal.next_record.provider_id
+            || journal.previous_record.network_id != self.genesis.network_id()
+            || journal.next_record.network_id != self.genesis.network_id()
+            || journal.previous_record.genesis_digest != expected_genesis
+            || journal.next_record.genesis_digest != expected_genesis
+            || journal.previous_record.generation.checked_add(1)
+                != Some(journal.next_record.generation)
+            || journal.previous_object_generation.checked_add(1)
+                != Some(journal.next_object_generation)
+            || journal.previous_record.generation.checked_add(1)
+                != Some(journal.previous_object_generation)
+            || journal.next_record.generation.checked_add(1) != Some(journal.next_object_generation)
+            || journal
+                .previous_record
+                .validate_successor(&journal.next_record)
+                .is_err()
+            || manifest_anchor_commitment(&journal.next_manifest)
+                != journal.next_record.next_state_digest
+            || self.manifest_anchor()? != journal.previous_record.next_state_digest
+        {
+            return Err(ForkStoreError::ExternalAnchorMismatch);
+        }
+
+        if path_exists_no_follow(&self.directory.join(QRUN_PENDING_NAME))? {
+            return Err(ForkStoreError::PendingRecoveryRequired);
+        }
+        let intent_path = self.directory.join(QRUN_MIGRATION_INTENT_NAME);
+        if let Some(existing) = read_existing_qrm1_intent(&intent_path)? {
+            return if existing == bytes {
+                Ok(())
+            } else {
+                Err(ForkStoreError::MigrationIntentConflict)
+            };
+        }
+        write_qrm1_intent_no_replace(&intent_path, bytes)
+    }
+
     pub fn manifest_anchor(&self) -> Result<[u8; 32], ForkStoreError> {
         let bytes = read_bounded_file(&self.directory.join(MANIFEST_NAME), MAX_MANIFEST_BYTES)
             .map_err(|error| match error {
@@ -794,6 +881,9 @@ impl PrivateTestnetForkStore {
         authenticator: &A,
         clock: &dyn ReferenceTimeProvider,
     ) -> Result<ForkChoiceOutcome, ForkStoreError> {
+        if qrun_migration_intent_exists(&self.directory)? {
+            return Err(ForkStoreError::MigrationRecoveryRequired);
+        }
         let is_qfp5 = envelope.starts_with(b"QFP5");
         if is_qfp5 != self.profile.is_qrun_fee_only() {
             return Err(ForkStoreError::Fork(ForkChoiceError::ExecutionModeMismatch));
@@ -1528,6 +1618,9 @@ where
         if !self.store.profile.is_qrun_fee_only() {
             return Err(ForkStoreError::ManifestProfileMismatch);
         }
+        if qrun_migration_intent_exists(&self.store.directory)? {
+            return Err(ForkStoreError::MigrationRecoveryRequired);
+        }
         if self.floor_write_blocked {
             return Err(ForkStoreError::PendingRecoveryRequired);
         }
@@ -1741,6 +1834,117 @@ fn read_bounded_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, BoundedRe
         return Err(BoundedReadError::TooLarge);
     }
     Ok(bytes)
+}
+
+fn path_exists_no_follow(path: &Path) -> Result<bool, ForkStoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(ForkStoreError::Io(error)),
+    }
+}
+
+fn qrun_migration_intent_exists(directory: &Path) -> Result<bool, ForkStoreError> {
+    path_exists_no_follow(&directory.join(QRUN_MIGRATION_INTENT_NAME))
+}
+
+fn read_existing_qrm1_intent(path: &Path) -> Result<Option<Vec<u8>>, ForkStoreError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ForkStoreError::Io(error)),
+    };
+    if !metadata.file_type().is_file() || metadata.len() > MAX_QRM1_BYTES as u64 {
+        return Err(ForkStoreError::MigrationIntentMalformed);
+    }
+    let bytes = read_bounded_file(path, MAX_QRM1_BYTES).map_err(|error| match error {
+        BoundedReadError::Io(error) => ForkStoreError::Io(error),
+        BoundedReadError::TooLarge => ForkStoreError::MigrationIntentMalformed,
+    })?;
+    Ok(Some(bytes))
+}
+
+#[cfg(windows)]
+fn publish_qrm1_temp_no_replace(source: &Path, destination: &Path) -> io::Result<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let from: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, new_name: *const u16, flags: u32) -> i32;
+    }
+    // Omitting MOVEFILE_REPLACE_EXISTING makes publication no-replace. WRITE_THROUGH asks
+    // Windows to complete the rename before returning; success consumes the temp path.
+    let success = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    if success == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(true)
+    }
+}
+
+#[cfg(not(windows))]
+fn publish_qrm1_temp_no_replace(source: &Path, destination: &Path) -> io::Result<bool> {
+    fs::hard_link(source, destination)?;
+    Ok(false)
+}
+
+fn write_qrm1_intent_no_replace(path: &Path, bytes: &[u8]) -> Result<(), ForkStoreError> {
+    if bytes.is_empty() || bytes.len() > MAX_QRM1_BYTES || !bytes.starts_with(b"QRM1") {
+        return Err(ForkStoreError::MigrationIntentMalformed);
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let final_name = path
+        .file_name()
+        .ok_or(ForkStoreError::MigrationIntentMalformed)?;
+    let temp = unique_temp_path(parent, final_name);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    let write_result = file
+        .write_all(bytes)
+        .and_then(|_| file.flush())
+        .and_then(|_| file.sync_all());
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp);
+        let _ = sync_parent(parent);
+        return Err(ForkStoreError::Io(error));
+    }
+
+    // Windows uses a no-replace write-through move; Unix uses an atomic same-directory hard
+    // link followed by unlink + directory fsync. Both publish only the already-synced complete
+    // bytes and never replace a pre-existing QRM1.
+    let (publish_result, temp_consumed) = match publish_qrm1_temp_no_replace(&temp, path) {
+        Ok(consumed) => (Ok(()), consumed),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let existing_result = match read_existing_qrm1_intent(path) {
+                Ok(Some(existing)) if existing == bytes => Ok(()),
+                Ok(_) => Err(ForkStoreError::MigrationIntentConflict),
+                Err(error) => Err(error),
+            };
+            (existing_result, false)
+        }
+        Err(error) => (Err(ForkStoreError::Io(error)), false),
+    };
+    let cleanup_result = if temp_consumed {
+        Ok(())
+    } else {
+        fs::remove_file(&temp).map_err(ForkStoreError::Io)
+    };
+    publish_result?;
+    cleanup_result?;
+    if temp_consumed {
+        Ok(())
+    } else {
+        sync_parent(parent).map_err(ForkStoreError::Io)
+    }
 }
 
 pub(crate) fn manifest_anchor_commitment(manifest_bytes: &[u8]) -> [u8; 32] {
@@ -2299,6 +2503,13 @@ fn cleanup_orphan_branch_files(
         let name = entry.file_name();
         let name = name.to_str().ok_or(ForkStoreError::UnexpectedStoreEntry)?;
         if name == LOCK_NAME || name == MANIFEST_NAME {
+            continue;
+        }
+        if name.starts_with(".qrun-v05-migration.qrm1.tmp-") {
+            // A crash before final QRM1 publication can leave only this uncommitted temp.
+            // The final intent is checked before this cleanup loop; if it exists, startup has
+            // already stopped for migration recovery and does not reach this point.
+            fs::remove_file(entry.path())?;
             continue;
         }
         if name == QRUN_PENDING_NAME {
@@ -3612,7 +3823,7 @@ mod tests {
         let client =
             VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
                 .unwrap();
-        let store = QRunV05ExternalCasForkStore::open_for_owner_genesis_with_floor(
+        let mut store = QRunV05ExternalCasForkStore::open_for_owner_genesis_with_floor(
             &dir.0,
             genesis.clone(),
             WALLET_BOUND_OWNER,
@@ -3624,6 +3835,22 @@ mod tests {
             floor,
         )
         .unwrap();
+
+        // An interrupted QRM1 migration intent must block the external-CAS submit path
+        // before it performs a signed provider read or attempts a new CAS operation.
+        let migration_intent_path = dir.0.join(QRUN_MIGRATION_INTENT_NAME);
+        fs::write(&migration_intent_path, b"QRM1-test-intent").unwrap();
+        assert!(matches!(
+            store.submit(&[], &EmptyAuthenticator, &FixedClock),
+            Err(ForkStoreError::MigrationRecoveryRequired)
+        ));
+        {
+            let state = shared.lock().unwrap();
+            assert_eq!(state.record, bootstrap);
+            assert_eq!(state.object_generation, 1);
+            assert!(state.lose_next_commit_response);
+        }
+        fs::remove_file(&migration_intent_path).unwrap();
 
         // Exercise the generic runtime API against the externally anchored backend.
         let mut runtime =

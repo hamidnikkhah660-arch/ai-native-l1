@@ -1265,7 +1265,7 @@ mod tests {
             v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES,
         };
 
-        let fixture = fixture();
+        let mut fixture = fixture();
         let archive = create(&fixture);
         let owner = [0x2A; 32];
         let genesis = QRunGenesisV05::new(fixture.network_id, owner).unwrap();
@@ -1389,6 +1389,76 @@ mod tests {
             ),
             Err(crate::qrun_v05_checkpoint_migration_candidate::QRunCheckpointMigrationError::ArchiveBindingMismatch)
         ));
+
+        // QRM1 and an ordinary QAP1 block-commit intent may never coexist.
+        let qap1_path = fixture.source.join("qrun-v05-external-cas.pending");
+        fs::write(&qap1_path, b"pending-qap1").unwrap();
+        assert!(matches!(
+            fixture.store.persist_qrun_v05_migration_intent(&plan),
+            Err(crate::private_testnet_fork_store::ForkStoreError::PendingRecoveryRequired)
+        ));
+        fs::remove_file(&qap1_path).unwrap();
+
+        // Durable staging is create-once and local-only. It blocks further PFS2 writes and
+        // ordinary restart until the dedicated signed-provider/QCF1 migration recovery exists.
+        let intent_path = fixture.source.join("qrun-v05-migration.qrm1");
+        fixture
+            .store
+            .persist_qrun_v05_migration_intent(&plan)
+            .unwrap();
+        assert_eq!(fs::read(&intent_path).unwrap(), plan.journal_bytes());
+        fixture
+            .store
+            .persist_qrun_v05_migration_intent(&plan)
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .store
+                .submit(&[], &RejectAllAuthenticator, &FixedClock),
+            Err(crate::private_testnet_fork_store::ForkStoreError::MigrationRecoveryRequired)
+        ));
+        fs::write(&intent_path, b"existing-intent-must-not-be-replaced").unwrap();
+        assert!(matches!(
+            fixture.store.persist_qrun_v05_migration_intent(&plan),
+            Err(crate::private_testnet_fork_store::ForkStoreError::MigrationIntentConflict)
+        ));
+        assert_eq!(
+            fs::read(&intent_path).unwrap(),
+            b"existing-intent-must-not-be-replaced"
+        );
+        drop(fixture.store);
+        assert!(matches!(
+            PrivateTestnetForkStore::open_qrun_v05_fee_only(
+                &fixture.source,
+                genesis.ledger().clone(),
+                fixture.params.clone(),
+                &RejectAllAuthenticator,
+                &FixedClock
+            ),
+            Err(crate::private_testnet_fork_store::ForkStoreError::MigrationRecoveryRequired)
+        ));
+    }
+
+    #[test]
+    fn qrm1_unpublished_temp_is_cleaned_on_reopen_without_changing_active_history() {
+        let fixture = fixture();
+        let orphan_temp = fixture.source.join(".qrun-v05-migration.qrm1.tmp-12345.7");
+        fs::write(&orphan_temp, b"crash-before-final-publication").unwrap();
+        let genesis = QRunGenesisV05::new(fixture.network_id, [0x2A; 32]).unwrap();
+        drop(fixture.store);
+
+        let reopened = PrivateTestnetForkStore::open_qrun_v05_fee_only(
+            &fixture.source,
+            genesis.ledger().clone(),
+            fixture.params.clone(),
+            &RejectAllAuthenticator,
+            &FixedClock,
+        )
+        .unwrap();
+        assert!(!orphan_temp.exists());
+        assert_eq!(reopened.canonical_tip(), fixture.branch_digest);
+        assert_eq!(reopened.canonical_height(), 1);
+        assert_eq!(reopened.manifest_anchor().unwrap(), fixture.manifest_anchor);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 Date: 2026-10-31
 
-Status: **Design proposal only; not implemented, not CI-validated as code, and not a Mainnet approval.** This document specifies a conservative migration from an already initialized Genesis-rooted QFP5 External-CAS provider manifest to a checkpoint-rooted QFP5 suffix manifest. It deliberately does not claim that current checkpoint bootstrap performs this transition.
+Status: **Design proposal with candidate implementation progress.** QRM1 v2 codec, QRA1-bound exact-tip preflight, and local durable-intent staging with fail-closed write/startup guards are implemented as candidate code. The live provider migration transaction, QCF1 reconciliation, checkpoint-rooted manifest installation, and complete crash-recovery engine remain not implemented; this is not a Mainnet approval. This document specifies a conservative migration from an already initialized Genesis-rooted QFP5 External-CAS provider manifest to a checkpoint-rooted QFP5 suffix manifest. It deliberately does not claim that current checkpoint bootstrap performs this transition.
 
 ## 1. Decision and safety boundary
 
@@ -85,6 +85,12 @@ All preparation is performed while the node is stopped or in a strict maintenanc
 14. Only after all checks succeed, remove QRM1 and fsync the active store directory. The verified history archive remains intact.
 
 The ECR1 generation and provider object generation each advance exactly once for this migration. No generation jump, second CAS, fallback provider or implicit floor initialization is permitted.
+
+## 5A. Candidate implementation boundary (2026-10-31)
+
+The current candidate code can build an exact-tip QRunV05CheckpointMigrationPlan from a replay-validated Genesis-rooted PFS2 store and a verified QRA1 archive. It can durably publish the canonical QRM1 bytes with no-replace semantics, reject a conflicting existing intent, prevent coexistence with QAP1, and block ordinary store open and both local and external-CAS block submission while the migration intent is present. A pre-publication orphan temporary file is removed on ordinary reopen only when no final QRM1 intent exists.
+
+This is a prepared-intent boundary only. The candidate does not yet decode and reconcile QRM1 at startup, inspect a fresh signed provider read, advance QCF1, install the checkpoint-rooted PFS2 manifest, or clear QRM1 after verified completion. Consequently a final QRM1 intent intentionally makes ordinary startup fail closed until a dedicated recovery implementation is added. Operators must not create such an intent against a live data directory until that recovery implementation is available and tested.
 
 ## 6. Crash-recovery decision table
 
