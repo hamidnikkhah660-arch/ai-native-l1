@@ -2,7 +2,7 @@
 
 Date: 2026-10-31
 
-Status: **Protocol candidate and in-memory contract tests implemented. No remote Anchor service or production store is deployed.**
+Status: **Signed protocol, injectable atomic-store contract, process-local test adapter and AWS DynamoDB CLI adapter candidate implemented. No AWS account/table, live AWS request, Anchor KMS key, independent operator domain, network service or node integration is deployed or qualified.**
 
 ## Scope
 
@@ -53,11 +53,11 @@ If the Anchor CAS commits but signing its response fails, the state remains comm
 
 A client-side read followed by an unconditional write is explicitly forbidden. The adapter returns the full authoritative current state on a precondition conflict. Storage errors, unavailable state, corrupt data or an ambiguous write are fail-closed.
 
-The included \`ExternalCasOffhostAnchorMemoryStore\` is only a process-local test implementation. It is neither durable nor off-host and does not protect against process/host rollback. The AWS DynamoDB implementation remains a future task under CP-0480.
+The included \`ExternalCasOffhostAnchorMemoryStore\` is only a process-local test implementation. It is neither durable nor off-host and does not protect against process/host rollback. CP-0483 adds an \`AwsDynamoDbOffhostAnchorStore\` candidate using AWS CLI v2 without a shell, strongly consistent base-table GetItem and a conditional PutItem that compares both expected sequence and full-state digest. Its six tests use a scripted CLI runner only; the AWS CLI is not installed in this environment and no live AWS request/table/account has been tested or provisioned.
 
 ## Tests
 
-Eleven focused tests cover:
+Twelve focused protocol tests cover:
 1. challenge-bound signed Read wire roundtrip and rejection when replayed against a different challenge;
 2. signed CAS, idempotent retry and fresh Read reconciliation after an ambiguous/lost response;
 3. two concurrent successors against the same predecessor, with exactly one Applied and one Conflict result;
@@ -68,22 +68,23 @@ Eleven focused tests cover:
 8. rejection of a Conflict receipt that certifies the expected old state or a rolled-back sequence;
 9. proof that the atomic store contract compares sequence and the complete state digest in one CAS;
 10. revalidation of every loaded state observation after service construction;
-11. commit persistence despite Anchor response-signing failure, resolved only by a fresh signed Read.
+11. commit persistence despite Anchor response-signing failure, resolved only by a fresh signed Read;
+12. rejection of a stale adapter Conflict payload unless a fresh authoritative read confirms the current high-water state.
 
 ## Validation
 
 Exact local validation on 2026-10-31, on the dependent atomic-store-contract branch:
 - `cargo fmt --all -- --check`: PASS
-- `cargo test --lib --locked --offline`: PASS, 995 passed, 0 failed
+- `cargo test --lib --locked --offline`: PASS, 1002 passed, 0 failed
 - `cargo check --all-targets --locked --offline`: PASS (existing unused-import/dead-code warnings in unrelated modules remain)
 - `git diff --check`: PASS
 
-The 11 focused protocol tests are included in the 995-test library run. Remote CI is tracked by PR #112 and must be rechecked after pushing the final local hardening diff.
+The 12 focused protocol tests and 6 scripted DynamoDB adapter tests are included in the 1002-test library run. The AWS adapter test runner simulates CLI responses and does not contact AWS.
 
 ## Remaining production gates
 
 Still not implemented or qualified:
-- a real separately administered remote storage adapter (AWS/DynamoDB candidate is only a design);
+- live qualification and deployment of the AWS DynamoDB adapter in a separately administered staging account/recovery domain, including actual CLI execution, IAM/SCP, backup/restore and concurrency behavior;
 - the deployable Anchor daemon, authenticated transport and operational configuration;
 - production KMS signer integration using a distinct Anchor key and independently governed key lifecycle;
 - explicit bootstrap provisioning ceremony and restore/delete/policy separation in a separate account;

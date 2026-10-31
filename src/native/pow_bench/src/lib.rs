@@ -36,6 +36,8 @@ pub mod external_cas_aws_kms_signer_candidate;
 pub mod external_cas_disk_provider_candidate;
 pub mod external_cas_floor_store_candidate;
 pub mod external_cas_noise_transport_candidate;
+/// CP-0483 AWS DynamoDB strongly-consistent, conditional-PutItem adapter candidate; no provisioned cloud resources.
+pub mod external_cas_offhost_anchor_aws_dynamodb_candidate;
 /// CP-0481 service-side validation of Provider ECR1/ECS1 proofs for a future off-host Anchor; no storage or runtime callsite.
 pub mod external_cas_offhost_anchor_candidate;
 /// CP-0482 challenge-bound signed Anchor protocol and in-memory concurrency model; no cloud storage or runtime callsite.
