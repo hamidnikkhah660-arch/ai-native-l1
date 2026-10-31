@@ -1,120 +1,99 @@
-# CP-0482 — QRun Off-Host Anchor Signed Read/CAS Protocol
+# CP-0482 — QRun Off-Host Anchor Signed Protocol and Atomic Store Contract
 
 Date: 2026-10-31
 
-Status: **The challenge-bound receipt codec, separate Anchor-key pin, verification API and process-local concurrency model are implemented as candidate code. This is not a production storage adapter or deployed off-host service.**
+Status: **Protocol candidate and in-memory contract tests implemented. No remote Anchor service or production store is deployed.**
 
 ## Scope
 
-CP-0480 defined the service design. CP-0481 added independent verification of Provider-signed ECR1/ECS1 commit evidence. CP-0482 adds the next protocol layer:
-- a separately pinned Anchor ML-DSA-65 receipt key, required to differ from the Provider receipt key;
-- a fixed-width, canonical signed Anchor receipt carrying the complete high-water state;
-- challenge-bound Read and CAS requests;
-- explicit Observed, Applied, AlreadyApplied and Conflict outcomes;
-- an in-memory, mutex-serialized state machine for adversarial protocol tests.
+CP-0480 specifies the AWS-first off-host monotonic Anchor architecture. CP-0481 implements independent verification of Provider ECR1/ECS1 commit evidence. CP-0482 adds a QRun-specific challenge-bound Anchor receipt protocol and a storage-adapter contract.
 
-New module:
-- src/native/pow_bench/src/external_cas_offhost_anchor_protocol_candidate.rs
+Module:
+- \`src/native/pow_bench/src/external_cas_offhost_anchor_protocol_candidate.rs\`
 
-The module has no network listener, AWS SDK, durable database, persistent challenge/idempotency journal, cloud key provisioning, node startup integration or consensus callsite.
+The module has no cloud SDK, network listener, Anchor private key storage, AWS account/table, node startup integration, or consensus callsite. It is not a deployed Anchor service.
 
-## Canonical receipt and state format
+## Trust and domain separation
 
-The Anchor receipt uses:
-- magic QAR1, version 1;
-- kind and outcome, with reserved bytes required to be zero;
-- client challenge, Anchor ID, Provider ID, Network ID, Genesis digest and Anchor receipt-key ID;
-- operation ID and request digest;
-- expected Anchor sequence, expected predecessor-state digest and requested target-state digest;
-- digest of the returned state and the full canonical state bytes;
-- a distinct ML-DSA-65 signature over a domain-separated SHA-256 digest of the complete payload.
-
-The receipt payload is 796 bytes and the complete receipt is 4,105 bytes including the 3,309-byte ML-DSA-65 signature. The embedded state is 424 bytes and contains:
-- Anchor sequence and Provider object generation;
-- canonical ECR1 record;
-- last operation ID, Provider request digest and first accepted signed ECS1 receipt digest;
-- exact predecessor Anchor sequence and predecessor Anchor state digest used for the last successful CAS.
-
-Every one of these fields is covered by the Anchor state digest. The first accepted Provider receipt digest is retained and never overwritten by an idempotent retry.
-
-The Anchor key pin binds Anchor ID and Provider/Network/Genesis domain and explicitly rejects reuse of the Provider receipt key ID or public key. The node/operator must provision both key pins independently out of band.
+- Provider and Anchor use distinct ML-DSA-65 receipt key IDs and public keys. The Anchor pin is independently configured and bound to the same Provider ID, Network ID and wallet-bound Genesis digest.
+- Receipt signing uses the \`QRUN-OFFHOST-ANCHOR-RECEIPT-V1\` domain.
+- Every receipt binds Anchor ID, Provider ID, Network ID, Genesis digest, Anchor receipt key ID, fresh client challenge, operation ID, request digest, expected predecessor sequence/state digest, target state digest, resulting state digest and the complete canonical Anchor state.
+- The state wire encoding includes the independent Anchor sequence, Provider object generation, canonical ECR1 bytes, last Provider operation ID, request digest, first accepted ECS1 receipt digest, and exact Anchor predecessor sequence/state digest used by the last successful CAS.
+- The full-state digest covers all of those fields. Decoding enforces exact lengths, fixed magic/version/reserved bytes and canonical re-encoding.
+- The canonical state is 424 bytes; the signed receipt payload is 796 bytes; with the 3,309-byte ML-DSA-65 signature, the complete QAR1 receipt is 4,105 bytes.
 
 ## Read protocol
 
-The client supplies a fresh, unpredictable, nonzero challenge plus nonzero operation/request identifiers. The Anchor returns a signed Observed receipt covering the challenge and complete current high-water state.
+A Read request carries a nonzero unpredictable challenge, operation ID and request digest. The Anchor service loads the authoritative state using \`load_consistent\`, revalidates the Provider/Network/Genesis pin and state invariants, and returns a signed \`Read/Observed\` receipt. The response includes the exact state, not only a digest. The client verifies the pinned independent Anchor ML-DSA-65 key, domain, challenge, request identifiers and state digest.
 
-The client:
-1. verifies the out-of-band Anchor pin and distinct key identity;
-2. verifies the Anchor ML-DSA-65 signature;
-3. checks the exact challenge, operation and request identifiers;
-4. decodes and validates the full ECR1/domain/state metadata;
-5. recomputes the complete state digest.
-
-A response from an older challenge is rejected. Fresh challenge generation belongs to the caller and must use a cryptographically secure random source. The current candidate accepts a caller-provided challenge; it does not yet implement an OS CSPRNG or an authenticated network session.
+A receipt signed for one challenge is rejected when replayed against a different challenge. The client is responsible for generating unpredictable fresh challenges; the protocol never treats a reused or stale receipt as a response to a different request.
 
 ## CAS protocol
 
-The request binds:
-- fresh challenge;
-- exact Provider operation ID and Provider request digest;
-- expected Anchor sequence and expected predecessor-state digest;
-- exact target-state digest.
+The client sends:
+- a fresh challenge, operation ID and request digest;
+- expected Anchor sequence and full expected state digest;
+- target state digest;
+- canonical next ECR1 bytes and the Provider's signed ECS1 commit receipt.
 
-The Anchor service must independently verify the Provider ECR1/ECS1 proof using CP-0481 before changing the state. Its backing store must then atomically compare the expected sequence and full state digest and install the exact one-step successor.
+The Anchor service independently verifies the Provider proof using CP-0481. It accepts only the exact one-step successor of the trusted Anchor state. It calls a single \`compare_and_swap_atomic(expected_sequence, expected_state_digest, next_state)\` operation.
 
-The signed response echoes every CAS precondition and the target digest:
-- Applied: the target was atomically installed;
-- AlreadyApplied: the exact same operation, payload and original predecessor already produced the current target;
-- Conflict: the expected predecessor did not match; the receipt authenticates the current state but is not success.
+Outcomes:
+- \`Applied\`: the adapter conditionally installed the exact complete target; the service performs a fresh authoritative read-back and requires field-exact equality before signing success.
+- \`AlreadyApplied\`: the exact operation/request/target/predecessor metadata is already the high-water state and the same Provider proof verifies; the service returns an idempotent signed response without a second sequence advance.
+- \`Conflict\`: the authoritative state differs from the requested predecessor. The signed conflict includes the full current state and cannot be interpreted as success. A state below the expected sequence, or a conflict-shaped response naming the exact requested committed operation, is rejected by the client.
 
-The client API returns the explicit outcome together with the returned state. It never flattens Conflict into a successful state read. Successful outcomes must have sequence exactly expected_sequence + 1, target digest match, operation/request identifiers match, and stored predecessor sequence/digest match the request.
+If the Anchor CAS commits but signing its response fails, the state remains committed. The caller must use a fresh challenge-bound Read, then retry the exact immutable operation only when the authoritative state proves the expected outcome. There is no fallback to local QCF1.
 
-For a retry, the Anchor checks the last operation, request digest, target, and original predecessor sequence/digest before it returns AlreadyApplied. Reuse of an operation ID under a different target or predecessor does not become a second advance.
+## Storage adapter contract
 
-## Storage adapter boundary
+\`ExternalCasOffhostAnchorStore\` requires:
+- \`load_consistent\`: authoritative strongly consistent read;
+- \`compare_and_swap_atomic\`: one server-side conditional update comparing both expected sequence and full state digest and atomically installing the complete next state.
 
-CP-0483 adds an injectable ExternalCasOffhostAnchorStore contract. The protocol now obtains the current item through load_consistent and performs the authoritative update only through compare_and_swap_atomic, which must atomically compare both expected sequence and full predecessor-state digest. The protocol does not implement a read-then-unconditional-write fallback.
+A client-side read followed by an unconditional write is explicitly forbidden. The adapter returns the full authoritative current state on a precondition conflict. Storage errors, unavailable state, corrupt data or an ambiguous write are fail-closed.
 
-ExternalCasOffhostAnchorMemoryStore implements the contract with a process-local Mutex for deterministic tests. A production adapter must be a separately administered durable backend; the in-memory implementation is not rollback resistance, multi-process linearizability, crash durability or independent administration.
+The included \`ExternalCasOffhostAnchorMemoryStore\` is only a process-local test implementation. It is neither durable nor off-host and does not protect against process/host rollback. The AWS DynamoDB implementation remains a future task under CP-0480.
 
-A signing error after the state update models the ambiguous lost-response window: the state remains committed, and the caller must issue a new challenge-bound Read to discover the exact committed state. It must not infer abort from a missing response.
+## Tests
 
-## Focused tests
-
-The protocol test module covers:
-1. signed Read encode/decode and rejection of a receipt replayed against a new challenge;
-2. wrong Anchor domain and altered state rejection;
-3. explicit distinction of Provider and Anchor receipt keys;
-4. signed CAS, exact idempotent retry and fresh Read reconciliation after an omitted response;
-5. one successful response and one signed Conflict in two concurrent successor attempts;
-6. committed CAS surviving an injected Anchor response-signing failure, then recovery by a fresh signed Read.
-
-The full suite additionally retains CP-0481 adversarial Provider-proof tests and the paired Provider/QCF1 rollback-boundary tests.
-
-## Remaining qualification
-
-Not implemented:
-- AWS/DynamoDB or another durable off-host monotonic storage adapter;
-- server-side durable atomic conditional update, durable operation/idempotency record and restore controls;
-- separate-account IAM/KMS provisioning and independent security administration;
-- production client CSPRNG, authenticated transport/session identity, wire framing and deadlines;
-- daemon, service health/availability handling and key rotation/revocation;
-- node startup and QAP1/QCF1/PFS2 integration;
-- cross-process, multi-host, crash, network-partition, restore, failover and independent security tests.
-
-The in-memory mutex is not evidence of DynamoDB conditional-write behavior or production anti-rollback. The off-host release gate remains open.
+Eleven focused tests cover:
+1. challenge-bound signed Read wire roundtrip and rejection when replayed against a different challenge;
+2. signed CAS, idempotent retry and fresh Read reconciliation after an ambiguous/lost response;
+3. two concurrent successors against the same predecessor, with exactly one Applied and one Conflict result;
+4. rejection when the Anchor key ID or public key is the Provider receipt key;
+5. rejection of altered full state and wrong Anchor ID/domain;
+6. rejection of an adapter which claims Applied without changing the authoritative state (read-back mismatch);
+7. rejection of unavailable atomic storage without fallback or publishing the target;
+8. rejection of a Conflict receipt that certifies the expected old state or a rolled-back sequence;
+9. proof that the atomic store contract compares sequence and the complete state digest in one CAS;
+10. revalidation of every loaded state observation after service construction;
+11. commit persistence despite Anchor response-signing failure, resolved only by a fresh signed Read.
 
 ## Validation
 
-Exact-branch validation on 2026-10-31:
+Exact local validation on 2026-10-31, on the dependent atomic-store-contract branch:
 - `cargo fmt --all -- --check`: PASS
-- `cargo test --lib --locked --offline`: PASS, 990 passed, 0 failed, 0 ignored
-- `cargo check --all-targets --locked --offline`: PASS (pre-existing unused-import/dead-code warnings in unrelated modules remain)
+- `cargo test --lib --locked --offline`: PASS, 995 passed, 0 failed
+- `cargo check --all-targets --locked --offline`: PASS (existing unused-import/dead-code warnings in unrelated modules remain)
 - `git diff --check`: PASS
 
-Focused candidate command:
-`cargo test --lib --locked --offline external_cas_offhost_anchor_protocol_candidate`
+The 11 focused protocol tests are included in the 995-test library run. Remote CI is tracked by PR #112 and must be rechecked after pushing the final local hardening diff.
 
-## Release boundary
+## Remaining production gates
 
-CP-0482 does not enable public provider deployment, Mainnet, public mint, firewall changes or QZXB/USDT trading. No consensus, Genesis, Network ID or 10B QZXB supply setting is changed.
+Still not implemented or qualified:
+- a real separately administered remote storage adapter (AWS/DynamoDB candidate is only a design);
+- the deployable Anchor daemon, authenticated transport and operational configuration;
+- production KMS signer integration using a distinct Anchor key and independently governed key lifecycle;
+- explicit bootstrap provisioning ceremony and restore/delete/policy separation in a separate account;
+- staging tests for actual consistency, conditional-write behavior, permissions, backups/restores, concurrency, partitions, crashes, key rotation, regional behavior and audit;
+- independent administrative and recovery custodians;
+- QRun node integration into startup, block acceptance, QAP1/QCF1/PFS2 ordering and recovery;
+- end-to-end multi-host qualification and independent security review.
+
+No AWS resources or independent operators have been provisioned or verified. This protocol/model does not close the off-host anti-rollback release gate.
+
+## Release decision
+
+No changes to consensus, monetary rules, Genesis, Network ID, 10B QZXB supply, public listener, firewall or mint settings. Mainnet release approval remains false and public mint remains disabled.

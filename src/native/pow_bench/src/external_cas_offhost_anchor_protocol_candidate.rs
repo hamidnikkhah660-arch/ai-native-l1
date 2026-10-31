@@ -402,7 +402,18 @@ impl ExternalCasOffhostAnchorReceipt {
         }
         match self.outcome {
             ExternalCasOffhostAnchorReceiptOutcome::Conflict => {
-                // A conflict is authenticated evidence of the current state, never success.
+                // A conflict must prove that the authoritative state differs from the expected
+                // predecessor. A lower sequence is an anchor rollback, and a receipt naming the
+                // exact requested target is success-shaped rather than a conflict.
+                if self.state.sequence < request.expected_sequence
+                    || (self.state.sequence == request.expected_sequence
+                        && self.state_digest == request.expected_state_digest)
+                    || (self.state_digest == request.target_state_digest
+                        && self.state.last_operation_id == request.operation_id
+                        && self.state.last_request_digest == request.request_digest)
+                {
+                    return Err(OffhostAnchorProtocolError::WrongOutcome);
+                }
                 Ok((
                     ExternalCasOffhostAnchorReceiptOutcome::Conflict,
                     self.state.clone(),
@@ -651,6 +662,9 @@ impl ExternalCasOffhostAnchorMemoryModel {
             .store
             .load_consistent()
             .map_err(OffhostAnchorProtocolError::Store)?;
+        // Revalidate every authoritative observation; a backend can become corrupt after
+        // service construction or return data from a restored/incorrect persistence domain.
+        state.validate(&self.provider_pin)?;
 
         let mut receipt = new_receipt(
             ExternalCasOffhostAnchorReceiptKind::Read,
@@ -681,6 +695,7 @@ impl ExternalCasOffhostAnchorMemoryModel {
             .store
             .load_consistent()
             .map_err(OffhostAnchorProtocolError::Store)?;
+        state.validate(&self.provider_pin)?;
 
         // Exact operation retry is checked before the stale predecessor precondition.
         if state.digest()? == request.target_state_digest
@@ -767,6 +782,18 @@ impl ExternalCasOffhostAnchorMemoryModel {
             .map_err(OffhostAnchorProtocolError::Store)?
         {
             ExternalCasOffhostAnchorStoreCasOutcome::Applied => {
+                // Never sign success from the adapter's return value alone. Re-read the
+                // authoritative item and require byte/field-exact equality with the target.
+                let read_back = self
+                    .store
+                    .load_consistent()
+                    .map_err(OffhostAnchorProtocolError::Store)?;
+                read_back.validate(&self.provider_pin)?;
+                if read_back != verified.next_state {
+                    return Err(OffhostAnchorProtocolError::Store(
+                        ExternalCasOffhostAnchorStoreError::Corrupt,
+                    ));
+                }
                 let mut receipt = new_receipt(
                     ExternalCasOffhostAnchorReceiptKind::Cas,
                     ExternalCasOffhostAnchorReceiptOutcome::Applied,
@@ -783,6 +810,7 @@ impl ExternalCasOffhostAnchorMemoryModel {
                 Ok(receipt)
             }
             ExternalCasOffhostAnchorStoreCasOutcome::Conflict(current) => {
+                current.validate(&self.provider_pin)?;
                 // A concurrent exact retry may have won the CAS while this request was in flight.
                 if current.digest()? == request.target_state_digest
                     && current.last_operation_id == request.operation_id
@@ -834,9 +862,12 @@ impl ExternalCasOffhostAnchorMemoryModel {
     }
 
     pub fn snapshot(&self) -> Result<ExternalCasOffhostAnchorState, OffhostAnchorProtocolError> {
-        self.store
+        let state = self
+            .store
             .load_consistent()
-            .map_err(OffhostAnchorProtocolError::Store)
+            .map_err(OffhostAnchorProtocolError::Store)?;
+        state.validate(&self.provider_pin)?;
+        Ok(state)
     }
 }
 
@@ -874,6 +905,31 @@ mod tests {
         ) -> Result<ExternalCasOffhostAnchorStoreCasOutcome, ExternalCasOffhostAnchorStoreError>
         {
             Err(ExternalCasOffhostAnchorStoreError::Unavailable)
+        }
+    }
+
+    struct FalseAppliedStore {
+        state: Mutex<ExternalCasOffhostAnchorState>,
+    }
+    impl ExternalCasOffhostAnchorStore for FalseAppliedStore {
+        fn load_consistent(
+            &self,
+        ) -> Result<ExternalCasOffhostAnchorState, ExternalCasOffhostAnchorStoreError> {
+            self.state
+                .lock()
+                .map(|state| state.clone())
+                .map_err(|_| ExternalCasOffhostAnchorStoreError::Poisoned)
+        }
+
+        fn compare_and_swap_atomic(
+            &self,
+            _expected_sequence: u64,
+            _expected_state_digest: &Digest32,
+            _next_state: &ExternalCasOffhostAnchorState,
+        ) -> Result<ExternalCasOffhostAnchorStoreCasOutcome, ExternalCasOffhostAnchorStoreError>
+        {
+            // Malicious/buggy adapter claims success without changing authoritative state.
+            Ok(ExternalCasOffhostAnchorStoreCasOutcome::Applied)
         }
     }
 
@@ -1456,6 +1512,169 @@ mod tests {
             ))
         );
         assert_eq!(model.snapshot().unwrap(), f.bootstrap);
+    }
+
+    #[test]
+    fn every_store_observation_is_revalidated_after_service_construction() {
+        let f = fixture();
+        let store = Arc::new(UnavailableWriteStore {
+            state: Mutex::new(f.bootstrap.clone()),
+        });
+        let adapter: Arc<dyn ExternalCasOffhostAnchorStore> = store.clone();
+        let model = ExternalCasOffhostAnchorMemoryModel::with_store(
+            f.anchor_pin.clone(),
+            f.provider_pin.clone(),
+            adapter,
+        )
+        .unwrap();
+
+        // Simulate corruption/restoration after the service has already initialized.
+        store.state.lock().unwrap().last_operation_id[0] ^= 1;
+        let expected_protocol_error =
+            OffhostAnchorProtocolError::State(ExternalCasOffhostAnchorError::InvalidAnchorState);
+        let read = ExternalCasOffhostAnchorReadRequest {
+            challenge: [0x71; 32],
+            operation_id: [0x72; 32],
+            request_digest: [0x73; 32],
+        };
+        assert_eq!(
+            model.read(&read, &anchor_signer(&f)),
+            Err(expected_protocol_error.clone())
+        );
+        assert_eq!(model.snapshot(), Err(expected_protocol_error.clone()));
+        let cas = ExternalCasOffhostAnchorCasRequest {
+            challenge: [0x74; 32],
+            operation_id: [0x75; 32],
+            request_digest: [0x76; 32],
+            expected_sequence: 1,
+            expected_state_digest: f.bootstrap.digest().unwrap(),
+            target_state_digest: [0x77; 32],
+        };
+        assert_eq!(
+            model.compare_and_swap(
+                &cas,
+                &[],
+                &[],
+                &LibcruxMlDsa65VerifierCandidate,
+                &anchor_signer(&f),
+            ),
+            Err(expected_protocol_error)
+        );
+    }
+
+    #[test]
+    fn adapter_cannot_claim_applied_without_an_exact_authoritative_read_back() {
+        let f = fixture();
+        let store: Arc<dyn ExternalCasOffhostAnchorStore> = Arc::new(FalseAppliedStore {
+            state: Mutex::new(f.bootstrap.clone()),
+        });
+        let model = ExternalCasOffhostAnchorMemoryModel::with_store(
+            f.anchor_pin.clone(),
+            f.provider_pin.clone(),
+            store,
+        )
+        .unwrap();
+        let (next, provider_receipt) =
+            provider_proof(&f, 0x81, 0x82, 0x83, ExternalCasReceiptOutcome::Applied);
+        let next_state = verify_provider_commit_for_offhost_anchor(
+            &f.provider_pin,
+            &f.bootstrap,
+            &next.encode().unwrap(),
+            &provider_receipt.encode().unwrap(),
+            &LibcruxMlDsa65VerifierCandidate,
+        )
+        .unwrap()
+        .next_state;
+        let request = cas_request(
+            &f.bootstrap,
+            0x82,
+            0x84,
+            next.request_digest,
+            next_state.digest().unwrap(),
+        );
+        assert_eq!(
+            model.compare_and_swap(
+                &request,
+                &next.encode().unwrap(),
+                &provider_receipt.encode().unwrap(),
+                &LibcruxMlDsa65VerifierCandidate,
+                &anchor_signer(&f),
+            ),
+            Err(OffhostAnchorProtocolError::Store(
+                ExternalCasOffhostAnchorStoreError::Corrupt
+            ))
+        );
+        assert_eq!(model.snapshot().unwrap(), f.bootstrap);
+    }
+
+    #[test]
+    fn conflict_receipt_cannot_certify_the_expected_or_a_rolled_back_state() {
+        let f = fixture();
+        let signer = anchor_signer(&f);
+        let unchanged_digest = f.bootstrap.digest().unwrap();
+        let request = ExternalCasOffhostAnchorCasRequest {
+            challenge: [0x91; 32],
+            operation_id: [0x92; 32],
+            request_digest: [0x93; 32],
+            expected_sequence: 1,
+            expected_state_digest: unchanged_digest,
+            target_state_digest: [0x94; 32],
+        };
+        let mut unchanged_conflict = new_receipt(
+            ExternalCasOffhostAnchorReceiptKind::Cas,
+            ExternalCasOffhostAnchorReceiptOutcome::Conflict,
+            &f.anchor_pin,
+            request.challenge,
+            request.operation_id,
+            request.request_digest,
+            request.expected_sequence,
+            request.expected_state_digest,
+            request.target_state_digest,
+            f.bootstrap.clone(),
+        )
+        .unwrap();
+        unchanged_conflict.sign(&signer).unwrap();
+        assert_eq!(
+            unchanged_conflict.verify_cas(
+                &f.anchor_pin,
+                &f.provider_pin,
+                &request,
+                &LibcruxMlDsa65VerifierCandidate,
+            ),
+            Err(OffhostAnchorProtocolError::WrongOutcome)
+        );
+
+        let rollback_request = ExternalCasOffhostAnchorCasRequest {
+            expected_sequence: 2,
+            expected_state_digest: [0x95; 32],
+            challenge: [0x96; 32],
+            operation_id: [0x97; 32],
+            request_digest: [0x98; 32],
+            target_state_digest: [0x99; 32],
+        };
+        let mut rollback_conflict = new_receipt(
+            ExternalCasOffhostAnchorReceiptKind::Cas,
+            ExternalCasOffhostAnchorReceiptOutcome::Conflict,
+            &f.anchor_pin,
+            rollback_request.challenge,
+            rollback_request.operation_id,
+            rollback_request.request_digest,
+            rollback_request.expected_sequence,
+            rollback_request.expected_state_digest,
+            rollback_request.target_state_digest,
+            f.bootstrap.clone(),
+        )
+        .unwrap();
+        rollback_conflict.sign(&signer).unwrap();
+        assert_eq!(
+            rollback_conflict.verify_cas(
+                &f.anchor_pin,
+                &f.provider_pin,
+                &rollback_request,
+                &LibcruxMlDsa65VerifierCandidate,
+            ),
+            Err(OffhostAnchorProtocolError::WrongOutcome)
+        );
     }
 
     #[test]
