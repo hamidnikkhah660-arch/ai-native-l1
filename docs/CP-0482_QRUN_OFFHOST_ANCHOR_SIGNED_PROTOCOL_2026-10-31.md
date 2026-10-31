@@ -2,7 +2,7 @@
 
 Date: 2026-10-31
 
-Status: **Signed protocol, injectable atomic-store contract, process-local test adapter and AWS DynamoDB CLI adapter candidate implemented. No AWS account/table, live AWS request, Anchor KMS key, independent operator domain, network service or node integration is deployed or qualified.**
+Status: **Signed protocol, injectable atomic-store contract, process-local test adapter, AWS DynamoDB CLI adapter candidate and explicit conditional bootstrap insert implemented. No AWS account/table, live AWS request, Anchor KMS key, independent operator domain, network service or node integration is deployed or qualified.**
 
 ## Scope
 
@@ -11,7 +11,7 @@ CP-0480 specifies the AWS-first off-host monotonic Anchor architecture. CP-0481 
 Module:
 - \`src/native/pow_bench/src/external_cas_offhost_anchor_protocol_candidate.rs\`
 
-The module has no cloud SDK, network listener, Anchor private key storage, AWS account/table, node startup integration, or consensus callsite. It is not a deployed Anchor service.
+The module has no cloud SDK, network listener, Anchor private key storage, AWS account/table, node startup integration, or consensus callsite. The storage contract includes an explicit one-time bootstrap operation, but it is not a deployed Anchor service.
 
 ## Trust and domain separation
 

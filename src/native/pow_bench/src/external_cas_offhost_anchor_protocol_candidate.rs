@@ -521,6 +521,14 @@ pub enum ExternalCasOffhostAnchorStoreError {
     Unavailable,
     Corrupt,
     Poisoned,
+    ProvisioningUnsupported,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalCasOffhostAnchorStoreProvisionOutcome {
+    Provisioned,
+    /// The anchor ID already exists. The caller must compare this authoritative state with the
+    /// expected provisioning record; an existing item is never overwritten or silently accepted.
+    AlreadyExists(ExternalCasOffhostAnchorState),
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalCasOffhostAnchorStoreCasOutcome {
@@ -537,6 +545,17 @@ pub enum ExternalCasOffhostAnchorStoreCasOutcome {
 /// This contract permits a future DynamoDB conditional PutItem adapter; it does not prove that an
 /// adapter or independent administrative domain is deployed.
 pub trait ExternalCasOffhostAnchorStore: Send + Sync {
+    /// Explicit administrator-only one-time insert of the generation-zero bootstrap.
+    /// Production adapters must implement this as a server-side conditional insert which cannot
+    /// replace an existing anchor. The default is deliberately unsupported.
+    fn provision_bootstrap_if_absent(
+        &self,
+        _bootstrap: &ExternalCasOffhostAnchorState,
+    ) -> Result<ExternalCasOffhostAnchorStoreProvisionOutcome, ExternalCasOffhostAnchorStoreError>
+    {
+        Err(ExternalCasOffhostAnchorStoreError::ProvisioningUnsupported)
+    }
+
     fn load_consistent(
         &self,
     ) -> Result<ExternalCasOffhostAnchorState, ExternalCasOffhostAnchorStoreError>;
