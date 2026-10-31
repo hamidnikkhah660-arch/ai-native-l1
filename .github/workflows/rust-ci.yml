@@ -2,9 +2,9 @@ name: Rust validation
 
 on:
   push:
-    branches: [main, "ci/**", "public/**", "work/**", "fix/**"]
+    branches: [main, "ci/**", "public/**", "work/**", "fix/**", "docs/**", "feat/**"]
   pull_request:
-    branches: [main, "work/**"]
+    branches: [main, "work/**", "docs/**", "feat/**"]
   workflow_dispatch:
 
 permissions:
