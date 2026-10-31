@@ -574,6 +574,7 @@ mod tests {
             ExternalCasClientError, ExternalCasReadRequest, ExternalCasWriteRequest,
             VerifiedExternalCasClient,
         },
+        external_cas_floor_store_candidate::ExternalCasFloorStore,
         external_cas_noise_transport_candidate::{
             serve_external_cas_noise_connection, NoiseTcpExternalCasProviderTransport,
         },
@@ -813,6 +814,72 @@ mod tests {
         let receipt = client.compare_and_swap(&request).unwrap();
         assert_eq!(receipt.outcome, ExternalCasReceiptOutcome::AlreadyApplied);
         assert_eq!(receipt.object_generation, 2);
+    }
+
+    #[test]
+    fn preserved_qcf1_floor_rejects_a_restored_provider_backup() {
+        let root = TestDir::new();
+        let provider_dir = root.0.join("provider");
+        let floor_dir = root.0.join("independent-floor");
+        fs::create_dir_all(&provider_dir).unwrap();
+        fs::create_dir_all(&floor_dir).unwrap();
+        let (pin, bootstrap, key) = setup();
+        let provider = DurableExternalCasProvider::initialize(
+            &provider_dir,
+            pin.clone(),
+            bootstrap.clone(),
+            signer(key.clone()),
+        )
+        .unwrap();
+        // This byte-for-byte image models a valid provider backup taken before a CAS.
+        let old_provider_backup = fs::read(provider.state_path()).unwrap();
+        let floor =
+            ExternalCasFloorStore::initialize(&floor_dir, pin.clone(), bootstrap.clone(), 1)
+                .unwrap();
+        let mut client =
+            VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
+                .unwrap();
+
+        let initial_read = client.fresh_read_request([0xA8; 32], [0xA9; 32]).unwrap();
+        let observed = client.read_current(&initial_read, 0, 1, None).unwrap();
+        assert_eq!(observed.record, bootstrap);
+
+        let request = write_request(&pin, &bootstrap, 0xAA, 0xAB, 0xAC, 1);
+        let receipt = client.compare_and_swap(&request).unwrap();
+        assert_eq!(receipt.outcome, ExternalCasReceiptOutcome::Applied);
+        assert_eq!(receipt.generation, 1);
+        assert_eq!(receipt.object_generation, 2);
+        // Advance the separately retained floor only after the client verified the signed CAS.
+        floor
+            .advance(&bootstrap, 1, &request.next_record, 2)
+            .unwrap();
+        drop(client);
+
+        // Simulate restoring only the provider's whole-directory backup. QCF1 remains ahead.
+        fs::write(provider_dir.join(STATE_FILE), old_provider_backup).unwrap();
+        let restored_provider =
+            DurableExternalCasProvider::open(&provider_dir, pin.clone(), signer(key)).unwrap();
+        let mut restored_client =
+            VerifiedExternalCasClient::new(pin, restored_provider, LibcruxMlDsa65VerifierCandidate)
+                .unwrap();
+        let trusted = floor.snapshot().unwrap();
+        let fresh_read = restored_client
+            .fresh_read_request(request.operation_id, request.request_digest)
+            .unwrap();
+        assert!(matches!(
+            restored_client.read_current(
+                &fresh_read,
+                trusted.trusted_record.generation,
+                trusted.minimum_object_generation,
+                Some(&trusted.trusted_record),
+            ),
+            Err(ExternalCasClientError::RollbackDetected {
+                observed_generation: 0,
+                minimum_generation: 1,
+                observed_object_generation: 1,
+                minimum_object_generation: 2,
+            })
+        ));
     }
 
     #[test]
