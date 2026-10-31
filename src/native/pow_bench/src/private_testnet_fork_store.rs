@@ -713,6 +713,50 @@ impl PrivateTestnetForkStore {
     /// Return the commitment that an operator must persist outside this archive directory
     /// to make later `open_anchored` calls meaningful. The manifest is checked against the
     /// already-open in-memory archive before the commitment is returned.
+    pub(crate) fn qrun_v05_history_archive_identity(
+        &self,
+    ) -> Result<(PathBuf, [u8; 32], [u8; 32], [u8; 32], [u8; 32]), ForkStoreError> {
+        if self.profile != ForkStoreProfile::QRunV05FeeOnly {
+            return Err(ForkStoreError::ManifestProfileMismatch);
+        }
+        let anchor = self.manifest_anchor()?;
+        Ok((
+            self.directory.clone(),
+            self.genesis.network_id(),
+            self.profile_fingerprint,
+            self.genesis_tip,
+            anchor,
+        ))
+    }
+
+    /// Snapshot digest/length/byte-hash tuples from the in-memory archive which startup fully
+    /// replayed under this store's held writer lock. QRA1 uses these to reject post-open branch
+    /// substitution before preserving files.
+    pub(crate) fn qrun_v05_history_archive_entries(
+        &self,
+    ) -> Result<Vec<([u8; 32], u64, [u8; 32])>, ForkStoreError> {
+        if self.profile != ForkStoreProfile::QRunV05FeeOnly {
+            return Err(ForkStoreError::ManifestProfileMismatch);
+        }
+        let _ = self.manifest_anchor()?;
+        let mut entries = self
+            .archive
+            .archive_envelopes()
+            .iter()
+            .map(|envelope| {
+                let decoded =
+                    decode_candidate_network_block(envelope).map_err(ForkStoreError::from_wire)?;
+                let digest = pow_digest(&decoded.header, self.params.pow)?;
+                let length = u64::try_from(envelope.len())
+                    .map_err(|_| ForkStoreError::BranchFileTooLarge)?;
+                let payload_hash: [u8; 32] = Sha256::digest(envelope).into();
+                Ok((digest, length, payload_hash))
+            })
+            .collect::<Result<Vec<_>, ForkStoreError>>()?;
+        entries.sort_unstable_by_key(|entry| entry.0);
+        Ok(entries)
+    }
+
     pub fn manifest_anchor(&self) -> Result<[u8; 32], ForkStoreError> {
         let bytes = read_bounded_file(&self.directory.join(MANIFEST_NAME), MAX_MANIFEST_BYTES)
             .map_err(|error| match error {

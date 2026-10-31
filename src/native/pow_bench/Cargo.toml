@@ -17,6 +17,8 @@ base64 = "=0.22.1"
 # Standard audited primitives for the research authenticated-transport prototype.
 hmac = "=0.12.1"
 sha2 = "=0.10.8"
+# Direct dependency for platform-specific no-follow file opens in bounded archive readers.
+libc = "=0.2.190"
 ed25519-dalek = "=2.1.1"
 getrandom = "=0.2.16"
 serde_json = "=1.0.154"

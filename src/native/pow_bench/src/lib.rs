@@ -116,6 +116,8 @@ pub mod private_testnet_v4_hybrid_fork_store_candidate;
 /// Candidate-only PTB2 envelope for linked PoW headers + canonical block-body transport.
 pub mod private_testnet_wire;
 pub mod protocol_profile;
+/// Candidate-only QRA1 preservation of every branch named by an old QRun v0.5 PFS2 manifest; no provider CAS or manifest rebase.
+pub mod qrun_v05_history_archive_candidate;
 /// Bounded QZAS/1 framing for canonical signed QAX1 operations; candidate-node ingress only.
 pub mod qzbe_amm_ingress_candidate;
 /// CP-0441 candidate: Genesis-rooted QZBE canonical replay across bounded in-memory segments; durable archive integration remains open.
