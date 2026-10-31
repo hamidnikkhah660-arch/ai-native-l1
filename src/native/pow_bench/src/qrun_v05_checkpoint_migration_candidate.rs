@@ -14,8 +14,9 @@ use crate::{
     },
     private_testnet_fork_choice::PrivateTestnetForkChoice,
     private_testnet_fork_store::{
-        decode_manifest, manifest_anchor_commitment, qrun_v05_fee_checkpoint_profile_fingerprint,
-        qrun_v05_fee_profile_fingerprint, MAX_MANIFEST_BYTES,
+        decode_manifest, encode_manifest, manifest_anchor_commitment,
+        qrun_v05_fee_checkpoint_profile_fingerprint, qrun_v05_fee_profile_fingerprint,
+        PrivateTestnetForkStore, MAX_MANIFEST_BYTES,
     },
     qrun_v05_checkpoint_candidate::{QRunCheckpointError, QRunV05PowCheckpoint, MAX_QRCP_BYTES},
     qrun_v05_genesis_candidate::QRunGenesisV05,
@@ -62,6 +63,9 @@ pub enum QRunCheckpointMigrationError {
     ProfileMismatch,
     ManifestBindingMismatch,
     ArchiveBindingMismatch,
+    SourceStoreMismatch,
+    RandomnessUnavailable,
+    GenerationOverflow,
 }
 
 impl fmt::Display for QRunCheckpointMigrationError {
@@ -105,6 +109,216 @@ pub struct QRunCheckpointMigrationJournal {
     pub next_manifest: Vec<u8>,
     pub archive_id: [u8; 32],
     pub archive_commitment: [u8; 32],
+}
+
+/// A fully validated, local-only migration preflight. Holding this value does not authorize or
+/// execute a provider write; callers must re-read and verify the provider state immediately before
+/// any future CAS executor uses the journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QRunV05CheckpointMigrationPlan {
+    journal: QRunCheckpointMigrationJournal,
+    journal_bytes: Vec<u8>,
+}
+
+impl QRunV05CheckpointMigrationPlan {
+    pub fn journal(&self) -> &QRunCheckpointMigrationJournal {
+        &self.journal
+    }
+
+    /// Canonical QRM1 v2 bytes suitable for durable local journal publication.
+    pub fn journal_bytes(&self) -> &[u8] {
+        &self.journal_bytes
+    }
+
+    pub fn external_cas_write_request(
+        &self,
+        pin: &ExternalCasPin,
+    ) -> Result<ExternalCasWriteRequest, QRunCheckpointMigrationError> {
+        self.journal.external_cas_write_request(pin)
+    }
+}
+
+/// Build a local-only exact-tip migration intent from a replay-validated Genesis-rooted PFS2 store
+/// and a QRA1 archive that has already been fully verified. No provider CAS, QCF1 floor advance,
+/// or PFS2 manifest write occurs here. previous_record and its object generation must come from
+/// independently trusted state (for example, the pinned QCF1 floor); a future executor must still
+/// perform a fresh signed provider read and compare it exactly before attempting the CAS.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_qrun_v05_checkpoint_migration(
+    source_store: &PrivateTestnetForkStore,
+    archive: &QRunHistoryArchiveSummary,
+    owner_account: [u8; 32],
+    params: &ConsensusParameters,
+    pin: &ExternalCasPin,
+    previous_record: ExternalCasRecord,
+    previous_object_generation: u64,
+    expected_parent_checkpoint_commitment: [u8; 32],
+) -> Result<QRunV05CheckpointMigrationPlan, QRunCheckpointMigrationError> {
+    pin.validate()?;
+    params
+        .validate()
+        .map_err(|_| QRunCheckpointMigrationError::ProfileMismatch)?;
+
+    let genesis = QRunGenesisV05::new(pin.network_id, owner_account)
+        .map_err(|_| QRunCheckpointMigrationError::GenesisMismatch)?;
+    if genesis.commitment() != pin.genesis_digest
+        || genesis.ledger() != source_store.genesis_state()
+        || !source_store.matches_qrun_v05_genesis_and_profile(genesis.ledger(), params)
+    {
+        return Err(QRunCheckpointMigrationError::GenesisMismatch);
+    }
+
+    let (_, network_id, profile_fingerprint, genesis_tip, manifest_anchor) = source_store
+        .qrun_v05_history_archive_identity()
+        .map_err(|_| QRunCheckpointMigrationError::SourceStoreMismatch)?;
+    let previous_manifest = archive.previous_manifest_bytes();
+    let old_manifest = decode_manifest(previous_manifest)
+        .map_err(|_| QRunCheckpointMigrationError::ManifestBindingMismatch)?;
+    let source_entries = source_store
+        .qrun_v05_history_archive_entries()
+        .map_err(|_| QRunCheckpointMigrationError::SourceStoreMismatch)?;
+    let source_digests: Vec<[u8; 32]> = source_entries
+        .iter()
+        .map(|(digest, _, _)| *digest)
+        .collect();
+
+    if network_id != pin.network_id
+        || archive.network_id != network_id
+        || archive.profile_fingerprint != profile_fingerprint
+        || archive.genesis_tip != genesis_tip
+        || archive.previous_manifest_anchor != manifest_anchor
+        || manifest_anchor_commitment(previous_manifest) != manifest_anchor
+        || archive.canonical_tip != source_store.canonical_tip()
+        || archive.branch_count as usize != old_manifest.digests.len()
+        || old_manifest.network_id != network_id
+        || old_manifest.profile_fingerprint != profile_fingerprint
+        || old_manifest.genesis_tip != genesis_tip
+        || old_manifest.canonical_tip != archive.canonical_tip
+        || old_manifest.digests != source_digests
+    {
+        return Err(QRunCheckpointMigrationError::ArchiveBindingMismatch);
+    }
+
+    previous_record.validate_shape()?;
+    if previous_record.provider_id != pin.provider_id
+        || previous_record.network_id != pin.network_id
+        || previous_record.genesis_digest != pin.genesis_digest
+        || previous_record.next_state_digest != manifest_anchor
+        || previous_object_generation == 0
+        || previous_record.generation.checked_add(1) != Some(previous_object_generation)
+    {
+        return Err(QRunCheckpointMigrationError::InvalidBinding);
+    }
+
+    let checkpoint = QRunV05PowCheckpoint::capture(
+        pin.network_id,
+        pin.genesis_digest,
+        params,
+        source_store.archive().canonical_chain(),
+        expected_parent_checkpoint_commitment,
+    )?;
+    if checkpoint.height == 0 || checkpoint.consensus_tip_digest != archive.canonical_tip {
+        return Err(QRunCheckpointMigrationError::ManifestBindingMismatch);
+    }
+    let minimum_checkpoint_height = checkpoint.height;
+    let checkpoint_bytes = checkpoint.encode(params)?;
+    let checkpoint_commitment = checkpoint.commitment(params)?;
+    let checkpoint_base = QRunV05PowCheckpoint::restore_chain_anchored(
+        &checkpoint_bytes,
+        &pin.network_id,
+        &pin.genesis_digest,
+        params,
+        checkpoint_commitment,
+        minimum_checkpoint_height,
+    )?;
+    let checkpoint_profile = qrun_v05_fee_checkpoint_profile_fingerprint(
+        checkpoint_base.state(),
+        params,
+        checkpoint_commitment,
+    )
+    .map_err(|_| QRunCheckpointMigrationError::ProfileMismatch)?;
+    let next_manifest = encode_manifest(
+        &pin.network_id,
+        &checkpoint_profile,
+        &checkpoint.consensus_tip_digest,
+        &checkpoint.consensus_tip_digest,
+        &[],
+    )
+    .map_err(|_| QRunCheckpointMigrationError::ManifestBindingMismatch)?;
+
+    let next_generation = previous_record
+        .generation
+        .checked_add(1)
+        .ok_or(QRunCheckpointMigrationError::GenerationOverflow)?;
+    let next_object_generation = previous_object_generation
+        .checked_add(1)
+        .ok_or(QRunCheckpointMigrationError::GenerationOverflow)?;
+    let operation_id = migration_random_nonzero_digest()?;
+    let cas_request_nonce = migration_random_nonzero_digest()?;
+    let next_record = ExternalCasRecord {
+        generation: next_generation,
+        provider_id: pin.provider_id,
+        network_id: pin.network_id,
+        genesis_digest: pin.genesis_digest,
+        previous_record_digest: previous_record.digest()?,
+        previous_state_digest: previous_record.next_state_digest,
+        next_state_digest: manifest_anchor_commitment(&next_manifest),
+        operation_id,
+        request_digest: [0xA5; 32],
+    };
+    let mut write_request = ExternalCasWriteRequest {
+        request_nonce: cas_request_nonce,
+        operation_id,
+        request_digest: [0xA5; 32],
+        expected_generation: previous_record.generation,
+        expected_object_generation: previous_object_generation,
+        expected_record_digest: previous_record.digest()?,
+        expected_state_digest: previous_record.next_state_digest,
+        next_record,
+    };
+    write_request.bind_request_digest(pin)?;
+
+    let receipt_public_key_hash: [u8; 32] = Sha256::digest(pin.receipt_public_key).into();
+    let journal = QRunCheckpointMigrationJournal {
+        previous_record,
+        next_record: write_request.next_record.clone(),
+        previous_object_generation,
+        next_object_generation,
+        cas_request_nonce,
+        owner_account,
+        receipt_key_id: pin.receipt_key_id,
+        receipt_public_key_hash,
+        checkpoint_commitment,
+        expected_parent_checkpoint_commitment,
+        minimum_checkpoint_height,
+        checkpoint_bytes,
+        previous_manifest: previous_manifest.to_vec(),
+        next_manifest,
+        archive_id: archive.archive_id,
+        archive_commitment: archive.archive_commitment,
+    };
+    let journal_bytes = journal.encode(pin, params, archive)?;
+    let decoded = QRunCheckpointMigrationJournal::decode(&journal_bytes, pin, params, archive)?;
+    if decoded != journal {
+        return Err(QRunCheckpointMigrationError::Malformed);
+    }
+
+    Ok(QRunV05CheckpointMigrationPlan {
+        journal,
+        journal_bytes,
+    })
+}
+
+fn migration_random_nonzero_digest() -> Result<[u8; 32], QRunCheckpointMigrationError> {
+    for _ in 0..4 {
+        let mut value = [0u8; 32];
+        getrandom::getrandom(&mut value)
+            .map_err(|_| QRunCheckpointMigrationError::RandomnessUnavailable)?;
+        if value.iter().any(|byte| *byte != 0) {
+            return Ok(value);
+        }
+    }
+    Err(QRunCheckpointMigrationError::RandomnessUnavailable)
 }
 
 impl QRunCheckpointMigrationJournal {
@@ -158,6 +372,9 @@ impl QRunCheckpointMigrationJournal {
 
         if self.previous_object_generation == 0
             || self.previous_object_generation.checked_add(1) != Some(self.next_object_generation)
+            || self.previous_record.generation.checked_add(1)
+                != Some(self.previous_object_generation)
+            || self.next_record.generation.checked_add(1) != Some(self.next_object_generation)
         {
             return Err(QRunCheckpointMigrationError::InvalidObjectGeneration);
         }
@@ -310,6 +527,7 @@ impl QRunCheckpointMigrationJournal {
             .map_err(|_| QRunCheckpointMigrationError::ManifestBindingMismatch)?;
         if archive.archive_id != self.archive_id
             || archive.archive_commitment != self.archive_commitment
+            || archive.previous_manifest_bytes() != self.previous_manifest
             || archive.previous_manifest_anchor
                 != manifest_anchor_commitment(&self.previous_manifest)
             || archive.network_id != old_manifest.network_id
@@ -746,7 +964,7 @@ pub(crate) mod tests {
             operation_id: next_record.operation_id,
             request_digest: [0x49; 32],
             expected_generation: previous_record.generation,
-            expected_object_generation: 14,
+            expected_object_generation: 8,
             expected_record_digest: previous_record.digest().unwrap(),
             expected_state_digest: previous_record.next_state_digest,
             next_record: next_record.clone(),
@@ -762,8 +980,8 @@ pub(crate) mod tests {
         let journal = QRunCheckpointMigrationJournal {
             previous_record,
             next_record,
-            previous_object_generation: 14,
-            next_object_generation: 15,
+            previous_object_generation: 8,
+            next_object_generation: 9,
             cas_request_nonce,
             owner_account: owner,
             receipt_key_id,
@@ -790,8 +1008,8 @@ pub(crate) mod tests {
         assert_eq!(decoded, journal);
         assert_eq!(decoded.previous_record.generation, 7);
         assert_eq!(decoded.next_record.generation, 8);
-        assert_eq!(decoded.previous_object_generation, 14);
-        assert_eq!(decoded.next_object_generation, 15);
+        assert_eq!(decoded.previous_object_generation, 8);
+        assert_eq!(decoded.next_object_generation, 9);
         assert_eq!(
             u16::from_be_bytes(bytes[4..6].try_into().unwrap()),
             QRM1_VERSION
@@ -818,6 +1036,17 @@ pub(crate) mod tests {
             journal.previous_record.next_state_digest
         );
         assert_eq!(request.next_record, journal.next_record);
+    }
+
+    #[test]
+    fn qrm1_rejects_object_generation_not_linked_to_record_generation() {
+        let (mut journal, pin, params) = fixture();
+        journal.previous_object_generation += 1;
+        journal.next_object_generation += 1;
+        assert_eq!(
+            journal.encode_without_archive(&pin, &params),
+            Err(QRunCheckpointMigrationError::InvalidObjectGeneration)
+        );
     }
 
     #[test]
