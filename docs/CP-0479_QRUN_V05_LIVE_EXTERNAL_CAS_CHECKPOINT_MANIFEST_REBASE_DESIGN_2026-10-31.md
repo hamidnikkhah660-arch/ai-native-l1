@@ -78,7 +78,7 @@ All preparation is performed while the node is stopped or in a strict maintenanc
 7. Construct the exact one-generation ECR1 successor. Its previous_record_digest and previous_state_digest must bind the old ECR1; its next_state_digest must equal the commitment of the new PFS2 manifest. Bind the migration operation ID and request digest using the existing CAS request contract.
 8. Write and fsync QRM1 before sending any provider write. The old active PFS2 manifest remains installed.
 9. Execute exactly one atomic server-side provider compare-and-swap from the exact old ECR1/object generation to the exact new successor. A filesystem read followed by an unconditional write is not acceptable.
-10. Verify the signed CAS receipt. If the response is ambiguous, use a fresh challenged signed provider read and accept only the exact old ECR1 or the exact prepared successor.
+10. Verify the signed CAS receipt. If the response is ambiguous, use a fresh challenged signed provider read and accept only the exact old ECR1 or the exact prepared successor. If the read still shows the exact old record/object generation, retry the exact CAS request reconstructed from QRM1 with the same request nonce, operation ID and request digest. Do not delete QRM1 solely because one fresh read still shows the predecessor: the earlier request may still be delayed or in flight. The provider must serialize/deduplicate exact operation retries; otherwise keep the store quarantined.
 11. Advance QCF1 from the exact previous record/object generation to the exact successor/object generation. The advance must be idempotent if QCF1 already equals the successor and must reject any other generation or digest.
 12. Atomically install the exact new PFS2 manifest. Do not synthesize a replacement manifest during recovery.
 13. Reopen the checkpoint-rooted store through the same strict constructor, verify the new local manifest anchor, checkpoint profile, canonical base tip, archive commitment, signed provider observation and QCF1 snapshot all agree.
@@ -90,7 +90,13 @@ The ECR1 generation and provider object generation each advance exactly once for
 
 The current candidate code can build an exact-tip QRunV05CheckpointMigrationPlan from a replay-validated Genesis-rooted PFS2 store and a verified QRA1 archive. It can durably publish the canonical QRM1 bytes with no-replace semantics, reject a conflicting existing intent, prevent coexistence with QAP1, and block ordinary store open and both local and external-CAS block submission while the migration intent is present. A pre-publication orphan temporary file is removed on ordinary reopen only when no final QRM1 intent exists.
 
-This is a prepared-intent boundary only. The candidate does not yet decode and reconcile QRM1 at startup, inspect a fresh signed provider read, advance QCF1, install the checkpoint-rooted PFS2 manifest, or clear QRM1 after verified completion. Consequently a final QRM1 intent intentionally makes ordinary startup fail closed until a dedicated recovery implementation is added. Operators must not create such an intent against a live data directory until that recovery implementation is available and tested.
+This is a prepared-intent and recovery-classification boundary only. Candidate code now includes a pure QRM1 recovery classifier for the four permitted states below and returns quarantine for every other combination. It does not yet perform startup recovery, obtain/verify the signed provider observation, retry the immutable CAS request, advance QCF1, install the checkpoint-rooted PFS2 manifest, open the checkpoint-rooted store under recovery authorization, or clear QRM1 after verified completion. Consequently a final QRM1 intent intentionally makes ordinary startup fail closed until the complete recovery engine is added. Operators must not create such an intent against a live data directory until that recovery implementation is available and tested.
+
+## 5B. Candidate recovery classifier boundary (2026-10-31)
+
+The candidate QRM1 module now contains a pure classifier over three independently observed values: the freshly signed provider record plus object generation, the QCF1 floor record plus object generation, and the exact active PFS2 manifest bytes. It accepts only the four consistent rows in Section 6 and quarantines every other state. It does not itself read files, contact a provider, advance a floor, or replace a manifest.
+
+An exact-old provider/floor/manifest observation is deliberately **not** treated as proof that a previous CAS was never sent. Recovery must retry the same immutable CAS request from QRM1 (same request nonce, operation ID and request digest) under a provider contract that serializes and deduplicates identical retries. Without that provider guarantee, the only safe response is to keep QRM1 and quarantine startup.
 
 ## 6. Crash-recovery decision table
 
@@ -98,14 +104,14 @@ Recovery must classify durable evidence, not infer intent from file presence or 
 
 | Provider signed record | QCF1 floor | Active PFS2 manifest | Permitted recovery |
 |---|---|---|---|
-| Exact old record | Exact old record | Exact old manifest | Migration did not commit. Abort the prepared migration, retain the old store/archive, and remove QRM1 only after all old-state checks pass. |
+| Exact old record | Exact old record | Exact old manifest | Re-submit the exact immutable CAS request from QRM1 using the same nonce, operation ID and request digest. Retain QRM1; do not infer abort from a single old read because the original request may still be in flight. |
 | Exact new successor | Exact old record | Exact old manifest | Provider committed. Advance QCF1 to the exact successor, then install the exact new manifest from QRM1. |
 | Exact new successor | Exact new successor | Exact old manifest | Floor committed. Verify the exact successor and install the exact new manifest from QRM1. |
 | Exact new successor | Exact new successor | Exact new manifest | Verify/open the checkpoint-rooted store, revalidate archive and all identities, then remove QRM1. |
 | Exact new successor | Exact old record | Exact new manifest | This is impossible under the required floor-before-manifest order. Fail closed and quarantine; do not repair this mixed state. |
 | Any other record, skipped generation, conflicting digest, stale checkpoint, missing/corrupt QRM1, mismatched archive, old provider with a new floor, or impossible mixed state | Any | Any | Fail closed and quarantine. Never roll back the floor, invent an intermediate record, recreate a generation-zero floor, or replace the local manifest with a guessed value. |
 
-The exact-old/exact-old/exact-old recovery may abort because the provider CAS is the sole remote commit point. The exact-new recovery paths may finish only the one successor encoded in QRM1. If QCF1 is already at the successor, reconciliation is idempotent; if it is ahead by anything else, migration is rejected.
+The exact-old/exact-old/exact-old recovery must retry the exact immutable CAS request, not abort: a fresh read can race with an earlier delayed request, and removing QRM1 would discard the only persisted retry identity/checkpoint evidence. The persisted request nonce and operation ID make the retry byte-identical and idempotently resolvable by a compliant provider. If the provider cannot guarantee serialized/idempotent operation retries, keep the node quarantined and retain QRM1. The exact-new recovery paths may finish only the one successor encoded in QRM1. If QCF1 is already at the successor, reconciliation is idempotent; if it is ahead by anything else, migration is rejected.
 
 ## 7. Required implementation and adversarial tests
 
