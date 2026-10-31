@@ -120,6 +120,105 @@ pub struct QRunV05CheckpointMigrationPlan {
     journal_bytes: Vec<u8>,
 }
 
+/// The only recovery actions permitted after QRM1, a fresh signed provider observation,
+/// the independent QCF1 floor, and the active PFS2 manifest have all been verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QRunCheckpointMigrationRecoveryAction {
+    /// Provider still shows the predecessor. Re-submit the byte-identical QRM1 CAS request;
+    /// an old signed read alone cannot prove the earlier request is no longer in flight.
+    RetryExactPreparedCas,
+    /// The provider committed the exact successor; advance QCF1 before installing its manifest.
+    AdvanceFloorThenInstallManifest,
+    /// QCF1 already records the exact successor; install only the journal's exact next manifest.
+    InstallNextManifest,
+    /// Provider, floor and manifest all name the successor; verify the checkpoint store then clear QRM1.
+    VerifyCommittedCheckpointStoreAndClearIntent,
+    /// Any unknown, inconsistent, skipped, or impossible mixed state must be quarantined.
+    Quarantine,
+}
+
+/// Classify the durable evidence matrix for a previously decoded QRM1 journal.
+///
+/// Callers must first verify the QRM1 checksum/domain/pin/consensus bindings, independently verify
+/// its QRA1 archive, and obtain a fresh challenge-bound signed provider read plus a locked QCF1
+/// snapshot. This pure classifier performs no I/O and deliberately accepts only byte-exact
+/// previous/next records, object generations, and PFS2 manifests. An exact-old observation
+/// maps to RetryExactPreparedCas, never an abort: the original CAS may have been delayed after
+/// the read, and QRM1 preserves the nonce/operation ID for a safe idempotent retry.
+pub fn classify_qrun_v05_checkpoint_migration_recovery(
+    journal: &QRunCheckpointMigrationJournal,
+    provider_record: &ExternalCasRecord,
+    provider_object_generation: u64,
+    floor_record: &ExternalCasRecord,
+    floor_object_generation: u64,
+    active_manifest: &[u8],
+) -> QRunCheckpointMigrationRecoveryAction {
+    let previous_object_generation = journal.previous_record.generation.checked_add(1);
+    let next_object_generation = journal.next_record.generation.checked_add(1);
+    let journal_is_consistent = journal.previous_record.validate_shape().is_ok()
+        && journal
+            .previous_record
+            .validate_successor(&journal.next_record)
+            .is_ok()
+        && previous_object_generation == Some(journal.previous_object_generation)
+        && next_object_generation == Some(journal.next_object_generation)
+        && journal.previous_object_generation.checked_add(1)
+            == Some(journal.next_object_generation)
+        && !journal.cas_request_nonce.iter().all(|byte| *byte == 0)
+        && !journal.archive_commitment.iter().all(|byte| *byte == 0)
+        && !journal.checkpoint_bytes.is_empty()
+        && QRunV05PowCheckpoint::commitment_for_bytes(&journal.checkpoint_bytes)
+            == journal.checkpoint_commitment
+        && manifest_anchor_commitment(&journal.previous_manifest)
+            == journal.previous_record.next_state_digest
+        && manifest_anchor_commitment(&journal.next_manifest)
+            == journal.next_record.next_state_digest
+        && journal.archive_id
+            == QRunCheckpointMigrationJournal::archive_id_for_previous_manifest(
+                manifest_anchor_commitment(&journal.previous_manifest),
+            )
+        && decode_manifest(&journal.previous_manifest).is_ok()
+        && decode_manifest(&journal.next_manifest).is_ok();
+
+    if !journal_is_consistent {
+        return QRunCheckpointMigrationRecoveryAction::Quarantine;
+    }
+
+    let provider_is_previous = provider_record == &journal.previous_record
+        && provider_object_generation == journal.previous_object_generation;
+    let provider_is_next = provider_record == &journal.next_record
+        && provider_object_generation == journal.next_object_generation;
+    let floor_is_previous = floor_record == &journal.previous_record
+        && floor_object_generation == journal.previous_object_generation;
+    let floor_is_next = floor_record == &journal.next_record
+        && floor_object_generation == journal.next_object_generation;
+    let manifest_is_previous = active_manifest == journal.previous_manifest;
+    let manifest_is_next = active_manifest == journal.next_manifest;
+
+    match (
+        provider_is_previous,
+        provider_is_next,
+        floor_is_previous,
+        floor_is_next,
+        manifest_is_previous,
+        manifest_is_next,
+    ) {
+        (true, false, true, false, true, false) => {
+            QRunCheckpointMigrationRecoveryAction::RetryExactPreparedCas
+        }
+        (false, true, true, false, true, false) => {
+            QRunCheckpointMigrationRecoveryAction::AdvanceFloorThenInstallManifest
+        }
+        (false, true, false, true, true, false) => {
+            QRunCheckpointMigrationRecoveryAction::InstallNextManifest
+        }
+        (false, true, false, true, false, true) => {
+            QRunCheckpointMigrationRecoveryAction::VerifyCommittedCheckpointStoreAndClearIntent
+        }
+        _ => QRunCheckpointMigrationRecoveryAction::Quarantine,
+    }
+}
+
 impl QRunV05CheckpointMigrationPlan {
     pub fn journal(&self) -> &QRunCheckpointMigrationJournal {
         &self.journal
@@ -996,6 +1095,113 @@ pub(crate) mod tests {
             archive_commitment,
         };
         (journal, pin, params)
+    }
+
+    #[test]
+    fn qrm1_recovery_classifier_accepts_only_the_four_exact_crash_states() {
+        use QRunCheckpointMigrationRecoveryAction as Action;
+
+        let (journal, _, _) = fixture();
+        let provider_states = [
+            (
+                journal.previous_record.clone(),
+                journal.previous_object_generation,
+            ),
+            (journal.next_record.clone(), journal.next_object_generation),
+        ];
+        let floor_states = provider_states.clone();
+        let manifest_states = [
+            journal.previous_manifest.clone(),
+            journal.next_manifest.clone(),
+        ];
+
+        for (provider_index, (provider, provider_generation)) in provider_states.iter().enumerate()
+        {
+            for (floor_index, (floor, floor_generation)) in floor_states.iter().enumerate() {
+                for (manifest_index, manifest) in manifest_states.iter().enumerate() {
+                    let expected = match (provider_index, floor_index, manifest_index) {
+                        (0, 0, 0) => Action::RetryExactPreparedCas,
+                        (1, 0, 0) => Action::AdvanceFloorThenInstallManifest,
+                        (1, 1, 0) => Action::InstallNextManifest,
+                        (1, 1, 1) => Action::VerifyCommittedCheckpointStoreAndClearIntent,
+                        _ => Action::Quarantine,
+                    };
+                    assert_eq!(
+                        classify_qrun_v05_checkpoint_migration_recovery(
+                            &journal,
+                            provider,
+                            *provider_generation,
+                            floor,
+                            *floor_generation,
+                            manifest,
+                        ),
+                        expected,
+                        "provider={provider_index}, floor={floor_index}, manifest={manifest_index}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn qrm1_recovery_classifier_quarantines_unrelated_records_generations_and_manifest_bytes() {
+        use QRunCheckpointMigrationRecoveryAction as Action;
+
+        let (journal, _, _) = fixture();
+        let mut unrelated_provider = journal.previous_record.clone();
+        unrelated_provider.operation_id[0] ^= 1;
+        assert_eq!(
+            classify_qrun_v05_checkpoint_migration_recovery(
+                &journal,
+                &unrelated_provider,
+                journal.previous_object_generation,
+                &journal.previous_record,
+                journal.previous_object_generation,
+                &journal.previous_manifest,
+            ),
+            Action::Quarantine
+        );
+
+        assert_eq!(
+            classify_qrun_v05_checkpoint_migration_recovery(
+                &journal,
+                &journal.previous_record,
+                journal.previous_object_generation + 1,
+                &journal.previous_record,
+                journal.previous_object_generation,
+                &journal.previous_manifest,
+            ),
+            Action::Quarantine
+        );
+
+        let mut altered_manifest = journal.previous_manifest.clone();
+        let last_manifest_byte = altered_manifest.len() - 1;
+        altered_manifest[last_manifest_byte] ^= 1;
+        assert_eq!(
+            classify_qrun_v05_checkpoint_migration_recovery(
+                &journal,
+                &journal.previous_record,
+                journal.previous_object_generation,
+                &journal.previous_record,
+                journal.previous_object_generation,
+                &altered_manifest,
+            ),
+            Action::Quarantine
+        );
+
+        let mut corrupt_journal = journal;
+        corrupt_journal.next_object_generation += 1;
+        assert_eq!(
+            classify_qrun_v05_checkpoint_migration_recovery(
+                &corrupt_journal,
+                &corrupt_journal.previous_record,
+                corrupt_journal.previous_object_generation,
+                &corrupt_journal.previous_record,
+                corrupt_journal.previous_object_generation,
+                &corrupt_journal.previous_manifest,
+            ),
+            Action::Quarantine
+        );
     }
 
     #[test]
