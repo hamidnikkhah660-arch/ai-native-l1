@@ -883,6 +883,79 @@ mod tests {
     }
 
     #[test]
+    fn jointly_restored_provider_and_qcf1_backups_can_replay_old_state() {
+        let root = TestDir::new();
+        let provider_dir = root.0.join("provider");
+        let floor_dir = root.0.join("independent-floor");
+        fs::create_dir_all(&provider_dir).unwrap();
+        fs::create_dir_all(&floor_dir).unwrap();
+        let (pin, bootstrap, key) = setup();
+        let provider = DurableExternalCasProvider::initialize(
+            &provider_dir,
+            pin.clone(),
+            bootstrap.clone(),
+            signer(key.clone()),
+        )
+        .unwrap();
+        // Capture both local rollback domains before advancing either one.
+        let old_provider_backup = fs::read(provider.state_path()).unwrap();
+        let floor =
+            ExternalCasFloorStore::initialize(&floor_dir, pin.clone(), bootstrap.clone(), 1)
+                .unwrap();
+        let floor_state_path = floor.state_path();
+        let old_floor_backup = fs::read(&floor_state_path).unwrap();
+        let mut client =
+            VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
+                .unwrap();
+
+        let initial_read = client.fresh_read_request([0xB8; 32], [0xB9; 32]).unwrap();
+        let observed = client.read_current(&initial_read, 0, 1, None).unwrap();
+        assert_eq!(observed.record, bootstrap);
+
+        let request = write_request(&pin, &bootstrap, 0xBA, 0xBB, 0xBC, 1);
+        let receipt = client.compare_and_swap(&request).unwrap();
+        assert_eq!(receipt.outcome, ExternalCasReceiptOutcome::Applied);
+        assert_eq!(receipt.generation, 1);
+        assert_eq!(receipt.object_generation, 2);
+        floor
+            .advance(&bootstrap, 1, &request.next_record, 2)
+            .unwrap();
+        drop(client);
+        drop(floor);
+
+        // A single operator able to restore both local directories can roll both anchors back.
+        fs::write(provider_dir.join(STATE_FILE), old_provider_backup).unwrap();
+        let floor_state_path = floor_dir.join("external-cas-floor.qcf1");
+        fs::write(&floor_state_path, old_floor_backup).unwrap();
+
+        let restored_provider =
+            DurableExternalCasProvider::open(&provider_dir, pin.clone(), signer(key)).unwrap();
+        let restored_floor = ExternalCasFloorStore::open(&floor_dir, pin.clone()).unwrap();
+        let trusted = restored_floor.snapshot().unwrap();
+        assert_eq!(trusted.trusted_record, bootstrap);
+        assert_eq!(trusted.minimum_object_generation, 1);
+
+        let mut restored_client =
+            VerifiedExternalCasClient::new(pin, restored_provider, LibcruxMlDsa65VerifierCandidate)
+                .unwrap();
+        let fresh_read = restored_client
+            .fresh_read_request(request.operation_id, request.request_digest)
+            .unwrap();
+        let replayed = restored_client
+            .read_current(
+                &fresh_read,
+                trusted.trusted_record.generation,
+                trusted.minimum_object_generation,
+                Some(&trusted.trusted_record),
+            )
+            .unwrap();
+        // This success is the documented limitation: QCF1 is not a hardware/off-host monotonic
+        // authority when the Provider and Floor backups share one rollback administrator.
+        assert_eq!(replayed.record, bootstrap);
+        assert_eq!(replayed.object_generation, 1);
+    }
+
+    #[test]
     fn writer_lock_contention_and_missing_state_fail_closed() {
         let dir = TestDir::new();
         let (pin, bootstrap, key) = setup();
