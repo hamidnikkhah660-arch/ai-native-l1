@@ -11,7 +11,10 @@ use crate::{
     },
 };
 use sha2::{Digest, Sha256};
-use std::{fmt, sync::Mutex};
+use std::{
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 type Digest32 = [u8; 32];
 
@@ -59,6 +62,7 @@ pub enum OffhostAnchorProtocolError {
     StateEncoding,
     State(ExternalCasOffhostAnchorError),
     Signing(String),
+    Store(ExternalCasOffhostAnchorStoreError),
     Poisoned,
 }
 impl fmt::Display for OffhostAnchorProtocolError {
@@ -497,12 +501,113 @@ fn new_receipt(
     })
 }
 
-/// Thread-safe in-memory model used to test the protocol's atomicity. It is deliberately
-/// process-local and MUST NOT be mistaken for the separately administered production store.
+/// Error boundary for an Anchor persistence adapter. Unavailability and malformed/corrupt
+/// state are distinct from a conditional-write conflict; neither may be treated as success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalCasOffhostAnchorStoreError {
+    Unavailable,
+    Corrupt,
+    Poisoned,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalCasOffhostAnchorStoreCasOutcome {
+    Applied,
+    Conflict(ExternalCasOffhostAnchorState),
+}
+
+/// Production adapters MUST implement load_consistent using an authoritative strongly-consistent
+/// read and compare_and_swap as ONE server-side conditional transaction over expected sequence
+/// AND expected full-state digest. A client-side read followed by unconditional Put is forbidden.
+/// The successful write must install the complete next state atomically and return only Applied.
+/// On stale precondition it must return the complete currently stored state as Conflict.
+///
+/// This contract permits a future DynamoDB conditional PutItem adapter; it does not prove that an
+/// adapter or independent administrative domain is deployed.
+pub trait ExternalCasOffhostAnchorStore: Send + Sync {
+    fn load_consistent(
+        &self,
+    ) -> Result<ExternalCasOffhostAnchorState, ExternalCasOffhostAnchorStoreError>;
+
+    fn compare_and_swap_atomic(
+        &self,
+        expected_sequence: u64,
+        expected_state_digest: &Digest32,
+        next_state: &ExternalCasOffhostAnchorState,
+    ) -> Result<ExternalCasOffhostAnchorStoreCasOutcome, ExternalCasOffhostAnchorStoreError>;
+}
+
+/// Test-only process-local store implementing the same compare-and-swap contract.
+/// It is not crash-durable, cross-process, off-host or anti-rollback protected.
+pub struct ExternalCasOffhostAnchorMemoryStore {
+    state: Mutex<ExternalCasOffhostAnchorState>,
+}
+impl ExternalCasOffhostAnchorMemoryStore {
+    pub fn new(bootstrap: ExternalCasOffhostAnchorState) -> Self {
+        Self {
+            state: Mutex::new(bootstrap),
+        }
+    }
+}
+impl ExternalCasOffhostAnchorStore for ExternalCasOffhostAnchorMemoryStore {
+    fn load_consistent(
+        &self,
+    ) -> Result<ExternalCasOffhostAnchorState, ExternalCasOffhostAnchorStoreError> {
+        self.state
+            .lock()
+            .map(|state| state.clone())
+            .map_err(|_| ExternalCasOffhostAnchorStoreError::Poisoned)
+    }
+
+    fn compare_and_swap_atomic(
+        &self,
+        expected_sequence: u64,
+        expected_state_digest: &Digest32,
+        next_state: &ExternalCasOffhostAnchorState,
+    ) -> Result<ExternalCasOffhostAnchorStoreCasOutcome, ExternalCasOffhostAnchorStoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ExternalCasOffhostAnchorStoreError::Poisoned)?;
+        let current_digest = state
+            .digest()
+            .map_err(|_| ExternalCasOffhostAnchorStoreError::Corrupt)?;
+        if state.sequence != expected_sequence || &current_digest != expected_state_digest {
+            return Ok(ExternalCasOffhostAnchorStoreCasOutcome::Conflict(
+                state.clone(),
+            ));
+        }
+        let expected_next_sequence = expected_sequence
+            .checked_add(1)
+            .ok_or(ExternalCasOffhostAnchorStoreError::Corrupt)?;
+        let expected_next_object_generation = state
+            .provider_object_generation
+            .checked_add(1)
+            .ok_or(ExternalCasOffhostAnchorStoreError::Corrupt)?;
+        if next_state.sequence != expected_next_sequence
+            || next_state.provider_object_generation != expected_next_object_generation
+            || next_state.last_expected_anchor_sequence != expected_sequence
+            || next_state.last_expected_anchor_state_digest != *expected_state_digest
+            || state
+                .provider_record
+                .validate_successor(&next_state.provider_record)
+                .is_err()
+            || next_state.last_operation_id != next_state.provider_record.operation_id
+            || next_state.last_request_digest != next_state.provider_record.request_digest
+            || next_state.digest().is_err()
+        {
+            return Err(ExternalCasOffhostAnchorStoreError::Corrupt);
+        }
+        *state = next_state.clone();
+        Ok(ExternalCasOffhostAnchorStoreCasOutcome::Applied)
+    }
+}
+
+/// Protocol model over an injectable Anchor store. The default constructor uses the process-local
+/// test store; production callers must supply a separately administered durable CAS adapter.
 pub struct ExternalCasOffhostAnchorMemoryModel {
     anchor_pin: ExternalCasOffhostAnchorPin,
     provider_pin: ExternalCasPin,
-    state: Mutex<ExternalCasOffhostAnchorState>,
+    store: Arc<dyn ExternalCasOffhostAnchorStore>,
 }
 impl ExternalCasOffhostAnchorMemoryModel {
     pub fn new(
@@ -512,10 +617,27 @@ impl ExternalCasOffhostAnchorMemoryModel {
     ) -> Result<Self, OffhostAnchorProtocolError> {
         anchor_pin.validate(&provider_pin)?;
         bootstrap.validate(&provider_pin)?;
+        let store: Arc<dyn ExternalCasOffhostAnchorStore> =
+            Arc::new(ExternalCasOffhostAnchorMemoryStore::new(bootstrap));
+        Self::with_store(anchor_pin, provider_pin, store)
+    }
+
+    /// Construct over an injected storage adapter. The adapter must implement the atomic
+    /// server-side CAS contract; using a local file or read-then-write implementation is unsafe.
+    pub fn with_store(
+        anchor_pin: ExternalCasOffhostAnchorPin,
+        provider_pin: ExternalCasPin,
+        store: Arc<dyn ExternalCasOffhostAnchorStore>,
+    ) -> Result<Self, OffhostAnchorProtocolError> {
+        anchor_pin.validate(&provider_pin)?;
+        store
+            .load_consistent()
+            .map_err(OffhostAnchorProtocolError::Store)?
+            .validate(&provider_pin)?;
         Ok(Self {
             anchor_pin,
             provider_pin,
-            state: Mutex::new(bootstrap),
+            store,
         })
     }
 
@@ -526,10 +648,10 @@ impl ExternalCasOffhostAnchorMemoryModel {
     ) -> Result<ExternalCasOffhostAnchorReceipt, OffhostAnchorProtocolError> {
         request.validate()?;
         let state = self
-            .state
-            .lock()
-            .map_err(|_| OffhostAnchorProtocolError::Poisoned)?
-            .clone();
+            .store
+            .load_consistent()
+            .map_err(OffhostAnchorProtocolError::Store)?;
+
         let mut receipt = new_receipt(
             ExternalCasOffhostAnchorReceiptKind::Read,
             ExternalCasOffhostAnchorReceiptOutcome::Observed,
@@ -555,10 +677,10 @@ impl ExternalCasOffhostAnchorMemoryModel {
         anchor_signer: &S,
     ) -> Result<ExternalCasOffhostAnchorReceipt, OffhostAnchorProtocolError> {
         request.validate()?;
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| OffhostAnchorProtocolError::Poisoned)?;
+        let state = self
+            .store
+            .load_consistent()
+            .map_err(OffhostAnchorProtocolError::Store)?;
 
         // Exact operation retry is checked before the stale predecessor precondition.
         if state.digest()? == request.target_state_digest
@@ -587,14 +709,15 @@ impl ExternalCasOffhostAnchorMemoryModel {
                 request.expected_sequence,
                 request.expected_state_digest,
                 request.target_state_digest,
-                state.clone(),
+                state,
             )?;
             receipt.sign(anchor_signer)?;
             return Ok(receipt);
         }
 
+        let expected_state_digest = state.digest()?;
         if state.sequence != request.expected_sequence
-            || state.digest()? != request.expected_state_digest
+            || expected_state_digest != request.expected_state_digest
         {
             let mut receipt = new_receipt(
                 ExternalCasOffhostAnchorReceiptKind::Cas,
@@ -606,12 +729,16 @@ impl ExternalCasOffhostAnchorMemoryModel {
                 request.expected_sequence,
                 request.expected_state_digest,
                 request.target_state_digest,
-                state.clone(),
+                state,
             )?;
             receipt.sign(anchor_signer)?;
             return Ok(receipt);
         }
 
+        let expected_next_sequence = request
+            .expected_sequence
+            .checked_add(1)
+            .ok_or(OffhostAnchorProtocolError::WrongTarget)?;
         let verified = verify_provider_commit_for_offhost_anchor(
             &self.provider_pin,
             &state,
@@ -623,34 +750,93 @@ impl ExternalCasOffhostAnchorMemoryModel {
             || verified.operation_id != request.operation_id
             || verified.request_digest != request.request_digest
             || verified.next_state.digest()? != request.target_state_digest
-            || verified.next_state.sequence != request.expected_sequence + 1
+            || verified.next_state.sequence != expected_next_sequence
         {
             return Err(OffhostAnchorProtocolError::WrongTarget);
         }
 
-        *state = verified.next_state;
-        let mut receipt = new_receipt(
-            ExternalCasOffhostAnchorReceiptKind::Cas,
-            ExternalCasOffhostAnchorReceiptOutcome::Applied,
-            &self.anchor_pin,
-            request.challenge,
-            request.operation_id,
-            request.request_digest,
-            request.expected_sequence,
-            request.expected_state_digest,
-            request.target_state_digest,
-            state.clone(),
-        )?;
-        receipt.sign(anchor_signer)?;
-        Ok(receipt)
+        // The backing adapter performs the only authoritative mutation. It must compare both
+        // expected sequence and expected full-state digest in one atomic server-side operation.
+        match self
+            .store
+            .compare_and_swap_atomic(
+                request.expected_sequence,
+                &request.expected_state_digest,
+                &verified.next_state,
+            )
+            .map_err(OffhostAnchorProtocolError::Store)?
+        {
+            ExternalCasOffhostAnchorStoreCasOutcome::Applied => {
+                let mut receipt = new_receipt(
+                    ExternalCasOffhostAnchorReceiptKind::Cas,
+                    ExternalCasOffhostAnchorReceiptOutcome::Applied,
+                    &self.anchor_pin,
+                    request.challenge,
+                    request.operation_id,
+                    request.request_digest,
+                    request.expected_sequence,
+                    request.expected_state_digest,
+                    request.target_state_digest,
+                    verified.next_state,
+                )?;
+                receipt.sign(anchor_signer)?;
+                Ok(receipt)
+            }
+            ExternalCasOffhostAnchorStoreCasOutcome::Conflict(current) => {
+                // A concurrent exact retry may have won the CAS while this request was in flight.
+                if current.digest()? == request.target_state_digest
+                    && current.last_operation_id == request.operation_id
+                    && current.last_request_digest == request.request_digest
+                    && current.last_expected_anchor_sequence == request.expected_sequence
+                    && current.last_expected_anchor_state_digest == request.expected_state_digest
+                {
+                    let retry_verified = verify_provider_commit_for_offhost_anchor(
+                        &self.provider_pin,
+                        &current,
+                        next_record_bytes,
+                        provider_receipt_bytes,
+                        provider_verifier,
+                    )?;
+                    if retry_verified.outcome != ExternalCasOffhostAnchorOutcome::AlreadyApplied {
+                        return Err(OffhostAnchorProtocolError::WrongOutcome);
+                    }
+                    let mut receipt = new_receipt(
+                        ExternalCasOffhostAnchorReceiptKind::Cas,
+                        ExternalCasOffhostAnchorReceiptOutcome::AlreadyApplied,
+                        &self.anchor_pin,
+                        request.challenge,
+                        request.operation_id,
+                        request.request_digest,
+                        request.expected_sequence,
+                        request.expected_state_digest,
+                        request.target_state_digest,
+                        current,
+                    )?;
+                    receipt.sign(anchor_signer)?;
+                    return Ok(receipt);
+                }
+                let mut receipt = new_receipt(
+                    ExternalCasOffhostAnchorReceiptKind::Cas,
+                    ExternalCasOffhostAnchorReceiptOutcome::Conflict,
+                    &self.anchor_pin,
+                    request.challenge,
+                    request.operation_id,
+                    request.request_digest,
+                    request.expected_sequence,
+                    request.expected_state_digest,
+                    request.target_state_digest,
+                    current,
+                )?;
+                receipt.sign(anchor_signer)?;
+                Ok(receipt)
+            }
+        }
     }
 
     pub fn snapshot(&self) -> Result<ExternalCasOffhostAnchorState, OffhostAnchorProtocolError> {
-        Ok(self
-            .state
-            .lock()
-            .map_err(|_| OffhostAnchorProtocolError::Poisoned)?
-            .clone())
+        self.store
+            .load_consistent()
+            .map_err(OffhostAnchorProtocolError::Store)
     }
 }
 
@@ -666,6 +852,30 @@ mod tests {
     };
     use libcrux_ml_dsa::ml_dsa_65::{portable, MLDSA65SigningKey};
     use std::{sync::Arc, thread};
+
+    struct UnavailableWriteStore {
+        state: Mutex<ExternalCasOffhostAnchorState>,
+    }
+    impl ExternalCasOffhostAnchorStore for UnavailableWriteStore {
+        fn load_consistent(
+            &self,
+        ) -> Result<ExternalCasOffhostAnchorState, ExternalCasOffhostAnchorStoreError> {
+            self.state
+                .lock()
+                .map(|state| state.clone())
+                .map_err(|_| ExternalCasOffhostAnchorStoreError::Poisoned)
+        }
+
+        fn compare_and_swap_atomic(
+            &self,
+            _expected_sequence: u64,
+            _expected_state_digest: &Digest32,
+            _next_state: &ExternalCasOffhostAnchorState,
+        ) -> Result<ExternalCasOffhostAnchorStoreCasOutcome, ExternalCasOffhostAnchorStoreError>
+        {
+            Err(ExternalCasOffhostAnchorStoreError::Unavailable)
+        }
+    }
 
     struct Signer(Arc<MLDSA65SigningKey>);
     struct FailingSigner;
@@ -1145,6 +1355,107 @@ mod tests {
                 signer: anchor_signer(f),
             }
         }
+    }
+
+    #[test]
+    fn atomic_store_contract_compares_sequence_and_full_digest_in_one_cas() {
+        let f = fixture();
+        let store = ExternalCasOffhostAnchorMemoryStore::new(f.bootstrap.clone());
+        let predecessor_digest = f.bootstrap.digest().unwrap();
+        let (next_a, receipt_a) =
+            provider_proof(&f, 0xF1, 0xF2, 0xF3, ExternalCasReceiptOutcome::Applied);
+        let next_state_a = verify_provider_commit_for_offhost_anchor(
+            &f.provider_pin,
+            &f.bootstrap,
+            &next_a.encode().unwrap(),
+            &receipt_a.encode().unwrap(),
+            &LibcruxMlDsa65VerifierCandidate,
+        )
+        .unwrap()
+        .next_state;
+        assert_eq!(
+            store
+                .compare_and_swap_atomic(1, &predecessor_digest, &next_state_a)
+                .unwrap(),
+            ExternalCasOffhostAnchorStoreCasOutcome::Applied
+        );
+        assert_eq!(store.load_consistent().unwrap(), next_state_a);
+
+        // A second successor built from the same predecessor loses the atomic CAS and receives
+        // the complete current high-water item; it cannot overwrite the winner.
+        let (next_b, receipt_b) =
+            provider_proof(&f, 0xF4, 0xF5, 0xF6, ExternalCasReceiptOutcome::Applied);
+        let next_state_b = verify_provider_commit_for_offhost_anchor(
+            &f.provider_pin,
+            &f.bootstrap,
+            &next_b.encode().unwrap(),
+            &receipt_b.encode().unwrap(),
+            &LibcruxMlDsa65VerifierCandidate,
+        )
+        .unwrap()
+        .next_state;
+        assert_eq!(
+            store
+                .compare_and_swap_atomic(1, &predecessor_digest, &next_state_b)
+                .unwrap(),
+            ExternalCasOffhostAnchorStoreCasOutcome::Conflict(next_state_a.clone())
+        );
+
+        // Sequence alone is insufficient: a matching sequence with a substituted state digest
+        // also conflicts and leaves the current item unchanged.
+        assert_eq!(
+            store
+                .compare_and_swap_atomic(2, &[0xA7; 32], &next_state_b)
+                .unwrap(),
+            ExternalCasOffhostAnchorStoreCasOutcome::Conflict(next_state_a.clone())
+        );
+        assert_eq!(store.load_consistent().unwrap(), next_state_a);
+    }
+
+    #[test]
+    fn unavailable_atomic_store_never_falls_back_or_publishes_the_target() {
+        let f = fixture();
+        let store: Arc<dyn ExternalCasOffhostAnchorStore> = Arc::new(UnavailableWriteStore {
+            state: Mutex::new(f.bootstrap.clone()),
+        });
+        let model = ExternalCasOffhostAnchorMemoryModel::with_store(
+            f.anchor_pin.clone(),
+            f.provider_pin.clone(),
+            store,
+        )
+        .unwrap();
+        let (next, provider_receipt) =
+            provider_proof(&f, 0xF7, 0xF8, 0xF9, ExternalCasReceiptOutcome::Applied);
+        let next_state = verify_provider_commit_for_offhost_anchor(
+            &f.provider_pin,
+            &f.bootstrap,
+            &next.encode().unwrap(),
+            &provider_receipt.encode().unwrap(),
+            &LibcruxMlDsa65VerifierCandidate,
+        )
+        .unwrap()
+        .next_state;
+        let request = cas_request(
+            &f.bootstrap,
+            0xF8,
+            0xFA,
+            next.request_digest,
+            next_state.digest().unwrap(),
+        );
+
+        assert_eq!(
+            model.compare_and_swap(
+                &request,
+                &next.encode().unwrap(),
+                &provider_receipt.encode().unwrap(),
+                &LibcruxMlDsa65VerifierCandidate,
+                &anchor_signer(&f),
+            ),
+            Err(OffhostAnchorProtocolError::Store(
+                ExternalCasOffhostAnchorStoreError::Unavailable
+            ))
+        );
+        assert_eq!(model.snapshot().unwrap(), f.bootstrap);
     }
 
     #[test]

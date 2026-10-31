@@ -71,9 +71,11 @@ The client API returns the explicit outcome together with the returned state. It
 
 For a retry, the Anchor checks the last operation, request digest, target, and original predecessor sequence/digest before it returns AlreadyApplied. Reuse of an operation ID under a different target or predecessor does not become a second advance.
 
-## Process-local state-machine model
+## Storage adapter boundary
 
-ExternalCasOffhostAnchorMemoryModel serializes reads and CAS with a mutex and uses the CP-0481 Provider proof verifier before install. It is intentionally only an in-memory model and does not provide rollback resistance, multi-process linearizability, crash durability or independent administration.
+CP-0483 adds an injectable ExternalCasOffhostAnchorStore contract. The protocol now obtains the current item through load_consistent and performs the authoritative update only through compare_and_swap_atomic, which must atomically compare both expected sequence and full predecessor-state digest. The protocol does not implement a read-then-unconditional-write fallback.
+
+ExternalCasOffhostAnchorMemoryStore implements the contract with a process-local Mutex for deterministic tests. A production adapter must be a separately administered durable backend; the in-memory implementation is not rollback resistance, multi-process linearizability, crash durability or independent administration.
 
 A signing error after the state update models the ambiguous lost-response window: the state remains committed, and the caller must issue a new challenge-bound Read to discover the exact committed state. It must not infer abort from a missing response.
 

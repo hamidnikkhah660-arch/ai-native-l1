@@ -157,8 +157,8 @@ This proposal is **not implemented or deployed**. No AWS account, DynamoDB table
 
 The next engineering sequence is:
 1. CP-0481 implements the QRun-specific service-side ECR1/ECS1 Provider-proof validator, including the exact prior Anchor sequence/state digest for retry binding.
-2. CP-0482 implements a separate Anchor-key pin, canonical challenge-bound signed Read/CAS receipts, explicit Conflict outcome and a mutex-serialized in-memory test model; it is not a durable service or cloud adapter.
-3. implement the separately deployable service and conditional storage adapter;
+2. CP-0482 implements a separate Anchor-key pin, canonical challenge-bound signed Read/CAS receipts and explicit Conflict outcome. Its protocol runs over an injectable store.
+3. CP-0483 specifies the atomic storage adapter contract: strongly consistent read and a single server-side conditional write over both predecessor sequence and full-state digest. Only a process-local test adapter exists; no durable or cloud adapter is implemented.
 4. provision a disposable, separately administered staging account and verify the actual IAM/KMS/DynamoDB behavior;
 5. integrate the remote anchor into node startup and QAP1/QCF1/PFS2 recovery only after the service passes crash and multi-host tests.
 
