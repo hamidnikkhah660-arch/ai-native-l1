@@ -18,6 +18,7 @@ use std::{
     collections::HashSet,
     fmt, io,
     net::{SocketAddr, TcpListener, TcpStream},
+    panic::{catch_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{sync_channel, TrySendError},
@@ -95,6 +96,7 @@ struct Counters {
     failed: AtomicU64,
     active_connections: AtomicU64,
     worker_threads_started: AtomicU64,
+    active_worker_threads: AtomicU64,
 }
 
 /// Monotonic daemon counters. Accepted includes sockets rejected because the bounded queue was full.
@@ -106,6 +108,8 @@ pub struct OffhostAnchorNoiseDaemonStats {
     pub failed_requests: u64,
     /// Total fixed worker threads started by this daemon run.
     pub worker_threads_started: u64,
+    /// Worker threads that have not yet exited.
+    pub active_worker_threads: u64,
 }
 
 impl Counters {
@@ -116,6 +120,7 @@ impl Counters {
             completed_requests: self.completed.load(Ordering::Relaxed),
             failed_requests: self.failed.load(Ordering::Relaxed),
             worker_threads_started: self.worker_threads_started.load(Ordering::Relaxed),
+            active_worker_threads: self.active_worker_threads.load(Ordering::Relaxed),
         }
     }
 }
@@ -152,7 +157,25 @@ impl Drop for ActiveConnectionGuard {
     }
 }
 
-/// Explicitly bound Anchor service. No background threads are started until run_until_shutdown.
+/// Tracks worker liveness independently of request/connection counters.
+struct ActiveWorkerGuard(Arc<Counters>);
+
+impl ActiveWorkerGuard {
+    fn new(counters: Arc<Counters>) -> Self {
+        counters
+            .active_worker_threads
+            .fetch_add(1, Ordering::Relaxed);
+        Self(counters)
+    }
+}
+
+impl Drop for ActiveWorkerGuard {
+    fn drop(&mut self) {
+        self.0.active_worker_threads.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Explicitly bound Anchor service. No background threads are started until run_until_shutdown or spawn.
 pub struct OffhostAnchorNoiseDaemon<S, V> {
     listener: TcpListener,
     local_static_private_key: Arc<SecretNoiseKey>,
@@ -165,6 +188,77 @@ pub struct OffhostAnchorNoiseDaemon<S, V> {
     max_workers: usize,
     queue_capacity: usize,
     counters: Arc<Counters>,
+}
+
+/// Owner handle for a daemon running on a dedicated thread.
+///
+/// Dropping the handle requests graceful shutdown and joins the daemon thread. In-flight
+/// handlers may run until their 20-second I/O deadline. No automatic restart is attempted: the
+/// owner must explicitly provision a fresh, independently validated configuration before starting
+/// a replacement service.
+pub struct OffhostAnchorNoiseDaemonTask {
+    shutdown: Arc<AtomicBool>,
+    counters: Arc<Counters>,
+    join:
+        Option<thread::JoinHandle<Result<OffhostAnchorNoiseDaemonStats, OffhostAnchorNoiseError>>>,
+}
+
+impl fmt::Debug for OffhostAnchorNoiseDaemonTask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OffhostAnchorNoiseDaemonTask")
+            .field("shutdown_requested", &self.shutdown.load(Ordering::Acquire))
+            .field("finished", &self.is_finished())
+            .field("stats", &self.stats())
+            .finish_non_exhaustive()
+    }
+}
+
+impl OffhostAnchorNoiseDaemonTask {
+    /// Request that the accept loop stop and all queued sockets be discarded.
+    pub fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
+
+    /// Whether the daemon thread has returned, including after a worker failure.
+    pub fn is_finished(&self) -> bool {
+        self.join
+            .as_ref()
+            .is_none_or(thread::JoinHandle::is_finished)
+    }
+
+    /// Return a live snapshot of the daemon's monotonic counters.
+    pub fn stats(&self) -> OffhostAnchorNoiseDaemonStats {
+        self.counters.snapshot()
+    }
+
+    /// Join the daemon after a shutdown request (or after it exits due to failure).
+    pub fn join(mut self) -> Result<OffhostAnchorNoiseDaemonStats, OffhostAnchorNoiseError> {
+        let join = self.join.take().ok_or_else(|| {
+            OffhostAnchorNoiseError::Io("off-host Anchor daemon task was already joined".into())
+        })?;
+        join.join().map_err(|_| {
+            OffhostAnchorNoiseError::Io("off-host Anchor daemon supervisor thread panicked".into())
+        })?
+    }
+
+    /// Request graceful shutdown and synchronously join the service and all its workers.
+    pub fn shutdown_and_join(
+        self,
+    ) -> Result<OffhostAnchorNoiseDaemonStats, OffhostAnchorNoiseError> {
+        self.request_shutdown();
+        self.join()
+    }
+}
+
+impl Drop for OffhostAnchorNoiseDaemonTask {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(join) = self.join.take() {
+            // Drop cannot report a service error; callers that need it must use join() or
+            // shutdown_and_join(). Joining here still guarantees the listener/workers are gone.
+            let _ = join.join();
+        }
+    }
 }
 
 impl<S, V> fmt::Debug for OffhostAnchorNoiseDaemon<S, V> {
@@ -255,6 +349,22 @@ where
         })
     }
 
+    /// Start the already-bound daemon under an owned shutdown/join handle.
+    pub fn spawn(self) -> Result<OffhostAnchorNoiseDaemonTask, OffhostAnchorNoiseError> {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let counters = Arc::clone(&self.counters);
+        let join = thread::Builder::new()
+            .name("qrun-anchor-noise-daemon".into())
+            .spawn(move || self.run_until_shutdown(worker_shutdown.as_ref()))
+            .map_err(|error| OffhostAnchorNoiseError::Io(error.to_string()))?;
+        Ok(OffhostAnchorNoiseDaemonTask {
+            shutdown,
+            counters,
+            join: Some(join),
+        })
+    }
+
     pub fn local_addr(&self) -> Result<SocketAddr, OffhostAnchorNoiseError> {
         self.listener
             .local_addr()
@@ -270,6 +380,8 @@ where
     /// The bounded channel never holds more than queue_capacity sockets, and exactly max_workers
     /// worker threads are created. On shutdown no queued sockets are newly served; workers finish
     /// their in-flight request (subject to the handler's 20-second I/O deadlines) and then exit.
+    /// A worker panic stops the accept loop, drains the queue without serving it, joins all workers,
+    /// and returns an error so an owner can decide whether to provision and start a replacement.
     /// Excess accepted sockets are immediately dropped instead of spawning unbounded threads.
     pub fn run_until_shutdown(
         self,
@@ -278,6 +390,7 @@ where
         let (sender, receiver) = sync_channel::<TcpStream>(self.queue_capacity);
         let shared_receiver = Arc::new(Mutex::new(receiver));
         let worker_stop = Arc::new(AtomicBool::new(false));
+        let worker_panic_signal = Arc::new(AtomicBool::new(false));
 
         // Scoped workers observe the caller's shutdown flag directly. This closes the race where
         // an in-flight handler returned before the accept loop had propagated shutdown to a
@@ -297,42 +410,52 @@ where
                 let verifier = Arc::clone(&self.provider_verifier);
                 let signer = Arc::clone(&self.anchor_signer);
                 let counters = Arc::clone(&self.counters);
+                let panic_stop = Arc::clone(&worker_panic_signal);
+                let panic_signal = Arc::clone(&worker_panic_signal);
                 let spawn = thread::Builder::new()
                     .name(format!("qrun-anchor-noise-{worker_index}"))
                     .spawn_scoped(scope, move || {
-                        counters
-                            .worker_threads_started
-                            .fetch_add(1, Ordering::Relaxed);
-                        loop {
-                            let received = match receiver.lock() {
-                                Ok(guard) => guard.recv(),
-                                Err(_) => break,
-                            };
-                            let stream = match received {
-                                Ok(stream) => stream,
-                                Err(_) => break,
-                            };
-                            if stop.load(Ordering::Acquire)
-                                || caller_shutdown.load(Ordering::Acquire)
-                            {
-                                drop(stream);
-                                break;
+                        let worker_result = catch_unwind(AssertUnwindSafe(|| {
+                            counters
+                                .worker_threads_started
+                                .fetch_add(1, Ordering::Relaxed);
+                            let _active_worker = ActiveWorkerGuard::new(Arc::clone(&counters));
+                            loop {
+                                let received = match receiver.lock() {
+                                    Ok(guard) => guard.recv(),
+                                    Err(_) => break,
+                                };
+                                let stream = match received {
+                                    Ok(stream) => stream,
+                                    Err(_) => break,
+                                };
+                                if stop.load(Ordering::Acquire)
+                                    || caller_shutdown.load(Ordering::Acquire)
+                                    || panic_stop.load(Ordering::Acquire)
+                                {
+                                    drop(stream);
+                                    break;
+                                }
+                                let mut stream = stream;
+                                let mut connection =
+                                    ActiveConnectionGuard::new(Arc::clone(&counters));
+                                let result = serve_offhost_anchor_noise_connection(
+                                    &mut stream,
+                                    &key.0,
+                                    clients.as_slice(),
+                                    &anchor_pin,
+                                    &provider_pin,
+                                    &model,
+                                    verifier.as_ref(),
+                                    signer.as_ref(),
+                                );
+                                if result.is_ok() {
+                                    connection.mark_completed();
+                                }
                             }
-                            let mut stream = stream;
-                            let mut connection = ActiveConnectionGuard::new(Arc::clone(&counters));
-                            let result = serve_offhost_anchor_noise_connection(
-                                &mut stream,
-                                &key.0,
-                                clients.as_slice(),
-                                &anchor_pin,
-                                &provider_pin,
-                                &model,
-                                verifier.as_ref(),
-                                signer.as_ref(),
-                            );
-                            if result.is_ok() {
-                                connection.mark_completed();
-                            }
+                        }));
+                        if worker_result.is_err() {
+                            panic_signal.store(true, Ordering::Release);
                         }
                     });
                 match spawn {
@@ -349,7 +472,8 @@ where
             }
 
             let mut accept_error: Option<io::Error> = None;
-            while !shutdown.load(Ordering::Acquire) {
+            while !shutdown.load(Ordering::Acquire) && !worker_panic_signal.load(Ordering::Acquire)
+            {
                 match self.listener.accept() {
                     Ok((stream, _peer)) => {
                         self.counters.accepted.fetch_add(1, Ordering::Relaxed);
@@ -381,7 +505,7 @@ where
 
             worker_stop.store(true, Ordering::Release);
             drop(sender);
-            let mut worker_panicked = false;
+            let mut worker_panicked = worker_panic_signal.load(Ordering::Acquire);
             for worker in workers {
                 if worker.join().is_err() {
                     worker_panicked = true;
@@ -551,6 +675,38 @@ mod tests {
             max_workers,
             queue_capacity,
         }
+    }
+
+    fn bind_daemon_at(
+        f: &Fixture,
+        bind_address: SocketAddr,
+        anchor_signer: TestSigner,
+        max_workers: usize,
+        queue_capacity: usize,
+    ) -> (
+        OffhostAnchorNoiseDaemon<TestSigner, LibcruxMlDsa65VerifierCandidate>,
+        [u8; 32],
+        [u8; 32],
+    ) {
+        let (server_private, server_public) = noise_keypair();
+        let (client_private, client_public) = noise_keypair();
+        let config = daemon_config(
+            bind_address,
+            f.anchor_pin.clone(),
+            f.provider_pin.clone(),
+            server_private,
+            client_public,
+            max_workers,
+            queue_capacity,
+        );
+        let daemon = OffhostAnchorNoiseDaemon::bind(
+            config,
+            model(f),
+            Arc::new(LibcruxMlDsa65VerifierCandidate),
+            Arc::new(anchor_signer),
+        )
+        .unwrap();
+        (daemon, server_public, client_private)
     }
 
     struct RunningDaemon {
@@ -1055,6 +1211,108 @@ mod tests {
     }
 
     #[test]
+    fn supervised_task_shutdown_joins_workers_and_reports_zero_active_threads() {
+        let f = fixture();
+        let (daemon, _server_public, _client_private) = bind_daemon_at(
+            &f,
+            "127.0.0.1:0".parse().unwrap(),
+            f.anchor_signer.clone(),
+            3,
+            2,
+        );
+        assert_eq!(daemon.stats().worker_threads_started, 0);
+        assert_eq!(daemon.stats().active_worker_threads, 0);
+        let task = daemon.spawn().unwrap();
+        assert!(wait_until(
+            || task.stats().active_worker_threads == 3,
+            Duration::from_secs(2),
+        ));
+        assert_eq!(task.stats().worker_threads_started, 3);
+        assert!(!task.is_finished());
+
+        task.request_shutdown();
+        let stats = task.join().unwrap();
+        assert_eq!(stats.worker_threads_started, 3);
+        assert_eq!(stats.active_worker_threads, 0);
+    }
+
+    #[test]
+    fn dropping_supervised_task_requests_shutdown_and_joins_workers() {
+        let f = fixture();
+        let (daemon, _server_public, _client_private) = bind_daemon_at(
+            &f,
+            "127.0.0.1:0".parse().unwrap(),
+            f.anchor_signer.clone(),
+            2,
+            1,
+        );
+        let counters = Arc::clone(&daemon.counters);
+        let task = daemon.spawn().unwrap();
+        assert!(wait_until(
+            || task.stats().active_worker_threads == 2,
+            Duration::from_secs(2),
+        ));
+
+        drop(task);
+        assert_eq!(counters.snapshot().active_worker_threads, 0);
+    }
+
+    #[test]
+    fn supervised_worker_panic_fails_closed_and_owner_can_explicitly_rebind() {
+        let f = fixture();
+        let mut panic_signer = f.anchor_signer.clone();
+        panic_signer.panic_on_sign = true;
+        let (daemon, server_public, client_private) =
+            bind_daemon_at(&f, "127.0.0.1:0".parse().unwrap(), panic_signer, 2, 1);
+        let address = daemon.local_addr().unwrap();
+        let counters = Arc::clone(&daemon.counters);
+        let task = daemon.spawn().unwrap();
+        assert!(wait_until(
+            || task.stats().active_worker_threads == 2,
+            Duration::from_secs(2),
+        ));
+
+        let transport = NoiseTcpOffhostAnchorTransport::new(
+            address,
+            client_private,
+            server_public,
+            f.anchor_pin.clone(),
+            f.provider_pin.clone(),
+        )
+        .unwrap();
+        let request = ExternalCasOffhostAnchorReadRequest {
+            challenge: [0xEA; 32],
+            operation_id: [0xEB; 32],
+            request_digest: [0xEC; 32],
+        };
+        assert!(transport.read(&request).is_err());
+        assert!(wait_until(|| task.is_finished(), Duration::from_secs(2)));
+        assert!(matches!(
+            task.join(),
+            Err(OffhostAnchorNoiseError::Io(message))
+                if message.contains("worker thread panicked")
+        ));
+        let failed_stats = counters.snapshot();
+        assert_eq!(failed_stats.accepted_connections, 1);
+        assert_eq!(failed_stats.failed_requests, 1);
+        assert_eq!(failed_stats.active_worker_threads, 0);
+
+        // Recovery is explicit: a fresh daemon with a newly constructed configuration must bind
+        // successfully after the failed service has been joined and released its listener.
+        let (replacement, _replacement_server_public, _replacement_client_private) =
+            bind_daemon_at(&f, address, f.anchor_signer.clone(), 1, 1);
+        assert_eq!(replacement.local_addr().unwrap(), address);
+        let replacement_task = replacement.spawn().unwrap();
+        assert!(wait_until(
+            || replacement_task.stats().active_worker_threads == 1,
+            Duration::from_secs(2),
+        ));
+        let replacement_stats = replacement_task.shutdown_and_join().unwrap();
+        assert_eq!(replacement_stats.active_worker_threads, 0);
+        assert_eq!(replacement_stats.worker_threads_started, 1);
+    }
+
+    #[test]
     fn worker_panic_releases_active_connection_counts_failure_and_is_reported() {
         let f = fixture();
         let (server_private, server_public) = noise_keypair();
@@ -1110,6 +1368,7 @@ mod tests {
         assert_eq!(stats.completed_requests, 0);
         assert_eq!(stats.failed_requests, 1);
         assert_eq!(stats.worker_threads_started, 2);
+        assert_eq!(stats.active_worker_threads, 0);
         assert_eq!(counters.active_connections.load(Ordering::Relaxed), 0);
     }
 }
