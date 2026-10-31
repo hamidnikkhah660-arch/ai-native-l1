@@ -1480,4 +1480,225 @@ mod tests {
         assert_eq!(stats.active_worker_threads, 0);
         assert_eq!(counters.active_connections.load(Ordering::Relaxed), 0);
     }
+
+    const CP0489_CHILD_ENV: &str = "QRUN_CP0489_SIGNAL_CHILD";
+    const CP0489_CHILD_READY: &str = "CP0489_CHILD_READY";
+    const CP0489_DAEMON_JOINED: &str = "CP0489_ANCHOR_DAEMON_JOINED_ACTIVE_WORKERS=0";
+    const CP0489_HANDLER_RESTORED: &str = "CP0489_SIGNAL_HANDLER_RESTORED=true";
+
+    #[test]
+    fn os_signal_child_probe_for_anchor_shutdown() {
+        if std::env::var_os(CP0489_CHILD_ENV).is_none() {
+            return;
+        }
+
+        use crate::external_cas_offhost_anchor_node_lifecycle_candidate::OffhostAnchorNodeServiceOwner;
+        use crate::qrun_node_shutdown_signal_candidate::QRunNodeShutdownSignalCandidate;
+
+        let signal = QRunNodeShutdownSignalCandidate::install().unwrap();
+        let f = fixture();
+        let (daemon, _server_public, _client_private) = bind_daemon_at(
+            &f,
+            "127.0.0.1:0".parse().unwrap(),
+            f.anchor_signer.clone(),
+            2,
+            1,
+        );
+        let counters = Arc::clone(&daemon.counters);
+        let task = daemon.spawn().unwrap();
+        let mut owner = OffhostAnchorNodeServiceOwner::disabled();
+        owner.try_attach(task).unwrap();
+        assert!(wait_until(
+            || owner
+                .stats()
+                .is_some_and(|stats| stats.active_worker_threads == 2),
+            Duration::from_secs(3),
+        ));
+
+        println!("{CP0489_CHILD_READY}");
+        while !signal.is_shutdown_requested() {
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let stats = owner.shutdown_and_join().unwrap().unwrap();
+        assert_eq!(stats.worker_threads_started, 2);
+        assert_eq!(stats.active_worker_threads, 0);
+        assert!(!owner.is_attached());
+        assert_eq!(counters.snapshot().active_worker_threads, 0);
+
+        signal.uninstall().unwrap();
+        println!("{CP0489_DAEMON_JOINED}");
+        println!("{CP0489_HANDLER_RESTORED}");
+    }
+
+    #[test]
+    fn os_signal_in_child_process_joins_anchor_workers_and_restores_handler() {
+        use std::{
+            io::{BufRead, BufReader},
+            process::{Command, Stdio},
+            sync::mpsc,
+        };
+
+        fn forward_pipe<R: std::io::Read + Send + 'static>(
+            pipe: R,
+            label: &'static str,
+            sender: mpsc::Sender<String>,
+        ) -> thread::JoinHandle<()> {
+            thread::spawn(move || {
+                for line in BufReader::new(pipe).lines() {
+                    match line {
+                        Ok(line) => {
+                            let _ = sender.send(format!("{label}: {line}"));
+                        }
+                        Err(error) => {
+                            let _ = sender.send(format!("{label}: <read error: {error}>"));
+                            break;
+                        }
+                    }
+                }
+            })
+        }
+
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("os_signal_child_probe_for_anchor_shutdown")
+            .arg("--nocapture")
+            .env(CP0489_CHILD_ENV, "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0000_0200); // CREATE_NEW_PROCESS_GROUP
+        }
+
+        let mut child = command
+            .spawn()
+            .expect("spawn isolated daemon lifecycle test");
+        let (sender, receiver) = mpsc::channel();
+        let stdout_thread = forward_pipe(child.stdout.take().unwrap(), "stdout", sender.clone());
+        let stderr_thread = forward_pipe(child.stderr.take().unwrap(), "stderr", sender);
+        let mut output = Vec::new();
+        let ready_deadline = Instant::now() + Duration::from_secs(20);
+        let mut ready = false;
+
+        while Instant::now() < ready_deadline {
+            if let Some(status) = child.try_wait().unwrap() {
+                stdout_thread.join().unwrap();
+                stderr_thread.join().unwrap();
+                while let Ok(line) = receiver.try_recv() {
+                    output.push(line);
+                }
+                panic!(
+                    "signal child exited before daemon was ready; status={status:?}; output={output:#?}"
+                );
+            }
+            if let Ok(line) = receiver.recv_timeout(Duration::from_millis(50)) {
+                output.push(line);
+                if output
+                    .last()
+                    .is_some_and(|line| line.contains(CP0489_CHILD_READY))
+                {
+                    ready = true;
+                    break;
+                }
+            }
+        }
+
+        if !ready {
+            let _ = child.kill();
+            let status = child.wait().unwrap();
+            stdout_thread.join().unwrap();
+            stderr_thread.join().unwrap();
+            while let Ok(line) = receiver.try_recv() {
+                output.push(line);
+            }
+            panic!(
+                "signal child did not start the supervised Anchor workers; status={status:?}; output={output:#?}"
+            );
+        }
+
+        #[cfg(unix)]
+        let signal_delivery = {
+            let result = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        };
+        #[cfg(windows)]
+        let signal_delivery = {
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn GenerateConsoleCtrlEvent(control_type: u32, process_group_id: u32) -> i32;
+            }
+            let result = unsafe { GenerateConsoleCtrlEvent(1, child.id()) }; // CTRL_BREAK_EVENT
+            if result != 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        };
+
+        if let Err(error) = signal_delivery {
+            let _ = child.kill();
+            let status = child.wait().unwrap();
+            stdout_thread.join().unwrap();
+            stderr_thread.join().unwrap();
+            while let Ok(line) = receiver.try_recv() {
+                output.push(line);
+            }
+            panic!(
+                "failed to send process shutdown signal to daemon child; error={error}; status={status:?}; output={output:#?}"
+            );
+        }
+
+        let shutdown_deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= shutdown_deadline {
+                let _ = child.kill();
+                let killed_status = child.wait().unwrap();
+                stdout_thread.join().unwrap();
+                stderr_thread.join().unwrap();
+                while let Ok(line) = receiver.try_recv() {
+                    output.push(line);
+                }
+                panic!(
+                    "signal child failed to stop/join its Anchor daemon; status={killed_status:?}; output={output:#?}"
+                );
+            }
+            if let Ok(line) = receiver.recv_timeout(Duration::from_millis(50)) {
+                output.push(line);
+            }
+        };
+
+        stdout_thread.join().unwrap();
+        stderr_thread.join().unwrap();
+        while let Ok(line) = receiver.try_recv() {
+            output.push(line);
+        }
+
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "daemon signal child failed: {output:#?}"
+        );
+        assert!(
+            output
+                .iter()
+                .any(|line| line.contains(CP0489_DAEMON_JOINED)),
+            "Anchor daemon workers were not joined before child exit: {output:#?}"
+        );
+        assert!(
+            output
+                .iter()
+                .any(|line| line.contains(CP0489_HANDLER_RESTORED)),
+            "signal handler restoration was not verified by the child: {output:#?}"
+        );
+    }
 }
