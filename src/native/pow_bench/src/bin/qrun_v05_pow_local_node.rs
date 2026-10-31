@@ -15,6 +15,8 @@ use ai_native_l1_pow_bench::external_cas_floor_store_candidate::{
     ExternalCasFloorError, ExternalCasFloorStore,
 };
 use ai_native_l1_pow_bench::external_cas_noise_transport_candidate::NoiseTcpExternalCasProviderTransport;
+use ai_native_l1_pow_bench::external_cas_offhost_anchor_node_lifecycle_candidate::OffhostAnchorNodeServiceOwner;
+use ai_native_l1_pow_bench::external_cas_offhost_anchor_noise_daemon_candidate::OffhostAnchorNoiseDaemonTask;
 use ai_native_l1_pow_bench::noise_key_provisioning::load_protected_noise_private_key;
 use ai_native_l1_pow_bench::private_testnet_fork_choice::ForkChoiceOutcome;
 use ai_native_l1_pow_bench::private_testnet_fork_store::{
@@ -539,10 +541,17 @@ struct NodeState {
     noise_private_key: Option<[u8; 32]>,
     trusted_peer_static_keys: Vec<[u8; 32]>,
     peer_static_keys_by_addr: BTreeMap<SocketAddr, [u8; 32]>,
+    offhost_anchor_service: OffhostAnchorNodeServiceOwner,
 }
 
 impl Drop for NodeState {
     fn drop(&mut self) {
+        if let Err(error) = self.shutdown_offhost_anchor_service() {
+            eprintln!(
+                "qrun_offhost_anchor_lifecycle_shutdown_failed reason={}",
+                error.to_string().replace(['\r', '\n'], "_")
+            );
+        }
         if let Some(private_key) = self.noise_private_key.as_mut() {
             private_key.fill(0);
         }
@@ -550,6 +559,23 @@ impl Drop for NodeState {
 }
 
 impl NodeState {
+    /// Attach a daemon task that was independently configured, bound and spawned by an explicit
+    /// provisioner. Ordinary node startup never calls this method.
+    #[allow(dead_code)] // Future provisioner hook; normal startup deliberately leaves this disabled.
+    fn attach_offhost_anchor_task(
+        &mut self,
+        task: OffhostAnchorNoiseDaemonTask,
+    ) -> Result<(), OffhostAnchorNoiseDaemonTask> {
+        self.offhost_anchor_service.try_attach(task)
+    }
+
+    fn shutdown_offhost_anchor_service(&mut self) -> Result<(), String> {
+        self.offhost_anchor_service
+            .shutdown_and_join()
+            .map(|_| ())
+            .map_err(|error| format!("join off-host Anchor daemon: {error}"))
+    }
+
     fn refresh_receipts(&mut self) -> Result<(), String> {
         let locations = self
             .runtime
@@ -2569,6 +2595,7 @@ fn run(config: Config) -> Result<(), String> {
             .copied()
             .zip(config.peer_static_public_keys.iter().copied())
             .collect(),
+        offhost_anchor_service: OffhostAnchorNodeServiceOwner::disabled(),
     }));
     state
         .lock()
@@ -3566,6 +3593,7 @@ mod tests {
             noise_private_key: None,
             trusted_peer_static_keys: Vec::new(),
             peer_static_keys_by_addr: BTreeMap::new(),
+            offhost_anchor_service: OffhostAnchorNodeServiceOwner::disabled(),
         };
         state.refresh_receipts().unwrap();
         state
@@ -3608,6 +3636,7 @@ mod tests {
             noise_private_key: None,
             trusted_peer_static_keys: Vec::new(),
             peer_static_keys_by_addr: BTreeMap::new(),
+            offhost_anchor_service: OffhostAnchorNodeServiceOwner::disabled(),
         };
         state.refresh_receipts().unwrap();
         state
@@ -4707,9 +4736,23 @@ mod tx_ingress_tests {
             noise_private_key: None,
             trusted_peer_static_keys: Vec::new(),
             peer_static_keys_by_addr: BTreeMap::new(),
+            offhost_anchor_service: OffhostAnchorNodeServiceOwner::disabled(),
         };
         state.refresh_receipts().unwrap();
         state
+    }
+
+    #[test]
+    fn qrun_node_state_keeps_offhost_anchor_daemon_disabled_by_default() {
+        let dir = TestDir::new();
+        let network = [0xA4; 32];
+        let signer = Ed25519TransactionSigner::from_seed([0xA5; 32]);
+        let mut state = test_node_state(&dir.0, network, &signer);
+
+        assert!(!state.offhost_anchor_service.is_attached());
+        assert_eq!(state.offhost_anchor_service.stats(), None);
+        state.shutdown_offhost_anchor_service().unwrap();
+        assert!(!state.offhost_anchor_service.is_attached());
     }
 
     #[test]

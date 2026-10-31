@@ -1211,6 +1211,115 @@ mod tests {
     }
 
     #[test]
+    fn node_service_owner_explicit_shutdown_joins_the_attached_daemon() {
+        use crate::external_cas_offhost_anchor_node_lifecycle_candidate::OffhostAnchorNodeServiceOwner;
+
+        let f = fixture();
+        let (daemon, _server_public, _client_private) = bind_daemon_at(
+            &f,
+            "127.0.0.1:0".parse().unwrap(),
+            f.anchor_signer.clone(),
+            2,
+            1,
+        );
+        let counters = Arc::clone(&daemon.counters);
+        let task = daemon.spawn().unwrap();
+        let mut owner = OffhostAnchorNodeServiceOwner::disabled();
+        owner.try_attach(task).unwrap();
+        assert!(owner.is_attached());
+        assert!(wait_until(
+            || owner
+                .stats()
+                .is_some_and(|stats| stats.active_worker_threads == 2),
+            Duration::from_secs(2),
+        ));
+
+        owner.request_shutdown();
+        assert!(wait_until(
+            || owner
+                .stats()
+                .is_some_and(|stats| stats.active_worker_threads == 0),
+            Duration::from_secs(2),
+        ));
+        let stats = owner.shutdown_and_join().unwrap().unwrap();
+        assert_eq!(stats.worker_threads_started, 2);
+        assert_eq!(stats.active_worker_threads, 0);
+        assert!(!owner.is_attached());
+        assert_eq!(owner.shutdown_and_join().unwrap(), None);
+        assert_eq!(counters.snapshot().active_worker_threads, 0);
+    }
+
+    #[test]
+    fn node_service_owner_returns_a_second_task_without_consuming_it() {
+        use crate::external_cas_offhost_anchor_node_lifecycle_candidate::OffhostAnchorNodeServiceOwner;
+
+        let f = fixture();
+        let (first_daemon, _first_server_public, _first_client_private) = bind_daemon_at(
+            &f,
+            "127.0.0.1:0".parse().unwrap(),
+            f.anchor_signer.clone(),
+            1,
+            1,
+        );
+        let (second_daemon, _second_server_public, _second_client_private) = bind_daemon_at(
+            &f,
+            "127.0.0.1:0".parse().unwrap(),
+            f.anchor_signer.clone(),
+            1,
+            1,
+        );
+        let first_counters = Arc::clone(&first_daemon.counters);
+        let second_counters = Arc::clone(&second_daemon.counters);
+        let mut owner = OffhostAnchorNodeServiceOwner::default();
+        owner.try_attach(first_daemon.spawn().unwrap()).unwrap();
+        let returned_task = owner
+            .try_attach(second_daemon.spawn().unwrap())
+            .unwrap_err();
+        assert!(!returned_task.is_finished());
+        assert!(wait_until(
+            || returned_task.stats().active_worker_threads == 1
+                && owner
+                    .stats()
+                    .is_some_and(|stats| stats.active_worker_threads == 1),
+            Duration::from_secs(2),
+        ));
+
+        let returned_stats = returned_task.shutdown_and_join().unwrap();
+        let owned_stats = owner.shutdown_and_join().unwrap().unwrap();
+        assert_eq!(returned_stats.active_worker_threads, 0);
+        assert_eq!(owned_stats.active_worker_threads, 0);
+        assert_eq!(first_counters.snapshot().active_worker_threads, 0);
+        assert_eq!(second_counters.snapshot().active_worker_threads, 0);
+    }
+
+    #[test]
+    fn dropping_node_service_owner_joins_its_attached_daemon() {
+        use crate::external_cas_offhost_anchor_node_lifecycle_candidate::OffhostAnchorNodeServiceOwner;
+
+        let f = fixture();
+        let (daemon, _server_public, _client_private) = bind_daemon_at(
+            &f,
+            "127.0.0.1:0".parse().unwrap(),
+            f.anchor_signer.clone(),
+            2,
+            1,
+        );
+        let counters = Arc::clone(&daemon.counters);
+        let task = daemon.spawn().unwrap();
+        let mut owner = OffhostAnchorNodeServiceOwner::default();
+        owner.try_attach(task).unwrap();
+        assert!(wait_until(
+            || owner
+                .stats()
+                .is_some_and(|stats| stats.active_worker_threads == 2),
+            Duration::from_secs(2),
+        ));
+
+        drop(owner);
+        assert_eq!(counters.snapshot().active_worker_threads, 0);
+    }
+
+    #[test]
     fn supervised_task_shutdown_joins_workers_and_reports_zero_active_threads() {
         let f = fixture();
         let (daemon, _server_public, _client_private) = bind_daemon_at(

@@ -439,10 +439,13 @@ mod tests {
 
 pub mod token_forge;
 
+/// CP-0487 opt-in node owner for an already spawned off-host Anchor daemon; disabled by default.
+pub mod external_cas_offhost_anchor_node_lifecycle_candidate;
 /// QRun canonical checkpoint codec with profile binding and external anti-rollback anchor checks.
 pub mod qrun_v05_checkpoint_candidate;
 /// Candidate-only canonical QRM1 journal codec for live External-CAS checkpoint re-rooting; no migration runtime or provider write callsite.
 pub mod qrun_v05_checkpoint_migration_candidate;
+
 /// Explicit candidate QRM1 provider/QCF1/PFS2 crash-recovery engine; not enabled by ordinary startup.
 pub mod qrun_v05_checkpoint_migration_recovery_candidate;
 /// Candidate QRun fee-only PoW envelope; payload commitment is not yet wired into fork choice.
