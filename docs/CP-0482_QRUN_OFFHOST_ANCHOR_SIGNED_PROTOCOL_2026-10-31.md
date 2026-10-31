@@ -73,13 +73,13 @@ Twelve focused protocol tests cover:
 
 ## Validation
 
-Exact local validation on 2026-10-31, on the dependent atomic-store-contract branch:
+Exact local validation on 2026-10-31, on the bootstrap-provisioning branch stacked on the atomic-store-contract and DynamoDB adapter branches:
 - `cargo fmt --all -- --check`: PASS
-- `cargo test --lib --locked --offline`: PASS, 1002 passed, 0 failed
+- `cargo test --lib --locked --offline`: PASS, 1008 passed, 0 failed
 - `cargo check --all-targets --locked --offline`: PASS (existing unused-import/dead-code warnings in unrelated modules remain)
 - `git diff --check`: PASS
 
-The 12 focused protocol tests and 6 scripted DynamoDB adapter tests are included in the 1002-test library run. The AWS adapter test runner simulates CLI responses and does not contact AWS.
+The 12 focused Anchor protocol tests and 12 scripted DynamoDB adapter tests (including six one-time bootstrap tests) are included in the 1008-test library run. The AWS adapter test runner simulates CLI responses and does not contact AWS.
 
 ## Remaining production gates
 
@@ -87,7 +87,7 @@ Still not implemented or qualified:
 - live qualification and deployment of the AWS DynamoDB adapter in a separately administered staging account/recovery domain, including actual CLI execution, IAM/SCP, backup/restore and concurrency behavior;
 - the deployable Anchor daemon, authenticated transport and operational configuration;
 - production KMS signer integration using a distinct Anchor key and independently governed key lifecycle;
-- explicit bootstrap provisioning ceremony and restore/delete/policy separation in a separate account;
+- live, operator-controlled bootstrap provisioning ceremony and restore/delete/policy separation in a separate account;
 - staging tests for actual consistency, conditional-write behavior, permissions, backups/restores, concurrency, partitions, crashes, key rotation, regional behavior and audit;
 - independent administrative and recovery custodians;
 - QRun node integration into startup, block acceptance, QAP1/QCF1/PFS2 ordering and recovery;

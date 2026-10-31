@@ -542,8 +542,9 @@ pub enum ExternalCasOffhostAnchorStoreCasOutcome {
 /// The successful write must install the complete next state atomically and return only Applied.
 /// On stale precondition it must return the complete currently stored state as Conflict.
 ///
-/// This contract permits a future DynamoDB conditional PutItem adapter; it does not prove that an
-/// adapter or independent administrative domain is deployed.
+/// An AWS/DynamoDB conditional PutItem adapter candidate implements this contract, including
+/// one-time bootstrap insertion; it does not prove that the adapter or an independent
+/// administrative domain is deployed or qualified.
 pub trait ExternalCasOffhostAnchorStore: Send + Sync {
     /// Explicit administrator-only one-time insert of the generation-zero bootstrap.
     /// Production adapters must implement this as a server-side conditional insert which cannot
