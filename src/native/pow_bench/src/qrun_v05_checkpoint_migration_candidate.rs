@@ -2,12 +2,15 @@
 //!
 //! This module does not execute a provider CAS, publish a PFS2 manifest, copy an archive,
 //! initialize QCF1, or alter node startup. It encodes and validates the exact evidence required
-//! by the proposed offline migration transaction. Runtime integration remains a separate gate.
+//! by the proposed offline migration transaction. QRM1 v2 persists the original CAS request nonce
+//! so recovery can reconstruct the exact same signed-CAS operation after a crash. Runtime
+//! integration remains a separate gate.
 
 use crate::{
     consensus::ConsensusParameters,
     external_cas_anchor_candidate::{
-        ExternalCasError, ExternalCasPin, ExternalCasRecord, EXTERNAL_CAS_RECORD_BYTES,
+        ExternalCasError, ExternalCasPin, ExternalCasRecord, ExternalCasWriteRequest,
+        EXTERNAL_CAS_RECORD_BYTES,
     },
     private_testnet_fork_choice::PrivateTestnetForkChoice,
     private_testnet_fork_store::{
@@ -23,9 +26,9 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 
 pub const QRM1_MAGIC: [u8; 4] = *b"QRM1";
-pub const QRM1_VERSION: u16 = 1;
+pub const QRM1_VERSION: u16 = 2;
 pub const QRM1_CHECKSUM_BYTES: usize = 32;
-pub const QRM1_CHECKSUM_DOMAIN: &[u8] = b"QRUN-V05-LIVE-CAS-REBASE-JOURNAL-V1\0";
+pub const QRM1_CHECKSUM_DOMAIN: &[u8] = b"QRUN-V05-LIVE-CAS-REBASE-JOURNAL-V2\0";
 pub const QRM1_ARCHIVE_ID_DOMAIN: &[u8] = b"QRUN-V05-QRM1-HISTORY-ARCHIVE-ID-V1\0";
 
 const FIXED_BYTES: usize = 4
@@ -34,7 +37,7 @@ const FIXED_BYTES: usize = 4
     + 8
     + 8
     + (EXTERNAL_CAS_RECORD_BYTES * 2)
-    + (32 * 7)
+    + (32 * 8)
     + 8
     + 4
     + 4
@@ -89,6 +92,8 @@ pub struct QRunCheckpointMigrationJournal {
     pub next_record: ExternalCasRecord,
     pub previous_object_generation: u64,
     pub next_object_generation: u64,
+    /// Exact challenge nonce persisted so crash recovery can reconstruct the identical CAS write.
+    pub cas_request_nonce: [u8; 32],
     pub owner_account: [u8; 32],
     pub receipt_key_id: [u8; 32],
     pub receipt_public_key_hash: [u8; 32],
@@ -109,6 +114,30 @@ impl QRunCheckpointMigrationJournal {
         hash.update(QRM1_ARCHIVE_ID_DOMAIN);
         hash.update(previous_manifest_anchor);
         hash.finalize().into()
+    }
+
+    /// Reconstruct the exact immutable CAS request from the persisted journal. This includes the
+    /// original nonce; generating a fresh nonce would change the request digest and would not be
+    /// an idempotent retry of the original operation.
+    pub fn external_cas_write_request(
+        &self,
+        pin: &ExternalCasPin,
+    ) -> Result<ExternalCasWriteRequest, QRunCheckpointMigrationError> {
+        let request = ExternalCasWriteRequest {
+            request_nonce: self.cas_request_nonce,
+            operation_id: self.next_record.operation_id,
+            request_digest: self.next_record.request_digest,
+            expected_generation: self.previous_record.generation,
+            expected_object_generation: self.previous_object_generation,
+            expected_record_digest: self.previous_record.digest()?,
+            expected_state_digest: self.previous_record.next_state_digest,
+            next_record: self.next_record.clone(),
+        };
+        request.validate(pin)?;
+        if request.calculate_request_digest(pin)? != self.next_record.request_digest {
+            return Err(QRunCheckpointMigrationError::InvalidBinding);
+        }
+        Ok(request)
     }
 
     /// Validate all self-contained QRM1 bindings against an independently configured CAS pin
@@ -132,7 +161,8 @@ impl QRunCheckpointMigrationJournal {
         {
             return Err(QRunCheckpointMigrationError::InvalidObjectGeneration);
         }
-        if self.owner_account.iter().all(|byte| *byte == 0)
+        if self.cas_request_nonce.iter().all(|byte| *byte == 0)
+            || self.owner_account.iter().all(|byte| *byte == 0)
             || self.receipt_key_id.iter().all(|byte| *byte == 0)
             || self.receipt_public_key_hash.iter().all(|byte| *byte == 0)
             || self.checkpoint_commitment.iter().all(|byte| *byte == 0)
@@ -157,6 +187,8 @@ impl QRunCheckpointMigrationJournal {
         {
             return Err(QRunCheckpointMigrationError::InvalidBinding);
         }
+        self.external_cas_write_request(pin)?;
+
         let expected_key_hash: [u8; 32] = Sha256::digest(pin.receipt_public_key).into();
         if expected_key_hash != self.receipt_public_key_hash {
             return Err(QRunCheckpointMigrationError::InvalidBinding);
@@ -330,6 +362,7 @@ impl QRunCheckpointMigrationJournal {
         bytes.extend_from_slice(&0u16.to_be_bytes());
         bytes.extend_from_slice(&self.previous_object_generation.to_be_bytes());
         bytes.extend_from_slice(&self.next_object_generation.to_be_bytes());
+        bytes.extend_from_slice(&self.cas_request_nonce);
         bytes.extend_from_slice(&previous);
         bytes.extend_from_slice(&next);
         bytes.extend_from_slice(&self.owner_account);
@@ -411,6 +444,7 @@ impl QRunCheckpointMigrationJournal {
         let mut cursor = 8usize;
         let previous_object_generation = take_u64(payload, &mut cursor)?;
         let next_object_generation = take_u64(payload, &mut cursor)?;
+        let cas_request_nonce = take_array::<32>(payload, &mut cursor)?;
         let previous_record = ExternalCasRecord::decode(take_slice(
             payload,
             &mut cursor,
@@ -457,6 +491,7 @@ impl QRunCheckpointMigrationJournal {
             next_record,
             previous_object_generation,
             next_object_generation,
+            cas_request_nonce,
             owner_account,
             receipt_key_id,
             receipt_public_key_hash,
@@ -705,6 +740,20 @@ pub(crate) mod tests {
             request_digest: [0x46; 32],
         };
 
+        let cas_request_nonce = [0x48; 32];
+        let mut write_request = ExternalCasWriteRequest {
+            request_nonce: cas_request_nonce,
+            operation_id: next_record.operation_id,
+            request_digest: [0x49; 32],
+            expected_generation: previous_record.generation,
+            expected_object_generation: 14,
+            expected_record_digest: previous_record.digest().unwrap(),
+            expected_state_digest: previous_record.next_state_digest,
+            next_record: next_record.clone(),
+        };
+        write_request.bind_request_digest(&pin).unwrap();
+        let next_record = write_request.next_record.clone();
+
         let archive_id = QRunCheckpointMigrationJournal::archive_id_for_previous_manifest(
             previous_manifest_anchor,
         );
@@ -715,6 +764,7 @@ pub(crate) mod tests {
             next_record,
             previous_object_generation: 14,
             next_object_generation: 15,
+            cas_request_nonce,
             owner_account: owner,
             receipt_key_id,
             receipt_public_key_hash: key_hash,
@@ -742,6 +792,59 @@ pub(crate) mod tests {
         assert_eq!(decoded.next_record.generation, 8);
         assert_eq!(decoded.previous_object_generation, 14);
         assert_eq!(decoded.next_object_generation, 15);
+        assert_eq!(
+            u16::from_be_bytes(bytes[4..6].try_into().unwrap()),
+            QRM1_VERSION
+        );
+
+        let request = decoded.external_cas_write_request(&pin).unwrap();
+        assert_eq!(request.request_nonce, journal.cas_request_nonce);
+        assert_eq!(request.operation_id, journal.next_record.operation_id);
+        assert_eq!(request.request_digest, journal.next_record.request_digest);
+        assert_eq!(
+            request.expected_generation,
+            journal.previous_record.generation
+        );
+        assert_eq!(
+            request.expected_object_generation,
+            journal.previous_object_generation
+        );
+        assert_eq!(
+            request.expected_record_digest,
+            journal.previous_record.digest().unwrap()
+        );
+        assert_eq!(
+            request.expected_state_digest,
+            journal.previous_record.next_state_digest
+        );
+        assert_eq!(request.next_record, journal.next_record);
+    }
+
+    #[test]
+    fn qrm1_rejects_changed_cas_nonce_or_request_digest_and_legacy_v1() {
+        let (journal, pin, params) = fixture();
+        let bytes = journal.encode_without_archive(&pin, &params).unwrap();
+
+        let mut wrong_nonce = journal.clone();
+        wrong_nonce.cas_request_nonce[0] ^= 1;
+        assert!(wrong_nonce.external_cas_write_request(&pin).is_err());
+        assert!(wrong_nonce.encode_without_archive(&pin, &params).is_err());
+
+        let mut wrong_request_digest = journal.clone();
+        wrong_request_digest.next_record.request_digest[0] ^= 1;
+        assert!(wrong_request_digest
+            .external_cas_write_request(&pin)
+            .is_err());
+        assert!(wrong_request_digest
+            .encode_without_archive(&pin, &params)
+            .is_err());
+
+        let mut legacy_v1 = bytes;
+        legacy_v1[4..6].copy_from_slice(&1u16.to_be_bytes());
+        assert_eq!(
+            QRunCheckpointMigrationJournal::decode_without_archive(&legacy_v1, &pin, &params),
+            Err(QRunCheckpointMigrationError::UnsupportedVersion(1))
+        );
     }
 
     #[test]
@@ -788,6 +891,19 @@ pub(crate) mod tests {
         journal.next_record.previous_state_digest = rebound_anchor;
         journal.archive_id =
             QRunCheckpointMigrationJournal::archive_id_for_previous_manifest(rebound_anchor);
+
+        let mut request = ExternalCasWriteRequest {
+            request_nonce: journal.cas_request_nonce,
+            operation_id: journal.next_record.operation_id,
+            request_digest: [0x4A; 32],
+            expected_generation: journal.previous_record.generation,
+            expected_object_generation: journal.previous_object_generation,
+            expected_record_digest: journal.previous_record.digest().unwrap(),
+            expected_state_digest: journal.previous_record.next_state_digest,
+            next_record: journal.next_record.clone(),
+        };
+        request.bind_request_digest(&pin).unwrap();
+        journal.next_record = request.next_record;
 
         assert!(matches!(
             journal.encode_without_archive(&pin, &params),
