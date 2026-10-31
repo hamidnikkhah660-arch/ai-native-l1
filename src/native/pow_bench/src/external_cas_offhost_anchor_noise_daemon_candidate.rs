@@ -112,6 +112,38 @@ impl Counters {
     }
 }
 
+/// Accounts for one connection even if the handler unwinds unexpectedly.
+struct ActiveConnectionGuard {
+    counters: Arc<Counters>,
+    completed: bool,
+}
+
+impl ActiveConnectionGuard {
+    fn new(counters: Arc<Counters>) -> Self {
+        counters.active_connections.fetch_add(1, Ordering::Relaxed);
+        Self {
+            counters,
+            completed: false,
+        }
+    }
+
+    fn mark_completed(&mut self) {
+        self.completed = true;
+        self.counters.completed.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for ActiveConnectionGuard {
+    fn drop(&mut self) {
+        self.counters
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+        if !self.completed {
+            self.counters.failed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Explicitly bound Anchor service. No background threads are started until run_until_shutdown.
 pub struct OffhostAnchorNoiseDaemon<S, V> {
     listener: TcpListener,
@@ -282,7 +314,7 @@ where
                                 break;
                             }
                             let mut stream = stream;
-                            counters.active_connections.fetch_add(1, Ordering::Relaxed);
+                            let mut connection = ActiveConnectionGuard::new(Arc::clone(&counters));
                             let result = serve_offhost_anchor_noise_connection(
                                 &mut stream,
                                 &key.0,
@@ -293,11 +325,8 @@ where
                                 verifier.as_ref(),
                                 signer.as_ref(),
                             );
-                            counters.active_connections.fetch_sub(1, Ordering::Relaxed);
                             if result.is_ok() {
-                                counters.completed.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                counters.failed.fetch_add(1, Ordering::Relaxed);
+                                connection.mark_completed();
                             }
                         }
                     });
@@ -398,6 +427,7 @@ mod tests {
     #[derive(Clone)]
     struct TestSigner {
         key: Arc<MLDSA65SigningKey>,
+        panic_on_sign: bool,
     }
 
     impl OffhostAnchorReceiptSigner for TestSigner {
@@ -405,6 +435,7 @@ mod tests {
             &self,
             digest: &[u8; 32],
         ) -> Result<[u8; ML_DSA_65_SIGNATURE_BYTES], String> {
+            assert!(!self.panic_on_sign, "injected signer panic");
             let signature = portable::sign(&self.key, digest, &[], [0xD1; 32])
                 .map_err(|error| format!("{error:?}"))?;
             Ok(*signature.as_ref())
@@ -462,9 +493,11 @@ mod tests {
             bootstrap_state,
             provider_signer: TestSigner {
                 key: Arc::new(provider_keys.signing_key),
+                panic_on_sign: false,
             },
             anchor_signer: TestSigner {
                 key: Arc::new(anchor_keys.signing_key),
+                panic_on_sign: false,
             },
         }
     }
@@ -984,5 +1017,94 @@ mod tests {
         assert_eq!(stats.completed_requests, 0);
         assert_eq!(stats.failed_requests, 1);
         assert_eq!(stats.worker_threads_started, 1);
+    }
+
+    #[test]
+    fn config_and_daemon_debug_redact_noise_private_key() {
+        let f = fixture();
+        let (server_private, _) = noise_keypair();
+        let (_, client_public) = noise_keypair();
+        let config = daemon_config(
+            "127.0.0.1:0".parse().unwrap(),
+            f.anchor_pin.clone(),
+            f.provider_pin.clone(),
+            server_private,
+            client_public,
+            1,
+            1,
+        );
+        let config_debug = format!("{config:?}");
+        assert!(config_debug.contains("<redacted>"));
+        assert!(!config_debug.contains(&format!("{server_private:?}")));
+
+        let daemon = OffhostAnchorNoiseDaemon::bind(
+            config,
+            model(&f),
+            Arc::new(LibcruxMlDsa65VerifierCandidate),
+            Arc::new(f.anchor_signer.clone()),
+        )
+        .unwrap();
+        let daemon_debug = format!("{daemon:?}");
+        assert!(daemon_debug.contains("<redacted>"));
+        assert!(!daemon_debug.contains(&format!("{server_private:?}")));
+    }
+
+    #[test]
+    fn worker_panic_releases_active_connection_counts_failure_and_is_reported() {
+        let f = fixture();
+        let (server_private, server_public) = noise_keypair();
+        let (client_private, client_public) = noise_keypair();
+        let config = daemon_config(
+            "127.0.0.1:0".parse().unwrap(),
+            f.anchor_pin.clone(),
+            f.provider_pin.clone(),
+            server_private,
+            client_public,
+            2,
+            1,
+        );
+        let mut panic_signer = f.anchor_signer.clone();
+        panic_signer.panic_on_sign = true;
+        let daemon = OffhostAnchorNoiseDaemon::bind(
+            config,
+            model(&f),
+            Arc::new(LibcruxMlDsa65VerifierCandidate),
+            Arc::new(panic_signer),
+        )
+        .unwrap();
+        let address = daemon.local_addr().unwrap();
+        let counters = Arc::clone(&daemon.counters);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
+        let join = thread::spawn(move || daemon.run_until_shutdown(&worker_shutdown));
+
+        let transport = NoiseTcpOffhostAnchorTransport::new(
+            address,
+            client_private,
+            server_public,
+            f.anchor_pin.clone(),
+            f.provider_pin.clone(),
+        )
+        .unwrap();
+        let request = ExternalCasOffhostAnchorReadRequest {
+            challenge: [0xE7; 32],
+            operation_id: [0xE8; 32],
+            request_digest: [0xE9; 32],
+        };
+        assert!(transport.read(&request).is_err());
+        shutdown.store(true, Ordering::Release);
+
+        let result = join.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(OffhostAnchorNoiseError::Io(message))
+                if message.contains("worker thread panicked")
+        ));
+        let stats = counters.snapshot();
+        assert_eq!(stats.accepted_connections, 1);
+        assert_eq!(stats.completed_requests, 0);
+        assert_eq!(stats.failed_requests, 1);
+        assert_eq!(stats.worker_threads_started, 2);
+        assert_eq!(counters.active_connections.load(Ordering::Relaxed), 0);
     }
 }

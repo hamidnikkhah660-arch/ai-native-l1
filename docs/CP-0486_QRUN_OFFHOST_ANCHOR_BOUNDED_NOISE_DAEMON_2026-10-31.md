@@ -53,11 +53,16 @@ The lifecycle test suite now exercises a real loopback daemon using independent 
 and Anchor fixtures, authenticated Noise Read with signature-verified receipt, a provider-proof
 CAS followed by a stale-state conflict, exact config/model pin mismatch rejection before listener
 bind, unpinned client rejection, incorrect server-key pin rejection, handshake timeout followed by
-worker reuse, bounded queue overload, worker-count ceilings, and shutdown/join behavior.
+worker reuse, bounded queue overload, worker-count ceilings, shutdown/join behavior, private-key
+redaction in both config and daemon Debug output, and injected worker panic propagation.
+
+Each active connection is managed by an RAII guard. Normal success marks the request completed;
+ordinary errors and unwinding both decrement the active-connection counter and record one failed
+request. Worker panics are joined and surfaced as a daemon error instead of being hidden.
 
 Windows local validation for the lifecycle expansion (package `src/native/pow_bench`):
-- `cargo test --lib --locked --offline`: 1,021 passed, 0 failed.
-- Focused daemon suite: 8 passed, 0 failed.
+- `cargo test --lib --locked --offline`: 1,023 passed, 0 failed.
+- Focused daemon suite: 10 passed, 0 failed.
 - `cargo check --all-targets --locked --offline`: passed.
 - `cargo fmt --all -- --check`: passed.
 - `git diff --check`: passed.
