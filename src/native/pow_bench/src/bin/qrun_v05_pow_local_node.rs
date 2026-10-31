@@ -21,6 +21,7 @@ use ai_native_l1_pow_bench::private_testnet_fork_store::{
     ForkStoreError, PrivateTestnetForkStore, QRunV05ExternalCasForkStore,
 };
 use ai_native_l1_pow_bench::private_testnet_wire::decode_candidate_network_block;
+use ai_native_l1_pow_bench::qrun_v05_checkpoint_migration_recovery_candidate::recover_qrun_v05_checkpoint_migration;
 use ai_native_l1_pow_bench::qrun_v05_genesis_candidate::QRunGenesisV05;
 use ai_native_l1_pow_bench::qrun_v05_noise_transport_candidate::{
     QRunV05NoiseSession, MAX_NOISE_APPLICATION_RECORD_BYTES,
@@ -291,7 +292,7 @@ fn open_node_runtime<A: TransactionAuthenticator>(
 
     // Authenticate the exact checkpoint and its parent before initializing the independent floor,
     // opening local storage, or making any provider request.
-    let checkpoint_bytes = if let Some(checkpoint) = &external.checkpoint {
+    let mut checkpoint_bytes = if let Some(checkpoint) = &external.checkpoint {
         let bytes = read_bounded_regular_file(
             &checkpoint.record_file,
             ai_native_l1_pow_bench::qrun_v05_checkpoint_candidate::MAX_QRCP_BYTES,
@@ -311,6 +312,19 @@ fn open_node_runtime<A: TransactionAuthenticator>(
     } else {
         None
     };
+
+    let mut checkpoint_commitment = external
+        .checkpoint
+        .as_ref()
+        .map(|checkpoint| checkpoint.expected_commitment);
+    let mut checkpoint_minimum_height = external
+        .checkpoint
+        .as_ref()
+        .map(|checkpoint| checkpoint.minimum_height);
+    let mut checkpoint_parent_commitment = external
+        .checkpoint
+        .as_ref()
+        .map(|checkpoint| checkpoint.expected_parent_commitment);
 
     let receipt_key_bytes = read_exact_regular_file(
         &external.receipt_public_key_file,
@@ -422,44 +436,87 @@ fn open_node_runtime<A: TransactionAuthenticator>(
     local_noise_private_key.fill(0);
     let transport = transport_result
         .map_err(|error| format!("configure pinned external-CAS Noise/TCP transport: {error:?}"))?;
-    let client =
+    let mut client =
         VerifiedExternalCasClient::new(pin.clone(), transport, LibcruxMlDsa65VerifierCandidate)
             .map_err(|error| format!("configure verified external-CAS client: {error:?}"))?;
-    let external_store = if let Some(checkpoint) = &external.checkpoint {
-        let checkpoint_bytes = checkpoint_bytes
-            .as_deref()
-            .ok_or("checkpoint configuration was not loaded")?;
-        QRunV05ExternalCasForkStore::open_from_checkpoint_with_parent_for_owner_genesis_and_floor(
+
+    if external.recover_qrm1 {
+        let archive_root = external
+            .history_archive_root
+            .as_ref()
+            .ok_or("--external-cas-history-archive-root is required for QRM1 recovery")?;
+        let report = recover_qrun_v05_checkpoint_migration(
             directory,
-            genesis.ledger().clone(),
+            archive_root,
+            genesis.ledger(),
             owner_account,
-            params.clone(),
+            &params,
+            &pin,
+            &mut client,
+            &floor,
             authenticator,
             clock,
-            checkpoint_bytes,
-            checkpoint.expected_commitment,
-            checkpoint.minimum_height,
-            checkpoint.expected_parent_commitment,
-            pin,
-            client,
-            floor,
         )
         .map_err(|error| {
-            format!("open checkpoint-rooted QRun external-CAS fork store: {error:?}")
-        })?
-    } else {
-        QRunV05ExternalCasForkStore::open_for_owner_genesis_with_floor(
-            directory,
-            genesis.ledger().clone(),
-            owner_account,
-            params.clone(),
-            authenticator,
-            clock,
-            pin,
-            client,
-            floor,
-        )
-        .map_err(|error| format!("open QRun external-CAS fork store: {error:?}"))?
+            format!("explicit QRM1 checkpoint migration recovery failed closed: {error}")
+        })?;
+        checkpoint_bytes = Some(report.checkpoint_bytes);
+        checkpoint_commitment = Some(report.checkpoint_commitment);
+        checkpoint_minimum_height = Some(report.minimum_checkpoint_height);
+        checkpoint_parent_commitment = Some(report.expected_parent_checkpoint_commitment);
+        println!(
+            "qrun_v05_qrm1_recovery_complete height={} checkpoint_commitment={} manifest_anchor={} provider_generation={} object_generation={} archive_id={} archive_commitment={}",
+            report.minimum_checkpoint_height,
+            hex(&report.checkpoint_commitment),
+            hex(&report.manifest_anchor),
+            report.provider_record.generation,
+            report.provider_object_generation,
+            hex(&report.archive_id),
+            hex(&report.archive_commitment),
+        );
+    }
+
+    let external_store = match (
+        checkpoint_bytes.as_deref(),
+        checkpoint_commitment,
+        checkpoint_minimum_height,
+        checkpoint_parent_commitment,
+    ) {
+        (Some(checkpoint_bytes), Some(expected_commitment), Some(minimum_height), Some(expected_parent_commitment)) => {
+            QRunV05ExternalCasForkStore::open_from_checkpoint_with_parent_for_owner_genesis_and_floor(
+                directory,
+                genesis.ledger().clone(),
+                owner_account,
+                params.clone(),
+                authenticator,
+                clock,
+                checkpoint_bytes,
+                expected_commitment,
+                minimum_height,
+                expected_parent_commitment,
+                pin,
+                client,
+                floor,
+            )
+            .map_err(|error| {
+                format!("open checkpoint-rooted QRun external-CAS fork store: {error:?}")
+            })?
+        }
+        (None, None, None, None) => {
+            QRunV05ExternalCasForkStore::open_for_owner_genesis_with_floor(
+                directory,
+                genesis.ledger().clone(),
+                owner_account,
+                params.clone(),
+                authenticator,
+                clock,
+                pin,
+                client,
+                floor,
+            )
+            .map_err(|error| format!("open QRun external-CAS fork store: {error:?}"))?
+        }
+        _ => return Err("incomplete recovered/external checkpoint trust tuple".into()),
     };
     QRunV05PowForkRuntime::from_store(
         network_id,
@@ -545,6 +602,8 @@ struct ExternalCasNodeConfig {
     bootstrap_record_file: PathBuf,
     floor_directory: PathBuf,
     initialize_floor: bool,
+    recover_qrm1: bool,
+    history_archive_root: Option<PathBuf>,
     checkpoint: Option<ExternalCasNodeCheckpointConfig>,
 }
 
@@ -590,10 +649,13 @@ fn parse_external_cas_config(
         .filter(|key| values.contains_key(**key))
         .count();
     let initialize_requested = values.contains_key("--external-cas-initialize-floor");
+    let recovery_options_present = values.contains_key("--external-cas-recover-qrm1")
+        || values.contains_key("--external-cas-history-archive-root");
     if present == 0 {
-        if initialize_requested {
+        if initialize_requested || recovery_options_present {
             return Err(
-                "--external-cas-initialize-floor requires the complete external-CAS pin set".into(),
+                "external-CAS initialization/recovery requires the complete external-CAS pin set"
+                    .into(),
             );
         }
         if checkpoint_present != 0 {
@@ -673,6 +735,46 @@ fn parse_external_cas_config(
         "false" => false,
         _ => return Err("--external-cas-initialize-floor must be exactly true or false".into()),
     };
+    let recover_qrm1 = match values
+        .get("--external-cas-recover-qrm1")
+        .map(String::as_str)
+        .unwrap_or("false")
+    {
+        "true" => true,
+        "false" => false,
+        _ => return Err("--external-cas-recover-qrm1 must be exactly true or false".into()),
+    };
+    let history_archive_root = values
+        .get("--external-cas-history-archive-root")
+        .map(PathBuf::from);
+    if recover_qrm1 && history_archive_root.is_none() {
+        return Err(
+            "--external-cas-recover-qrm1 true requires --external-cas-history-archive-root".into(),
+        );
+    }
+    if !recover_qrm1 && history_archive_root.is_some() {
+        return Err(
+            "--external-cas-history-archive-root is valid only with --external-cas-recover-qrm1 true".into(),
+        );
+    }
+    if recover_qrm1 && initialize_floor {
+        return Err(
+            "QRM1 recovery requires an existing QCF1 floor; it cannot initialize or reset the floor".into(),
+        );
+    }
+    if recover_qrm1 && checkpoint_present != 0 {
+        return Err(
+            "QRM1 recovery derives the replacement checkpoint from the verified journal; do not pass checkpoint bootstrap options".into(),
+        );
+    }
+    if let Some(root) = &history_archive_root {
+        if !root.is_absolute() || root.file_name().is_none() {
+            return Err(
+                "--external-cas-history-archive-root must be an absolute existing directory path"
+                    .into(),
+            );
+        }
+    }
     let checkpoint = match checkpoint_present {
         0 => None,
         count if count != CHECKPOINT_REQUIRED.len() => {
@@ -727,6 +829,8 @@ fn parse_external_cas_config(
         bootstrap_record_file: absolute_file_path("--external-cas-bootstrap-record-file")?,
         floor_directory,
         initialize_floor,
+        recover_qrm1,
+        history_archive_root,
         checkpoint,
     }))
 }
@@ -942,7 +1046,7 @@ fn parse_config() -> Result<Config, String> {
 Local test: qrun_v05_pow_local_node --local-testnet --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH\n\
 Public alpha: qrun_v05_pow_local_node --public-alpha --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH --noise-private-key-file NPK1\n\
 Mainnet: qrun_v05_pow_local_node --mainnet --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH --noise-private-key-file NPK1 --peer IP:PORT --peer-static-public-key-hex HEX64 --sync-on-start true\n\
-External CAS (QFP5 only): add --external-cas-endpoint IP:PORT --external-cas-provider-id-hex HEX64 --external-cas-genesis-id-hex HEX64 --external-cas-noise-server-static-public-key-hex HEX64 --external-cas-noise-private-key-file NPK1 --external-cas-receipt-key-id-hex HEX64 --external-cas-receipt-public-key-file RAW_MLDSA65_PUBLIC_KEY --external-cas-bootstrap-record-file ECR1_FILE --external-cas-floor-dir ABSOLUTE_SEPARATE_DIRECTORY. Keep the floor directory outside --data-dir and back it up separately. On first install, set --external-cas-initialize-floor true to create the QCF1 floor from the out-of-band generation-zero bootstrap; keep it true on later starts (existing floors are reopened, missing-after-initialization remains fatal). External-CAS options are all-or-none; no local fallback occurs after provider config is supplied. Optional checkpoint bootstrap requires all four: --external-cas-checkpoint-file QRCP_FILE --external-cas-checkpoint-commitment-hex HEX64 --external-cas-checkpoint-min-height HEIGHT --external-cas-checkpoint-parent-commitment-hex HEX64. The ECR1 bootstrap must already anchor the exact checkpoint-rooted PFS2 manifest; this does not perform a live CAS manifest rebase/rollover.\nMainnet also requires --sync-on-start true, non-loopback pinned peers, and frozen identity checks. RPC/transaction ingress stay loopback-only. IMPORTANT: this candidate build keeps --mainnet blocked until production consensus, full-history recovery, independent-operator validation, and security/release tests are complete."
+External CAS (QFP5 only): add --external-cas-endpoint IP:PORT --external-cas-provider-id-hex HEX64 --external-cas-genesis-id-hex HEX64 --external-cas-noise-server-static-public-key-hex HEX64 --external-cas-noise-private-key-file NPK1 --external-cas-receipt-key-id-hex HEX64 --external-cas-receipt-public-key-file RAW_MLDSA65_PUBLIC_KEY --external-cas-bootstrap-record-file ECR1_FILE --external-cas-floor-dir ABSOLUTE_SEPARATE_DIRECTORY. Keep the floor directory outside --data-dir and back it up separately. On first install, set --external-cas-initialize-floor true to create the QCF1 floor from the out-of-band generation-zero bootstrap; keep it true on later starts (existing floors are reopened, missing-after-initialization remains fatal). External-CAS options are all-or-none; no local fallback occurs after provider config is supplied. Optional checkpoint bootstrap requires all four: --external-cas-checkpoint-file QRCP_FILE --external-cas-checkpoint-commitment-hex HEX64 --external-cas-checkpoint-min-height HEIGHT --external-cas-checkpoint-parent-commitment-hex HEX64. The ECR1 bootstrap must already anchor the exact checkpoint-rooted PFS2 manifest; this does not perform a live CAS manifest rebase/rollover. Explicit operator recovery is opt-in only: add --external-cas-recover-qrm1 true --external-cas-history-archive-root ABSOLUTE_EXISTING_DIRECTORY. Recovery requires an existing QCF1 floor and derives the replacement checkpoint from the verified QRM1/QRA1 journal; do not pass --external-cas-initialize-floor true or checkpoint bootstrap options in this mode. Ordinary startup never runs QRM1 recovery.\nMainnet also requires --sync-on-start true, non-loopback pinned peers, and frozen identity checks. RPC/transaction ingress stay loopback-only. IMPORTANT: this candidate build keeps --mainnet blocked until production consensus, full-history recovery, independent-operator validation, and security/release tests are complete."
         );
         return Err("__help__".into());
     }
@@ -1021,6 +1125,8 @@ External CAS (QFP5 only): add --external-cas-endpoint IP:PORT --external-cas-pro
         "--external-cas-bootstrap-record-file",
         "--external-cas-floor-dir",
         "--external-cas-initialize-floor",
+        "--external-cas-recover-qrm1",
+        "--external-cas-history-archive-root",
         "--external-cas-checkpoint-file",
         "--external-cas-checkpoint-commitment-hex",
         "--external-cas-checkpoint-min-height",
@@ -2625,6 +2731,65 @@ mod tests {
     }
 
     #[test]
+    fn qrm1_recovery_cli_is_explicit_and_requires_separate_archive_and_existing_floor() {
+        let mut missing_archive_root = external_cas_cli_values();
+        missing_archive_root.insert("--external-cas-recover-qrm1".into(), "true".into());
+        assert!(parse_external_cas_config(&missing_archive_root, false)
+            .unwrap_err()
+            .contains("--external-cas-history-archive-root"));
+
+        let mut recovery = external_cas_cli_values();
+        let archive_root = std::env::temp_dir().join("qrun-qra1-operator-archives");
+        recovery.insert("--external-cas-recover-qrm1".into(), "true".into());
+        recovery.insert(
+            "--external-cas-history-archive-root".into(),
+            archive_root.to_string_lossy().into_owned(),
+        );
+        let config = parse_external_cas_config(&recovery, false)
+            .unwrap()
+            .unwrap();
+        assert!(config.recover_qrm1);
+        assert_eq!(config.history_archive_root, Some(archive_root.clone()));
+        assert!(!config.initialize_floor);
+
+        let mut reset_floor = recovery.clone();
+        reset_floor.insert("--external-cas-initialize-floor".into(), "true".into());
+        assert!(parse_external_cas_config(&reset_floor, false)
+            .unwrap_err()
+            .contains("existing QCF1 floor"));
+
+        let mut stale_checkpoint = recovery.clone();
+        stale_checkpoint.insert(
+            "--external-cas-checkpoint-file".into(),
+            std::env::temp_dir()
+                .join("qrun-old-checkpoint.qrcp")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        stale_checkpoint.insert(
+            "--external-cas-checkpoint-commitment-hex".into(),
+            "55".repeat(32),
+        );
+        stale_checkpoint.insert("--external-cas-checkpoint-min-height".into(), "10".into());
+        stale_checkpoint.insert(
+            "--external-cas-checkpoint-parent-commitment-hex".into(),
+            "66".repeat(32),
+        );
+        assert!(parse_external_cas_config(&stale_checkpoint, false)
+            .unwrap_err()
+            .contains("derives the replacement checkpoint"));
+
+        let mut orphan_root = external_cas_cli_values();
+        orphan_root.insert(
+            "--external-cas-history-archive-root".into(),
+            archive_root.to_string_lossy().into_owned(),
+        );
+        assert!(parse_external_cas_config(&orphan_root, false)
+            .unwrap_err()
+            .contains("only with --external-cas-recover-qrm1 true"));
+    }
+
+    #[test]
     fn external_cas_cli_config_is_all_or_none_and_requires_numeric_endpoint() {
         assert!(parse_external_cas_config(&BTreeMap::new(), false)
             .unwrap()
@@ -2663,6 +2828,8 @@ mod tests {
         assert_eq!(config.noise_server_static_public_key, [0x33; 32]);
         assert_eq!(config.receipt_key_id, [0x44; 32]);
         assert!(config.initialize_floor);
+        assert!(!config.recover_qrm1);
+        assert!(config.history_archive_root.is_none());
         assert_eq!(
             config.floor_directory,
             std::env::temp_dir().join("qrun-independent-floor")
@@ -2973,6 +3140,8 @@ mod tests {
             bootstrap_record_file,
             floor_directory: floor_dir.clone(),
             initialize_floor: true,
+            recover_qrm1: false,
+            history_archive_root: None,
             checkpoint: Some(ExternalCasNodeCheckpointConfig {
                 record_file: checkpoint_record_file,
                 expected_commitment: checkpoint_commitment,
