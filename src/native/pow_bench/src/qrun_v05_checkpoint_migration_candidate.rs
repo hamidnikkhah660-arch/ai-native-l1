@@ -20,7 +20,7 @@ use crate::{
     },
     qrun_v05_checkpoint_candidate::{QRunCheckpointError, QRunV05PowCheckpoint, MAX_QRCP_BYTES},
     qrun_v05_genesis_candidate::QRunGenesisV05,
-    qrun_v05_history_archive_candidate::QRunHistoryArchiveSummary,
+    qrun_v05_history_archive_candidate::{QRunHistoryArchiveReplay, QRunHistoryArchiveSummary},
     state_machine::MAX_TOTAL_SUPPLY_ATOMS,
 };
 use sha2::{Digest, Sha256};
@@ -63,6 +63,7 @@ pub enum QRunCheckpointMigrationError {
     ProfileMismatch,
     ManifestBindingMismatch,
     ArchiveBindingMismatch,
+    HistoryReplayMismatch,
     SourceStoreMismatch,
     RandomnessUnavailable,
     GenerationOverflow,
@@ -243,7 +244,36 @@ impl QRunV05CheckpointMigrationPlan {
 /// independently trusted state (for example, the pinned QCF1 floor); a future executor must still
 /// perform a fresh signed provider read and compare it exactly before attempting the CAS.
 #[allow(clippy::too_many_arguments)]
+/// Build a local-only exact-tip migration plan only from a completely replayed QRA1 archive.
+/// The supplied replay witness binds every archived branch to the original wallet Genesis,
+/// QFP5 execution rules, exact canonical tip and byte-identical QRCP checkpoint.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_qrun_v05_checkpoint_migration(
+    source_store: &PrivateTestnetForkStore,
+    replay: &QRunHistoryArchiveReplay,
+    owner_account: [u8; 32],
+    params: &ConsensusParameters,
+    pin: &ExternalCasPin,
+    previous_record: ExternalCasRecord,
+    previous_object_generation: u64,
+    expected_parent_checkpoint_commitment: [u8; 32],
+) -> Result<QRunV05CheckpointMigrationPlan, QRunCheckpointMigrationError> {
+    let plan = prepare_qrun_v05_checkpoint_migration_from_archive(
+        source_store,
+        replay.summary(),
+        owner_account,
+        params,
+        pin,
+        previous_record,
+        previous_object_generation,
+        expected_parent_checkpoint_commitment,
+    )?;
+    plan.journal()
+        .validate_replayed_history(pin, params, replay)?;
+    Ok(plan)
+}
+
+pub(crate) fn prepare_qrun_v05_checkpoint_migration_from_archive(
     source_store: &PrivateTestnetForkStore,
     archive: &QRunHistoryArchiveSummary,
     owner_account: [u8; 32],
@@ -421,6 +451,48 @@ fn migration_random_nonzero_digest() -> Result<[u8; 32], QRunCheckpointMigration
 }
 
 impl QRunCheckpointMigrationJournal {
+    /// Prove that this journal's exact QRCP bytes are the canonical checkpoint of a fully
+    /// replayed QRA1 history. The replay witness is produced only by the QRA1 full-history replay
+    /// API, which executes every archived QFP5 branch from the original wallet-bound Genesis.
+    pub fn validate_replayed_history(
+        &self,
+        pin: &ExternalCasPin,
+        params: &ConsensusParameters,
+        replay: &QRunHistoryArchiveReplay,
+    ) -> Result<(), QRunCheckpointMigrationError> {
+        self.validate(pin, params, replay.summary())?;
+        let previous_manifest = decode_manifest(&self.previous_manifest)
+            .map_err(|_| QRunCheckpointMigrationError::ManifestBindingMismatch)?;
+        let replayed = replay.replayed_archive();
+        if replay.summary().network_id() != &pin.network_id
+            || replay.genesis_commitment() != &pin.genesis_digest
+            || replay.summary().profile_fingerprint() != &previous_manifest.profile_fingerprint
+            || replay.summary().genesis_tip() != &previous_manifest.genesis_tip
+            || replay.summary().canonical_tip() != &previous_manifest.canonical_tip
+            || replayed.genesis_tip() != previous_manifest.genesis_tip
+            || replayed.archive_len() != previous_manifest.digests.len()
+            || replay.canonical_tip() != previous_manifest.canonical_tip
+            || replay.canonical_height() != self.minimum_checkpoint_height
+        {
+            return Err(QRunCheckpointMigrationError::HistoryReplayMismatch);
+        }
+
+        let rebuilt = QRunV05PowCheckpoint::capture(
+            pin.network_id,
+            pin.genesis_digest,
+            params,
+            replayed.canonical_chain(),
+            self.expected_parent_checkpoint_commitment,
+        )?;
+        let rebuilt_bytes = rebuilt.encode(params)?;
+        if rebuilt_bytes != self.checkpoint_bytes
+            || rebuilt.commitment(params)? != self.checkpoint_commitment
+        {
+            return Err(QRunCheckpointMigrationError::HistoryReplayMismatch);
+        }
+        Ok(())
+    }
+
     /// Derive the archive directory identifier from the old PFS2 manifest anchor.
     pub fn archive_id_for_previous_manifest(previous_manifest_anchor: [u8; 32]) -> [u8; 32] {
         let mut hash = Sha256::new();

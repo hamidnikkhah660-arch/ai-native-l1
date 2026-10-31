@@ -1,18 +1,20 @@
 //! Candidate-only QRA1 immutable archive for the complete old PFS2 branch catalog.
 //!
 //! This module preserves exact branch payload bytes before a future checkpoint-rooted manifest
-//! rebase. It does not perform provider CAS, update QCF1, replace an active PFS2 manifest, or
-//! prove full consensus ancestry. Callers must first open/replay the source PFS2 store successfully.
+//! rebase. Descriptor verification alone does not prove consensus ancestry; the explicit QRA1
+//! replay API re-executes every archived QFP5 branch from the original wallet-bound Genesis.
+//! This module does not perform provider CAS, update QCF1, or replace an active PFS2 manifest.
 
 use crate::{
     consensus::{pow_digest, ConsensusParameters, Uint256},
-    private_testnet_fork_choice::MAX_FORK_ARCHIVE_BLOCKS,
+    private_testnet_fork_choice::{PrivateTestnetForkChoice, MAX_FORK_ARCHIVE_BLOCKS},
     private_testnet_fork_store::{
         decode_manifest, manifest_anchor_commitment, ParsedManifest, PrivateTestnetForkStore,
         MAX_MANIFEST_BYTES,
     },
     private_testnet_wire::{decode_candidate_network_block, MAX_CANDIDATE_NETWORK_ENVELOPE_BYTES},
     qrun_v05_checkpoint_migration_candidate::QRunCheckpointMigrationJournal,
+    qrun_v05_genesis_candidate::QRunGenesisV05,
     store_writer_lock::StoreWriterLock,
 };
 use sha2::{Digest, Sha256};
@@ -70,6 +72,7 @@ pub enum QRunHistoryArchiveError {
     UnsupportedExecutionVariant,
     DuplicateDigest,
     ArchiveAlreadyExistsInvalid,
+    HistoryReplayMismatch,
 }
 
 impl std::fmt::Display for QRunHistoryArchiveError {
@@ -170,6 +173,37 @@ impl QRunHistoryArchiveSummary {
 
     pub fn total_payload_bytes(&self) -> u64 {
         self.total_payload_bytes
+    }
+}
+
+/// Opaque witness that every QRA1 branch payload was re-read, hash/PoW checked and replayed
+/// under the exact wallet-bound QRun v0.5 Genesis and fee-only consensus profile.
+pub struct QRunHistoryArchiveReplay {
+    summary: QRunHistoryArchiveSummary,
+    genesis_commitment: [u8; 32],
+    replayed: PrivateTestnetForkChoice,
+}
+
+impl QRunHistoryArchiveReplay {
+    pub fn summary(&self) -> &QRunHistoryArchiveSummary {
+        &self.summary
+    }
+
+    /// Wallet-bound Genesis commitment used to build the replayed ledger.
+    pub fn genesis_commitment(&self) -> &[u8; 32] {
+        &self.genesis_commitment
+    }
+
+    pub fn canonical_tip(&self) -> [u8; 32] {
+        self.replayed.canonical_chain().chain_tip().tip_hash
+    }
+
+    pub fn canonical_height(&self) -> u64 {
+        self.replayed.canonical_chain().state().height()
+    }
+
+    pub(crate) fn replayed_archive(&self) -> &PrivateTestnetForkChoice {
+        &self.replayed
     }
 }
 
@@ -591,6 +625,120 @@ pub fn create_or_verify_qrun_v05_history_archive(
 }
 
 /// Verify a QRA1 archive against the exact prior PFS2 identity and consensus PoW parameters.
+
+/// Fully replay every preserved QRA1 branch from the original wallet-bound QRun v0.5 Genesis.
+///
+/// In addition to QRA1 descriptor, exact-directory, payload-hash and PoW-envelope validation,
+/// this routine executes/replays all QFP5 branches using the canonical fork-choice implementation
+/// and requires the replayed Genesis identity, branch count and canonical tip to match the exact
+/// archived PFS2 manifest. The returned replay witness cannot be constructed by external callers.
+#[allow(clippy::too_many_arguments)]
+pub fn replay_qrun_v05_history_archive<A: crate::state_machine::TransactionAuthenticator>(
+    archive_directory: impl AsRef<Path>,
+    expected_network_id: [u8; 32],
+    expected_genesis_commitment: [u8; 32],
+    expected_profile_fingerprint: [u8; 32],
+    expected_genesis_tip: [u8; 32],
+    expected_manifest_anchor: [u8; 32],
+    owner_account: [u8; 32],
+    params: &ConsensusParameters,
+    authenticator: &A,
+    clock: &dyn crate::chain_admission::ReferenceTimeProvider,
+) -> Result<QRunHistoryArchiveReplay, QRunHistoryArchiveError> {
+    let summary = verify_qrun_v05_history_archive(
+        &archive_directory,
+        expected_network_id,
+        expected_profile_fingerprint,
+        expected_genesis_tip,
+        expected_manifest_anchor,
+        params,
+    )?;
+
+    // Re-open and re-hash every branch after verification. Do not replay an earlier in-memory
+    // copy: each file is bounded and revalidated immediately before consensus replay.
+    let directory = canonical_real_directory(archive_directory.as_ref())?;
+    let descriptor_bytes = read_regular_file_nofollow(
+        &directory.join(QRA1_DESCRIPTOR_NAME),
+        MAX_QRA1_DESCRIPTOR_BYTES,
+    )?;
+    let descriptor = Qra1Descriptor::decode(
+        &descriptor_bytes,
+        expected_network_id,
+        expected_profile_fingerprint,
+        expected_genesis_tip,
+        expected_manifest_anchor,
+    )?;
+    if archive_commitment(&descriptor_bytes) != summary.archive_commitment
+        || descriptor.archive_id != summary.archive_id
+        || descriptor.previous_manifest_anchor != summary.previous_manifest_anchor
+        || descriptor.entries.len() != summary.branch_count as usize
+    {
+        return Err(QRunHistoryArchiveError::ArchiveCommitmentMismatch);
+    }
+    let manifest = descriptor.validate_context(
+        expected_network_id,
+        expected_profile_fingerprint,
+        expected_genesis_tip,
+        expected_manifest_anchor,
+    )?;
+
+    let mut expected_names = std::collections::BTreeSet::new();
+    expected_names.insert(QRA1_DESCRIPTOR_NAME.to_string());
+    let mut envelopes = Vec::with_capacity(descriptor.entries.len());
+    for entry in &descriptor.entries {
+        let name = branch_file_name(&entry.digest);
+        expected_names.insert(name.clone());
+        let payload = read_regular_file_nofollow(
+            &directory.join(&name),
+            MAX_CANDIDATE_NETWORK_ENVELOPE_BYTES,
+        )?;
+        let payload_hash: [u8; 32] = Sha256::digest(&payload).into();
+        if payload.len() as u64 != entry.payload_len || payload_hash != entry.payload_sha256 {
+            return Err(QRunHistoryArchiveError::BranchPayloadMismatch);
+        }
+        validate_branch_payload(&payload, &entry.digest, expected_network_id, params)?;
+        envelopes.push(payload);
+    }
+    validate_exact_directory_entries(&directory, &expected_names)?;
+
+    let genesis = QRunGenesisV05::new(expected_network_id, owner_account)
+        .map_err(|_| QRunHistoryArchiveError::ManifestProfileMismatch)?;
+    if genesis.commitment() != expected_genesis_commitment {
+        return Err(QRunHistoryArchiveError::ManifestProfileMismatch);
+    }
+    let genesis_archive =
+        PrivateTestnetForkChoice::new_qrun_v05_fee_only(genesis.ledger().clone(), params.clone())
+            .map_err(|_| QRunHistoryArchiveError::ManifestProfileMismatch)?;
+    if genesis_archive.genesis_tip() != manifest.genesis_tip
+        || genesis_archive.genesis_tip() != expected_genesis_tip
+    {
+        return Err(QRunHistoryArchiveError::ManifestProfileMismatch);
+    }
+
+    let replayed = PrivateTestnetForkChoice::rebuild_qrun_v05_fee_from_envelopes(
+        genesis.ledger().clone(),
+        params.clone(),
+        envelopes,
+        authenticator,
+        clock,
+    )
+    .map_err(|_| QRunHistoryArchiveError::HistoryReplayMismatch)?;
+    if replayed.genesis_tip() != expected_genesis_tip
+        || replayed.archive_len() != descriptor.entries.len()
+        || replayed.archive_len() != manifest.digests.len()
+        || replayed.canonical_chain().chain_tip().tip_hash != manifest.canonical_tip
+        || replayed.canonical_chain().chain_tip().tip_hash != summary.canonical_tip
+    {
+        return Err(QRunHistoryArchiveError::HistoryReplayMismatch);
+    }
+
+    Ok(QRunHistoryArchiveReplay {
+        summary,
+        genesis_commitment: expected_genesis_commitment,
+        replayed,
+    })
+}
+
 pub fn verify_qrun_v05_history_archive(
     archive_directory: impl AsRef<Path>,
     expected_network_id: [u8; 32],
@@ -1288,9 +1436,39 @@ mod tests {
             request_digest: [0x97; 32],
         };
         let expected_parent = [0x98; 32];
+        let replay = replay_qrun_v05_history_archive(
+            fixture.archive_root.join(encode_hex(&archive.archive_id)),
+            fixture.network_id,
+            genesis.commitment(),
+            fixture.profile_fingerprint,
+            fixture.genesis_tip,
+            fixture.manifest_anchor,
+            owner,
+            &fixture.params,
+            &RejectAllAuthenticator,
+            &FixedClock,
+        )
+        .unwrap();
+        assert_eq!(replay.canonical_tip(), fixture.branch_digest);
+        assert_eq!(replay.canonical_height(), fixture.store.canonical_height());
+        assert!(matches!(
+            replay_qrun_v05_history_archive(
+                fixture.archive_root.join(encode_hex(&archive.archive_id)),
+                fixture.network_id,
+                genesis.commitment(),
+                fixture.profile_fingerprint,
+                fixture.genesis_tip,
+                fixture.manifest_anchor,
+                [0x2B; 32],
+                &fixture.params,
+                &RejectAllAuthenticator,
+                &FixedClock,
+            ),
+            Err(QRunHistoryArchiveError::ManifestProfileMismatch)
+        ));
         let plan = prepare_qrun_v05_checkpoint_migration(
             &fixture.store,
-            &archive,
+            &replay,
             owner,
             &fixture.params,
             &pin,
@@ -1362,7 +1540,7 @@ mod tests {
         assert!(matches!(
             prepare_qrun_v05_checkpoint_migration(
                 &fixture.store,
-                &archive,
+                &replay,
                 owner,
                 &fixture.params,
                 &pin,
@@ -1377,7 +1555,7 @@ mod tests {
         wrong_archive.canonical_tip[0] ^= 1;
         let correct_record = plan.journal().previous_record.clone();
         assert!(matches!(
-            prepare_qrun_v05_checkpoint_migration(
+            crate::qrun_v05_checkpoint_migration_candidate::prepare_qrun_v05_checkpoint_migration_from_archive(
                 &fixture.store,
                 &wrong_archive,
                 owner,
