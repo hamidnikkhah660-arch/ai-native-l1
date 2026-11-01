@@ -18,6 +18,8 @@ hmac = "=0.12.1"
 sha2 = "=0.10.8"
 ed25519-dalek = "=2.1.1"
 getrandom = "=0.2.16"
+# O_NOFOLLOW/O_CLOEXEC flags for secure Unix lock-file opens.
+libc = "=0.2.190"
 # Noise framework prototype; pinned to the local Rust 1.82-compatible line.
 snow = "=0.9.6"
 # FIPS 204 ML-DSA-65 implementation; its arithmetic/NTT/serialization components are formally verified, but deployment still requires an external review.

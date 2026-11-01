@@ -1132,7 +1132,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_corruption_and_profile_change_fail_closed_but_stale_pid_text_recovers() {
+    fn manifest_corruption_and_profile_change_fail_closed_while_stale_pid_text_is_preserved() {
         let directory = TestDir::new();
         let genesis = genesis();
         let params = params();
@@ -1199,8 +1199,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            fs::read_to_string(directory.path().join(LOCK_NAME)).unwrap(),
-            format!("pid={}\n", process::id())
+            fs::read(directory.path().join(LOCK_NAME)).unwrap(),
+            b"pid=stale\n"
         );
         drop(reopened);
     }

@@ -87,6 +87,7 @@ pub enum V04ExecutionForkStoreError {
     ExternalCasConflict,
     ExternalCasInvalidOutcome(ExternalCasReceiptOutcome),
     UnexpectedBranchFile,
+    UnsafeStorePath,
 }
 
 impl std::fmt::Display for V04ExecutionForkStoreError {
@@ -140,6 +141,10 @@ impl std::fmt::Display for V04ExecutionForkStoreError {
             Self::UnexpectedBranchFile => write!(
                 f,
                 "QZBE branch directory contains an uncommitted or non-canonical entry"
+            ),
+            Self::UnsafeStorePath => write!(
+                f,
+                "QZBE store path contains a symlink, reparse point, or non-directory entry"
             ),
         }
     }
@@ -350,7 +355,9 @@ fn persist_anchor_mode_marker(
             if existing != expected {
                 return Err(V04ExecutionForkStoreError::ExternalAnchorMismatch);
             }
-            Ok(())
+            // Re-publish an existing marker too: it may have been created by an older writer
+            // that synced file contents but did not flush the parent directory entry.
+            write_replace_atomic(&path, &bytes)
         }
         None => write_new_atomic(&path, &bytes),
     }
@@ -407,6 +414,7 @@ fn prune_unreferenced_branch_files(
         .map(|(digest, _)| format!("{}{}", hex(digest), BRANCH_SUFFIX))
         .collect();
     let branches_dir = store.directory.join(BRANCH_DIR);
+    let mut removed = false;
     for entry in fs::read_dir(&branches_dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
@@ -426,7 +434,11 @@ fn prune_unreferenced_branch_files(
         }
         if !committed.contains(&name) {
             fs::remove_file(entry.path())?;
+            removed = true;
         }
+    }
+    if removed {
+        sync_directory(&branches_dir)?;
     }
     Ok(())
 }
@@ -439,7 +451,7 @@ impl V04ExecutionForkStoreCandidate {
         authenticator: &A,
     ) -> Result<Self, V04ExecutionForkStoreError> {
         let directory = directory.as_ref().to_path_buf();
-        fs::create_dir_all(&directory)?;
+        ensure_store_root_directory(&directory)?;
         let writer_lock = StoreWriterLock::acquire(&directory, LOCK_NAME).map_err(|error| {
             if error.kind() == io::ErrorKind::WouldBlock {
                 V04ExecutionForkStoreError::StoreLocked
@@ -450,16 +462,17 @@ impl V04ExecutionForkStoreCandidate {
         // Read mutable recovery state only after acquiring the process lock. Checking the pending
         // CAS manifest before lock acquisition permits a stale pre-lock observation if another
         // writer creates it while this opener waits.
+        // Atomic marker/pending publication also stages files in the store root, so clean those
+        // abandoned temporaries alongside the branch and manifest staging files below.
+        clean_temporary_files(&directory)?;
         let pending_path = directory.join(PENDING_MANIFEST_NAME);
         let pending_exists = match fs::symlink_metadata(&pending_path) {
             Ok(_) => true,
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
             Err(error) => return Err(V04ExecutionForkStoreError::Io(error)),
         };
-        let branches_dir = directory.join(BRANCH_DIR);
-        let manifests_dir = directory.join(MANIFEST_DIR);
-        fs::create_dir_all(&branches_dir)?;
-        fs::create_dir_all(&manifests_dir)?;
+        let branches_dir = ensure_store_subdirectory(&directory, BRANCH_DIR)?;
+        let manifests_dir = ensure_store_subdirectory(&directory, MANIFEST_DIR)?;
         clean_temporary_files(&branches_dir)?;
         clean_temporary_files(&manifests_dir)?;
 
@@ -624,12 +637,24 @@ impl V04ExecutionForkStoreCandidate {
 
             if remote.generation == store.generation
                 && remote.next_state_digest == local_anchor
+                && pending.generation == store.generation
+                && pending_anchor == local_anchor
+            {
+                // A prior promotion may have published the exact committed generation but the
+                // pending-name deletion may have been lost across a platform crash. The signed
+                // remote anchor and already-replayed local manifest prove this is stale duplicate
+                // intent, not a new operation; remove it idempotently.
+                verify_manifest_profile(&pending, &store.fork_choice, &store.params)?;
+                remove_file_synced(&pending_path)?;
+                prune_unreferenced_branch_files(&store)?;
+            } else if remote.generation == store.generation
+                && remote.next_state_digest == local_anchor
                 && pending.generation == next_generation
             {
                 // The conditional write did not commit. The signed remote record still names
                 // the active local state, so discard the pending manifest and any uncommitted
                 // branches only after this anchor has been verified.
-                fs::remove_file(&pending_path)?;
+                remove_file_synced(&pending_path)?;
                 prune_unreferenced_branch_files(&store)?;
             } else if remote.generation == next_generation
                 && remote.previous_state_digest == local_anchor
@@ -655,10 +680,7 @@ impl V04ExecutionForkStoreCandidate {
                 let target = directory
                     .join(MANIFEST_DIR)
                     .join(manifest_filename(remote.generation));
-                if target.exists() {
-                    return Err(V04ExecutionForkStoreError::PendingManifestMalformed);
-                }
-                fs::rename(&pending_path, &target)?;
+                promote_pending_manifest(&pending_path, &target, &pending_bytes)?;
                 drop(store);
                 let mut reopened = Self::open(&directory, genesis, params, authenticator)?;
                 if reopened.generation != remote.generation
@@ -820,6 +842,9 @@ impl V04ExecutionForkStoreCandidate {
             if existing != envelope_bytes {
                 return Err(V04ExecutionForkStoreError::BranchBytesMismatch);
             }
+            // Re-publish identical bytes so a branch created by an older, non-durable writer is
+            // durable before a new manifest is allowed to reference it.
+            write_replace_atomic(&branch_path, envelope_bytes)?;
         } else {
             write_new_atomic(&branch_path, envelope_bytes)?;
         }
@@ -907,10 +932,7 @@ impl V04ExecutionForkStoreCandidate {
             .directory
             .join(MANIFEST_DIR)
             .join(manifest_filename(next_generation));
-        if target.exists() {
-            return Err(V04ExecutionForkStoreError::ManifestGenerationMismatch);
-        }
-        fs::rename(&pending_path, &target)?;
+        promote_pending_manifest(&pending_path, &target, &manifest_bytes)?;
         self.fork_choice = staged;
         self.generation = next_generation;
         Ok(V04ExecutionAnchoredSubmitOutcome {
@@ -983,6 +1005,9 @@ impl V04ExecutionForkStoreCandidate {
             if existing != envelope_bytes {
                 return Err(V04ExecutionForkStoreError::BranchBytesMismatch);
             }
+            // Re-publish identical bytes so a branch created by an older, non-durable writer is
+            // durable before a new manifest is allowed to reference it.
+            write_replace_atomic(&branch_path, envelope_bytes)?;
         } else {
             write_new_atomic(&branch_path, envelope_bytes)?;
         }
@@ -1212,16 +1237,29 @@ fn has_branch_files(directory: &Path) -> Result<bool, V04ExecutionForkStoreError
 }
 
 fn clean_temporary_files(directory: &Path) -> Result<(), V04ExecutionForkStoreError> {
+    let mut removed = false;
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
-        if entry.file_type()?.is_file()
-            && entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".qzbe-tmp-")
-        {
-            fs::remove_file(entry.path())?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        if name.starts_with(".qzbe-tmp-") {
+            let metadata = fs::symlink_metadata(&path)?;
+            if !is_reparse_point(&metadata) && metadata.is_file() {
+                fs::remove_file(path)?;
+                removed = true;
+            }
+        } else if name.starts_with(".qzbe-dir-tmp-") {
+            let metadata = fs::symlink_metadata(&path)?;
+            // Staging directories are created empty. Remove only an actual empty directory;
+            // never recurse through a reparse point or delete an unexpected non-empty tree.
+            if !is_reparse_point(&metadata) && metadata.is_dir() {
+                fs::remove_dir(path)?;
+                removed = true;
+            }
         }
+    }
+    if removed {
+        sync_directory(directory)?;
     }
     Ok(())
 }
@@ -1230,7 +1268,7 @@ fn write_new_atomic(destination: &Path, bytes: &[u8]) -> Result<(), V04Execution
     let parent = destination
         .parent()
         .ok_or(V04ExecutionForkStoreError::ManifestMalformed)?;
-    fs::create_dir_all(parent)?;
+    ensure_real_directory(parent)?;
     let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
     let temporary = parent.join(format!(".qzbe-tmp-{}-{id}", std::process::id()));
     let mut file = OpenOptions::new()
@@ -1241,7 +1279,7 @@ fn write_new_atomic(destination: &Path, bytes: &[u8]) -> Result<(), V04Execution
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&temporary, destination)?;
+        publish_new_atomic(&temporary, destination)?;
         Ok(())
     })();
     if let Err(error) = write_result {
@@ -1251,25 +1289,412 @@ fn write_new_atomic(destination: &Path, bytes: &[u8]) -> Result<(), V04Execution
     Ok(())
 }
 
-fn read_bounded(path: &Path, maximum: usize) -> Result<Vec<u8>, V04ExecutionForkStoreError> {
-    // Do not follow symlinks for branch or manifest objects. A digest-valid target outside
-    // the store directory is not itself an approved store object.
+/// Publish a fully synced sibling file without replacing an existing entry. On Unix, the
+/// hard-link makes publication atomic and no-replace; syncing the directory before unlinking
+/// the temporary name preserves a recoverable name across the two durability boundaries. On
+/// Windows, MoveFileExW without REPLACE_EXISTING plus WRITE_THROUGH provides the equivalent move.
+fn publish_new_atomic(source: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+        let from: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to: Vec<u16> = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        #[link(name = "Kernel32")]
+        extern "system" {
+            fn MoveFileExW(existing: *const u16, new_name: *const u16, flags: u32) -> i32;
+        }
+        let success = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+        if success == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        let destination_parent = destination.parent().unwrap_or_else(|| Path::new("."));
+        let source_parent = source.parent().unwrap_or_else(|| Path::new("."));
+        fs::hard_link(source, destination)?;
+        sync_directory(destination_parent)?;
+        fs::remove_file(source)?;
+        sync_directory(source_parent)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = (source, destination);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable no-replace publication is unsupported on this platform",
+        ))
+    }
+}
+
+/// Re-publish already-verified bytes over an existing manifest name and request the platform's
+/// durability barrier again. Used when recovery finds an identical target left by an interrupted
+/// promotion while the pending source still exists.
+fn write_replace_atomic(
+    destination: &Path,
+    bytes: &[u8],
+) -> Result<(), V04ExecutionForkStoreError> {
+    let parent = destination
+        .parent()
+        .ok_or(V04ExecutionForkStoreError::ManifestMalformed)?;
+    ensure_real_directory(parent)?;
+    let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(".qzbe-tmp-{}-{id}", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| -> io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        replace_existing_atomic(&temporary, destination)
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(V04ExecutionForkStoreError::Io(error));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_existing_atomic(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    let from: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, new_name: *const u16, flags: u32) -> i32;
+    }
+    let success = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if success == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn replace_existing_atomic(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)?;
+    sync_directory(destination.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn replace_existing_atomic(_source: &Path, _destination: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "durable replace publication is unsupported on this platform",
+    ))
+}
+
+fn remove_file_synced(path: &Path) -> io::Result<()> {
+    fs::remove_file(path)?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    sync_directory(parent)
+}
+
+/// Promote a CAS-pending manifest while retaining the recovery source until the committed
+/// manifest name has crossed its durability boundary. If a previous attempt published the
+/// exact target but failed before removing pending, accept only byte-identical replay.
+fn promote_pending_manifest(
+    pending_path: &Path,
+    target_path: &Path,
+    expected_bytes: &[u8],
+) -> Result<(), V04ExecutionForkStoreError> {
+    match fs::symlink_metadata(target_path) {
+        Ok(_) => {
+            let committed_bytes = read_bounded(target_path, MAX_MANIFEST_BYTES)?;
+            if committed_bytes != expected_bytes {
+                return Err(V04ExecutionForkStoreError::PendingManifestMalformed);
+            }
+            write_replace_atomic(target_path, expected_bytes)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            write_new_atomic(target_path, expected_bytes)?;
+        }
+        Err(error) => return Err(V04ExecutionForkStoreError::Io(error)),
+    }
+    remove_file_synced(pending_path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory(directory: &Path) -> io::Result<()> {
+    File::open(directory)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_directory(_directory: &Path) -> io::Result<()> {
+    // This implementation does not issue a directory-handle flush on Windows. State-changing
+    // publications use MoveFileExW(MOVEFILE_WRITE_THROUGH); removals are limited to idempotent
+    // cleanup and pending-marker housekeeping, so recovery must tolerate them reappearing.
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_directory(_directory: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(unix)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+fn ensure_real_directory(path: &Path) -> Result<(), V04ExecutionForkStoreError> {
     let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() {
+    if is_reparse_point(&metadata) || !metadata.is_dir() {
+        return Err(V04ExecutionForkStoreError::UnsafeStorePath);
+    }
+    Ok(())
+}
+
+fn parent_or_dot(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+#[cfg(unix)]
+fn create_directory_durable(path: &Path) -> io::Result<()> {
+    fs::create_dir(path)?;
+    sync_directory(parent_or_dot(path))
+}
+
+#[cfg(windows)]
+fn create_directory_durable(path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, new_name: *const u16, flags: u32) -> i32;
+    }
+
+    // Stage the directory beside its destination so the final same-volume rename can request
+    // write-through metadata flushing. A process crash before publication can leave only an
+    // unreferenced staging directory, never a partially initialized store directory.
+    let parent = parent_or_dot(path);
+    for _ in 0..1024 {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(".qzbe-dir-tmp-{}-{id}", std::process::id()));
+        match fs::create_dir(&temporary) {
+            Ok(()) => {
+                let from: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+                let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+                let success =
+                    unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+                if success != 0 {
+                    return Ok(());
+                }
+                let error = io::Error::last_os_error();
+                let _ = fs::remove_dir(&temporary);
+                return Err(error);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique QZBE directory staging path",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_directory_durable(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "durable store directory creation is unsupported on this platform",
+    ))
+}
+
+/// Create each missing root component separately and sync the parent directory after each
+/// creation. Existing ancestor symlinks may be intentional user path aliases; the final store
+/// root itself must always be a real directory and not a reparse point.
+fn ensure_store_root_directory(path: &Path) -> Result<(), V04ExecutionForkStoreError> {
+    let mut missing = Vec::<PathBuf>::new();
+    let mut current = path;
+    loop {
+        match fs::symlink_metadata(current) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(current.to_path_buf());
+                let parent = parent_or_dot(current);
+                if parent == current {
+                    return Err(V04ExecutionForkStoreError::UnsafeStorePath);
+                }
+                current = parent;
+            }
+            Err(error) => return Err(V04ExecutionForkStoreError::Io(error)),
+        }
+    }
+
+    for directory in missing.iter().rev() {
+        match create_directory_durable(directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(V04ExecutionForkStoreError::Io(error)),
+        }
+        ensure_real_directory(directory)?;
+    }
+    ensure_real_directory(path)
+}
+
+fn ensure_store_subdirectory(
+    store_directory: &Path,
+    name: &str,
+) -> Result<PathBuf, V04ExecutionForkStoreError> {
+    ensure_real_directory(store_directory)?;
+    let path = store_directory.join(name);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if is_reparse_point(&metadata) || !metadata.is_dir() {
+                return Err(V04ExecutionForkStoreError::UnsafeStorePath);
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match create_directory_durable(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(V04ExecutionForkStoreError::Io(error)),
+            }
+            ensure_real_directory(&path)?;
+        }
+        Err(error) => return Err(V04ExecutionForkStoreError::Io(error)),
+    }
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(windows)]
+fn same_file_identity(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
+    // The file is opened with FILE_FLAG_OPEN_REPARSE_POINT and its handle metadata is checked
+    // below. Stable file-index metadata APIs are not available on the pinned Rust 1.82 toolchain.
+    true
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_identity(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
+    true
+}
+
+#[cfg(unix)]
+fn open_regular_file_no_follow(path: &Path) -> io::Result<File> {
+    use std::{ffi::CString, os::fd::FromRawFd, os::unix::ffi::OsStrExt};
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let descriptor = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+#[cfg(windows)]
+fn open_regular_file_no_follow(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_regular_file_no_follow(path: &Path) -> io::Result<File> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "symlink rejected",
+        ));
+    }
+    File::open(path)
+}
+
+fn read_exact_bounded<R: Read>(
+    reader: R,
+    expected_length: usize,
+    maximum: usize,
+) -> Result<Vec<u8>, V04ExecutionForkStoreError> {
+    if expected_length > maximum {
+        return Err(V04ExecutionForkStoreError::ArchiveCapacityExceeded);
+    }
+    // Metadata length is only an observation: another local process may append to the file
+    // after open(). Limit the actual read to maximum + 1 so growth cannot turn a bounded file
+    // into an unbounded allocation. The extra byte distinguishes exact-limit data from growth.
+    let read_limit = maximum
+        .checked_add(1)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or(V04ExecutionForkStoreError::ArchiveCapacityExceeded)?;
+    let mut bytes = Vec::with_capacity(expected_length);
+    reader.take(read_limit).read_to_end(&mut bytes)?;
+    if bytes.len() != expected_length || bytes.len() > maximum {
         return Err(V04ExecutionForkStoreError::ManifestMalformed);
     }
-    let length = usize::try_from(metadata.len())
+    Ok(bytes)
+}
+
+fn read_bounded(path: &Path, maximum: usize) -> Result<Vec<u8>, V04ExecutionForkStoreError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if is_reparse_point(&metadata) || !metadata.is_file() {
+        return Err(V04ExecutionForkStoreError::ManifestMalformed);
+    }
+    let file = open_regular_file_no_follow(path)?;
+    let opened_metadata = file.metadata()?;
+    if is_reparse_point(&opened_metadata)
+        || !opened_metadata.is_file()
+        || !same_file_identity(&metadata, &opened_metadata)
+    {
+        return Err(V04ExecutionForkStoreError::ManifestMalformed);
+    }
+    let length = usize::try_from(opened_metadata.len())
         .map_err(|_| V04ExecutionForkStoreError::ArchiveCapacityExceeded)?;
     if length > maximum {
         return Err(V04ExecutionForkStoreError::ArchiveCapacityExceeded);
     }
-    let mut file = File::open(path)?;
-    let mut bytes = Vec::with_capacity(length);
-    file.read_to_end(&mut bytes)?;
-    if bytes.len() != length || bytes.len() > maximum {
-        return Err(V04ExecutionForkStoreError::ManifestMalformed);
-    }
-    Ok(bytes)
+    read_exact_bounded(file, length, maximum)
 }
 
 fn take_slice<'a>(
@@ -1325,6 +1750,8 @@ mod tests {
         v4_fat1_mldsa65_candidate::LibcruxMlDsa65VerifierCandidate,
     };
     use libcrux_ml_dsa::ml_dsa_65::portable;
+    #[cfg(windows)]
+    use std::process::Command;
     use std::{
         fs,
         path::PathBuf,
@@ -1568,6 +1995,123 @@ mod tests {
             "qzbe-store-test-{}-{nanos}-{sequence}",
             std::process::id()
         ))
+    }
+
+    #[cfg(unix)]
+    fn create_directory_link(target: &std::path::Path, link: &std::path::Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn create_directory_link(target: &std::path::Path, link: &std::path::Path) {
+        let output = Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("cmd.exe must be available for junction test");
+        assert!(
+            output.status.success(),
+            "could not create test junction: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn open_rejects_reparse_point_store_root() {
+        let (_manifest, profile) = profile();
+        let parent = temporary_directory();
+        let store_path = parent.join("store");
+        let target_path = parent.join("target");
+        fs::create_dir_all(&target_path).unwrap();
+        create_directory_link(&target_path, &store_path);
+
+        let result = V04ExecutionForkStoreCandidate::open(
+            &store_path,
+            genesis(&profile),
+            params(),
+            &TestAuthenticator,
+        );
+        assert!(matches!(
+            result,
+            Err(V04ExecutionForkStoreError::UnsafeStorePath)
+        ));
+        let _ = fs::remove_dir(&store_path);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn open_rejects_reparse_point_store_subdirectories() {
+        let (_manifest, profile) = profile();
+        for name in [BRANCH_DIR, MANIFEST_DIR] {
+            let store_path = temporary_directory();
+            let target_path = temporary_directory();
+            fs::create_dir_all(&store_path).unwrap();
+            fs::create_dir_all(&target_path).unwrap();
+            let link_path = store_path.join(name);
+            create_directory_link(&target_path, &link_path);
+
+            let result = V04ExecutionForkStoreCandidate::open(
+                &store_path,
+                genesis(&profile),
+                params(),
+                &TestAuthenticator,
+            );
+            assert!(
+                matches!(result, Err(V04ExecutionForkStoreError::UnsafeStorePath)),
+                "store must reject redirected subdirectory {name}"
+            );
+
+            let _ = fs::remove_dir(&link_path);
+            fs::remove_dir_all(&store_path).unwrap();
+            fs::remove_dir_all(&target_path).unwrap();
+        }
+    }
+
+    #[test]
+    fn new_atomic_publication_never_overwrites_an_existing_entry() {
+        let directory = temporary_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let destination = directory.join("already-committed.qzmf");
+        fs::write(&destination, b"committed-bytes").unwrap();
+
+        let result = write_new_atomic(&destination, b"replacement-bytes");
+        assert!(matches!(result, Err(V04ExecutionForkStoreError::Io(_))));
+        assert_eq!(fs::read(&destination).unwrap(), b"committed-bytes");
+        assert_eq!(
+            fs::read_dir(&directory).unwrap().count(),
+            1,
+            "failed publication must not leave a temporary file"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pending_promotion_is_idempotent_only_for_the_exact_published_manifest() {
+        let directory = temporary_directory();
+        let manifests = directory.join(MANIFEST_DIR);
+        fs::create_dir_all(&manifests).unwrap();
+        let pending = directory.join(PENDING_MANIFEST_NAME);
+        let target = manifests.join(manifest_filename(1));
+        let committed = b"exact-committed-manifest";
+        fs::write(&pending, committed).unwrap();
+        fs::write(&target, committed).unwrap();
+
+        promote_pending_manifest(&pending, &target, committed).unwrap();
+        assert!(!pending.exists());
+        assert_eq!(fs::read(&target).unwrap(), committed);
+
+        let pending_mismatch = directory.join("pending-mismatch");
+        let target_mismatch = manifests.join(manifest_filename(2));
+        fs::write(&pending_mismatch, b"pending-bytes").unwrap();
+        fs::write(&target_mismatch, b"different-committed-bytes").unwrap();
+        assert!(matches!(
+            promote_pending_manifest(&pending_mismatch, &target_mismatch, b"pending-bytes"),
+            Err(V04ExecutionForkStoreError::PendingManifestMalformed)
+        ));
+        assert_eq!(fs::read(&pending_mismatch).unwrap(), b"pending-bytes");
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1841,6 +2385,75 @@ mod tests {
     }
 
     #[test]
+    fn bounded_reader_rejects_growth_without_reading_past_maximum_plus_one() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        struct GrowingReader(Arc<AtomicUsize>);
+        impl Read for GrowingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let count = buffer.len().min(3);
+                buffer[..count].fill(0xA5);
+                self.0.fetch_add(count, Ordering::Relaxed);
+                Ok(count)
+            }
+        }
+
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let result = read_exact_bounded(GrowingReader(bytes_read.clone()), 0, 31);
+        assert!(matches!(
+            result,
+            Err(V04ExecutionForkStoreError::ManifestMalformed)
+        ));
+        assert_eq!(bytes_read.load(Ordering::Relaxed), 32);
+    }
+
+    #[test]
+    fn clean_temporary_files_removes_abandoned_root_publication_files() {
+        let directory = temporary_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let abandoned = directory.join(".qzbe-tmp-1234-7");
+        let abandoned_directory = directory.join(".qzbe-dir-tmp-1234-8");
+        let unrelated = directory.join("pending-manifest.bin");
+        fs::write(&abandoned, b"incomplete").unwrap();
+        fs::create_dir(&abandoned_directory).unwrap();
+        fs::write(&unrelated, b"preserve").unwrap();
+
+        clean_temporary_files(&directory).unwrap();
+
+        assert!(!abandoned.exists());
+        assert!(!abandoned_directory.exists());
+        assert_eq!(fs::read(&unrelated).unwrap(), b"preserve");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_follow_reader_opens_fifo_without_blocking() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let directory = temporary_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let fifo = directory.join("branch.pipe");
+        let c_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        let created = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(
+            created,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let opened = open_regular_file_no_follow(&fifo)
+            .expect("O_NONBLOCK must allow safe metadata validation without a writer");
+        assert!(!opened.metadata().unwrap().is_file());
+        drop(opened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn external_cas_commits_qzbe_manifest_only_after_verified_receipt_and_reopens() {
         let (_manifest, profile) = profile();
         let genesis_state = genesis(&profile);
@@ -1901,6 +2514,15 @@ mod tests {
         let next_floor = receipt.object_generation;
         drop(store);
 
+        // Simulate a pending-name deletion that reappears after a platform crash. The bytes are
+        // exactly the now-committed generation; recovery must reconcile it idempotently.
+        let committed_manifest = fs::read(
+            path.join(MANIFEST_DIR)
+                .join(manifest_filename(current_record.generation)),
+        )
+        .unwrap();
+        fs::write(path.join(PENDING_MANIFEST_NAME), committed_manifest).unwrap();
+
         // A regular reopen must not forget the externally anchored mode and accidentally accept
         // a local-only submit. A corrupted mode latch must fail closed as well.
         assert!(path.join(ANCHOR_MODE_MARKER_NAME).is_file());
@@ -1945,6 +2567,10 @@ mod tests {
                 next_floor,
             )
             .unwrap();
+        assert!(
+            !path.join(PENDING_MANIFEST_NAME).exists(),
+            "an already-committed duplicate pending manifest must be cleaned up"
+        );
         assert_eq!(reopened.generation(), 1);
         assert_eq!(reopened.canonical_height(), 1);
         assert_eq!(
