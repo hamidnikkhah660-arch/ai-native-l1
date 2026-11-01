@@ -83,6 +83,8 @@ pub mod private_testnet_monetary_wire;
 pub mod private_testnet_pfm5_archive_binding_candidate;
 /// Candidate-only orchestration for immutable PFM5 publication and pinned signed ECR1 anchoring.
 pub mod private_testnet_pfm5_external_cas_candidate;
+/// Candidate-only durable journal for exact PFM5 External-CAS intents and crash recovery.
+pub mod private_testnet_pfm5_external_cas_journal_candidate;
 /// Candidate-only durable PFM5/PCP4 checkpoint-rooted PMT4 branch store; no live provider or node wiring.
 pub mod private_testnet_pfm5_fork_store_candidate;
 /// Candidate-only immutable PFM5/PCP4/PMT4 object transport with read-back and full replay validation.
