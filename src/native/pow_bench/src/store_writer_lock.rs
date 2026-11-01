@@ -82,12 +82,13 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     const O_NOFOLLOW: i32 = libc::O_NOFOLLOW;
     const O_CLOEXEC: i32 = libc::O_CLOEXEC;
+    const O_NONBLOCK: i32 = libc::O_NONBLOCK;
     OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .custom_flags(O_NOFOLLOW | O_CLOEXEC)
+        .custom_flags(O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
         .open(path)
 }
 
@@ -373,6 +374,31 @@ mod tests {
         let result = StoreWriterLock::acquire(&directory, "writer.lock");
         assert!(result.is_err_and(|error| error.kind() == std::io::ErrorKind::InvalidInput));
         assert_eq!(fs::read(&protected).unwrap(), b"do-not-truncate");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lockfile_fifo_open_is_nonblocking_for_metadata_validation() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let directory = temp_dir();
+        let lock_path = directory.join("writer.lock");
+        let c_path = CString::new(lock_path.as_os_str().as_bytes()).unwrap();
+        let created = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(
+            created,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        // Simulate the race where a path that passed the earlier metadata check is replaced
+        // before open. The opener must return a handle for type validation, never wait for a peer.
+        let opened = super::open_lock_file(&lock_path)
+            .expect("O_NONBLOCK must prevent a FIFO lock path from hanging open");
+        assert!(!super::safe_lock_file_metadata(&opened.metadata().unwrap()));
+        drop(opened);
         fs::remove_dir_all(directory).unwrap();
     }
 
