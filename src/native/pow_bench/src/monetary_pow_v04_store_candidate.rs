@@ -2391,6 +2391,7 @@ mod tests {
         use std::{ffi::CString, os::unix::ffi::OsStrExt};
 
         let directory = temporary_directory();
+        fs::create_dir_all(&directory).unwrap();
         let fifo = directory.join("branch.pipe");
         let c_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
         let created = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
