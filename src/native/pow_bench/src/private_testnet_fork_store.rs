@@ -21,7 +21,7 @@ use crate::{
         decode_candidate_network_block, PrivateTestnetWireError,
         MAX_CANDIDATE_NETWORK_ENVELOPE_BYTES,
     },
-    qrun_v05_checkpoint_candidate::MAX_QRCP_BYTES,
+    qrun_v05_checkpoint_candidate::{QRunV05PowCheckpoint, MAX_QRCP_BYTES},
     qrun_v05_checkpoint_migration_candidate::{
         prepare_qrun_v05_checkpoint_migration, QRunCheckpointMigrationError,
         QRunV05CheckpointMigrationPlan, MAX_QRM1_BYTES,
@@ -217,6 +217,7 @@ pub enum QRunV05CheckpointMigrationExecutionError {
     CheckpointRecordConflict,
     CheckpointRecordTooLarge,
     CommittedCheckpointMismatch,
+    GenesisCheckpointParentMismatch,
 }
 
 impl std::fmt::Display for QRunV05CheckpointMigrationExecutionError {
@@ -236,6 +237,18 @@ impl From<ForkStoreError> for QRunV05CheckpointMigrationExecutionError {
         Self::Store(value)
     }
 }
+impl From<ForkChoiceError> for QRunV05CheckpointMigrationExecutionError {
+    fn from(value: ForkChoiceError) -> Self {
+        Self::Store(ForkStoreError::Fork(value))
+    }
+}
+impl From<crate::qrun_v05_checkpoint_candidate::QRunCheckpointError>
+    for QRunV05CheckpointMigrationExecutionError
+{
+    fn from(value: crate::qrun_v05_checkpoint_candidate::QRunCheckpointError) -> Self {
+        Self::Migration(QRunCheckpointMigrationError::Checkpoint(value))
+    }
+}
 impl From<QRunHistoryArchiveError> for QRunV05CheckpointMigrationExecutionError {
     fn from(value: QRunHistoryArchiveError) -> Self {
         Self::Archive(value)
@@ -250,6 +263,27 @@ impl From<QRunCheckpointMigrationRecoveryError> for QRunV05CheckpointMigrationEx
     fn from(value: QRunCheckpointMigrationRecoveryError) -> Self {
         Self::Recovery(value)
     }
+}
+
+/// Derive the only valid parent commitment for the first checkpoint rooted at this QRun Genesis.
+/// This is intentionally deterministic and requires no provider access or local-store mutation;
+/// callers can run it before provisioning QCF1 or opening a network transport.
+pub fn qrun_v05_genesis_checkpoint_parent_commitment(
+    network_id: [u8; 32],
+    genesis_commitment: [u8; 32],
+    genesis: &LedgerState,
+    params: &ConsensusParameters,
+) -> Result<[u8; 32], QRunV05CheckpointMigrationExecutionError> {
+    let genesis_archive =
+        PrivateTestnetForkChoice::new_qrun_v05_fee_only(genesis.clone(), params.clone())?;
+    let genesis_checkpoint = QRunV05PowCheckpoint::capture(
+        network_id,
+        genesis_commitment,
+        params,
+        genesis_archive.canonical_chain(),
+        [0; 32],
+    )?;
+    Ok(genesis_checkpoint.commitment(params)?)
 }
 
 #[derive(Debug)]
@@ -1712,6 +1746,21 @@ where
             ));
         }
 
+        // The first checkpoint of a Genesis-rooted history must link to the exact deterministic
+        // height-zero QRCP derived from this Genesis/network/consensus profile. Treating an
+        // operator-supplied arbitrary parent hash as trusted would let an unrelated checkpoint
+        // lineage be grafted onto otherwise valid replayed history.
+        let params = store.params.clone();
+        let expected_genesis_checkpoint_commitment = qrun_v05_genesis_checkpoint_parent_commitment(
+            pin.network_id,
+            pin.genesis_digest,
+            &store.genesis,
+            &params,
+        )?;
+        if expected_parent_checkpoint_commitment != expected_genesis_checkpoint_commitment {
+            return Err(QRunV05CheckpointMigrationExecutionError::GenesisCheckpointParentMismatch);
+        }
+
         let floor_snapshot = floor.snapshot().map_err(|error| {
             QRunV05CheckpointMigrationExecutionError::Store(ForkStoreError::ExternalCasFloor(error))
         })?;
@@ -1735,7 +1784,6 @@ where
             return Err(QRunV05CheckpointMigrationExecutionError::FloorDoesNotMatchOpenStore);
         }
 
-        let params = store.params.clone();
         let archive_root = fs::canonicalize(archive_root.as_ref())?;
         let archive_summary =
             create_or_verify_qrun_v05_history_archive(&store, &archive_root, &params)?;
