@@ -214,6 +214,7 @@ pub enum QRunV05CheckpointMigrationExecutionError {
     FloorWriteBlocked,
     FloorDoesNotMatchOpenStore,
     CheckpointRecordPathInvalid,
+    IndependentFloorArchivePathOverlap,
     CheckpointRecordConflict,
     CheckpointRecordTooLarge,
     CommittedCheckpointMismatch,
@@ -1712,6 +1713,18 @@ where
             ));
         }
 
+        let floor_state_path = floor.state_path();
+        let floor_directory = floor_state_path
+            .parent()
+            .ok_or(QRunV05CheckpointMigrationExecutionError::CheckpointRecordPathInvalid)?;
+        let floor_directory = fs::canonicalize(floor_directory)?;
+        let archive_root = fs::canonicalize(archive_root.as_ref())?;
+        if canonical_directories_overlap(&floor_directory, &archive_root) {
+            return Err(
+                QRunV05CheckpointMigrationExecutionError::IndependentFloorArchivePathOverlap,
+            );
+        }
+
         let floor_snapshot = floor.snapshot().map_err(|error| {
             QRunV05CheckpointMigrationExecutionError::Store(ForkStoreError::ExternalCasFloor(error))
         })?;
@@ -1736,7 +1749,6 @@ where
         }
 
         let params = store.params.clone();
-        let archive_root = fs::canonicalize(archive_root.as_ref())?;
         let archive_summary =
             create_or_verify_qrun_v05_history_archive(&store, &archive_root, &params)?;
         let archive_id_hex: String = archive_summary
@@ -1778,7 +1790,8 @@ where
             checkpoint_record_file.as_ref(),
             &checkpoint_bytes,
             &store_directory,
-            &archive_directory,
+            &archive_root,
+            &floor_directory,
         )?;
 
         // QRM1 is create-once and durably published while this process still owns the PFS2 lock.
@@ -2336,11 +2349,16 @@ fn remove_pending_external_cas_commit(directory: &Path) -> Result<(), ForkStoreE
     }
 }
 
+fn canonical_directories_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
 fn persist_checkpoint_record_create_once(
     requested_path: &Path,
     checkpoint_bytes: &[u8],
     store_directory: &Path,
-    archive_directory: &Path,
+    archive_root: &Path,
+    floor_directory: &Path,
 ) -> Result<PathBuf, QRunV05CheckpointMigrationExecutionError> {
     if !requested_path.is_absolute()
         || checkpoint_bytes.is_empty()
@@ -2359,7 +2377,9 @@ fn persist_checkpoint_record_create_once(
         .file_name()
         .ok_or(QRunV05CheckpointMigrationExecutionError::CheckpointRecordPathInvalid)?;
     let canonical_path = canonical_parent.join(file_name);
-    if canonical_path.starts_with(store_directory) || canonical_path.starts_with(archive_directory)
+    if canonical_path.starts_with(store_directory)
+        || canonical_path.starts_with(archive_root)
+        || canonical_path.starts_with(floor_directory)
     {
         return Err(QRunV05CheckpointMigrationExecutionError::CheckpointRecordPathInvalid);
     }
@@ -4246,6 +4266,77 @@ mod tests {
             true
         );
         assert_eq!(exact_qrm1_bytes.len() > 0, true);
+    }
+
+    #[test]
+    fn migrated_checkpoint_record_stays_outside_store_archive_and_independent_floor() {
+        let dir = TestDir::new();
+        let store = dir.0.join("store");
+        let archive = dir.0.join("archive");
+        let floor = dir.0.join("floor");
+        let output = dir.0.join("output");
+        for path in [&store, &archive, &floor, &output] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let store = fs::canonicalize(store).unwrap();
+        let archive = fs::canonicalize(archive).unwrap();
+        let floor = fs::canonicalize(floor).unwrap();
+        let checkpoint_bytes = b"bounded checkpoint test bytes";
+
+        let forbidden_paths = [
+            floor.join("checkpoint.qrcp"),
+            floor.join("..").join("floor").join("checkpoint.qrcp"),
+            archive.join("checkpoint.qrcp"),
+            store.join("checkpoint.qrcp"),
+        ];
+        for path in forbidden_paths {
+            assert!(matches!(
+                persist_checkpoint_record_create_once(
+                    &path,
+                    checkpoint_bytes,
+                    &store,
+                    &archive,
+                    &floor,
+                ),
+                Err(QRunV05CheckpointMigrationExecutionError::CheckpointRecordPathInvalid)
+            ));
+        }
+
+        let allowed = dir.0.join("output").join("checkpoint.qrcp");
+        let persisted = persist_checkpoint_record_create_once(
+            &allowed,
+            checkpoint_bytes,
+            &store,
+            &archive,
+            &floor,
+        )
+        .unwrap();
+        assert_eq!(fs::read(persisted).unwrap(), checkpoint_bytes);
+    }
+
+    #[test]
+    fn independent_floor_and_history_archive_must_not_overlap() {
+        let dir = TestDir::new();
+        let floor = dir.0.join("floor");
+        let archive = floor.join("archives");
+        fs::create_dir_all(&archive).unwrap();
+        let canonical_floor = fs::canonicalize(&floor).unwrap();
+        let canonical_archive = fs::canonicalize(&archive).unwrap();
+        assert!(canonical_directories_overlap(
+            &canonical_floor,
+            &canonical_archive
+        ));
+        assert!(canonical_directories_overlap(
+            &canonical_archive,
+            &canonical_floor
+        ));
+
+        let separate_archive = TestDir::new();
+        let canonical_separate = fs::canonicalize(&separate_archive.0).unwrap();
+        assert!(!canonical_directories_overlap(
+            &canonical_floor,
+            &canonical_separate
+        ));
     }
 
     #[test]
