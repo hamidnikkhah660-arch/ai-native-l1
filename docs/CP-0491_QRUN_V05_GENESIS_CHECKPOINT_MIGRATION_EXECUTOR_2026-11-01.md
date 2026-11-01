@@ -37,16 +37,15 @@ If an earlier run stopped with an ambiguous committed QRM1 intent, use the exist
 
 ## Execution ordering
 
-1. Open the configured provider identity, ECR1 bootstrap and independent QCF1 floor; load the protected Noise key and construct the pinned, receipt-verifying client.
-2. Open the wallet-bound Genesis-rooted fee-only PFS2 store with its writer lock and attached floor. Reject an incomplete/mismatched trust tuple or non-Genesis source.
-3. Recompute the deterministic height-zero Genesis QRCP commitment and require an exact match with the requested parent commitment.
-4. Perform a fresh challenge-bound signed provider read immediately before preparing the migration; cached state alone cannot authorize the operation.
-5. While the source PFS2 writer lock is held, create-or-verify QRA1 and replay it from the original wallet-bound Genesis. Replay checks archive identity/profile/Genesis/manifest bindings and reconstructs the canonical QFP5 tip.
-6. Prepare the exact QRM1 intent from the verified replay and exact current ECR1 successor.
-7. Persist the bounded QRCP bytes to the separate caller-supplied absolute path using create-once semantics. Identical existing bytes are idempotent; different bytes, symlinks/reparse points and paths inside the PFS2 or QRA1 directory are refused. Sync the file and parent directory where supported.
-8. Persist QRM1 while the source PFS2 lock is still held, then release that lock.
-9. Invoke the existing recovery executor only after lock release. It reconciles exact provider CAS state, verifies the signed receipt, advances QCF1 and installs the checkpoint-rooted PFS2 manifest. QRM1 is cleared only after successful recovery.
-10. Verify the recovered checkpoint commitment and bytes against the durable QRCP file. Reopen QCF1 and a fresh authenticated Noise/TCP session before ordinary runtime startup continues.
+1. Construct the wallet-bound Genesis and independently derive the deterministic height-zero QRCP parent commitment from the active network and consensus profile. Compare it with the operator-supplied value before reading ECR1/receipt bootstrap material, initializing or opening QCF1, loading the protected Noise key, creating a Noise/TCP session, opening PFS2 or contacting the provider.
+2. Load and validate the pinned provider identity, ML-DSA-65 receipt key and generation-zero ECR1 bootstrap. Open the existing QCF1 floor, or initialize it only when the explicit initialization switch is supplied for the intended first bootstrap; then construct the pinned authenticated provider client.
+3. Open the wallet-bound Genesis-rooted fee-only PFS2 store with its writer lock and attached floor. The consuming Store API independently derives and rechecks the height-zero parent commitment before reading the floor snapshot or issuing its fresh challenge-bound signed provider read.
+4. While the source PFS2 writer lock is held, create-or-verify QRA1 and replay it from the original wallet-bound Genesis. Replay checks archive identity/profile/Genesis/manifest bindings and reconstructs the canonical QFP5 tip.
+5. Prepare the exact QRM1 intent from the verified replay and exact current ECR1 successor.
+6. Persist the bounded QRCP bytes to the separate caller-supplied absolute path using create-once semantics. Identical existing bytes are idempotent; different bytes, symlinks/reparse points and paths inside the PFS2 or QRA1 archive directory are refused. Sync the file and parent directory where supported.
+7. Persist QRM1 while the source PFS2 lock is still held, then release that lock.
+8. Invoke the existing recovery executor only after lock release. It reconciles exact provider CAS state, verifies the signed receipt, advances QCF1 and installs the checkpoint-rooted PFS2 manifest. QRM1 is cleared only after successful recovery.
+9. Verify the recovered checkpoint commitment and bytes against the durable QRCP file. Reopen QCF1 and a fresh authenticated Noise/TCP session before ordinary runtime startup continues.
 
 The API and CLI do not initialize a provider, replace a trust pin, reset a floor, infer provider state or fall back to a local store.
 
@@ -58,11 +57,9 @@ The Windows node integration test `external_cas_node_startup_uses_pinned_noise_p
 
 ## Validation on this branch
 
-- Focused executor integration test: **1 passed, 0 failed**.
-- QRun node binary suite: **28 passed, 0 failed**, including the Windows end-to-end migration/restart case.
 - Full Rust library suite on the final source: **1,035 passed, 0 failed** (`cargo test --lib --locked --offline`).
 - QRun node binary suite: **28 passed, 0 failed**, including the Windows explicit-migration end-to-end test.
-- Focused Genesis-rooted migration executor test: **1 passed, 0 failed**.
+- Focused Genesis-rooted migration executor integration test: **1 passed, 0 failed**.
 - All-target compile check: **PASS** (`cargo check --all-targets --locked --offline`).
 - Rust formatting check: **PASS** (`cargo fmt --all -- --check`).
 - `git diff --check`: **PASS**.
