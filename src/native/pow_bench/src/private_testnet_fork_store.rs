@@ -21,8 +21,20 @@ use crate::{
         decode_candidate_network_block, PrivateTestnetWireError,
         MAX_CANDIDATE_NETWORK_ENVELOPE_BYTES,
     },
-    qrun_v05_checkpoint_migration_candidate::{QRunV05CheckpointMigrationPlan, MAX_QRM1_BYTES},
+    qrun_v05_checkpoint_candidate::MAX_QRCP_BYTES,
+    qrun_v05_checkpoint_migration_candidate::{
+        prepare_qrun_v05_checkpoint_migration, QRunCheckpointMigrationError,
+        QRunV05CheckpointMigrationPlan, MAX_QRM1_BYTES,
+    },
+    qrun_v05_checkpoint_migration_recovery_candidate::{
+        recover_qrun_v05_checkpoint_migration, QRunCheckpointMigrationRecoveryError,
+        QRunCheckpointMigrationRecoveryReport,
+    },
     qrun_v05_genesis_candidate::QRunGenesisV05,
+    qrun_v05_history_archive_candidate::{
+        create_or_verify_qrun_v05_history_archive, replay_qrun_v05_history_archive,
+        QRunHistoryArchiveError,
+    },
     state_machine::{AccountId, LedgerState, StateError, TransactionAuthenticator},
     store_writer_lock::StoreWriterLock,
     v4_fat1_trust_candidate::MlDsa65Verifier,
@@ -190,6 +202,61 @@ impl From<crate::external_cas_anchor_candidate::ExternalCasError> for ForkStoreE
     fn from(value: crate::external_cas_anchor_candidate::ExternalCasError) -> Self {
         Self::ExternalCasContract(value)
     }
+}
+
+#[derive(Debug)]
+pub enum QRunV05CheckpointMigrationExecutionError {
+    Store(ForkStoreError),
+    Archive(QRunHistoryArchiveError),
+    Migration(QRunCheckpointMigrationError),
+    Recovery(QRunCheckpointMigrationRecoveryError),
+    MissingIndependentFloor,
+    FloorWriteBlocked,
+    FloorDoesNotMatchOpenStore,
+    CheckpointRecordPathInvalid,
+    CheckpointRecordConflict,
+    CheckpointRecordTooLarge,
+    CommittedCheckpointMismatch,
+}
+
+impl std::fmt::Display for QRunV05CheckpointMigrationExecutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for QRunV05CheckpointMigrationExecutionError {}
+
+impl From<io::Error> for QRunV05CheckpointMigrationExecutionError {
+    fn from(value: io::Error) -> Self {
+        Self::Store(ForkStoreError::Io(value))
+    }
+}
+impl From<ForkStoreError> for QRunV05CheckpointMigrationExecutionError {
+    fn from(value: ForkStoreError) -> Self {
+        Self::Store(value)
+    }
+}
+impl From<QRunHistoryArchiveError> for QRunV05CheckpointMigrationExecutionError {
+    fn from(value: QRunHistoryArchiveError) -> Self {
+        Self::Archive(value)
+    }
+}
+impl From<QRunCheckpointMigrationError> for QRunV05CheckpointMigrationExecutionError {
+    fn from(value: QRunCheckpointMigrationError) -> Self {
+        Self::Migration(value)
+    }
+}
+impl From<QRunCheckpointMigrationRecoveryError> for QRunV05CheckpointMigrationExecutionError {
+    fn from(value: QRunCheckpointMigrationRecoveryError) -> Self {
+        Self::Recovery(value)
+    }
+}
+
+#[derive(Debug)]
+pub struct QRunV05CheckpointMigrationExecutionReport {
+    pub recovery: QRunCheckpointMigrationRecoveryReport,
+    /// Durable QRCP file created before the QRM1 intent is published.
+    pub checkpoint_record_file: PathBuf,
 }
 
 fn acquire_writer_lock(directory: &Path) -> Result<StoreWriterLock, ForkStoreError> {
@@ -1600,6 +1667,149 @@ where
         self.minimum_object_generation
     }
 
+    /// Execute the first Genesis-rooted QRun v0.5 checkpoint rollover as one consuming
+    /// maintenance operation. This method deliberately requires an already-open external-CAS
+    /// store with its QCF1 floor attached; it does not bootstrap or invent a provider.
+    ///
+    /// Ordering is strict: hold the PFS2 writer lock while publishing and replaying QRA1,
+    /// verify a fresh signed provider read against QCF1, prepare and persist the exact QRM1
+    /// intent, durably publish the QRCP file, drop the PFS2 lock, then run the existing recovery
+    /// executor (exact CAS retry, floor advancement, manifest install, and intent cleanup).
+    ///
+    /// This initial executor only accepts a Genesis-rooted `QRunV05FeeOnly` store. Repeated
+    /// checkpoint-to-checkpoint rollover requires a linked multi-segment history format and is
+    /// intentionally not inferred from a local checkpoint alone.
+    #[allow(clippy::too_many_arguments)]
+    pub fn migrate_genesis_rooted_store_to_checkpoint<A: TransactionAuthenticator>(
+        self,
+        archive_root: impl AsRef<Path>,
+        checkpoint_record_file: impl AsRef<Path>,
+        expected_parent_checkpoint_commitment: [u8; 32],
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+    ) -> Result<QRunV05CheckpointMigrationExecutionReport, QRunV05CheckpointMigrationExecutionError>
+    {
+        let QRunV05ExternalCasForkStore {
+            store,
+            mut client,
+            pin,
+            genesis_identity,
+            owner_account,
+            trusted_record,
+            minimum_object_generation,
+            floor,
+            floor_write_blocked,
+        } = self;
+
+        if floor_write_blocked {
+            return Err(QRunV05CheckpointMigrationExecutionError::FloorWriteBlocked);
+        }
+        let floor =
+            floor.ok_or(QRunV05CheckpointMigrationExecutionError::MissingIndependentFloor)?;
+        if store.profile != ForkStoreProfile::QRunV05FeeOnly || store.genesis.height() != 0 {
+            return Err(QRunV05CheckpointMigrationExecutionError::Store(
+                ForkStoreError::ManifestProfileMismatch,
+            ));
+        }
+
+        let floor_snapshot = floor.snapshot().map_err(|error| {
+            QRunV05CheckpointMigrationExecutionError::Store(ForkStoreError::ExternalCasFloor(error))
+        })?;
+        if floor_snapshot.trusted_record != trusted_record
+            || floor_snapshot.minimum_object_generation != minimum_object_generation
+            || store.manifest_anchor()? != trusted_record.next_state_digest
+        {
+            return Err(QRunV05CheckpointMigrationExecutionError::FloorDoesNotMatchOpenStore);
+        }
+
+        // A fresh challenge-bound read is required immediately before the migration plan is
+        // prepared. A stale in-memory receipt or local manifest is not enough to initiate CAS.
+        let (fresh_record, fresh_object_generation) = read_verified_external_record(
+            &mut client,
+            &floor_snapshot.trusted_record,
+            floor_snapshot.minimum_object_generation,
+        )?;
+        if fresh_record != floor_snapshot.trusted_record
+            || fresh_object_generation != floor_snapshot.minimum_object_generation
+        {
+            return Err(QRunV05CheckpointMigrationExecutionError::FloorDoesNotMatchOpenStore);
+        }
+
+        let params = store.params.clone();
+        let archive_root = fs::canonicalize(archive_root.as_ref())?;
+        let archive_summary =
+            create_or_verify_qrun_v05_history_archive(&store, &archive_root, &params)?;
+        let archive_id_hex: String = archive_summary
+            .archive_id()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let archive_directory = archive_root.join(archive_id_hex);
+        let replay = replay_qrun_v05_history_archive(
+            &archive_directory,
+            pin.network_id,
+            pin.genesis_digest,
+            *archive_summary.profile_fingerprint(),
+            *archive_summary.genesis_tip(),
+            *archive_summary.previous_manifest_anchor(),
+            owner_account,
+            &params,
+            authenticator,
+            clock,
+        )?;
+        let plan = prepare_qrun_v05_checkpoint_migration(
+            &store,
+            &replay,
+            owner_account,
+            &params,
+            &pin,
+            floor_snapshot.trusted_record.clone(),
+            floor_snapshot.minimum_object_generation,
+            expected_parent_checkpoint_commitment,
+        )?;
+
+        let checkpoint_bytes = plan.journal().checkpoint_bytes.clone();
+        let checkpoint_commitment = plan.journal().checkpoint_commitment;
+        if checkpoint_bytes.is_empty() || checkpoint_bytes.len() > MAX_QRCP_BYTES {
+            return Err(QRunV05CheckpointMigrationExecutionError::CheckpointRecordTooLarge);
+        }
+        let store_directory = fs::canonicalize(&store.directory)?;
+        let checkpoint_record_file = persist_checkpoint_record_create_once(
+            checkpoint_record_file.as_ref(),
+            &checkpoint_bytes,
+            &store_directory,
+            &archive_directory,
+        )?;
+
+        // QRM1 is create-once and durably published while this process still owns the PFS2 lock.
+        // The following recovery executor reacquires that lock only after this store is dropped.
+        store.persist_qrun_v05_migration_intent(&plan)?;
+        drop(store);
+
+        let recovery = recover_qrun_v05_checkpoint_migration(
+            &store_directory,
+            &archive_root,
+            &genesis_identity,
+            owner_account,
+            &params,
+            &pin,
+            &mut client,
+            &floor,
+            authenticator,
+            clock,
+        )?;
+        if recovery.checkpoint_commitment != checkpoint_commitment
+            || recovery.checkpoint_bytes != checkpoint_bytes
+        {
+            return Err(QRunV05CheckpointMigrationExecutionError::CommittedCheckpointMismatch);
+        }
+
+        Ok(QRunV05CheckpointMigrationExecutionReport {
+            recovery,
+            checkpoint_record_file,
+        })
+    }
+
     /// Two-phase QRun commit:
     /// 1. verify the current external anchor and candidate branch;
     /// 2. durably write QAP1 containing the exact next manifest and CAS successor;
@@ -2123,6 +2333,64 @@ fn remove_pending_external_cas_commit(directory: &Path) -> Result<(), ForkStoreE
         Ok(()) => sync_parent(directory).map_err(ForkStoreError::Io),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(ForkStoreError::Io(error)),
+    }
+}
+
+fn persist_checkpoint_record_create_once(
+    requested_path: &Path,
+    checkpoint_bytes: &[u8],
+    store_directory: &Path,
+    archive_directory: &Path,
+) -> Result<PathBuf, QRunV05CheckpointMigrationExecutionError> {
+    if !requested_path.is_absolute()
+        || checkpoint_bytes.is_empty()
+        || checkpoint_bytes.len() > MAX_QRCP_BYTES
+    {
+        return Err(QRunV05CheckpointMigrationExecutionError::CheckpointRecordPathInvalid);
+    }
+    let parent = requested_path
+        .parent()
+        .ok_or(QRunV05CheckpointMigrationExecutionError::CheckpointRecordPathInvalid)?;
+    let canonical_parent = fs::canonicalize(parent)?;
+    if !canonical_parent.is_dir() {
+        return Err(QRunV05CheckpointMigrationExecutionError::CheckpointRecordPathInvalid);
+    }
+    let file_name = requested_path
+        .file_name()
+        .ok_or(QRunV05CheckpointMigrationExecutionError::CheckpointRecordPathInvalid)?;
+    let canonical_path = canonical_parent.join(file_name);
+    if canonical_path.starts_with(store_directory) || canonical_path.starts_with(archive_directory)
+    {
+        return Err(QRunV05CheckpointMigrationExecutionError::CheckpointRecordPathInvalid);
+    }
+
+    match fs::symlink_metadata(&canonical_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let existing = crate::qrun_v05_history_archive_candidate::read_regular_file_nofollow(
+                &canonical_path,
+                MAX_QRCP_BYTES,
+            )?;
+            if existing != checkpoint_bytes {
+                return Err(QRunV05CheckpointMigrationExecutionError::CheckpointRecordConflict);
+            }
+            Ok(canonical_path)
+        }
+        Ok(_) => Err(QRunV05CheckpointMigrationExecutionError::CheckpointRecordConflict),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // create_new is no-follow by construction: an existing symlink/reparse point is
+            // treated as a conflict rather than followed or replaced.
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&canonical_path)?;
+            file.write_all(checkpoint_bytes)?;
+            file.sync_all()?;
+            sync_parent(&canonical_parent)?;
+            Ok(canonical_path)
+        }
+        Err(error) => Err(QRunV05CheckpointMigrationExecutionError::Store(
+            ForkStoreError::Io(error),
+        )),
     }
 }
 
@@ -3978,6 +4246,211 @@ mod tests {
             true
         );
         assert_eq!(exact_qrm1_bytes.len() > 0, true);
+    }
+
+    #[test]
+    fn qrun_genesis_rooted_migration_executor_archives_commits_and_reopens_checkpoint() {
+        const NETWORK: [u8; 32] = [0xC4; 32];
+        const OWNER: AccountId = [0xC7; 32];
+
+        let store_dir = TestDir::new();
+        let archive_root = TestDir::new();
+        let floor_dir = TestDir::new();
+        let checkpoint_dir = TestDir::new();
+
+        let genesis_candidate = QRunGenesisV05::new(NETWORK, OWNER).unwrap();
+        let genesis = genesis_candidate.ledger().clone();
+        let mut params = params();
+        params.protocol_version = 5;
+        params.initial_target = Uint256::MAX;
+        params.pow_limit = Uint256::MAX;
+        params.pow.memory_kib = 8;
+        params.pow.iterations = 1;
+        params.pow.lanes = 1;
+
+        let genesis_chain = crate::private_testnet_driver::PrivateTestnetChain::new(
+            genesis.clone(),
+            params.clone(),
+        )
+        .unwrap();
+        let genesis_checkpoint =
+            crate::qrun_v05_checkpoint_candidate::QRunV05PowCheckpoint::capture(
+                NETWORK,
+                genesis_candidate.commitment(),
+                &params,
+                &genesis_chain,
+                [0; 32],
+            )
+            .unwrap();
+        let parent_checkpoint_commitment = genesis_checkpoint.commitment(&params).unwrap();
+
+        // Build and replay a genuine Genesis-rooted source store, then close it before the
+        // external-CAS owner acquires the same PFS2 writer lock.
+        let mut source = PrivateTestnetForkStore::open_qrun_v05_fee_only(
+            &store_dir.0,
+            genesis.clone(),
+            params.clone(),
+            &EmptyAuthenticator,
+            &FixedClock,
+        )
+        .unwrap();
+        let envelope = qrun_fee_envelope(&genesis, &params);
+        source
+            .submit(&envelope, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+        assert_eq!(source.canonical_height(), 1);
+        let expected_tip = source.canonical_tip();
+        let expected_state_root = source.archive().canonical_chain().state().state_root();
+        let initial_anchor = source.manifest_anchor().unwrap();
+        drop(source);
+
+        let receipt_keys = portable::generate_key_pair([0xC5u8; 32]);
+        let signing_key = Arc::new(receipt_keys.signing_key);
+        let public_key: [u8; crate::v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES] =
+            *receipt_keys.verification_key.as_ref();
+        let pin = ExternalCasPin {
+            provider_id: [0xC6; 32],
+            network_id: NETWORK,
+            genesis_digest: genesis_candidate.commitment(),
+            receipt_key_id: [0xC8; 32],
+            receipt_public_key: public_key,
+        };
+        let bootstrap = ExternalCasRecord {
+            generation: 0,
+            provider_id: pin.provider_id,
+            network_id: pin.network_id,
+            genesis_digest: pin.genesis_digest,
+            previous_record_digest: [0; 32],
+            previous_state_digest: [0; 32],
+            next_state_digest: initial_anchor,
+            operation_id: [0xC9; 32],
+            request_digest: [0xCA; 32],
+        };
+        let floor =
+            ExternalCasFloorStore::initialize(&floor_dir.0, pin.clone(), bootstrap.clone(), 1)
+                .unwrap();
+        let shared = Arc::new(Mutex::new(MemoryCasState {
+            record: bootstrap.clone(),
+            object_generation: 1,
+            // The provider commits the exact successor but drops the first response.
+            lose_next_commit_response: true,
+            reject_next_commit_before_apply: false,
+        }));
+        let sign_key = signing_key.clone();
+        let provider = make_memory_cas_provider(pin.clone(), shared.clone(), move |mut receipt| {
+            let digest = receipt.signing_digest().unwrap();
+            receipt.signature = *portable::sign(&sign_key, &digest, &[], [0xCBu8; 32])
+                .unwrap()
+                .as_ref();
+            receipt
+        });
+        let client =
+            VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
+                .unwrap();
+        let store = QRunV05ExternalCasForkStore::open_for_owner_genesis_with_floor(
+            &store_dir.0,
+            genesis.clone(),
+            OWNER,
+            params.clone(),
+            &EmptyAuthenticator,
+            &FixedClock,
+            pin.clone(),
+            client,
+            floor,
+        )
+        .unwrap();
+
+        let checkpoint_path = checkpoint_dir.0.join("qrun-v05-genesis-migration.qrcp");
+        let report = store
+            .migrate_genesis_rooted_store_to_checkpoint(
+                &archive_root.0,
+                &checkpoint_path,
+                parent_checkpoint_commitment,
+                &EmptyAuthenticator,
+                &FixedClock,
+            )
+            .unwrap();
+
+        assert_eq!(report.recovery.minimum_checkpoint_height, 1);
+        assert_eq!(
+            report.recovery.expected_parent_checkpoint_commitment,
+            parent_checkpoint_commitment
+        );
+        assert_eq!(
+            fs::read(&checkpoint_path).unwrap(),
+            report.recovery.checkpoint_bytes
+        );
+        assert_eq!(
+            crate::qrun_v05_checkpoint_candidate::QRunV05PowCheckpoint::commitment_for_bytes(
+                &report.recovery.checkpoint_bytes
+            ),
+            report.recovery.checkpoint_commitment
+        );
+        assert!(!store_dir.0.join(QRUN_MIGRATION_INTENT_NAME).exists());
+        assert!(!store_dir.0.join(QRUN_PENDING_NAME).exists());
+
+        let floor_after = ExternalCasFloorStore::open(&floor_dir.0, pin.clone()).unwrap();
+        let floor_snapshot = floor_after.snapshot().unwrap();
+        assert_eq!(
+            floor_snapshot.trusted_record,
+            report.recovery.provider_record
+        );
+        assert_eq!(floor_snapshot.minimum_object_generation, 2);
+        {
+            let remote = shared.lock().unwrap();
+            assert_eq!(remote.record, report.recovery.provider_record);
+            assert_eq!(remote.object_generation, 2);
+            assert!(!remote.lose_next_commit_response);
+        }
+        let archive_id_hex: String = report
+            .recovery
+            .archive_id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert!(archive_root
+            .0
+            .join(archive_id_hex)
+            .join("archive.qra1")
+            .is_file());
+
+        // A fresh provider client and reopened QCF1 floor must reopen the checkpoint-rooted
+        // QFP5 suffix with the exact same tip/state root and original height-zero Genesis pin.
+        let sign_key = signing_key.clone();
+        let provider = make_memory_cas_provider(pin.clone(), shared.clone(), move |mut receipt| {
+            let digest = receipt.signing_digest().unwrap();
+            receipt.signature = *portable::sign(&sign_key, &digest, &[], [0xCCu8; 32])
+                .unwrap()
+                .as_ref();
+            receipt
+        });
+        let client =
+            VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
+                .unwrap();
+        let reopened =
+            QRunV05ExternalCasForkStore::open_from_checkpoint_with_parent_for_owner_genesis_and_floor(
+                &store_dir.0,
+                genesis,
+                OWNER,
+                params,
+                &EmptyAuthenticator,
+                &FixedClock,
+                &report.recovery.checkpoint_bytes,
+                report.recovery.checkpoint_commitment,
+                report.recovery.minimum_checkpoint_height,
+                report.recovery.expected_parent_checkpoint_commitment,
+                pin,
+                client,
+                floor_after,
+            )
+            .unwrap();
+        assert_eq!(reopened.canonical_height(), 1);
+        assert_eq!(
+            reopened.archive().canonical_chain().chain_tip().tip_hash,
+            expected_tip
+        );
+        assert_eq!(reopened.canonical_state().state_root(), expected_state_root);
+        assert_eq!(reopened.trusted_record(), &report.recovery.provider_record);
     }
 
     #[test]
