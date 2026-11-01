@@ -29,7 +29,7 @@ The complete existing External-CAS trust tuple is also required: numeric provide
 
 The parent commitment is not an arbitrary trust-on-first-use value. The CLI independently reconstructs the deterministic height-zero QRCP from the active Genesis, network and consensus profile, then requires the supplied parent commitment to match exactly before it reads bootstrap material, initializes QCF1, opens Noise/TCP or touches PFS2. The consuming Store API repeats the check for direct callers. A mismatch therefore cannot create the QCF1 floor, QRA1 archive, QRM1 intent or QRCP file, and cannot issue a provider request or CAS mutation through this CLI path.
 
-The checkpoint output file must be outside the QCF1 floor, source PFS2 store and QRA1 archive directories. Existing different output bytes are not overwritten. The migration flag cannot be combined with `--external-cas-recover-qrm1 true` or with caller-supplied checkpoint-bootstrap fields; recovery remains a separate operation.
+The checkpoint output file must be outside the QCF1 floor, source PFS2 store and the entire QRA1 archive root. The executor canonicalizes the floor, archive and output-parent paths before checking their separation, so parent traversal and path aliases cannot place QRCP inside those trust stores. The floor and archive roots must also be disjoint. Existing different output bytes are not overwritten. The migration flag cannot be combined with `--external-cas-recover-qrm1 true` or with caller-supplied checkpoint-bootstrap fields; recovery remains a separate operation.
 
 After a successful migration, startup verifies that the persisted QRCP bytes equal the checkpoint returned by QRM1 recovery, reopens QCF1, creates a fresh pinned Noise/TCP client session, opens the checkpoint-rooted PFS2 store and continues with the ordinary node runtime.
 
@@ -42,7 +42,7 @@ If an earlier run stopped with an ambiguous committed QRM1 intent, use the exist
 3. Open the wallet-bound Genesis-rooted fee-only PFS2 store with its writer lock and attached floor. The consuming Store API independently derives and rechecks the height-zero parent commitment before reading the floor snapshot or issuing its fresh challenge-bound signed provider read.
 4. While the source PFS2 writer lock is held, create-or-verify QRA1 and replay it from the original wallet-bound Genesis. Replay checks archive identity/profile/Genesis/manifest bindings and reconstructs the canonical QFP5 tip.
 5. Prepare the exact QRM1 intent from the verified replay and exact current ECR1 successor.
-6. Persist the bounded QRCP bytes to the separate caller-supplied absolute path using create-once semantics. Identical existing bytes are idempotent; different bytes, symlinks/reparse points and paths inside the PFS2 or QRA1 archive directory are refused. Sync the file and parent directory where supported.
+6. Persist the bounded QRCP bytes to the separate caller-supplied absolute path using create-once semantics. Identical existing bytes are idempotent; different bytes, symlinks/reparse points and paths inside the PFS2, QRA1 archive root or independent QCF1 floor are refused. Sync the file and parent directory where supported.
 7. Persist QRM1 while the source PFS2 lock is still held, then release that lock.
 8. Invoke the existing recovery executor only after lock release. It reconciles exact provider CAS state, verifies the signed receipt, advances QCF1 and installs the checkpoint-rooted PFS2 manifest. QRM1 is cleared only after successful recovery.
 9. Verify the recovered checkpoint commitment and bytes against the durable QRCP file. Reopen QCF1 and a fresh authenticated Noise/TCP session before ordinary runtime startup continues.
@@ -57,9 +57,10 @@ The Windows node integration test `external_cas_node_startup_uses_pinned_noise_p
 
 ## Validation on this branch
 
-- Full Rust library suite on the final source: **1,035 passed, 0 failed** (`cargo test --lib --locked --offline`).
+- Full Rust library suite on the final source: **1,037 passed, 0 failed** (`cargo test --lib --locked --offline`).
 - QRun node binary suite: **28 passed, 0 failed**, including the Windows explicit-migration end-to-end test.
 - Focused Genesis-rooted migration executor integration test: **1 passed, 0 failed**.
+- QCF1/QRA1/QRCP path-isolation regressions: **2 library tests and the CLI path-overlap test passed**, covering traversal aliases, canonical directory overlap and output placement.
 - All-target compile check: **PASS** (`cargo check --all-targets --locked --offline`).
 - Rust formatting check: **PASS** (`cargo fmt --all -- --check`).
 - `git diff --check`: **PASS**.

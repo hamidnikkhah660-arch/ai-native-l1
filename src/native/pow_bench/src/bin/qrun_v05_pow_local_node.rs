@@ -1225,16 +1225,49 @@ fn validate_frozen_mainnet_genesis(
 
 fn paths_overlap(left: &std::path::Path, right: &std::path::Path) -> bool {
     let normalize = |path: &std::path::Path| {
-        path.to_string_lossy()
+        let raw = path
+            .to_string_lossy()
             .replace('/', "\\")
-            .trim_end_matches('\\')
-            .to_ascii_lowercase()
+            .to_ascii_lowercase();
+        let (prefix, remainder, protected_components, rooted) =
+            if raw.len() >= 3 && raw.as_bytes()[1] == b':' && raw.as_bytes()[2] == b'\\' {
+                (raw[..3].to_string(), &raw[3..], 0usize, true)
+            } else if raw.starts_with("\\\\") {
+                ("\\\\".to_string(), &raw[2..], 2usize, true)
+            } else if raw.starts_with('\\') {
+                ("\\".to_string(), &raw[1..], 0usize, true)
+            } else if raw.len() >= 2 && raw.as_bytes()[1] == b':' {
+                (raw[..2].to_string(), &raw[2..], 0usize, false)
+            } else {
+                (String::new(), raw.as_str(), 0usize, false)
+            };
+        let mut components: Vec<&str> = Vec::new();
+        for component in remainder.split('\\') {
+            match component {
+                "" | "." => {}
+                ".." if components.len() > protected_components => {
+                    components.pop();
+                }
+                ".." if !rooted => components.push(".."),
+                ".." => {}
+                value => components.push(value),
+            }
+        }
+        if components.is_empty() {
+            if rooted {
+                prefix
+            } else {
+                prefix.trim_end_matches('\\').to_string()
+            }
+        } else {
+            format!("{}{}", prefix, components.join("\\"))
+        }
     };
     let left = normalize(left);
     let right = normalize(right);
     left == right
-        || left.starts_with(&(right.clone() + "\\"))
-        || right.starts_with(&(left.clone() + "\\"))
+        || left.starts_with(&(right.trim_end_matches('\\').to_string() + "\\"))
+        || right.starts_with(&(left.trim_end_matches('\\').to_string() + "\\"))
 }
 
 fn parse_config() -> Result<Config, String> {
@@ -3252,6 +3285,18 @@ mod tests {
         assert!(!paths_overlap(
             std::path::Path::new(r"C:\qrun\data"),
             std::path::Path::new(r"C:\qrun\data-floor")
+        ));
+        assert!(paths_overlap(
+            std::path::Path::new(r"C:\qrun\floor"),
+            std::path::Path::new(r"C:\qrun\floor\..\floor\checkpoint.qrcp")
+        ));
+        assert!(paths_overlap(
+            std::path::Path::new("/qrun/floor"),
+            std::path::Path::new("/qrun/floor/../floor/checkpoint.qrcp")
+        ));
+        assert!(!paths_overlap(
+            std::path::Path::new(r"C:\qrun\floor"),
+            std::path::Path::new(r"C:\qrun\checkpoint.qrcp")
         ));
     }
 
