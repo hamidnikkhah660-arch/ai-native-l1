@@ -1653,12 +1653,35 @@ fn open_regular_file_no_follow(path: &Path) -> io::Result<File> {
     File::open(path)
 }
 
+fn read_exact_bounded<R: Read>(
+    reader: R,
+    expected_length: usize,
+    maximum: usize,
+) -> Result<Vec<u8>, V04ExecutionForkStoreError> {
+    if expected_length > maximum {
+        return Err(V04ExecutionForkStoreError::ArchiveCapacityExceeded);
+    }
+    // Metadata length is only an observation: another local process may append to the file
+    // after open(). Limit the actual read to maximum + 1 so growth cannot turn a bounded file
+    // into an unbounded allocation. The extra byte distinguishes exact-limit data from growth.
+    let read_limit = maximum
+        .checked_add(1)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or(V04ExecutionForkStoreError::ArchiveCapacityExceeded)?;
+    let mut bytes = Vec::with_capacity(expected_length);
+    reader.take(read_limit).read_to_end(&mut bytes)?;
+    if bytes.len() != expected_length || bytes.len() > maximum {
+        return Err(V04ExecutionForkStoreError::ManifestMalformed);
+    }
+    Ok(bytes)
+}
+
 fn read_bounded(path: &Path, maximum: usize) -> Result<Vec<u8>, V04ExecutionForkStoreError> {
     let metadata = fs::symlink_metadata(path)?;
     if is_reparse_point(&metadata) || !metadata.is_file() {
         return Err(V04ExecutionForkStoreError::ManifestMalformed);
     }
-    let mut file = open_regular_file_no_follow(path)?;
+    let file = open_regular_file_no_follow(path)?;
     let opened_metadata = file.metadata()?;
     if is_reparse_point(&opened_metadata)
         || !opened_metadata.is_file()
@@ -1671,12 +1694,7 @@ fn read_bounded(path: &Path, maximum: usize) -> Result<Vec<u8>, V04ExecutionFork
     if length > maximum {
         return Err(V04ExecutionForkStoreError::ArchiveCapacityExceeded);
     }
-    let mut bytes = Vec::with_capacity(length);
-    file.read_to_end(&mut bytes)?;
-    if bytes.len() != length || bytes.len() > maximum {
-        return Err(V04ExecutionForkStoreError::ManifestMalformed);
-    }
-    Ok(bytes)
+    read_exact_bounded(file, length, maximum)
 }
 
 fn take_slice<'a>(
@@ -2364,6 +2382,32 @@ mod tests {
             Err(V04ExecutionForkStoreError::ManifestMalformed)
         ));
         fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn bounded_reader_rejects_growth_without_reading_past_maximum_plus_one() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        struct GrowingReader(Arc<AtomicUsize>);
+        impl Read for GrowingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let count = buffer.len().min(3);
+                buffer[..count].fill(0xA5);
+                self.0.fetch_add(count, Ordering::Relaxed);
+                Ok(count)
+            }
+        }
+
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let result = read_exact_bounded(GrowingReader(bytes_read.clone()), 0, 31);
+        assert!(matches!(
+            result,
+            Err(V04ExecutionForkStoreError::ManifestMalformed)
+        ));
+        assert_eq!(bytes_read.load(Ordering::Relaxed), 32);
     }
 
     #[test]
