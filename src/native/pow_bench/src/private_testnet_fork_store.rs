@@ -1707,9 +1707,9 @@ where
     /// store with its QCF1 floor attached; it does not bootstrap or invent a provider.
     ///
     /// Ordering is strict: hold the PFS2 writer lock while publishing and replaying QRA1,
-    /// verify a fresh signed provider read against QCF1, prepare and persist the exact QRM1
-    /// intent, durably publish the QRCP file, drop the PFS2 lock, then run the existing recovery
-    /// executor (exact CAS retry, floor advancement, manifest install, and intent cleanup).
+    /// verify the pinned provider state against QCF1, prepare the exact QRM1 intent, durably
+    /// publish the QRCP output file, persist QRM1, drop the PFS2 lock, then run the existing
+    /// recovery executor (exact CAS retry, floor advancement, manifest install, and intent cleanup).
     ///
     /// This initial executor only accepts a Genesis-rooted `QRunV05FeeOnly` store. Repeated
     /// checkpoint-to-checkpoint rollover requires a linked multi-segment history format and is
@@ -3003,6 +3003,8 @@ mod tests {
     struct MemoryCasState {
         record: ExternalCasRecord,
         object_generation: u64,
+        read_calls: usize,
+        cas_calls: usize,
         lose_next_commit_response: bool,
         reject_next_commit_before_apply: bool,
     }
@@ -3054,10 +3056,11 @@ mod tests {
             &mut self,
             request: &ExternalCasReadRequest,
         ) -> Result<(ExternalCasRecord, ExternalCasReceipt), Self::Error> {
-            let state = self
+            let mut state = self
                 .state
                 .lock()
                 .map_err(|_| "CAS test lock poisoned".to_string())?;
+            state.read_calls += 1;
             let record = state.record.clone();
             let receipt = sign_cas_receipt(
                 &self.sign,
@@ -3085,6 +3088,7 @@ mod tests {
                     .state
                     .lock()
                     .map_err(|_| "CAS test lock poisoned".to_string())?;
+                state.cas_calls += 1;
                 if state.reject_next_commit_before_apply {
                     state.reject_next_commit_before_apply = false;
                     return Err("simulated CAS rejection before external commit".to_string());
@@ -3699,6 +3703,8 @@ mod tests {
         let shared = Arc::new(Mutex::new(MemoryCasState {
             record: next_record.clone(),
             object_generation: 2,
+            read_calls: 0,
+            cas_calls: 0,
             lose_next_commit_response: false,
             reject_next_commit_before_apply: false,
         }));
@@ -3837,6 +3843,8 @@ mod tests {
         let shared = Arc::new(Mutex::new(MemoryCasState {
             record: bootstrap.clone(),
             object_generation: 1,
+            read_calls: 0,
+            cas_calls: 0,
             lose_next_commit_response: false,
             reject_next_commit_before_apply: false,
         }));
@@ -4024,6 +4032,8 @@ mod tests {
         let shared = Arc::new(Mutex::new(MemoryCasState {
             record: bootstrap.clone(),
             object_generation: 1,
+            read_calls: 0,
+            cas_calls: 0,
             lose_next_commit_response: false,
             reject_next_commit_before_apply: true,
         }));
@@ -4199,6 +4209,8 @@ mod tests {
         let shared = Arc::new(Mutex::new(MemoryCasState {
             record: bootstrap.clone(),
             object_generation: 1,
+            read_calls: 0,
+            cas_calls: 0,
             // Simulate a provider that commits the exact CAS then loses its response.
             lose_next_commit_response: true,
             reject_next_commit_before_apply: false,
@@ -4473,6 +4485,8 @@ mod tests {
         let shared = Arc::new(Mutex::new(MemoryCasState {
             record: bootstrap.clone(),
             object_generation: 1,
+            read_calls: 0,
+            cas_calls: 0,
             // The provider commits the exact successor but drops the first response.
             lose_next_commit_response: true,
             reject_next_commit_before_apply: false,
@@ -4509,6 +4523,10 @@ mod tests {
             floor,
         )
         .unwrap();
+        let provider_counts_before_bad_parent = {
+            let remote = shared.lock().unwrap();
+            (remote.read_calls, remote.cas_calls)
+        };
         let wrong_checkpoint_path = checkpoint_dir.0.join("wrong-parent.qrcp");
         assert!(matches!(
             bad_parent_store.migrate_genesis_rooted_store_to_checkpoint(
@@ -4543,6 +4561,8 @@ mod tests {
             let remote = shared.lock().unwrap();
             assert_eq!(remote.record, bootstrap);
             assert_eq!(remote.object_generation, 1);
+            assert_eq!(remote.read_calls, provider_counts_before_bad_parent.0);
+            assert_eq!(remote.cas_calls, provider_counts_before_bad_parent.1);
             assert!(remote.lose_next_commit_response);
         }
 
@@ -4739,6 +4759,8 @@ mod tests {
         let shared = Arc::new(Mutex::new(MemoryCasState {
             record: bootstrap.clone(),
             object_generation: 1,
+            read_calls: 0,
+            cas_calls: 0,
             lose_next_commit_response: true,
             reject_next_commit_before_apply: false,
         }));
@@ -5020,6 +5042,8 @@ mod tests {
         let shared = Arc::new(Mutex::new(MemoryCasState {
             record: bootstrap.clone(),
             object_generation: 1,
+            read_calls: 0,
+            cas_calls: 0,
             // Force the second-block submit to recover through a newly signed provider read.
             lose_next_commit_response: true,
             reject_next_commit_before_apply: false,
