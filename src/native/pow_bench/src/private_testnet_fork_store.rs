@@ -4477,6 +4477,75 @@ mod tests {
             lose_next_commit_response: true,
             reject_next_commit_before_apply: false,
         }));
+        // A direct caller that supplies an unrelated Genesis parent must fail before the
+        // migration executor reads the QCF1 snapshot, performs its fresh provider challenge,
+        // creates QRA1/QRCP, or publishes QRM1/CAS state. Opening the Store establishes its
+        // existing pinned trust tuple; the consuming migration API owns the ancestry invariant.
+        let bad_parent_sign_key = signing_key.clone();
+        let bad_parent_provider =
+            make_memory_cas_provider(pin.clone(), shared.clone(), move |mut receipt| {
+                let digest = receipt.signing_digest().unwrap();
+                receipt.signature =
+                    *portable::sign(&bad_parent_sign_key, &digest, &[], [0xCAu8; 32])
+                        .unwrap()
+                        .as_ref();
+                receipt
+            });
+        let bad_parent_client = VerifiedExternalCasClient::new(
+            pin.clone(),
+            bad_parent_provider,
+            LibcruxMlDsa65VerifierCandidate,
+        )
+        .unwrap();
+        let bad_parent_store = QRunV05ExternalCasForkStore::open_for_owner_genesis_with_floor(
+            &store_dir.0,
+            genesis.clone(),
+            OWNER,
+            params.clone(),
+            &EmptyAuthenticator,
+            &FixedClock,
+            pin.clone(),
+            bad_parent_client,
+            floor,
+        )
+        .unwrap();
+        let wrong_checkpoint_path = checkpoint_dir.0.join("wrong-parent.qrcp");
+        assert!(matches!(
+            bad_parent_store.migrate_genesis_rooted_store_to_checkpoint(
+                &archive_root.0,
+                &wrong_checkpoint_path,
+                [0xDD; 32],
+                &EmptyAuthenticator,
+                &FixedClock,
+            ),
+            Err(QRunV05CheckpointMigrationExecutionError::GenesisCheckpointParentMismatch)
+        ));
+        assert!(!wrong_checkpoint_path.exists());
+        assert_eq!(fs::read_dir(&archive_root.0).unwrap().count(), 0);
+        assert!(!store_dir.0.join(QRUN_MIGRATION_INTENT_NAME).exists());
+        assert!(!store_dir.0.join(QRUN_PENDING_NAME).exists());
+        let unchanged_source = PrivateTestnetForkStore::open_qrun_v05_fee_only(
+            &store_dir.0,
+            genesis.clone(),
+            params.clone(),
+            &EmptyAuthenticator,
+            &FixedClock,
+        )
+        .unwrap();
+        assert_eq!(unchanged_source.manifest_anchor().unwrap(), initial_anchor);
+        drop(unchanged_source);
+        let floor_after_bad_parent =
+            ExternalCasFloorStore::open(&floor_dir.0, pin.clone()).unwrap();
+        let unchanged_floor = floor_after_bad_parent.snapshot().unwrap();
+        assert_eq!(unchanged_floor.trusted_record, bootstrap);
+        assert_eq!(unchanged_floor.minimum_object_generation, 1);
+        {
+            let remote = shared.lock().unwrap();
+            assert_eq!(remote.record, bootstrap);
+            assert_eq!(remote.object_generation, 1);
+            assert!(remote.lose_next_commit_response);
+        }
+
         let sign_key = signing_key.clone();
         let provider = make_memory_cas_provider(pin.clone(), shared.clone(), move |mut receipt| {
             let digest = receipt.signing_digest().unwrap();
@@ -4497,7 +4566,7 @@ mod tests {
             &FixedClock,
             pin.clone(),
             client,
-            floor,
+            floor_after_bad_parent,
         )
         .unwrap();
 

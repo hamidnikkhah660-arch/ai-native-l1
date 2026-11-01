@@ -55,18 +55,20 @@ The API and CLI do not initialize a provider, replace a trust pin, reset a floor
 
 The Windows node integration test `external_cas_node_startup_uses_pinned_noise_provider_and_advances_floor_before_return` now drives the real CLI/startup migration path. It creates a Genesis-rooted PFS2 source and a loopback Noise/TCP provider, uses a DPAPI-protected test Noise key and signed ML-DSA-65 receipts, verifies an incorrect parent is rejected before any provider request or QCF1 floor creation, without changing the source store, executes the correct migration, checks QRA1/QRCP publication and QCF1 generation advance, creates a further QFP5 block, then restarts from the generated QRCP and confirms canonical height, tip and state root. All paths, identities and keys are disposable test fixtures on loopback; no user wallet or production provider is involved.
 
+The consuming Store API is also exercised directly inside `qrun_genesis_rooted_migration_executor_archives_commits_and_reopens_checkpoint`: a caller-provided wrong Genesis parent returns `GenesisCheckpointParentMismatch`; no QRA1 archive, QRCP file or QRM1 intent is created, the PFS2 manifest and QCF1 floor remain unchanged, and no provider CAS successor is applied. The same test then reopens the floor and runs the exact valid parent through response-loss recovery and checkpoint restart. This prevents the parent executor PR from depending on CLI-only enforcement in its child PR.
+
 ## Validation on this branch
 
 - Full Rust library suite on the final source: **1,037 passed, 0 failed** (`cargo test --lib --locked --offline`).
 - QRun node binary suite: **28 passed, 0 failed**, including the Windows explicit-migration end-to-end test.
-- Focused Genesis-rooted migration executor integration test: **1 passed, 0 failed**.
-- QCF1/QRA1/QRCP path-isolation regressions: **2 library tests and the CLI path-overlap test passed**, covering traversal aliases, canonical directory overlap and output placement.
+- Focused Genesis-rooted migration executor integration test, including direct wrong-parent rejection followed by valid migration/recovery/restart: **1 passed, 0 failed**.
+- QCF1/QRA1/QRCP path-isolation regressions: **2 library tests and the Windows/Unix CLI path-overlap test passed**, covering traversal aliases, canonical directory overlap and output placement.
 - All-target compile check: **PASS** (`cargo check --all-targets --locked --offline`).
 - Rust formatting check: **PASS** (`cargo fmt --all -- --check`).
 - `git diff --check`: **PASS**.
 - Existing warnings are unrelated unused-import/dead-code/unused-mut warnings in candidate modules.
 
-The stacked parent PR #119 at base SHA `67a53cdd5431616ada6d8092f59ac1b35e2cd1e7` and head SHA `f5be3da0244f1ffdcf0432e49761971d11e0bd6a` completed both exact-head CI workflows successfully: [push run 41264531536](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/41264531536) and [pull-request run 41264548563](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/41264548563). PR #119 remains Draft/Open and is not merged.
+The stacked parent PR #119 now includes the same direct-Store Genesis-parent invariant and canonical QCF1/QRA1/QRCP isolation. Its latest head is `13d24ff79a9f3a9619195bfebc9146ee7375a43e`; fresh exact-head push and pull-request CI are pending. PR #119 remains Draft/Open and is not merged.
 
 ## Explicit limitations
 
