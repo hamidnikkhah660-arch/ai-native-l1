@@ -92,15 +92,17 @@ const QZXB_MAINNET_PROFILE_ID_HEX: &str =
 const QZXB_MAINNET_STATE_ROOT_HEX: &str =
     "a44e545c2cd8fa4e56e228f4f242cbf5445b1cc983c7b1f8fe89c5b42aef88d7";
 
-// Keep production activation disabled until each independent release gate has evidence. This is
-// intentionally not a CLI flag: an operator must not be able to bypass unimplemented protocol
-// guarantees by adding an argument or pointing at a convenient peer.
+// Keep production activation disabled until concrete protocol/operations gates have evidence.
+// Exchange listings, a minimum operator count, and the availability of a third-party auditor are
+// not permission gates for publishing a permissionless protocol; CP-0443 keeps those as disclosed
+// evidence/recruitment work. This is intentionally not a CLI flag: an operator must not bypass
+// unfinished consensus, history/recovery, peer-network, or transaction-safety guarantees.
 const QRUN_MAINNET_RELEASE_APPROVED: bool = false;
 const QRUN_MAINNET_RELEASE_BLOCKERS: &[&str] = &[
-    "production consensus profile is not frozen and proven by at least three independent operators",
-    "provider-backed checkpoint manifest rollover/rebase and full-history validation/recovery are not integrated",
-    "adversarial multi-host restart/reorg/partition/transaction-relay tests and independent security review are incomplete",
-    "external Mainnet P2P reachability, independent public operations, and monitored recovery have not been verified",
+    "production consensus profile and difficulty/retarget policy are not frozen and reproducibly validated",
+    "full-history validation/recovery and safe checkpoint rollover/rebase are not integrated",
+    "multi-host restart/reorg/partition/transaction-relay and independently queried receipt/balance behavior are incomplete",
+    "external Mainnet P2P reachability, authenticated bootstrap, and monitored recovery have not been verified",
 ];
 
 #[derive(Clone)]
@@ -3391,12 +3393,23 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_release_gate_fails_closed_without_source_approval() {
+    fn mainnet_release_gate_fails_closed_on_concrete_protocol_blockers() {
+        assert!(!QRUN_MAINNET_RELEASE_APPROVED);
         assert!(validate_mainnet_release_gate(false).is_ok());
         let error = validate_mainnet_release_gate(true).unwrap_err();
         assert!(error.contains("--mainnet is disabled by the QRun production release gate"));
         assert!(error.contains("full-history validation/recovery"));
-        assert!(error.contains("three independent operators"));
+        assert!(error.contains("multi-host restart/reorg/partition/transaction-relay"));
+        assert!(error.contains("authenticated bootstrap"));
+    }
+
+    #[test]
+    fn permissionless_release_gate_does_not_require_a_fixed_operator_count_or_auditor() {
+        let blockers = QRUN_MAINNET_RELEASE_BLOCKERS.join(" ");
+        assert!(!blockers.contains("three independent operators"));
+        assert!(!blockers.contains("independent security review"));
+        // Removing those non-protocol dependencies never opens the actual release gate.
+        assert!(!QRUN_MAINNET_RELEASE_APPROVED);
     }
 
     #[test]
