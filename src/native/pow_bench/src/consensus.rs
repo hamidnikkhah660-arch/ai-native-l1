@@ -797,6 +797,7 @@ mod tests {
             10_000_000_000u128 * ATOMS_PER_COIN
         );
         assert_eq!(params.issuance.initial_subsidy(), 0);
+        assert_eq!(params.issuance.blocks_per_halving(), 1);
         assert_eq!(
             params
                 .issuance
