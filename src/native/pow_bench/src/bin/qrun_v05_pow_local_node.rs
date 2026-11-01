@@ -523,7 +523,7 @@ fn open_node_runtime<A: TransactionAuthenticator>(
         )?;
         let expected_parent_commitment = external
             .checkpoint_parent_commitment
-            .ok_or("--external-cas-checkpoint-parent-commitment-hex is required for Genesis checkpoint migration")?;
+            .ok_or("--external-cas-migration-parent-commitment-hex is required for Genesis checkpoint migration")?;
 
         // The migration API consumes the open PFS2/CAS owner so it can keep the writer lock
         // through QRA1 replay and durable QRM1 publication. It never bootstraps/replaces the
