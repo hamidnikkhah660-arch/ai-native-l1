@@ -81,6 +81,8 @@ pub mod private_testnet_monetary_fork_store;
 pub mod private_testnet_monetary_wire;
 /// Candidate-only verifier for binding PFM5 metadata to a fully replayed Genesis archive.
 pub mod private_testnet_pfm5_archive_binding_candidate;
+/// Candidate-only durable PFM5/PCP4 checkpoint-rooted PMT4 branch store; no live provider or node wiring.
+pub mod private_testnet_pfm5_fork_store_candidate;
 /// Candidate-only durable PFM3 store for PMT3 monetary branch archives.
 /// Candidate-only PFM5 manifest codec; not integrated with durable storage or archive replay.
 pub mod private_testnet_pfm5_manifest_candidate;
