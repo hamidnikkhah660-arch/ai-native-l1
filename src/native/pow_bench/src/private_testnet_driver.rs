@@ -1733,6 +1733,88 @@ mod tests {
     }
 
     #[test]
+    fn retarget_timestamp_extremes_are_clamped_across_checkpoint_recovery() {
+        let mut params = params();
+        params.difficulty_window_blocks = 8;
+        let initial = params.initial_target;
+        let target_interval = params.target_block_time_secs;
+        let mut history = TargetHistory::new(params.clone()).unwrap();
+
+        // A deliberately compressed first window cannot tighten difficulty by more than 4x.
+        for height in 1..=8 {
+            history.record_next(height, initial, height).unwrap();
+        }
+        let first_checkpoint = history.checkpoint_snapshot().unwrap();
+        let mut restored =
+            TargetHistory::from_checkpoint_snapshot(params.clone(), &first_checkpoint).unwrap();
+        let compressed = restored.expected_target(9, None).unwrap();
+        assert_eq!(compressed, initial.mul_div_u64(1, 4).unwrap());
+        restored.record_next(9, compressed, 9).unwrap();
+
+        // A deliberately expanded second window cannot ease difficulty by more than 4x.
+        for height in 10..=16 {
+            let expected = restored.expected_target(height, None).unwrap();
+            assert_eq!(expected, compressed, "compressed window height {height}");
+            let timestamp = 9 + (height - 9) * (target_interval * 10);
+            restored.record_next(height, expected, timestamp).unwrap();
+        }
+        let expanded = restored.expected_target(17, None).unwrap();
+        let independently_bounded =
+            crate::consensus::retarget_target(compressed, target_interval * 71, &params).unwrap();
+        assert_eq!(expanded, independently_bounded);
+        assert_eq!(expanded, compressed.mul_div_u64(4, 1).unwrap());
+
+        // A second checkpoint/restart must preserve the exact next retarget decision.
+        let second_checkpoint = restored.checkpoint_snapshot().unwrap();
+        let mut restored_again =
+            TargetHistory::from_checkpoint_snapshot(params.clone(), &second_checkpoint).unwrap();
+        assert_eq!(
+            restored_again.expected_target(17, None),
+            restored.expected_target(17, None)
+        );
+        let second_window_end = 9 + 7 * target_interval * 10;
+        let third_window_start = second_window_end + target_interval;
+        restored_again
+            .record_next(17, expanded, third_window_start)
+            .unwrap();
+
+        // A nominal third window must return exactly the same target after restart.
+        for height in 18..=24 {
+            let expected = restored_again.expected_target(height, None).unwrap();
+            assert_eq!(expected, expanded, "expanded window height {height}");
+            let timestamp = third_window_start + (height - 17) * target_interval;
+            restored_again
+                .record_next(height, expected, timestamp)
+                .unwrap();
+        }
+        assert_eq!(restored_again.expected_target(25, None), Ok(expanded));
+    }
+
+    #[test]
+    fn retarget_timestamp_elapsed_overflow_fails_closed_after_checkpoint_restore() {
+        let mut params = params();
+        params.difficulty_window_blocks = 8;
+        let mut history = TargetHistory::new(params.clone()).unwrap();
+        for height in 1..=7 {
+            history
+                .record_next(height, params.initial_target, height)
+                .unwrap();
+        }
+        history
+            .record_next(8, params.initial_target, u64::MAX - 10)
+            .unwrap();
+
+        let overflow = Err(PrivateConsensusError::Consensus(
+            crate::consensus::ConsensusError::DifficultyOverflow,
+        ));
+        assert_eq!(history.expected_target(9, None), overflow);
+
+        let checkpoint = history.checkpoint_snapshot().unwrap();
+        let restored = TargetHistory::from_checkpoint_snapshot(params, &checkpoint).unwrap();
+        assert_eq!(restored.expected_target(9, None), overflow);
+    }
+
+    #[test]
     fn target_history_checkpoint_rejects_noncanonical_or_malformed_entries() {
         let mut params = params();
         params.difficulty_window_blocks = 8;
