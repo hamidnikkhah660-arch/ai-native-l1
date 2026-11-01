@@ -6,10 +6,113 @@
 
 use std::{
     fs::{File, OpenOptions},
-    io::{self, Seek, SeekFrom, Write},
+    io,
     path::Path,
-    process,
 };
+
+#[cfg(unix)]
+fn safe_lock_file_metadata(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.is_file() && !metadata.file_type().is_symlink() && metadata.nlink() == 1
+}
+
+#[cfg(windows)]
+fn safe_lock_file_metadata(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+}
+
+#[cfg(windows)]
+fn safe_lock_file_handle(file: &File) -> io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        attributes: u32,
+        creation_time: FileTime,
+        last_access_time: FileTime,
+        last_write_time: FileTime,
+        volume_serial_number: u32,
+        size_high: u32,
+        size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(
+            file: *mut std::ffi::c_void,
+            information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    let mut information = std::mem::MaybeUninit::<ByHandleFileInformation>::uninit();
+    let success = unsafe {
+        GetFileInformationByHandle(
+            file.as_raw_handle() as *mut std::ffi::c_void,
+            information.as_mut_ptr(),
+        )
+    };
+    if success == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let information = unsafe { information.assume_init() };
+    Ok(information.number_of_links == 1)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn safe_lock_file_metadata(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file() && !metadata.file_type().is_symlink()
+}
+
+#[cfg(not(windows))]
+fn safe_lock_file_handle(_file: &File) -> io::Result<bool> {
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn open_lock_file(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    const O_NOFOLLOW: i32 = libc::O_NOFOLLOW;
+    const O_CLOEXEC: i32 = libc::O_CLOEXEC;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(O_NOFOLLOW | O_CLOEXEC)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_lock_file(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_lock_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
 
 pub(crate) struct StoreWriterLock {
     file: File,
@@ -21,12 +124,24 @@ pub(crate) struct StoreWriterLock {
 impl StoreWriterLock {
     pub(crate) fn acquire(directory: &Path, file_name: &str) -> io::Result<Self> {
         let path = directory.join(file_name);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if !safe_lock_file_metadata(&metadata) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "writer lock path must be a single-link regular file, not a symlink/reparse point",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let file = open_lock_file(&path)?;
+        if !safe_lock_file_metadata(&file.metadata()?) || !safe_lock_file_handle(&file)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "opened writer lock is not a safe single-link regular file",
+            ));
+        }
 
         let mut lock = Self {
             file,
@@ -37,13 +152,9 @@ impl StoreWriterLock {
         lock.lock_exclusive()?;
         lock.locked = true;
 
-        // Write diagnostic ownership only after acquiring the OS lock. It is never used as
-        // the locking primitive or as proof that a prior PID is dead.
-        lock.file.set_len(0)?;
-        lock.file.seek(SeekFrom::Start(0))?;
-        lock.file
-            .write_all(format!("pid={}\n", process::id()).as_bytes())?;
-        lock.file.sync_all()?;
+        // The lock file is deliberately never modified. Its kernel lock state, not its
+        // contents, is the ownership primitive; avoiding writes also avoids truncating a
+        // hard-linked target if an attacker races link creation after the metadata check.
         Ok(lock)
     }
 
@@ -59,7 +170,7 @@ impl StoreWriterLock {
 
             // SAFETY: file is a valid open handle; OVERLAPPED is correctly laid out and stored
             // in this guard for the whole lock lifetime. The operation is immediate, not pending.
-            // It locks byte 4096, separate from the diagnostic PID header rewritten at offset 0.
+            // It locks byte 4096 of the persistent lock file.
             let result = unsafe {
                 LockFileEx(
                     self.file.as_raw_handle() as *mut std::ffi::c_void,
@@ -125,8 +236,7 @@ impl Default for WindowsOverlapped {
         Self {
             internal: 0,
             internal_high: 0,
-            // Reserve byte 4096 for locking so rewriting/truncating the diagnostic PID header
-            // at the beginning of the file does not overlap the locked byte range.
+            // Reserve byte 4096 as the persistent lock range; file contents are not used.
             offset: 4096,
             offset_high: 0,
             event: std::ptr::null_mut(),
@@ -235,24 +345,67 @@ mod tests {
             "the persistent lock pathname must not be removed on unlock"
         );
         let reopened = StoreWriterLock::acquire(&directory, "writer.lock").unwrap();
-        let content = fs::read_to_string(&lock_path).unwrap();
-        assert_eq!(content, format!("pid={}\n", std::process::id()));
+        assert_eq!(fs::read(&lock_path).unwrap(), Vec::<u8>::new());
         drop(reopened);
         fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    fn stale_pid_text_does_not_prevent_os_lock_acquisition() {
+    fn stale_diagnostic_bytes_do_not_affect_os_lock_acquisition_or_get_rewritten() {
         let directory = temp_dir();
         let lock_path = directory.join("writer.lock");
         fs::write(&lock_path, "pid=stale\n").unwrap();
 
         let lock = StoreWriterLock::acquire(&directory, "writer.lock").unwrap();
-        assert_eq!(
-            fs::read_to_string(&lock_path).unwrap(),
-            format!("pid={}\n", std::process::id())
-        );
+        assert_eq!(fs::read(&lock_path).unwrap(), b"pid=stale\n");
         drop(lock);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn hard_linked_lockfile_is_rejected_without_truncating_the_other_name() {
+        let directory = temp_dir();
+        let protected = directory.join("protected.data");
+        let lock_path = directory.join("writer.lock");
+        fs::write(&protected, b"do-not-truncate").unwrap();
+        fs::hard_link(&protected, &lock_path).unwrap();
+
+        let result = StoreWriterLock::acquire(&directory, "writer.lock");
+        assert!(result.is_err_and(|error| error.kind() == std::io::ErrorKind::InvalidInput));
+        assert_eq!(fs::read(&protected).unwrap(), b"do-not-truncate");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_lockfile_is_rejected_without_touching_its_target() {
+        let directory = temp_dir();
+        let protected = directory.join("protected.data");
+        let lock_path = directory.join("writer.lock");
+        fs::write(&protected, b"do-not-truncate").unwrap();
+        std::os::unix::fs::symlink(&protected, &lock_path).unwrap();
+
+        let result = StoreWriterLock::acquire(&directory, "writer.lock");
+        assert!(result.is_err());
+        assert_eq!(fs::read(&protected).unwrap(), b"do-not-truncate");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reparse_point_lockfile_is_rejected_when_file_symlinks_are_available() {
+        let directory = temp_dir();
+        let protected = directory.join("protected.data");
+        let lock_path = directory.join("writer.lock");
+        fs::write(&protected, b"do-not-truncate").unwrap();
+        if std::os::windows::fs::symlink_file(&protected, &lock_path).is_err() {
+            fs::remove_dir_all(directory).unwrap();
+            return;
+        }
+
+        let result = StoreWriterLock::acquire(&directory, "writer.lock");
+        assert!(result.is_err());
+        assert_eq!(fs::read(&protected).unwrap(), b"do-not-truncate");
         fs::remove_dir_all(directory).unwrap();
     }
 }

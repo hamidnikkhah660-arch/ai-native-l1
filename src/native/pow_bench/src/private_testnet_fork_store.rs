@@ -975,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_pid_text_does_not_block_os_lock_recovery() {
+    fn stale_pid_text_does_not_block_os_lock_recovery_or_get_rewritten() {
         let dir = TestDir::new();
         fs::write(dir.0.join(LOCK_NAME), b"pid=4294967295\n").unwrap();
         let reopened = PrivateTestnetForkStore::open(
@@ -987,8 +987,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            fs::read_to_string(dir.0.join(LOCK_NAME)).unwrap(),
-            format!("pid={}\n", std::process::id())
+            fs::read(dir.0.join(LOCK_NAME)).unwrap(),
+            b"pid=4294967295\n"
         );
         drop(reopened);
     }
