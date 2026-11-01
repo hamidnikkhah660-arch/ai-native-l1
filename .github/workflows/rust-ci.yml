@@ -54,6 +54,12 @@ jobs:
 
       - name: Verify CP-0459 QRun measured PoW calibration candidate
         run: python3 ../../../simulations/qrun_v05_consensus_calibration_oracle.py
+      - name: Verify QRun v0.5 consensus profile fingerprint across Python and runtime identity
+        working-directory: .
+        run: python3 simulations/qrun_v05_consensus_profile_conformance.py
+      - name: Verify QRun v0.5 consensus profile oracle fails closed under Python optimization
+        working-directory: .
+        run: python3 -O -m unittest simulations.test_qrun_v05_consensus_profile_conformance -v
 
       - name: Verify CP-0437 QRun full-supply Genesis direction
         run: python3 ../../../simulations/qrun_full_genesis_direction_checker.py

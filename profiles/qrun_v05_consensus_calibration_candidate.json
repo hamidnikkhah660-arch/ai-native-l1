@@ -1,6 +1,7 @@
 {
   "profile_status": "candidate_multi_runner_calibrated_not_frozen",
   "network_profile": "QRun v0.5 / QZXB; candidate identity only",
+  "protocol_version": 5,
   "mainnet_activated": false,
   "production_consensus_profile_frozen": false,
   "pow": {
@@ -9,6 +10,12 @@
     "iterations": 1,
     "lanes": 1,
     "output_bytes": 32
+  },
+  "issuance": {
+    "mode": "fee_only",
+    "maximum_supply_atoms": "1000000000000000000",
+    "initial_subsidy_atoms": "0",
+    "blocks_per_halving": 1
   },
   "difficulty": {
     "target_block_time_seconds": 30,
