@@ -925,6 +925,32 @@ fn manifest_anchor_commitment(manifest_bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(&canonical).into()
 }
 
+/// Derive the stable External-CAS Genesis pin using the exact PFM4 store profile binding.
+///
+/// This digest is deliberately distinct from the PCP4/PFM5 trusted Genesis fingerprint.
+/// External-CAS deployments that already pin a PFM4 store must use this same derivation.
+pub fn derive_external_cas_genesis_digest(
+    genesis: &MonetaryLedgerState,
+    params: &ConsensusParameters,
+    expected_manifest_id: [u8; 32],
+) -> Result<[u8; 32], V4HybridForkStoreError> {
+    let network_id = genesis.ledger().network_id();
+    let profile = profile_fingerprint(genesis, params, &expected_manifest_id)?;
+    let empty = PrivateTestnetV4HybridForkChoice::new(
+        genesis.clone(),
+        params.clone(),
+        expected_manifest_id,
+    )
+    .map_err(V4HybridForkStoreError::Fork)?;
+    let genesis_tip = empty.genesis_tip();
+    let mut hasher = Sha256::new();
+    hasher.update(EXTERNAL_CAS_GENESIS_DOMAIN);
+    hasher.update(network_id);
+    hasher.update(profile);
+    hasher.update(genesis_tip);
+    Ok(hasher.finalize().into())
+}
+
 fn profile_fingerprint(
     genesis: &MonetaryLedgerState,
     params: &ConsensusParameters,
