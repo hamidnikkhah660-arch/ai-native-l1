@@ -1283,6 +1283,19 @@ mod tests {
         }
     }
 
+    struct ClockAt(u64);
+    impl ReferenceTimeProvider for ClockAt {
+        fn sample(
+            &self,
+        ) -> Result<ReferenceTimeSample, crate::chain_admission::ReferenceTimeError> {
+            Ok(ReferenceTimeSample {
+                unix_seconds: self.0,
+                provenance: ReferenceTimeProvenance::ConfiguredProvider,
+                source_id: "qrun-v05-genesis-time-anchor-probe",
+            })
+        }
+    }
+
     fn params() -> ConsensusParameters {
         let mut params = ConsensusParameters::candidate_testnet().unwrap();
         params.initial_target = Uint256::MAX;
@@ -1419,6 +1432,91 @@ mod tests {
             target: chain.expected_target(None).unwrap(),
             nonce,
         }
+    }
+
+    #[test]
+    fn qrun_v05_first_window_accepts_stale_epoch_and_eases_target_to_max_clamp() {
+        let mut params = params();
+        params.difficulty_window_blocks = 8;
+        params.target_block_time_secs = 30;
+        params.initial_target = Uint256::from_be_bytes([0x3F; 32]);
+        params.pow_limit = Uint256::MAX;
+        params.pow.memory_kib = 8;
+
+        let initial_target = params.initial_target;
+        let expected_eased_target = initial_target.mul_div_u64(4, 1).unwrap();
+        let mut chain = PrivateTestnetChain::new(state(), params.clone()).unwrap();
+
+        // The first block may be backdated to Unix second 1. The node-local future guard
+        // has no lower/past-time bound, so a stale but increasing prefix is admitted.
+        for height in 1..=8 {
+            let reference_time = 1_000_000 + (height - 1) * params.target_block_time_secs;
+            let timestamp = if height == 8 {
+                // At the retarget boundary, jump to the inclusive local future-time ceiling.
+                reference_time
+                    + crate::timestamp_policy::TimestampPolicy::testnet().max_future_drift_secs
+            } else {
+                height
+            };
+            let block = qrun_fee_block(chain.state(), timestamp, [0x77; 32]);
+            let mut header = qrun_fee_header(&chain, &block, &params, 0);
+
+            // Find a valid nonce under the candidate target; target is intentionally easy
+            // enough that this loop is deterministic and short in the test fixture.
+            while Uint256::from_be_bytes(crate::consensus::pow_digest(&header, params.pow).unwrap())
+                > header.target
+            {
+                header.nonce = header.nonce.checked_add(1).expect("nonce budget");
+            }
+
+            chain
+                .append_qrun_v05_fee_live(
+                    &block,
+                    &header,
+                    None,
+                    &EmptyAuthenticator,
+                    &ClockAt(reference_time),
+                )
+                .unwrap();
+        }
+
+        let observed = chain.expected_target(None).unwrap();
+        assert_eq!(
+            observed,
+            expected_eased_target,
+            "a stale first-block timestamp followed by a boundary jump can ease the next target by 4x"
+        );
+        assert!(chain.target_history.timestamps[0].unwrap() < 1_000_000);
+        assert_eq!(chain.state().height(), 8);
+
+        // The repository's research-only 11-block MTP rule would also accept this jump:
+        // it constrains a candidate relative to the recent median, not relative to the
+        // network's creation time. A Genesis-time floor is a separate requirement.
+        let mtp_history: Vec<_> = (0..8u64)
+            .map(
+                |height| crate::asert_anchor_policy_candidate::HeaderTimeSample {
+                    height,
+                    timestamp: height as i128,
+                    bits: 0x207f_ffff,
+                    parent_hash: if height == 0 {
+                        [0; 32]
+                    } else {
+                        [(height - 1) as u8; 32]
+                    },
+                    block_hash: [height as u8; 32],
+                },
+            )
+            .collect();
+        assert_eq!(
+            crate::asert_anchor_policy_candidate::validate_candidate_mtp(
+                &mtp_history,
+                8,
+                mtp_history.last().unwrap().block_hash,
+                chain.target_history.timestamps[7].unwrap() as i128,
+            ),
+            Ok(()),
+            "MTP alone does not prevent a forward jump after a backdated first block"
+        );
     }
 
     #[test]
