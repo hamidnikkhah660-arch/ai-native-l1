@@ -1,6 +1,6 @@
-﻿# CP-0512 — QRun v0.5 Zero-Cost Cross-Host Qualification Plan
+# CP-0512 — QRun v0.5 Zero-Cost Cross-Host Qualification Plan
 Date: 2026-11-02
-Status: **Prepared; laptop enrolled in NetBird; second peer NOT RUN. No VPS purchased.**
+Status: **Cross-host startup qualification PASS with temporary GitHub Windows runner on 2026-11-03; signed transaction/block-gossip extension prepared but NOT RUN pending a fresh one-off Setup Key. No VPS purchased.**
 
 ## Objective
 Qualify QRun from the owner's existing Windows laptop against a second, temporary Windows VM without purchasing a VPS or using the old/infected computer. The first target is a real cross-host authenticated P2P test over a private overlay. This is not yet independent-operator or native public-Internet qualification.
@@ -112,3 +112,15 @@ Status: **Laptop connected; peer onboarding paused pending restrictive access-po
 - No NetBird Setup Key, OAuth client, GitHub Actions secret, or repository setting created.
 - No Mainnet gate change; QRUN_MAINNET_RELEASE_APPROVED remains false.
 - No commit, push, PR, merge, reset, or clean.
+
+## 2026-11-03 qualification update
+
+The initial private-overlay cross-host stage is now verified by GitHub Actions run [41540604143](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/41540604143):
+- The temporary Windows Runner enrolled into NetBird and established a direct WireGuard P2P tunnel to the owner's Windows 11 laptop.
+- The allowed P2P/time ports 49341 and 49550 were reachable; remote RPC/TX canaries 49339 and 49340 remained blocked.
+- Pinned Noise XX authenticated startup sync passed with matching Network/Profile/Tip/State-root identity at Genesis height 0.
+- Node A was stopped and cleaned, NetBird Block Inbound restored, and the consumed one-off Setup Key was removed from GitHub Secrets.
+
+The CI runner harness now contains an unrun Stage C1 extension to submit one disposable signed test transaction from Node B's loopback TX listener and require Node A's authenticated QRA5 block acknowledgement. It uses the existing B-to-A P2P ACL only; no reverse ACL or remote RPC/TX is needed. This extension has passed PowerShell parser/build checks but still requires a new one-off ephemeral NETBIRD_SETUP_KEY before execution. It is not yet cross-host propagation evidence.
+
+This remains temporary hosted-runner qualification, not independent-operator or native public-Internet qualification. QRUN_MAINNET_RELEASE_APPROVED=false.

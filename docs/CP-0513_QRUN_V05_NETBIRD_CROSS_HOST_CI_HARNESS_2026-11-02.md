@@ -1,7 +1,7 @@
 # CP-0513 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â QRun v0.5 NetBird Cross-Host CI Harness
 
 **Date:** 2026-11-02
-**Status:** First hosted Runner enrollment succeeded; NetBird peer transport and authenticated QRun sync remain unqualified. Updated 2026-11-03.
+**Status:** Cross-host authenticated startup PASS (run 41540604143). Signed transaction / QFP5 block-gossip extension implemented on 2026-11-03; NOT RUN pending a fresh one-off Setup Key.
 **Branch:** `feat/qrun-v05-netbird-cross-host-qualification-20261102`
 **Last verified implementation commit before this harness:** `38df9662baa457e4b2a2ca98d9797e87cf0a11fd`
 
@@ -114,3 +114,41 @@ The detailed dashboard inspection confirmed:
 The preparation script now performs an explicit netbird down followed by netbird up --block-inbound=false before opening Node A listeners. The preparation failure path and normal stop script likewise force down followed by up --block-inbound, restoring fail-closed behavior. Both scripts passed PowerShell parser validation after the edits.
 
 The last failed run remains unqualified: Node B did not build or start, and no authenticated Noise XX sync or block convergence was demonstrated. Node A, the time authority, and the policy canary are stopped; the temporary test root was deleted; block-inbound=true was restored through an actual reconnect; no QRun test listener remains open on the overlay. A fresh one-off ephemeral Setup Key will be required for the next hosted run.
+
+## Cross-host authenticated startup qualification PASS (2026-11-03)
+
+This section supersedes earlier historical statements that the NetBird peer tunnel or authenticated startup sync remained unqualified.
+
+GitHub Actions run [41540604143](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/41540604143) completed with **success** on commit `8c23199b3e376fabce04a12f6f1579c4eb5cf088`.
+
+Observed evidence:
+- The temporary Windows runner enrolled into NetBird and Node A observed the peer at `100.113.55.84`.
+- Node A reported a direct WireGuard `P2P` connection, a recent handshake and nonzero receive/send counters.
+- TCP 49341 (QRun P2P) and TCP 49550 (signed reference time) were reachable from Node B.
+- Remote TCP 49339 (RPC canary) and 49340 (transaction-ingress canary) remained blocked.
+- Node B created its own CurrentUser-DPAPI-protected NPK1 Noise key; the private key was not exported.
+- Pinned Noise XX authenticated startup sync completed.
+- Node B reported the expected network ID, profile ID, tip and state root. The startup stage ended at height 0; no transaction or block propagation was tested in that run.
+- The job completed and the hosted runner disconnected. Node A's QRun services, temporary keys and data were stopped/removed. `block-inbound=true` was restored through an explicit reconnect. The consumed one-off `NETBIRD_SETUP_KEY` was deleted from GitHub Actions Secrets. NetBird Management/Signal remain connected on Node A; no QRun test listener remains open.
+
+## Stage C1: cross-host signed transaction and QFP5 block gossip (implemented; NOT RUN)
+
+The runner script now extends the existing B-to-A-only network path after authenticated startup sync:
+
+1. Build `qrun_v05_public_alpha_process_smoke.exe` on the temporary Windows runner.
+2. Run its `identity` command and require its public account/key to match the newly generated Node A Genesis owner identity. This helper uses the documented deterministic `TEST_ONLY_SEED` fixture in source; it is a publicly visible test fixture, not a wallet secret, not a production identity, and must only be used with the fresh disposable Public Alpha network.
+3. Submit nonce-1 (recipient account consisting of 32 bytes of `0x78`, amount 1,000 atoms) to Node B's own loopback-only QZTS/1 listener at `127.0.0.1:49340`. No remote RPC or TX endpoint is opened.
+4. Require the Node B QZTA/1 acknowledgement to say Accepted, Node B's canonical height to reach 1, the transaction receipt to be `confirmed`, owner nonce to be 1 and the test recipient balance to be 1,000 atoms.
+5. Require Node B's log to contain `qrun_pow_local_block_broadcast peer=<Node-A-overlay-IP>:49341`. This marker is written only after the remote peer's encrypted QRA5 acknowledgement passes the expected protocol version, block height, block ID and non-rejection status checks. Thus the test will fail if Node A cannot authenticate, validate or acknowledge the received block.
+
+The extension was parser-checked and its Release test-signer binary built successfully on the authorized Windows workstation. The helper's public identity was verified; the private seed is not printed. **No Stage C1 workflow run has occurred yet**, so transaction/block gossip across the physical hosts is not yet claimed as PASS.
+
+Safety boundary remains unchanged:
+- Only the existing qrun-node-b-to-qrun-node-a TCP 49341 and 49550 rules are used.
+- No reverse A-to-B policy is enabled.
+- RPC 49339 and TX 49340 remain loopback-only and are tested as blocked from Node B.
+- No router/WAN port, public RPC or public TX listener is opened.
+- The Setup Key used by run 41540604143 was one-off and consumed; `NETBIRD_SETUP_KEY` was subsequently removed. A fresh one-off ephemeral key scoped to `qrun-node-b` must be created and stored in the Actions Secret before Stage C1 can run. Do not reuse a consumed key.
+- The Stage C1 result, if it passes, proves one-way B-to-A signed transaction/block propagation and independent Node A block acceptance. It does not prove reverse A-to-B propagation, cross-host partition/reorg, independent operators, public Internet reachability, or Mainnet readiness.
+
+**Current state summary:** Stage B authenticated cross-host startup = PASS. Stage C1 signed transaction and block gossip = implemented, parser/build checks PASS, workflow NOT RUN. The earlier failed-run chronology above remains as historical record only. `QRUN_MAINNET_RELEASE_APPROVED=false`.

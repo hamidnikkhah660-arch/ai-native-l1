@@ -144,7 +144,7 @@ try {
     $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
     $manifest = Join-Path $repoRoot "src/native/pow_bench/Cargo.toml"
     Write-Host "=== Build isolated QRun v0.5 Node B ==="
-    cargo build --release --locked --manifest-path $manifest --bin qrun_v05_pow_local_node --bin qrun_v05_noise_key_provision
+    cargo build --release --locked --manifest-path $manifest --bin qrun_v05_pow_local_node --bin qrun_v05_noise_key_provision --bin qrun_v05_public_alpha_process_smoke
     if ($LASTEXITCODE -ne 0) { throw "QRun Node B build failed." }
 
     $target = Join-Path $repoRoot "src/native/pow_bench/target/release"
@@ -228,6 +228,96 @@ try {
         throw "Node B status did not expose a complete profile/tip/state-root tuple."
     }
 
+    $startupProfileId = [string]$statusJson.profile_id
+    # Stage C1: have Node B originate a signed test-only transaction on this disposable Public Alpha network.
+    # This helper embeds the documented TEST_ONLY_SEED and is permitted only on this
+    # freshly generated Public Alpha network; it is never a wallet or Mainnet key.
+    if ([uint64]$statusJson.height -ne 0) {
+        throw "Cross-host gossip stage requires a fresh height-zero Genesis on Node B."
+    }
+    $smokeExe = Join-Path $repoRoot "src/native/pow_bench/target/release/qrun_v05_public_alpha_process_smoke.exe"
+    if (-not (Test-Path $smokeExe)) { throw "Public Alpha test-only signed transaction helper was not built." }
+    $testIdentity = & $smokeExe identity 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "Could not derive the documented disposable Public Alpha test identity." }
+    $testAccountLine = $testIdentity | Where-Object { "$_" -match "^owner_account_id_hex=" } | Select-Object -First 1
+    $testPublicLine = $testIdentity | Where-Object { "$_" -match "^owner_public_key_hex=" } | Select-Object -First 1
+    $testAccount = ("$testAccountLine" -replace "^owner_account_id_hex=", "").Trim()
+    $testPublic = ("$testPublicLine" -replace "^owner_public_key_hex=", "").Trim()
+    if ($testAccount -ne $OwnerAccountIdHex.ToLowerInvariant() -or
+        $testPublic -ne $OwnerPublicKeyHex.ToLowerInvariant()) {
+        throw "Node B's test-only signer does not match the freshly generated Genesis owner identity."
+    }
+    Write-Host "CROSS_HOST_TEST_SIGNER_MATCHES_GENESIS=PASS"
+    Write-Host "CROSS_HOST_TEST_SIGNER_PRIVATE_SEED_EXPORTED=NO"
+
+    Write-Host "=== Submit one signed QZTS/1 test transaction to Node B loopback ingress ==="
+    $submitOutput = & $smokeExe submit --network-id-hex $NetworkIdHex --address "127.0.0.1:49340" 2>&1
+    $submitExit = $LASTEXITCODE
+    if ($submitExit -ne 0) {
+        throw "Node B signed QZTS/1 submission/PoW failed (exit=$submitExit): $($submitOutput -join ' ')"
+    }
+    $txidLine = $submitOutput | Where-Object { "$_" -match "^transaction_id=" } | Select-Object -First 1
+    $statusLine = $submitOutput | Where-Object { "$_" -match "^qzts_status=" } | Select-Object -First 1
+    $crossHostTxid = ("$txidLine" -replace "^transaction_id=", "").Trim()
+    $qztsStatus = ("$statusLine" -replace "^qzts_status=", "").Trim()
+    if ($crossHostTxid -notmatch '^[0-9a-fA-F]{64}$' -or $qztsStatus -ne "Accepted") {
+        throw "Node B did not return an Accepted QZTA/1 acknowledgement for the signed cross-host transaction."
+    }
+
+    $ownerBalance = $null
+    $recipientBalance = $null
+    $txReceipt = $null
+    for ($attempt = 0; $attempt -lt 90; $attempt++) {
+        try {
+            $statusJson = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:49339/v1/status" -TimeoutSec 5
+            $txReceipt = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:49339/v1/transaction/$crossHostTxid" -TimeoutSec 5
+            $ownerBalance = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:49339/v1/balance/$OwnerAccountIdHex" -TimeoutSec 5
+            $testRecipient = ("78" * 32)
+            $recipientBalance = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:49339/v1/balance/$testRecipient" -TimeoutSec 5
+            if ([uint64]$statusJson.height -ge 1 -and
+                $txReceipt.status -eq "confirmed" -and
+                [uint64]$ownerBalance.nonce -eq 1 -and
+                [uint64]$recipientBalance.balance_atoms -eq 1000) {
+                break
+            }
+        } catch {}
+        Start-Sleep -Seconds 1
+    }
+    if ([uint64]$statusJson.height -ne 1 -or
+        $txReceipt.status -ne "confirmed" -or
+        [uint64]$ownerBalance.nonce -ne 1 -or
+        [uint64]$recipientBalance.balance_atoms -ne 1000) {
+        throw "Node B did not reach canonical height 1 with the signed transaction receipt and expected owner/recipient balances."
+    }
+    if ($statusJson.network_id -ne $NetworkIdHex.ToLowerInvariant() -or $statusJson.profile_id -ne $startupProfileId) {
+        throw "Node B network/profile identity changed during cross-host block gossip."
+    }
+
+    # A successful broadcast marker is written only after Node A's authenticated QRA5
+    # response passed its block-height/hash/status checks. The receiver returns a reject
+    # status for invalid blocks, so this is evidence of independent remote validation.
+    $nodeBLog = Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue
+    $expectedBroadcast = "qrun_pow_local_block_broadcast peer=$($NodeAOverlayIp):49341"
+    if (-not $nodeBLog.Contains($expectedBroadcast)) {
+        throw "Node B did not record a successful authenticated block ACK from Node A."
+    }
+    if ($nodeBLog -match [regex]::Escape("qrun_pow_local_block_broadcast_failed peer=$($NodeAOverlayIp):49341")) {
+        throw "Node B recorded a failed authenticated block broadcast to Node A."
+    }
+    $expectedIngress = "qrun_pow_local_tx_ingress accepted_pow_candidate txid=$crossHostTxid height=1 canonical_height=1"
+    if (-not $nodeBLog.Contains($expectedIngress)) {
+        throw "Node B did not log the signed transaction as canonically included in its height-1 candidate."
+    }
+
+    Write-Host "CROSS_HOST_SIGNED_QZTS_TX_ACCEPTED=PASS"
+    Write-Host "CROSS_HOST_NODE_B_CANONICAL_RECEIPT=PASS"
+    Write-Host "CROSS_HOST_NODE_B_RECIPIENT_BALANCE=PASS"
+    Write-Host "CROSS_HOST_NOISE_QFP5_BLOCK_GOSSIP_NODE_A_ACK=PASS"
+    Write-Host "cross_host_transaction_id=$crossHostTxid"
+    Write-Host "cross_host_canonical_height=$($statusJson.height)"
+    Write-Host "cross_host_canonical_tip=$($statusJson.tip)"
+    Write-Host "cross_host_state_root=$($statusJson.state_root)"
+    Write-Host "mainnet=false"
     Write-Host "NETBIRD_CROSS_HOST_TCP_P2P_49341=PASS"
     Write-Host "NETBIRD_CROSS_HOST_AUTH_TIME_49550=PASS"
     Write-Host "REMOTE_RPC_49339_BLOCKED=PASS"

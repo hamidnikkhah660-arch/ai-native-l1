@@ -1,5 +1,5 @@
 # CP-0510 — QRun v0.5 Two-Physical-Host Operator Qualification Runbook
-**Status:** Prepared; NOT RUN — only one authorized device was online during preparation.
+**Status:** Independent-operator/LAN runbook remains NOT RUN. A temporary GitHub-hosted Windows runner has passed private-overlay startup qualification; cross-host signed transaction/block propagation is prepared but not yet run.
 **Date:** 2026-11-02
 **Scope:** Public Alpha/test-only, private LAN first; no Mainnet or public QZXB trading.
 
@@ -52,3 +52,9 @@ The code has same-host two-process partition/reconnect/reorg/restart evidence an
 
 ## Stop conditions
 Stop immediately on Noise pin mismatch, Genesis/profile/time-policy mismatch, unexpected RPC/transaction exposure, a balance/supply invariant failure, receipt inconsistency after reorg, failure to preserve the canonical tip on durable reopen, or any attempt to enable Mainnet. Keep `QRUN_MAINNET_RELEASE_APPROVED=false`.
+
+## 2026-11-03 distinction from the CI qualification
+
+The temporary GitHub-hosted Windows runner is a second physical virtual machine and completed authenticated NetBird/Noise XX startup qualification against Node A. It is not an independently administered volunteer operator and does not complete this runbook.
+
+The CI runner's signed transaction/QFP5 block-gossip extension is implemented but not yet executed. This operator runbook still requires a separately administered second computer for the LAN phase, followed by the separately controlled routed-network phase. Do not describe temporary CI execution as independent-operator evidence. QRUN_MAINNET_RELEASE_APPROVED=false.
