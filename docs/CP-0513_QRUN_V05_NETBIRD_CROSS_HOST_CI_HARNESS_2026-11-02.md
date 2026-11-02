@@ -195,3 +195,31 @@ Scope and limitations:
 - Draft PR #132 remains open and unmerged; `main` was not changed.
 
 **Updated state:** Stage B authenticated cross-host startup = PASS. Stage C1 cross-host signed transaction and QFP5 block gossip = PASS. Cross-host partition/reorg and independent-operator qualification remain future gates. `QRUN_MAINNET_RELEASE_APPROVED=false`.
+
+
+## Stage C2 preparation: cross-host partition, reconnect, reorg and durable reopen (2026-11-03)
+
+**Status: HARNESS PREPARED; NOT RUN.** This is a separate manual-only workflow and does not alter the already-passed Stage C1 workflow.
+
+Files:
+- `.github/workflows/qrun-v05-netbird-cross-host-partition-reorg.yml`: manual `workflow_dispatch` only, exact-branch guard, read-only contents permission, ephemeral Windows runner, and the same disposable public-only config plus one-off `NETBIRD_SETUP_KEY`.
+- `tools/qrun-v05-netbird-partition-controller.ps1`: runs on Node A after the guarded prepare script. It waits for all stale peers to disappear, then requires exactly one stable directly connected P2P Node B peer. After a bounded delay it submits Node A's nonce-1 and nonce-2 test transactions locally, confirms height 2 and the expected receipt/balance state, and logs Node A's canonical tip/state root under the dedicated temporary root.
+- `tools/qrun-v05-netbird-cross-host-runner.ps1`: gained an opt-in `-StagePartitionReconnectReorg` mode. The original Stage C1 behavior remains the default. The C2 mode prebuilds the Node B release binaries before NetBird enrollment, completes pinned startup sync at Genesis, then adds a temporary Windows Firewall **outbound-only** block rule restricted to Node A's exact overlay IP and TCP 49341. It proves TCP 49341 is blocked while authenticated-time TCP 49550 and NetBird Management/Signal remain reachable.
+
+Planned C2 evidence:
+1. Node B submits a signed conflicting nonce-1 transaction while P2P is isolated and must reach canonical height 1 with its own confirmed receipt and recipient balance.
+2. Node B's attempted P2P block broadcast must appear as a failed send on stderr; no successful broadcast marker may exist for the isolated competing block.
+3. Node A independently builds a nonce-1/nonce-2 branch while Node B's outbound P2P path is blocked. Node A must reach canonical height 2 with owner nonce 2, owner balance `999999999999995998` atoms, and only the two Node A test-recipient balances.
+4. The runner removes only its temporary TCP 49341 outbound block, proves P2P and authenticated-time connectivity recovered, then restarts Node B with the same DPAPI key/data and pinned `--sync-on-start true`. Node B must select Node A's higher-work height-2 branch, remove the losing Node B receipt from canonical view, and reproduce the expected owner/recipient balances.
+5. Node B is restarted once more without startup sync and must preserve the post-reorg canonical tip, state root, orphan receipt status, nonce and balances from durable storage.
+
+Safety / execution boundary:
+- Only Node B's temporary Windows Firewall outbound TCP 49341 rule is added. It is restricted to Node A's private overlay IP and is removed on the normal path and in the runner's `finally` path.
+- The NetBird group/ACLs are unchanged. No reverse A-to-B policy, Default All-to-All, public NIC listener, router port, RPC 49339 or transaction ingress 49340 exposure is introduced.
+- Node A continues to bind RPC/TX to loopback and P2P/reference-time to its existing private overlay addresses. Port 49550 remains reachable during the P2P partition for authenticated time.
+- The Node A preparation/stop scripts retain the existing fail-closed lifecycle: temporary keys/data are disposable, and `block-inbound=true` is restored after the run.
+- A **fresh** one-off ephemeral Setup Key and regenerated public runner config are required because C1 cleanup intentionally deleted both the old `NETBIRD_SETUP_KEY` Secret and `QRUN_CROSS_HOST_CONFIG_JSON` Variable.
+- Before dispatch, start the Node A partition controller and confirm its `NODE_A_CONTROLLER_READY=PASS` / `NETBIRD_PRETEST_PEERS_CLEAR=PASS` log markers. Dispatch only after the controller is waiting for the single Node B peer. After any runner conclusion, execute the guarded Node A stop script and delete the consumed Secret and temporary Variable.
+- The runner and controller PowerShell files passed the PowerShell parser; the workflow YAML parsed; `git diff --check` passed. These are harness validations, not a Stage C2 execution result.
+
+**Scope remains explicitly unqualified:** no cross-host partition/reconnect/reorg or durable-reopen PASS is claimed until a real Stage C2 workflow run and matching Node A controller evidence are recorded. `mainnet=false`; `QRUN_MAINNET_RELEASE_APPROVED=false`.

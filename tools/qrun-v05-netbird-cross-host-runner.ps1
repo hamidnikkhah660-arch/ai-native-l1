@@ -7,7 +7,8 @@ param(
     [Parameter(Mandatory)][string]$GenesisTimeUnixSecs,
     [Parameter(Mandatory)][string]$NodeANoisePublicKeyHex,
     [Parameter(Mandatory)][string]$ReferenceTimeAdminPublicKeyHex,
-    [Parameter(Mandatory)][string]$ReferenceTimePolicyBase64
+    [Parameter(Mandatory)][string]$ReferenceTimePolicyBase64,
+    [switch]$StagePartitionReconnectReorg
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,6 +16,7 @@ $netbirdExe = "C:\Program Files\NetBird\netbird.exe"
 $nodeProcess = $null
 $tempRoot = Join-Path $env:TEMP ("qrun-v05-cross-host-" + [guid]::NewGuid().ToString("N"))
 $netbirdConnected = $false
+$partitionRuleName = $null
 
 function Assert-Hex32([string]$Name, [string]$Value) {
     if ($Value -notmatch '^[0-9a-fA-F]{64}$' -or $Value -match '^0{64}$') {
@@ -93,6 +95,16 @@ try {
 
     $service = Get-Service -Name NetBird -ErrorAction Stop
     if ($service.Status -ne "Running") { Start-Service -Name NetBird }
+    if ($StagePartitionReconnectReorg) {
+        # Build before enrollment so the Node A controller's 120-second delay
+        # starts only after compilation is complete.
+        $preRepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+        $preManifest = Join-Path $preRepoRoot "src/native/pow_bench/Cargo.toml"
+        Write-Host "=== Pre-build QRun binaries before NetBird enrollment for Stage C2 ==="
+        cargo build --release --locked --manifest-path $preManifest --bin qrun_v05_pow_local_node --bin qrun_v05_noise_key_provision --bin qrun_v05_public_alpha_process_smoke
+        if ($LASTEXITCODE -ne 0) { throw "Pre-enrollment QRun build failed." }
+        Write-Host "CROSS_HOST_PARTITION_RUNNER_PREBUILD=PASS"
+    }
     $env:NB_SETUP_KEY = $setupKey
     Remove-Item Env:NETBIRD_SETUP_KEY -ErrorAction SilentlyContinue
     & $netbirdExe up
@@ -250,6 +262,235 @@ try {
     Write-Host "CROSS_HOST_TEST_SIGNER_MATCHES_GENESIS=PASS"
     Write-Host "CROSS_HOST_TEST_SIGNER_PRIVATE_SEED_EXPORTED=NO"
 
+    if ($StagePartitionReconnectReorg) {
+        Write-Host "=== Stage C2: isolate only Node B -> Node A QRun P2P while retaining authenticated time ==="
+        if ([uint64]$statusJson.height -ne 0) {
+            throw "Stage C2 requires both hosts at the shared Genesis before the partition."
+        }
+        if (-not (Test-TcpEndpoint $NodeAOverlayIp 49341 3000)) {
+            throw "Node B could not reach Node A P2P TCP 49341 immediately before the controlled partition."
+        }
+        Write-Host "CROSS_HOST_PARTITION_PREBLOCK_P2P_49341_REACHABLE=PASS"
+        $partitionRuleName = "QRun-CrossHost-StageC2-" + [guid]::NewGuid().ToString("N")
+        $existingRule = Get-NetFirewallRule -DisplayName $partitionRuleName -ErrorAction SilentlyContinue
+        if ($existingRule) { throw "Unexpected Stage C2 firewall rule name collision." }
+        New-NetFirewallRule -DisplayName $partitionRuleName -Direction Outbound -Action Block -Protocol TCP -RemoteAddress $NodeAOverlayIp -RemotePort 49341 -Profile Any -Enabled True | Out-Null
+        $activeRule = Get-NetFirewallRule -DisplayName $partitionRuleName -ErrorAction Stop
+        $activePortFilter = $activeRule | Get-NetFirewallPortFilter
+        $activeAddressFilter = $activeRule | Get-NetFirewallAddressFilter
+        $remoteAddressScope = @($activeAddressFilter.RemoteAddress) -join ","
+        if ($activeRule.Direction -ne "Outbound" -or $activeRule.Action -ne "Block" -or
+            $activePortFilter.Protocol -ne "TCP" -or "$($activePortFilter.RemotePort)" -notmatch "49341" -or
+            $remoteAddressScope -notmatch [regex]::Escape($NodeAOverlayIp)) {
+            throw "Stage C2 outbound firewall partition rule did not match the exact Node A overlay IP and TCP 49341 scope."
+        }
+        if (Test-TcpEndpoint $NodeAOverlayIp 49341 1500) {
+            throw "Stage C2 partition failed: Node B can still establish TCP to Node A P2P 49341."
+        }
+        if (-not (Test-TcpEndpoint $NodeAOverlayIp 49550 3000)) {
+            throw "Stage C2 partition is not selective: authenticated reference-time TCP 49550 must remain reachable."
+        }
+        Write-Host "CROSS_HOST_PARTITION_P2P_49341_BLOCKED=PASS"
+        $partitionNetBirdStatus = (& $netbirdExe status 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0 -or
+            $partitionNetBirdStatus -notmatch "Management:\s+Connected" -or
+            $partitionNetBirdStatus -notmatch "Signal:\s+Connected") {
+            throw "NetBird overlay must remain connected while only TCP 49341 is partitioned."
+        }
+        Write-Host "CROSS_HOST_PARTITION_AUTH_TIME_49550_RETAINED=PASS"
+        Write-Host "NETBIRD_OVERLAY_REMAINS_CONNECTED=PASS"
+
+        Write-Host "=== Submit the competing nonce-1 branch on isolated Node B ==="
+        $conflictOutput = & $smokeExe submit-conflict --network-id-hex $NetworkIdHex --address "127.0.0.1:49340" 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "Node B partitioned conflict transaction failed: $($conflictOutput -join ' ')"
+        }
+        $conflictIdLine = $conflictOutput | Where-Object { "$_" -match "^transaction_id=" } | Select-Object -First 1
+        $conflictStatusLine = $conflictOutput | Where-Object { "$_" -match "^qzts_status=" } | Select-Object -First 1
+        $partitionTxid = ("$conflictIdLine" -replace "^transaction_id=", "").Trim()
+        $partitionAck = ("$conflictStatusLine" -replace "^qzts_status=", "").Trim()
+        if ($partitionTxid -notmatch "^[0-9a-fA-F]{64}$" -or $partitionAck -ne "Accepted") {
+            throw "Node B did not accept its signed conflicting nonce-1 transaction."
+        }
+
+        $partitionStatus = $null
+        $partitionReceipt = $null
+        $partitionOwner = $null
+        $partitionRecipient = $null
+        for ($attempt = 0; $attempt -lt 180; $attempt++) {
+            try {
+                $partitionStatus = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:49339/v1/status" -TimeoutSec 5
+                $partitionReceipt = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:49339/v1/transaction/$partitionTxid" -TimeoutSec 5
+                $partitionOwner = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:49339/v1/balance/$OwnerAccountIdHex" -TimeoutSec 5
+                $partitionRecipient = Invoke-RestMethod -Method Get -Uri ("http://127.0.0.1:49339/v1/balance/" + ("79" * 32)) -TimeoutSec 5
+                if ([uint64]$partitionStatus.height -eq 1 -and
+                    $partitionReceipt.status -eq "confirmed" -and
+                    [uint64]$partitionOwner.nonce -eq 1 -and
+                    [uint64]$partitionRecipient.balance_atoms -eq 2000) { break }
+            } catch {}
+            Start-Sleep -Seconds 1
+        }
+        if ([uint64]$partitionStatus.height -ne 1 -or
+            $partitionStatus.network_id -ne $NetworkIdHex.ToLowerInvariant() -or
+            $partitionStatus.profile_id -ne $startupProfileId -or
+            $partitionStatus.mainnet -ne $false -or
+            $partitionReceipt.status -ne "confirmed" -or
+            [uint64]$partitionOwner.nonce -ne 1 -or
+            [uint64]$partitionRecipient.balance_atoms -ne 2000) {
+            throw "Node B did not reach its isolated canonical height-1 conflicting branch."
+        }
+        $partitionNodeBStdout = Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue
+        $partitionNodeBStderr = Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue
+        $expectedFailedBroadcast = "qrun_pow_local_block_broadcast_failed peer=" + $NodeAOverlayIp + ":49341"
+        $unexpectedSuccessBroadcast = "qrun_pow_local_block_broadcast peer=" + $NodeAOverlayIp + ":49341"
+        if (-not $partitionNodeBStderr.Contains($expectedFailedBroadcast)) {
+            throw "Node B did not record the failed P2P broadcast on stderr caused by the Stage C2 partition."
+        }
+        if ($partitionNodeBStdout.Contains($unexpectedSuccessBroadcast)) {
+            throw "Node B unexpectedly broadcast its competing branch to Node A while partitioned."
+        }
+        Write-Host "CROSS_HOST_PARTITION_NODE_B_BRANCH_HEIGHT1=PASS"
+        Write-Host "CROSS_HOST_PARTITION_NODE_B_CANONICAL_RECEIPT=PASS"
+        Write-Host "CROSS_HOST_PARTITION_NODE_B_RECIPIENT_BALANCE=PASS"
+        Write-Host "partition_node_b_txid=$partitionTxid"
+        Write-Host "partition_node_b_height=$($partitionStatus.height)"
+        Write-Host "partition_node_b_tip=$($partitionStatus.tip)"
+        Write-Host "mainnet=false"
+
+        # Node A's local controller waits 120 seconds after the Node B peer becomes
+        # directly connected, then creates its nonce-1/nonce-2 branch. The P2P block
+        # above is already active. Hold it closed long enough for Node A's two PoW blocks.
+        Write-Host "CROSS_HOST_PARTITION_HOLD_SECONDS=600"
+        Start-Sleep -Seconds 600
+
+        Write-Host "=== Heal only the P2P partition and verify both allowed paths ==="
+        Remove-NetFirewallRule -DisplayName $partitionRuleName -ErrorAction Stop
+        $partitionRuleName = $null
+        $healed = $false
+        for ($attempt = 0; $attempt -lt 90; $attempt++) {
+            $p2pReady = Test-TcpEndpoint $NodeAOverlayIp 49341 1000
+            $timeReady = Test-TcpEndpoint $NodeAOverlayIp 49550 1000
+            if ($p2pReady -and $timeReady) { $healed = $true; break }
+            Start-Sleep -Seconds 1
+        }
+        if (-not $healed) { throw "Stage C2 P2P and authenticated-time paths did not recover after removing the firewall rule." }
+        Write-Host "CROSS_HOST_PARTITION_RECONNECTED=PASS"
+
+        Write-Host "=== Restart Node B with pinned authenticated sync to the higher-work Node A branch ==="
+        if ($nodeProcess -and -not $nodeProcess.HasExited) {
+            Stop-Process -Id $nodeProcess.Id -Force -ErrorAction SilentlyContinue
+            Wait-Process -Id $nodeProcess.Id -Timeout 10 -ErrorAction SilentlyContinue
+        }
+        $nodeProcess = $null
+        $reorgOut = Join-Path $tempRoot "node-b-reorg-sync.stdout.log"
+        $reorgErr = Join-Path $tempRoot "node-b-reorg-sync.stderr.log"
+        $quotedReorgArgs = $nodeArgs | ForEach-Object { ConvertTo-QuotedArgument "$_" }
+        $nodeProcess = Start-Process -FilePath $nodeExe -ArgumentList $quotedReorgArgs -PassThru -WindowStyle Hidden -RedirectStandardOutput $reorgOut -RedirectStandardError $reorgErr
+        $reorgStatus = $null
+        $reorgSyncComplete = $false
+        for ($attempt = 0; $attempt -lt 600; $attempt++) {
+            $nodeProcess.Refresh()
+            if ($nodeProcess.HasExited) {
+                throw "Node B exited during cross-host reorg sync. STDERR=$(Get-Content -LiteralPath $reorgErr -Raw -ErrorAction SilentlyContinue)"
+            }
+            $reorgText = Get-Content -LiteralPath $reorgOut -Raw -ErrorAction SilentlyContinue
+            if ($reorgText -match "qrun_pow_authenticated_startup_sync_complete peer=" -and
+                $reorgText -match "qrun_pow_local_rpc_ready") {
+                try { $reorgStatus = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:49339/v1/status" -TimeoutSec 5 } catch {}
+                if ($reorgStatus) { $reorgSyncComplete = $true; break }
+            }
+            Start-Sleep -Seconds 1
+        }
+        if (-not $reorgSyncComplete) {
+            throw "Node B did not complete authenticated restart sync. STDERR=$(Get-Content -LiteralPath $reorgErr -Raw -ErrorAction SilentlyContinue)"
+        }
+        if ([uint64]$reorgStatus.height -ne 2 -or
+            $reorgStatus.network_id -ne $NetworkIdHex.ToLowerInvariant() -or
+            $reorgStatus.profile_id -ne $startupProfileId -or
+            $reorgStatus.mainnet -ne $false) {
+            throw "Node B did not adopt the expected height-2 Node A branch under the same Network/Profile identity."
+        }
+        $orphanReceipt = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:49339/v1/transaction/$partitionTxid" -TimeoutSec 5
+        $reorgOwner = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:49339/v1/balance/$OwnerAccountIdHex" -TimeoutSec 5
+        $reorgA1 = Invoke-RestMethod -Method Get -Uri ("http://127.0.0.1:49339/v1/balance/" + ("78" * 32)) -TimeoutSec 5
+        $reorgA2 = Invoke-RestMethod -Method Get -Uri ("http://127.0.0.1:49339/v1/balance/" + ("7a" * 32)) -TimeoutSec 5
+        $reorgB = Invoke-RestMethod -Method Get -Uri ("http://127.0.0.1:49339/v1/balance/" + ("79" * 32)) -TimeoutSec 5
+        if ($orphanReceipt.status -ne "not_found_in_canonical_chain" -or
+            [uint64]$reorgOwner.nonce -ne 2 -or
+            [uint64]$reorgOwner.balance_atoms -ne 999999999999995998 -or
+            [uint64]$reorgA1.balance_atoms -ne 1000 -or
+            [uint64]$reorgA2.balance_atoms -ne 3000 -or
+            [uint64]$reorgB.balance_atoms -ne 0) {
+            throw "Node B failed to orphan its losing receipt and rebuild the winning branch's canonical ledger."
+        }
+        Write-Host "CROSS_HOST_AUTHENTICATED_RECONNECT_REORG=PASS"
+        Write-Host "CROSS_HOST_ORPHAN_RECEIPT_REMOVED=PASS"
+        Write-Host "CROSS_HOST_CANONICAL_RECEIPTS_AND_BALANCES=PASS"
+        Write-Host "node_b_reorg_height=$($reorgStatus.height)"
+        Write-Host "node_b_reorg_tip=$($reorgStatus.tip)"
+        Write-Host "node_b_reorg_state_root=$($reorgStatus.state_root)"
+        Write-Host "node_b_owner_nonce=$($reorgOwner.nonce)"
+        Write-Host "node_b_owner_balance_atoms=$($reorgOwner.balance_atoms)"
+
+        Write-Host "=== Durable restart Node B without startup sync ==="
+        Stop-Process -Id $nodeProcess.Id -Force -ErrorAction SilentlyContinue
+        Wait-Process -Id $nodeProcess.Id -Timeout 10 -ErrorAction SilentlyContinue
+        $nodeProcess = $null
+        $durableArgs = New-Object System.Collections.Generic.List[string]
+        for ($i = 0; $i -lt $nodeArgs.Count; $i++) {
+            if ($nodeArgs[$i] -eq "--sync-on-start") { $i++; continue }
+            [void]$durableArgs.Add([string]$nodeArgs[$i])
+        }
+        $durableOut = Join-Path $tempRoot "node-b-durable-reopen.stdout.log"
+        $durableErr = Join-Path $tempRoot "node-b-durable-reopen.stderr.log"
+        $quotedDurableArgs = $durableArgs.ToArray() | ForEach-Object { ConvertTo-QuotedArgument "$_" }
+        $nodeProcess = Start-Process -FilePath $nodeExe -ArgumentList $quotedDurableArgs -PassThru -WindowStyle Hidden -RedirectStandardOutput $durableOut -RedirectStandardError $durableErr
+        $durableStatus = $null
+        for ($attempt = 0; $attempt -lt 180; $attempt++) {
+            $nodeProcess.Refresh()
+            if ($nodeProcess.HasExited) {
+                throw "Node B exited during durable reopen. STDERR=$(Get-Content -LiteralPath $durableErr -Raw -ErrorAction SilentlyContinue)"
+            }
+            $durableText = Get-Content -LiteralPath $durableOut -Raw -ErrorAction SilentlyContinue
+            if ($durableText -match "qrun_pow_local_rpc_ready" -and
+                $durableText -match "qrun_reference_time_ready source=ed25519-attested-time-v1 provenance=ConfiguredProvider") {
+                try { $durableStatus = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:49339/v1/status" -TimeoutSec 5 } catch {}
+                if ($durableStatus) { break }
+            }
+            Start-Sleep -Seconds 1
+        }
+        if (-not $durableStatus -or
+            [uint64]$durableStatus.height -ne 2 -or
+            $durableStatus.mainnet -ne $false -or
+            $durableStatus.network_id -ne $NetworkIdHex.ToLowerInvariant() -or
+            $durableStatus.profile_id -ne $startupProfileId -or
+            $durableStatus.tip -ne $reorgStatus.tip -or
+            $durableStatus.state_root -ne $reorgStatus.state_root) {
+            throw "Node B durable reopen did not preserve the post-reorg canonical tip and state root."
+        }
+        $durableOrphan = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:49339/v1/transaction/$partitionTxid" -TimeoutSec 5
+        $durableOwner = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:49339/v1/balance/$OwnerAccountIdHex" -TimeoutSec 5
+        $durableA1 = Invoke-RestMethod -Method Get -Uri ("http://127.0.0.1:49339/v1/balance/" + ("78" * 32)) -TimeoutSec 5
+        $durableA2 = Invoke-RestMethod -Method Get -Uri ("http://127.0.0.1:49339/v1/balance/" + ("7a" * 32)) -TimeoutSec 5
+        $durableB = Invoke-RestMethod -Method Get -Uri ("http://127.0.0.1:49339/v1/balance/" + ("79" * 32)) -TimeoutSec 5
+        if ($durableOrphan.status -ne "not_found_in_canonical_chain" -or
+            [uint64]$durableOwner.nonce -ne 2 -or
+            [uint64]$durableA1.balance_atoms -ne 1000 -or
+            [uint64]$durableA2.balance_atoms -ne 3000 -or
+            [uint64]$durableB.balance_atoms -ne 0) {
+            throw "Node B durable reopen restored a stale receipt or incorrect canonical ledger."
+        }
+
+        Write-Host "CROSS_HOST_DURABLE_REOPEN_AFTER_REORG=PASS"
+        Write-Host "CROSS_HOST_PARTITION_RECONNECT_REORG=PASS"
+        Write-Host "node_b_final_height=$($durableStatus.height)"
+        Write-Host "node_b_final_tip=$($durableStatus.tip)"
+        Write-Host "node_b_final_state_root=$($durableStatus.state_root)"
+        Write-Host "partition_orphaned_tx=$partitionTxid"
+        Write-Host "mainnet=false"
+        return
+    }
+
     Write-Host "=== Submit one signed QZTS/1 test transaction to Node B loopback ingress ==="
     $submitOutput = & $smokeExe submit --network-id-hex $NetworkIdHex --address "127.0.0.1:49340" 2>&1
     $submitExit = $LASTEXITCODE
@@ -331,6 +572,9 @@ try {
     Write-Host "mainnet=false"
 }
 finally {
+    if ($partitionRuleName) {
+        Remove-NetFirewallRule -DisplayName $partitionRuleName -ErrorAction SilentlyContinue
+    }
     if ($nodeProcess -and -not $nodeProcess.HasExited) {
         Stop-Process -Id $nodeProcess.Id -Force -ErrorAction SilentlyContinue
         Wait-Process -Id $nodeProcess.Id -Timeout 10 -ErrorAction SilentlyContinue

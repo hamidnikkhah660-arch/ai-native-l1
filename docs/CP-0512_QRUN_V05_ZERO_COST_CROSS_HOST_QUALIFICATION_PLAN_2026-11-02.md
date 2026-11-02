@@ -1,6 +1,6 @@
 # CP-0512 — QRun v0.5 Zero-Cost Cross-Host Qualification Plan
 Date: 2026-11-02
-Status: **Cross-host startup qualification PASS with temporary GitHub Windows runner on 2026-11-03; signed transaction/block-gossip extension prepared but NOT RUN pending a fresh one-off Setup Key. No VPS purchased.**
+Status: **Stage B authenticated cross-host startup PASS (run 41540604143); Stage C1 signed transaction and QFP5 block-gossip PASS (run 41546003659). Stage C2 cross-host partition/reconnect/reorg harness prepared and parser/YAML-validated, NOT RUN pending a fresh one-off Setup Key and Node A controller launch. No VPS purchased.**
 
 ## Objective
 Qualify QRun from the owner's existing Windows laptop against a second, temporary Windows VM without purchasing a VPS or using the old/infected computer. The first target is a real cross-host authenticated P2P test over a private overlay. This is not yet independent-operator or native public-Internet qualification.
@@ -121,6 +121,8 @@ The initial private-overlay cross-host stage is now verified by GitHub Actions r
 - Pinned Noise XX authenticated startup sync passed with matching Network/Profile/Tip/State-root identity at Genesis height 0.
 - Node A was stopped and cleaned, NetBird Block Inbound restored, and the consumed one-off Setup Key was removed from GitHub Secrets.
 
-The CI runner harness now contains an unrun Stage C1 extension to submit one disposable signed test transaction from Node B's loopback TX listener and require Node A's authenticated QRA5 block acknowledgement. It uses the existing B-to-A P2P ACL only; no reverse ACL or remote RPC/TX is needed. This extension has passed PowerShell parser/build checks but still requires a new one-off ephemeral NETBIRD_SETUP_KEY before execution. It is not yet cross-host propagation evidence.
+Stage C1 is now executed and passed in GitHub Actions run [41546003659](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/41546003659): Node B submitted a signed QZTS/1 transaction, Node A independently accepted and canonically stored the QFP5 block, both nodes converged at height 1, and remote RPC/TX remained blocked. Cleanup stopped all temporary QRun processes, restored Node A block-inbound, removed temporary keys/data, and deleted the consumed one-off Setup Key and public configuration variable.
+
+Stage C2 is now prepared as a separate manual-only workflow and Node A partition controller. It will block only Node B outbound TCP 49341 to Node A while preserving TCP 49550 authenticated time, build competing nonce-1 branches (Node B) and nonce-1/nonce-2 branches (Node A), heal the P2P path, restart Node B with pinned authenticated sync, verify the losing receipt is removed and the winning balances restored, then perform a durable reopen without sync. Its PowerShell scripts passed parser validation, the workflow YAML parsed, and the Git diff check passed. **Stage C2 is NOT RUN**; it requires a fresh one-off ephemeral NETBIRD_SETUP_KEY, regeneration of Node A's disposable public configuration, and launch of the Node A partition controller before manual dispatch.
 
 This remains temporary hosted-runner qualification, not independent-operator or native public-Internet qualification. QRUN_MAINNET_RELEASE_APPROVED=false.

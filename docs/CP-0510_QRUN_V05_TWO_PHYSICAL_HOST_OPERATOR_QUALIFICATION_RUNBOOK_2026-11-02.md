@@ -1,5 +1,5 @@
 # CP-0510 — QRun v0.5 Two-Physical-Host Operator Qualification Runbook
-**Status:** Independent-operator/LAN runbook remains NOT RUN. A temporary GitHub-hosted Windows runner has passed private-overlay startup qualification; cross-host signed transaction/block propagation is prepared but not yet run.
+**Status:** Independent-operator/LAN runbook remains NOT RUN. Temporary GitHub-hosted Windows runner has passed Stage B authenticated startup and Stage C1 signed transaction/QFP5 block propagation. Stage C2 cross-host partition/reconnect/reorg harness is prepared but not yet run.
 **Date:** 2026-11-02
 **Scope:** Public Alpha/test-only, private LAN first; no Mainnet or public QZXB trading.
 
@@ -57,4 +57,4 @@ Stop immediately on Noise pin mismatch, Genesis/profile/time-policy mismatch, un
 
 The temporary GitHub-hosted Windows runner is a second physical virtual machine and completed authenticated NetBird/Noise XX startup qualification against Node A. It is not an independently administered volunteer operator and does not complete this runbook.
 
-The CI runner's signed transaction/QFP5 block-gossip extension is implemented but not yet executed. This operator runbook still requires a separately administered second computer for the LAN phase, followed by the separately controlled routed-network phase. Do not describe temporary CI execution as independent-operator evidence. QRUN_MAINNET_RELEASE_APPROVED=false.
+The CI runner's signed transaction/QFP5 block-gossip stage (Stage C1) is now PASS, independently confirmed by Node A's local canonical height/tip/state-root and receipt/balance queries. A separate Stage C2 partition/reconnect/reorg/durable-reopen harness is prepared and parser/YAML-validated but **NOT RUN**. This operator runbook still requires a separately administered second computer for the LAN phase, followed by the separately controlled routed-network phase. Do not describe temporary CI execution as independent-operator evidence. QRUN_MAINNET_RELEASE_APPROVED=false.
