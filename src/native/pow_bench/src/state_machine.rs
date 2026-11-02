@@ -2562,7 +2562,8 @@ mod tests {
         let before = state.encode_snapshot().unwrap();
 
         let mut too_old = block(1, state.tip_hash(), vec![]);
-        too_old.timestamp = 879;
+        // QRun v0.5 live admission permits up to 300 seconds of past drift.
+        too_old.timestamp = 699;
         too_old.state_root = state
             .preview_state_root_after(&too_old, &TestOnlyAuthenticator)
             .unwrap();
@@ -2574,11 +2575,28 @@ mod tests {
                 TimestampPolicy::qrun_v05_live(),
             ),
             Err(StateError::TimestampTooFarInPast {
-                earliest_allowed: 880,
-                actual: 879,
+                earliest_allowed: 700,
+                actual: 699,
             })
         );
         assert_eq!(state.encode_snapshot().unwrap(), before);
+
+        // The lower edge is inclusive for the QRun v0.5 live-only freshness window.
+        let mut past_boundary_state = alice_bob_state();
+        let mut at_past_limit = block(1, past_boundary_state.tip_hash(), vec![]);
+        at_past_limit.timestamp = 700;
+        at_past_limit.state_root = past_boundary_state
+            .preview_state_root_after(&at_past_limit, &TestOnlyAuthenticator)
+            .unwrap();
+        past_boundary_state
+            .apply_block_with_timestamp_policy(
+                &at_past_limit,
+                &TestOnlyAuthenticator,
+                1_000,
+                TimestampPolicy::qrun_v05_live(),
+            )
+            .unwrap();
+        assert_eq!(past_boundary_state.last_timestamp(), 700);
 
         let mut too_far = block(1, state.tip_hash(), vec![]);
         too_far.timestamp = 1_121;

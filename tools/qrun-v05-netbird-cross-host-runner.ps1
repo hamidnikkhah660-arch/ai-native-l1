@@ -66,6 +66,12 @@ try {
     if ([string]::IsNullOrWhiteSpace($env:NETBIRD_SETUP_KEY)) {
         throw "Required GitHub Actions secret NETBIRD_SETUP_KEY is missing."
     }
+    # NetBird parses cloud Setup Keys as canonical UUIDs. Validate the exact secret
+    # before installing/starting the runner client so pasted labels or extra text fail early.
+    $setupKey = $env:NETBIRD_SETUP_KEY.Trim()
+    if ($setupKey -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+        throw "NETBIRD_SETUP_KEY is not a canonical 36-character UUID Setup Key. Recreate it in NetBird and copy the actual key value."
+    }
 
     New-Item -ItemType Directory -Path $tempRoot | Out-Null
     $msiPath = Join-Path $tempRoot "netbird_installer_0.82.0_windows_amd64.msi"
@@ -87,7 +93,7 @@ try {
 
     $service = Get-Service -Name NetBird -ErrorAction Stop
     if ($service.Status -ne "Running") { Start-Service -Name NetBird }
-    $env:NB_SETUP_KEY = $env:NETBIRD_SETUP_KEY
+    $env:NB_SETUP_KEY = $setupKey
     Remove-Item Env:NETBIRD_SETUP_KEY -ErrorAction SilentlyContinue
     & $netbirdExe up
     $upExit = $LASTEXITCODE
