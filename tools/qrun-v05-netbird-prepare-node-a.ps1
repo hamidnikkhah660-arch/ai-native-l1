@@ -206,7 +206,7 @@ try {
     $canaryLog = Join-Path $root "canary.log"
     $canaryArgs = @(
         "-NoProfile","-ExecutionPolicy","Bypass","-File",$canaryScript,
-        "-BindIp",$OverlayIp,"-StopFile",$canaryStop,"-LogFile",$canaryLog,"-MaxSeconds","1800"
+        "-BindIp",$OverlayIp,"-StopFile",$canaryStop,"-LogFile",$canaryLog,"-MaxSeconds","14400"
     )
     $quotedCanary = $canaryArgs | ForEach-Object { ConvertTo-QuotedArgument "$_" }
     $canaryProcess = Start-Process -FilePath (Join-Path $PSHOME "powershell.exe") -ArgumentList $quotedCanary -PassThru -WindowStyle Hidden

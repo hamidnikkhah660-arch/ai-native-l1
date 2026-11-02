@@ -113,12 +113,31 @@ try {
     }
     if (-not $nodeBIp) { throw "Temporary runner did not obtain a connected NetBird overlay address." }
 
-    if (-not (Test-TcpEndpoint $NodeAOverlayIp 49341)) {
-        throw "Node A QRun P2P TCP 49341 is not reachable over NetBird."
+    # Management/signalling can become Connected before the peer-to-peer WireGuard
+    # path finishes establishing. Wait for both allowed TCP endpoints instead of
+    # failing on the first probe immediately after enrollment.
+    $overlayReady = $false
+    $lastP2pReachable = $false
+    $lastTimeReachable = $false
+    for ($attempt = 0; $attempt -lt 90; $attempt++) {
+        $status = Get-NetBirdStatus
+        if ($status -match "Management:\s+Connected" -and $status -match "Signal:\s+Connected") {
+            $lastP2pReachable = Test-TcpEndpoint $NodeAOverlayIp 49341 1000
+            $lastTimeReachable = Test-TcpEndpoint $NodeAOverlayIp 49550 1000
+            if ($lastP2pReachable -and $lastTimeReachable) {
+                $overlayReady = $true
+                break
+            }
+        }
+        if (($attempt + 1) % 15 -eq 0) {
+            Write-Host "NETBIRD_OVERLAY_WAIT attempt=$($attempt + 1) p2p=$lastP2pReachable time=$lastTimeReachable"
+        }
+        Start-Sleep -Seconds 1
     }
-    if (-not (Test-TcpEndpoint $NodeAOverlayIp 49550)) {
-        throw "Node A authenticated reference-time TCP 49550 is not reachable over NetBird."
+    if (-not $overlayReady) {
+        throw "NetBird peer tunnel was not ready within 90 seconds (P2P 49341=$lastP2pReachable, reference-time 49550=$lastTimeReachable)."
     }
+    Write-Host "NETBIRD_PEER_TUNNEL_READY=PASS"
     if (Test-TcpEndpoint $NodeAOverlayIp 49339) { throw "Security boundary failed: Node A RPC 49339 is reachable remotely." }
     if (Test-TcpEndpoint $NodeAOverlayIp 49340) { throw "Security boundary failed: Node A transaction ingress 49340 is reachable remotely." }
 
