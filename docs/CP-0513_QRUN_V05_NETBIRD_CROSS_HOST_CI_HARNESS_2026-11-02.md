@@ -62,10 +62,16 @@ This first stage does not yet test signed transaction propagation, partition/rec
 - YAML parser: workflow parsed successfully.
 - `QRUN_MAINNET_RELEASE_APPROVED` remains `false`.
 
+## Current verified network posture (2026-11-02)
+
+- Authenticated NetBird dashboard access was confirmed; `heymed` is the only current peer and belongs to `qrun-node-a` (`100.113.232.54`).
+- `qrun-node-b` exists and currently has zero peers.
+- The catch-all `Default` All-to-All policy is OFF.
+- The only enabled QRun inbound paths to Node A are `qrun-node-b` → `qrun-node-a` TCP 49341 (P2P) and TCP 49550 (authenticated reference time).
+- The reverse A-to-B P2P policy is OFF. The Node A machine remains fail-closed with NetBird `block-inbound` enabled until the guarded preparation script is explicitly run.
+
 ## Current blockers / non-actions
 
-- NetBird browser sign-in must be re-established before making any dashboard change; the latest browser profile had no recorded NetBird sign-in.
-- A prior browser audit, run on a profile without a recorded NetBird sign-in, reported the Default All-to-All policy ON. Treat that report as unverified, but keep Node A stopped until the authenticated dashboard is rechecked and the policy is confirmed OFF.
 - No second peer, Setup Key, Actions variable, Actions secret, PR, or cross-host run has been created.
 - No public P2P, RPC, transaction-ingress or router port has been opened.
 - No Mainnet activation, QZXB market, or trading claim is made.

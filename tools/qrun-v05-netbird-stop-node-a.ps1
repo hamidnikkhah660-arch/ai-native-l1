@@ -41,6 +41,15 @@ foreach ($name in @("node-a.pid","authority.pid")) {
         }
     }
 }
+
+# Re-enable the workstation's fail-closed inbound posture after stopping QRun listeners.
+$netbirdExe = "C:\Program Files\NetBird\netbird.exe"
+if (Test-Path $netbirdExe) {
+    & $netbirdExe up --block-inbound=true 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Could not restore NetBird block-inbound protection." }
+    Write-Host "NETBIRD_BLOCK_INBOUND_RESTORED=PASS"
+}
+
 if (Test-Path $root) {
     Remove-Item -LiteralPath $root -Recurse -Force
 }

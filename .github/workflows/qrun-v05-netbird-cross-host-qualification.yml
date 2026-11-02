@@ -20,10 +20,14 @@ concurrency:
 jobs:
   cross-host-public-alpha:
     if: >-
-      github.event_name == 'workflow_dispatch' ||
       (
+        github.event_name == 'pull_request' &&
         github.event.pull_request.head.ref == 'feat/qrun-v05-netbird-cross-host-qualification-20261102' &&
         github.event.pull_request.head.repo.full_name == github.repository
+      ) ||
+      (
+        github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/feat/qrun-v05-netbird-cross-host-qualification-20261102'
       )
     runs-on: windows-latest
     timeout-minutes: 35

@@ -261,6 +261,10 @@ catch {
     }
     Stop-Child $nodeProcess
     Stop-Child $authorityProcess
+    # Restore the workstation's fail-closed inbound posture on every failed preparation.
+    if (Test-Path $netbirdExe) {
+        & $netbirdExe up --block-inbound=true 2>&1 | Out-Null
+    }
     if ($root -and (Test-Path $root)) {
         Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
     }
