@@ -15,7 +15,7 @@ Prepare a zero-cost, temporary Windows GitHub-hosted runner as Node B to qualify
 - `tools/qrun-v05-netbird-cross-host-runner.ps1`: installs/verifies NetBird v0.82.0 on the temporary Windows runner when needed, trims and validates `NETBIRD_SETUP_KEY` as a canonical 36-character UUID before use, then consumes `NB_SETUP_KEY` without printing it, waits up to 90 seconds for the overlay P2P and authenticated-time TCP paths after peer enrollment, validates the restricted ingress canaries, builds QRun Node B, provisions a unique DPAPI NPK1 key locally, pins Node A's Noise public key, and performs authenticated startup sync.
 - `tools/qrun-v05-netbird-policy-canary.ps1`: temporary no-protocol TCP canaries bound only to Node A's overlay IP on ports 49339 and 49340. These allow the runner to test that remote RPC and transaction-ingress reachability are denied even though the actual QRun listeners are loopback-only. The canaries accept no application payload.
 - `tools/qrun-v05-netbird-stop-node-a.ps1`: stops the temporary canary, QRun Node A and time authority, then removes the dedicated temporary key/data directory.
-- `.github/workflows/qrun-v05-netbird-cross-host-qualification.yml`: restricted Windows hosted runner job. It uses `pull_request` activity for the exact same-repository qualification branch and has `contents: read`; checkout credentials are not persisted. `workflow_dispatch` is also declared for later use once the workflow exists on the default branch.
+- `.github/workflows/qrun-v05-netbird-cross-host-qualification.yml`: manual `workflow_dispatch` only, guarded to the exact qualification branch, with `contents: read`; checkout credentials are not persisted. It deliberately does not run on push or pull-request events because the job consumes a one-off NetBird Setup Key and opens narrowly scoped private-overlay listeners on Node A.
 
 ## Network boundary
 
@@ -152,3 +152,7 @@ Safety boundary remains unchanged:
 - The Stage C1 result, if it passes, proves one-way B-to-A signed transaction/block propagation and independent Node A block acceptance. It does not prove reverse A-to-B propagation, cross-host partition/reorg, independent operators, public Internet reachability, or Mainnet readiness.
 
 **Current state summary:** Stage B authenticated cross-host startup = PASS. Stage C1 signed transaction and block gossip = implemented, parser/build checks PASS, workflow NOT RUN. The earlier failed-run chronology above remains as historical record only. `QRUN_MAINNET_RELEASE_APPROVED=false`.
+
+## Manual dispatch safeguard (2026-11-03)
+
+After the Stage C1 runner extension was committed, an automatic push-triggered run started while NETBIRD_SETUP_KEY had deliberately been removed. The workflow reached the runner step and failed its missing-secret precondition before NetBird enrollment; no key was consumed and Node A was not modified. The run was cancelled during cleanup. The workflow now uses workflow_dispatch only, restricted to the exact qualification branch, so private listeners and one-off setup keys are never activated by routine branch pushes or PR updates. A new one-off key is required only when the operator explicitly starts the manual run.

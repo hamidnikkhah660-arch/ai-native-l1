@@ -1,48 +1,27 @@
 name: QRun v0.5 NetBird cross-host qualification
 
+# Manual only: this workflow consumes a one-off NetBird Setup Key and opens
+# narrowly scoped private-overlay listeners on the owner's workstation.
 on:
-  push:
-    branches:
-      - feat/qrun-v05-netbird-cross-host-qualification-20261102
-  pull_request:
-    branches:
-      - main
-    types:
-      - opened
-      - synchronize
-      - reopened
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: qrun-v05-netbird-cross-host-${{ github.event.pull_request.head.ref || github.ref }}
+  group: qrun-v05-netbird-cross-host-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   cross-host-public-alpha:
-    if: >-
-      (
-        github.event_name == 'pull_request' &&
-        github.event.pull_request.head.ref == 'feat/qrun-v05-netbird-cross-host-qualification-20261102' &&
-        github.event.pull_request.head.repo.full_name == github.repository
-      ) ||
-      (
-        github.event_name == 'workflow_dispatch' &&
-        github.ref == 'refs/heads/feat/qrun-v05-netbird-cross-host-qualification-20261102'
-      ) ||
-      (
-        github.event_name == 'push' &&
-        github.ref == 'refs/heads/feat/qrun-v05-netbird-cross-host-qualification-20261102'
-      )
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/feat/qrun-v05-netbird-cross-host-qualification-20261102'
     runs-on: windows-latest
     timeout-minutes: 35
     steps:
       - name: Checkout the exact qualification branch revision
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Verify runner toolchain and configuration
