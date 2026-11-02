@@ -81,9 +81,36 @@ This first stage does not yet test signed transaction propagation, partition/rec
 - The Runner script now waits up to 90 seconds for both allowed overlay TCP paths after Management/Signal registration, rather than probing immediately and failing during a possible tunnel-establishment race. The edited PowerShell scripts passed parser validation.
 - The successful Runner enrollment consumed the one-off Setup Key. NetBird documents one-off keys as single-use; a fresh one-off ephemeral key scoped to `qrun-node-b` is required for the next hosted attempt. Replace the repository secret with that new key value before retrying.
 
+## Second hosted Runner attempt and ACL diagnosis (2026-11-03)
+
+- GitHub Actions run [41532581169](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/41532581169) used commit `39ffa01a581b7f109478969abb002a838c13b440`. Checkout and Runner configuration validation passed, and NetBird accepted the replacement one-off Setup Key.
+- Node A observed Runner peer `100.113.192.57` with a recent WireGuard handshake and nonzero transfer counters during the run. However, both allowed TCP probes (49341 and 49550) remained unreachable for the full 90-second wait. The workflow failed before building or starting QRun Node B. No Noise XX or authenticated startup sync occurred.
+- After the Runner terminated, its ephemeral peer disconnected as expected. The active peer was no longer present in Node A's peer list.
+- Node A diagnostic `netbird debug trace in 100.113.192.57 self -p tcp --dport <port> --syn` returned `Peer ACL: Blocked by peer ACL rules (<no id>)` and `Final disposition: DENIED` for TCP 49341, 49550, 49339 and 49340. Denial of 49339/49340 is correct; denial of the two intended allowed ports shows that the active access-control policy did not match this B-to-A flow.
+- Most likely items to audit in the NetBird dashboard are Runner peer group membership (source must be `qrun-node-b`), Node A membership (destination must be `qrun-node-a`), policy activation, B-to-A direction, protocol TCP, and ports 49341/49550. Do not enable Default All-to-All or broaden access to all ports as a workaround.
+- Local safety cleanup completed after the failed run: Node A and time authority stopped, RPC/TX canary stopped, `block-inbound=true` restored, and the temporary root containing disposable keys and test state deleted. No QRun test listener remains exposed on the overlay.
+
 ## Current blockers / non-actions
 
 - Repeat the hosted qualification using a new one-off ephemeral Setup Key and verify the Node A ↔ Runner WireGuard handshake and both allowed TCP paths.
 - Only after transport is connected can the test evaluate the RPC/TX ACL canaries, build Node B, and attempt authenticated Noise XX startup sync.
 - GitHub Actions variable `QRUN_CROSS_HOST_CONFIG_JSON` is configured with disposable public-only test configuration; repository secret `NETBIRD_SETUP_KEY` is set but its one-off value has already been consumed.
 - Draft PR #132 remains open and unmerged. The qualification branch is separate from `main`; no Mainnet activation, public RPC/TX ingress, public router port, QZXB live market, or trading claim is made.
+
+
+## Correction and updated diagnosis (2026-11-03)
+
+The operator directly confirmed that the NetBird Default All-to-All policy is OFF. A read-only automated dashboard inspection returned a contradictory ON state; no dashboard policy was changed during these inspections. Treat the automated Default-policy reading as unreliable. Do not enable or otherwise modify the Default policy.
+
+The detailed dashboard inspection confirmed:
+- Node A peer heymed (100.113.232.54) belongs to qrun-node-a.
+- Temporary Node B peer runnervmhao91 (100.113.192.57) belongs to qrun-node-b.
+- QRun P2P B-to-A TCP 49341 is enabled, unidirectional from qrun-node-b to qrun-node-a.
+- QRun Time B-to-A TCP 49550 is enabled, unidirectional from qrun-node-b to qrun-node-a.
+- The reverse P2P policy is disabled. RPC/TX ports 49339 and 49340 have no allow rule.
+
+**Leading root-cause diagnosis:** NetBird official CLI documentation/source says that netbird up on an already-connected peer prints Already connected and exits without applying changed configuration flags. The original Node A preparation script invoked netbird up --block-inbound=false while already connected. Therefore the client-side Block Inbound override may have remained enabled, overriding the two correctly configured B-to-A ACL policies and causing the peer ACL trace to deny all inbound ports. This is strongly supported by the observed Already connected output, but must be verified in a new cross-host test.
+
+The preparation script now performs an explicit netbird down followed by netbird up --block-inbound=false before opening Node A listeners. The preparation failure path and normal stop script likewise force down followed by up --block-inbound, restoring fail-closed behavior. Both scripts passed PowerShell parser validation after the edits.
+
+The last failed run remains unqualified: Node B did not build or start, and no authenticated Noise XX sync or block convergence was demonstrated. Node A, the time authority, and the policy canary are stopped; the temporary test root was deleted; block-inbound=true was restored through an actual reconnect; no QRun test listener remains open on the overlay. A fresh one-off ephemeral Setup Key will be required for the next hosted run.

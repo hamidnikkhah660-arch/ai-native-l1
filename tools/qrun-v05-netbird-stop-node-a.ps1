@@ -45,8 +45,15 @@ foreach ($name in @("node-a.pid","authority.pid")) {
 # Re-enable the workstation's fail-closed inbound posture after stopping QRun listeners.
 $netbirdExe = "C:\Program Files\NetBird\netbird.exe"
 if (Test-Path $netbirdExe) {
-    & $netbirdExe up --block-inbound=true 2>&1 | Out-Null
+    # Force a reconnect because "up" on an already-connected client may not
+    # apply changes to the block-inbound flag (it can return "Already connected").
+    & $netbirdExe down 2>&1 | Out-Null
+    & $netbirdExe up --block-inbound 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Could not restore NetBird block-inbound protection." }
+    $restoredStatus = (& $netbirdExe status 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0 -or $restoredStatus -notmatch "Management:\s+Connected" -or $restoredStatus -notmatch "Signal:\s+Connected") {
+        throw "NetBird did not reconnect after restoring fail-closed inbound protection."
+    }
     Write-Host "NETBIRD_BLOCK_INBOUND_RESTORED=PASS"
 }
 

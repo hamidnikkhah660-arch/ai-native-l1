@@ -57,8 +57,11 @@ try {
         throw "Refusing to open Node A listeners until restrictive NetBird policies have been independently re-verified."
     }
     if (-not (Test-Path $netbirdExe)) { throw "NetBird CLI is not installed." }
-    # Clear the client-side block-inbound override only after the operator has verified
-    # that Default all-to-all is disabled and the qrun-node-b -> qrun-node-a ACLs are exact.
+    # NetBird may return "Already connected" when 'up' is called with a changed
+    # block-inbound flag. Cycle the client so the fail-closed override is definitely
+    # replaced by policy-scoped inbound access, only after the operator verifies ACLs.
+    & $netbirdExe down
+    if ($LASTEXITCODE -ne 0) { throw "Could not disconnect NetBird before applying the restricted inbound mode." }
     & $netbirdExe up --block-inbound=false
     if ($LASTEXITCODE -ne 0) { throw "Could not apply the policy-scoped NetBird inbound mode." }
     foreach ($path in @($nodeExe,$authorityExe,$noiseExe,$smokeExe)) {
@@ -287,7 +290,13 @@ catch {
     Stop-Child $authorityProcess
     # Restore the workstation's fail-closed inbound posture on every failed preparation.
     if (Test-Path $netbirdExe) {
-        & $netbirdExe up --block-inbound=true 2>&1 | Out-Null
+        # Force the setting through a reconnect; an already-connected "up" can
+        # return "Already connected" without applying a changed inbound flag.
+        & $netbirdExe down 2>&1 | Out-Null
+        & $netbirdExe up --block-inbound 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Could not confirm fail-closed NetBird inbound mode in the preparation failure path."
+        }
     }
     if ($root -and (Test-Path $root)) {
         Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
