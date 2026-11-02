@@ -1,7 +1,7 @@
 # CP-0513 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â QRun v0.5 NetBird Cross-Host CI Harness
 
 **Date:** 2026-11-02
-**Status:** Cross-host authenticated startup PASS (run 41540604143). Signed transaction / QFP5 block-gossip extension implemented on 2026-11-03; NOT RUN pending a fresh one-off Setup Key.
+**Status:** Cross-host authenticated startup PASS (run 41540604143). Stage C1 signed transaction and QFP5 block-gossip PASS (run 41546003659). Cross-host partition/reorg and independent-operator gates remain unqualified.
 **Branch:** `feat/qrun-v05-netbird-cross-host-qualification-20261102`
 **Last verified implementation commit before this harness:** `38df9662baa457e4b2a2ca98d9797e87cf0a11fd`
 
@@ -156,3 +156,42 @@ Safety boundary remains unchanged:
 ## Manual dispatch safeguard (2026-11-03)
 
 After the Stage C1 runner extension was committed, an automatic push-triggered run started while NETBIRD_SETUP_KEY had deliberately been removed. The workflow reached the runner step and failed its missing-secret precondition before NetBird enrollment; no key was consumed and Node A was not modified. The run was cancelled during cleanup. The workflow now uses workflow_dispatch only, restricted to the exact qualification branch, so private listeners and one-off setup keys are never activated by routine branch pushes or PR updates. A new one-off key is required only when the operator explicitly starts the manual run.
+
+
+## Stage C1 cross-host signed transaction and QFP5 block-gossip PASS (2026-11-03)
+
+This section supersedes the earlier "implemented; NOT RUN" status above. Stage C1 completed successfully on the exact qualification branch using GitHub Actions run [41546003659](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/41546003659). The run completed with **success** on the manual-only workflow.
+
+Observed evidence from the Runner log and Node A's local RPC/logs:
+
+- The temporary Windows GitHub-hosted Node B enrolled into NetBird as ephemeral peer `runnervmhao91-49-120` at overlay IP `100.113.49.120`. Node A observed a direct WireGuard `P2P` connection with a recent handshake and nonzero transfer counters.
+- Node B reached Node A's overlay TCP 49341 (QRun P2P) and 49550 (signed reference time). Remote access to RPC 49339 and transaction ingress 49340 remained blocked.
+- Node B created its own CurrentUser-DPAPI-protected NPK1 key. The Runner emitted `NODE_B_PRIVATE_KEY_EXPORTED=NO`; no private Noise key or wallet seed was transferred.
+- Pinned Noise XX authenticated startup sync completed against the fresh disposable Public Alpha network.
+- The test-only signer public identity matched the fresh Node A Genesis owner identity; the deterministic fixture seed was not exported.
+- Node B submitted a signed QZTS/1 transaction and received Accepted. Its canonical receipt became `confirmed`; owner nonce reached 1; recipient balance reached 1,000 atoms.
+- Node B received a valid encrypted QRA5 acknowledgement from Node A after Node A validated the incoming height-1 block. Runner markers included `CROSS_HOST_NOISE_QFP5_BLOCK_GOSSIP_NODE_A_ACK=PASS`.
+- Node A's own stdout recorded `qrun_pow_local_block_gossip accepted height=1 canonical_height=1`. A subsequent loopback-only RPC query independently confirmed Node A at height 1 with the same canonical tip and state root as Node B.
+- Transaction ID: `eaedac9df248b37f40b735deed95696895c4a3e62d34f0a558d07ca1b1308efe`.
+- Canonical height: `1`.
+- Canonical tip: `0055f5a920c3ee5377e89af7d979f27a1fe6a70ef7aaf478e1a9c215f5035acb`.
+- State root: `f71d7ca1ca2bc34d33c95dcfa263769332e206b6837b74375136bf826f01cb81`.
+- Node A local RPC reported owner nonce 1, owner balance `999999999999999000` atoms and recipient balance `1000` atoms.
+- All Runner markers passed: `NETBIRD_PEER_TUNNEL_READY`, `CROSS_HOST_TEST_SIGNER_MATCHES_GENESIS`, `CROSS_HOST_SIGNED_QZTS_TX_ACCEPTED`, `CROSS_HOST_NODE_B_CANONICAL_RECEIPT`, `CROSS_HOST_NODE_B_RECIPIENT_BALANCE`, `CROSS_HOST_NOISE_QFP5_BLOCK_GOSSIP_NODE_A_ACK`, `NETBIRD_CROSS_HOST_TCP_P2P_49341`, `NETBIRD_CROSS_HOST_AUTH_TIME_49550`, `REMOTE_RPC_49339_BLOCKED`, `REMOTE_TX_49340_BLOCKED`, and `NOISE_XX_PINNED_STARTUP_SYNC`.
+
+Cleanup completed successfully after the run:
+
+- Node B's Runner `finally` path stopped the temporary Node B process, disconnected its NetBird peer, removed its ephemeral DPAPI key and data directory, and cleared the setup-key environment variables.
+- The guarded Node A stop script stopped Node A, the reference-time authority and the policy canary; restored NetBird `block-inbound=true` through an explicit reconnect; and removed the entire dedicated temporary root containing Node A keys and test state. The script exited 0 and emitted `NETBIRD_BLOCK_INBOUND_RESTORED=PASS` and `NODE_A_TEMP_KEYS_AND_DATA_REMOVED=PASS`.
+- A post-cleanup check found no QRun processes and no listeners on 49339, 49340, 49341 or 49550. Node A's NetBird Management and Signal remain Connected; the temporary peer is disconnected.
+- The consumed `NETBIRD_SETUP_KEY` repository secret and temporary `QRUN_CROSS_HOST_CONFIG_JSON` repository variable were both deleted and verified absent.
+
+Scope and limitations:
+
+- **Verified:** one-way cross-host B-to-A signed transaction and block propagation over a direct NetBird P2P tunnel; pinned Noise XX startup authentication; independent Node A block validation/acknowledgement; and canonical height-1 state agreement on both hosts.
+- **Not verified by Stage C1:** reverse A-to-B propagation, cross-host partition/reconnect/reorg, multiple independently administered operators, native public-Internet reachability, external users, Mainnet readiness or any live-market/QZXB trading claim.
+- Node A and Node B ran the same disposable Public Alpha network with `mainnet=false`. The test-only signer fixture is not a production wallet identity.
+- The workstation is back in its restrictive fail-closed inbound posture. No temporary key, QRun listener, test process or test data remains active.
+- Draft PR #132 remains open and unmerged; `main` was not changed.
+
+**Updated state:** Stage B authenticated cross-host startup = PASS. Stage C1 cross-host signed transaction and QFP5 block gossip = PASS. Cross-host partition/reorg and independent-operator qualification remain future gates. `QRUN_MAINNET_RELEASE_APPROVED=false`.
