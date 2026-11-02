@@ -1,6 +1,9 @@
 name: QRun v0.5 NetBird cross-host qualification
 
 on:
+  push:
+    branches:
+      - feat/qrun-v05-netbird-cross-host-qualification-20261102
   pull_request:
     branches:
       - main
@@ -27,6 +30,10 @@ jobs:
       ) ||
       (
         github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/feat/qrun-v05-netbird-cross-host-qualification-20261102'
+      ) ||
+      (
+        github.event_name == 'push' &&
         github.ref == 'refs/heads/feat/qrun-v05-netbird-cross-host-qualification-20261102'
       )
     runs-on: windows-latest
