@@ -32,7 +32,7 @@ use crate::{
     },
     qrun_v05_genesis_candidate::QRunGenesisV05,
     qrun_v05_history_archive_candidate::{
-        create_or_verify_qrun_v05_history_archive, replay_qrun_v05_history_archive,
+        create_or_verify_qrun_v05_history_archive, replay_qrun_v05_history_archive_with_genesis,
         QRunHistoryArchiveError,
     },
     state_machine::{AccountId, LedgerState, StateError, TransactionAuthenticator},
@@ -1043,8 +1043,16 @@ fn qrun_v05_genesis_commitment_for_owner(
     genesis: &LedgerState,
     owner_account: AccountId,
 ) -> Result<[u8; 32], ForkStoreError> {
-    let expected_genesis = QRunGenesisV05::new(genesis.network_id(), owner_account)
-        .map_err(|_| ForkStoreError::ManifestProfileMismatch)?;
+    let expected_genesis = if genesis.last_timestamp() == 0 {
+        QRunGenesisV05::new(genesis.network_id(), owner_account)
+    } else {
+        QRunGenesisV05::new_with_genesis_timestamp(
+            genesis.network_id(),
+            owner_account,
+            genesis.last_timestamp(),
+        )
+    }
+    .map_err(|_| ForkStoreError::ManifestProfileMismatch)?;
     if expected_genesis.state_root() != genesis.state_root()
         || genesis.total_value().ok() != Some(crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS)
     {
@@ -1807,7 +1815,19 @@ where
             .map(|byte| format!("{byte:02x}"))
             .collect();
         let archive_directory = archive_root.join(archive_id_hex);
-        let replay = replay_qrun_v05_history_archive(
+        let replay_genesis = if genesis_identity.last_timestamp() == 0 {
+            QRunGenesisV05::new(pin.network_id, owner_account)
+        } else {
+            QRunGenesisV05::new_with_genesis_timestamp(
+                pin.network_id,
+                owner_account,
+                genesis_identity.last_timestamp(),
+            )
+        }
+        .map_err(|_| {
+            QRunV05CheckpointMigrationExecutionError::Store(ForkStoreError::ManifestProfileMismatch)
+        })?;
+        let replay = replay_qrun_v05_history_archive_with_genesis(
             &archive_directory,
             pin.network_id,
             pin.genesis_digest,
@@ -1815,6 +1835,7 @@ where
             *archive_summary.genesis_tip(),
             *archive_summary.previous_manifest_anchor(),
             owner_account,
+            replay_genesis,
             &params,
             authenticator,
             clock,
@@ -3000,6 +3021,20 @@ mod tests {
         }
     }
 
+    struct ClockAt(u64);
+
+    impl ReferenceTimeProvider for ClockAt {
+        fn sample(
+            &self,
+        ) -> Result<ReferenceTimeSample, crate::chain_admission::ReferenceTimeError> {
+            Ok(ReferenceTimeSample {
+                unix_seconds: self.0,
+                provenance: ReferenceTimeProvenance::ConfiguredProvider,
+                source_id: "fork-store-test-clock-at",
+            })
+        }
+    }
+
     struct MemoryCasState {
         record: ExternalCasRecord,
         object_generation: u64,
@@ -3307,8 +3342,9 @@ mod tests {
         let mut genesis_archive =
             PrivateTestnetForkChoice::new_qrun_v05_fee_only(genesis.clone(), params.clone())
                 .unwrap();
+        let first_clock = ClockAt(100);
         genesis_archive
-            .insert_encoded(&first, &EmptyAuthenticator, &FixedClock)
+            .insert_encoded(&first, &EmptyAuthenticator, &first_clock)
             .unwrap();
         let checkpoint_chain = genesis_archive.canonical_chain().clone();
         assert_eq!(checkpoint_chain.state().height(), 1);
@@ -3362,7 +3398,7 @@ mod tests {
             101,
         );
         store
-            .submit(&next, &EmptyAuthenticator, &FixedClock)
+            .submit(&next, &EmptyAuthenticator, &ClockAt(101))
             .unwrap();
         assert_eq!(store.canonical_height(), 2);
         assert_eq!(
@@ -3512,8 +3548,9 @@ mod tests {
             &header, &fee_block,
         )
         .unwrap();
+        let envelope_clock = ClockAt(100);
         store
-            .submit(&envelope, &EmptyAuthenticator, &FixedClock)
+            .submit(&envelope, &EmptyAuthenticator, &envelope_clock)
             .unwrap();
         assert_eq!(store.canonical_height(), 1);
         assert_eq!(
@@ -3634,8 +3671,9 @@ mod tests {
         let mut candidate_archive =
             PrivateTestnetForkChoice::new_qrun_v05_fee_only(genesis.clone(), params.clone())
                 .unwrap();
+        let envelope_clock = ClockAt(100);
         let outcome = candidate_archive
-            .insert_encoded(&envelope, &EmptyAuthenticator, &FixedClock)
+            .insert_encoded(&envelope, &EmptyAuthenticator, &envelope_clock)
             .unwrap();
         write_branch_create_new(
             &dir.0.join(branch_file_name(&outcome.block_digest)),
@@ -3785,8 +3823,9 @@ mod tests {
             .unwrap();
         let genesis_checkpoint_commitment = genesis_checkpoint.commitment(&params).unwrap();
         let first = qrun_fee_envelope(&genesis, &params);
+        let first_clock = ClockAt(100);
         archive
-            .insert_encoded(&first, &EmptyAuthenticator, &FixedClock)
+            .insert_encoded(&first, &EmptyAuthenticator, &first_clock)
             .unwrap();
         assert_eq!(archive.canonical_chain().state().height(), 1);
         let checkpoint = crate::qrun_v05_checkpoint_candidate::QRunV05PowCheckpoint::capture(
@@ -3929,8 +3968,9 @@ mod tests {
             .unwrap();
         restored_chain.enable_qrun_v05_fee_only_execution().unwrap();
         let next = qrun_fee_envelope_from_chain(&restored_chain, &params, [0x78; 32], 101);
+        let next_clock = ClockAt(101);
         store
-            .submit(&next, &EmptyAuthenticator, &FixedClock)
+            .submit(&next, &EmptyAuthenticator, &next_clock)
             .unwrap();
         assert_eq!(store.canonical_height(), 2);
         let expected_root = store.canonical_state().state_root();
@@ -4065,7 +4105,7 @@ mod tests {
             store.submit(
                 &qrun_fee_envelope(&genesis, &params),
                 &EmptyAuthenticator,
-                &FixedClock
+                &ClockAt(100)
             ),
             Err(ForkStoreError::ExternalCasClient(
                 ExternalCasClientError::Provider(_)
@@ -4091,7 +4131,9 @@ mod tests {
         let archive_root = TestDir::new();
         let floor_dir = TestDir::new();
 
-        let genesis_candidate = QRunGenesisV05::new(NETWORK, OWNER).unwrap();
+        let genesis_timestamp = 1_800_000_000;
+        let genesis_candidate =
+            QRunGenesisV05::new_with_genesis_timestamp(NETWORK, OWNER, genesis_timestamp).unwrap();
         let genesis = genesis_candidate.ledger().clone();
         let mut params = params();
         params.protocol_version = 5;
@@ -4118,7 +4160,7 @@ mod tests {
             .unwrap();
         let parent_checkpoint_commitment = genesis_checkpoint.commitment(&params).unwrap();
 
-        // Build a replay-validated Genesis-rooted PFS2 containing one real QFP5 block.
+        // Build a replay-validated time-anchored Genesis-rooted PFS2 containing one real QFP5 block.
         let mut source = PrivateTestnetForkStore::open_qrun_v05_fee_only(
             &store_dir.0,
             genesis.clone(),
@@ -4127,9 +4169,18 @@ mod tests {
             &FixedClock,
         )
         .unwrap();
-        let envelope = qrun_fee_envelope(&genesis, &params);
+        let envelope = qrun_fee_envelope_from_chain(
+            &genesis_chain,
+            &params,
+            [0x77; 32],
+            genesis_timestamp + 1,
+        );
         source
-            .submit(&envelope, &EmptyAuthenticator, &FixedClock)
+            .submit(
+                &envelope,
+                &EmptyAuthenticator,
+                &ClockAt(genesis_timestamp + 1),
+            )
             .unwrap();
         assert_eq!(source.canonical_height(), 1);
         let previous_manifest_anchor = source.manifest_anchor().unwrap();
@@ -4148,18 +4199,20 @@ mod tests {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>(),
         );
-        let replay = crate::qrun_v05_history_archive_candidate::replay_qrun_v05_history_archive(
-            &archive_directory,
-            NETWORK,
-            genesis_candidate.commitment(),
-            *archive_summary.profile_fingerprint(),
-            *archive_summary.genesis_tip(),
-            *archive_summary.previous_manifest_anchor(),
-            OWNER,
-            &params,
-            &EmptyAuthenticator,
-            &FixedClock,
-        )
+        let replay =
+            crate::qrun_v05_history_archive_candidate::replay_qrun_v05_history_archive_with_genesis(
+                &archive_directory,
+                NETWORK,
+                genesis_candidate.commitment(),
+                *archive_summary.profile_fingerprint(),
+                *archive_summary.genesis_tip(),
+                *archive_summary.previous_manifest_anchor(),
+                OWNER,
+                genesis_candidate.clone(),
+                &params,
+                &EmptyAuthenticator,
+                &FixedClock,
+            )
         .unwrap();
         assert_eq!(replay.canonical_height(), 1);
 
@@ -4449,7 +4502,7 @@ mod tests {
         .unwrap();
         let envelope = qrun_fee_envelope(&genesis, &params);
         source
-            .submit(&envelope, &EmptyAuthenticator, &FixedClock)
+            .submit(&envelope, &EmptyAuthenticator, &ClockAt(100))
             .unwrap();
         assert_eq!(source.canonical_height(), 1);
         let expected_tip = source.canonical_tip();
@@ -4817,7 +4870,7 @@ mod tests {
             .mine_candidate(100, Vec::new(), &EmptyAuthenticator, 1)
             .unwrap();
         runtime
-            .submit_block(&envelope, &EmptyAuthenticator, &FixedClock)
+            .submit_block(&envelope, &EmptyAuthenticator, &ClockAt(100))
             .unwrap();
         assert_eq!(runtime.canonical_height(), 1);
         assert_eq!(
@@ -4960,7 +5013,7 @@ mod tests {
         let genesis_checkpoint_commitment = genesis_checkpoint.commitment(&params).unwrap();
         let first = qrun_fee_envelope(&genesis, &params);
         archive
-            .insert_encoded(&first, &EmptyAuthenticator, &FixedClock)
+            .insert_encoded(&first, &EmptyAuthenticator, &ClockAt(100))
             .unwrap();
         let checkpoint = crate::qrun_v05_checkpoint_candidate::QRunV05PowCheckpoint::capture(
             WALLET_BOUND_NETWORK_ID,
@@ -5123,7 +5176,7 @@ mod tests {
             200,
         );
         store
-            .submit(&second, &EmptyAuthenticator, &FixedClock)
+            .submit(&second, &EmptyAuthenticator, &ClockAt(200))
             .unwrap();
         assert_eq!(store.canonical_height(), 2);
         assert_eq!(store.trusted_record().generation, 1);
@@ -5145,8 +5198,9 @@ mod tests {
             215,
         );
         let mut candidate_archive = store.archive().clone();
+        let third_clock = ClockAt(215);
         let third_outcome = candidate_archive
-            .insert_encoded(&third, &EmptyAuthenticator, &FixedClock)
+            .insert_encoded(&third, &EmptyAuthenticator, &third_clock)
             .unwrap();
         write_branch_create_new(
             &dir.0.join(branch_file_name(&third_outcome.block_digest)),
@@ -5363,7 +5417,7 @@ mod tests {
         )
         .unwrap();
         store
-            .submit(&fee, &EmptyAuthenticator, &FixedClock)
+            .submit(&fee, &EmptyAuthenticator, &ClockAt(100))
             .unwrap();
         assert_eq!(store.canonical_height(), 1);
         assert_eq!(
@@ -5933,15 +5987,19 @@ mod tests {
 
                 let (a1, a1_digest) = envelope(&genesis_chain, &params, 1_000_001, 101);
                 let (b1, b1_digest) = envelope(&genesis_chain, &params, 1_000_002, 201);
-                store.submit(&a1, &EmptyAuthenticator, &FixedClock).unwrap();
-                store.submit(&b1, &EmptyAuthenticator, &FixedClock).unwrap();
+                let a1_clock = ClockAt(1_000_001);
+                let b1_clock = ClockAt(1_000_002);
+                store.submit(&a1, &EmptyAuthenticator, &a1_clock).unwrap();
+                store.submit(&b1, &EmptyAuthenticator, &b1_clock).unwrap();
 
                 let a1_chain = store.archive().branch_chain(&a1_digest).unwrap().clone();
                 let b1_chain = store.archive().branch_chain(&b1_digest).unwrap().clone();
                 let (a2, a2_digest) = envelope(&a1_chain, &params, 1_000_010, 102);
                 let (b2, b2_digest) = envelope(&b1_chain, &params, 1_000_020, 202);
-                store.submit(&a2, &EmptyAuthenticator, &FixedClock).unwrap();
-                store.submit(&b2, &EmptyAuthenticator, &FixedClock).unwrap();
+                let a2_clock = ClockAt(1_000_010);
+                let b2_clock = ClockAt(1_000_020);
+                store.submit(&a2, &EmptyAuthenticator, &a2_clock).unwrap();
+                store.submit(&b2, &EmptyAuthenticator, &b2_clock).unwrap();
 
                 assert_eq!(store.archive().archive_len(), 4);
                 // Equal-height/equal-work choice has one loser; extend that branch so the
@@ -5958,8 +6016,9 @@ mod tests {
                     )
                 };
                 let (child, child_digest) = envelope(&loser_chain, &params, child_timestamp, 303);
+                let child_clock = ClockAt(child_timestamp);
                 let outcome = store
-                    .submit(&child, &EmptyAuthenticator, &FixedClock)
+                    .submit(&child, &EmptyAuthenticator, &child_clock)
                     .unwrap();
                 assert_eq!(outcome.canonical_tip, child_digest);
                 assert_eq!(outcome.canonical_height, 3);

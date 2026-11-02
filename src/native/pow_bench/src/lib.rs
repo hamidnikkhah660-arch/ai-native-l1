@@ -137,6 +137,7 @@ pub mod qzxb_amm_candidate;
 pub mod qzxb_wallet_store_candidate;
 pub mod recovery;
 pub mod reference_time;
+pub mod reference_time_authority;
 pub mod reference_time_store;
 pub mod reference_time_tcp;
 /// Research-only durable file wrapper for reward-pool snapshots; not canonical persistence.

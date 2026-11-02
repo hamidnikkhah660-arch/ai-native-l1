@@ -171,6 +171,16 @@ impl ChainAdmissionBoundary {
     pub const fn testnet() -> Self {
         Self::new(ChainAdmissionConfig::testnet())
     }
+
+    /// Candidate QRun v0.5 live policy: local reference-time freshness is bounded
+    /// on both sides. Historical replay uses a separate clock-free entrypoint.
+    pub const fn qrun_v05_live() -> Self {
+        Self::new(ChainAdmissionConfig::new(
+            TimestampPolicy::qrun_v05_live(),
+            ReferenceTimeSourcePolicy::SystemClockOrConfiguredProvider,
+        ))
+    }
+
     pub const fn config(&self) -> ChainAdmissionConfig {
         self.config
     }

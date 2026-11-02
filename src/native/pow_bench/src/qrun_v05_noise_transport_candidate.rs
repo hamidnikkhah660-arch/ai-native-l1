@@ -34,6 +34,9 @@ const MAX_RECORD_CIPHERTEXT: usize = MAX_NOISE_APPLICATION_RECORD_BYTES + 128;
 const MIN_RECORD_CIPHERTEXT: usize = 16;
 const HANDSHAKE_BUDGET: Duration = Duration::from_secs(5);
 const RECORD_BUDGET: Duration = Duration::from_secs(5);
+// An authenticated block ACK follows full PoW and state-transition validation on the peer.
+// Keep ordinary records at five seconds; only this response path receives the wider bound.
+const BLOCK_ACK_RECORD_BUDGET: Duration = Duration::from_secs(30);
 const MAX_TRUSTED_PEERS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -382,7 +385,25 @@ impl QRunV05NoiseSession {
 
     /// Read one length-bounded Noise record and authenticate it before returning plaintext.
     pub fn read_record(&mut self, stream: &mut TcpStream) -> Result<Vec<u8>, QRunV05NoiseError> {
-        let deadline = Instant::now() + RECORD_BUDGET;
+        self.read_record_with_budget(stream, RECORD_BUDGET)
+    }
+
+    /// Read an authenticated block-validation ACK. The peer emits this only after full PoW
+    /// and state-transition validation, which can exceed the ordinary five-second record budget.
+    /// This path remains bounded to 30 seconds; all other Noise records retain the five-second cap.
+    pub fn read_block_ack_record(
+        &mut self,
+        stream: &mut TcpStream,
+    ) -> Result<Vec<u8>, QRunV05NoiseError> {
+        self.read_record_with_budget(stream, BLOCK_ACK_RECORD_BUDGET)
+    }
+
+    fn read_record_with_budget(
+        &mut self,
+        stream: &mut TcpStream,
+        budget: Duration,
+    ) -> Result<Vec<u8>, QRunV05NoiseError> {
+        let deadline = Instant::now() + budget;
         apply_timeouts(stream, deadline).map_err(io_error)?;
         let mut length = [0u8; 4];
         read_exact_until(stream, &mut length, deadline).map_err(map_record_io_error)?;
@@ -837,6 +858,47 @@ mod tests {
         assert_eq!(
             session.read_record(&mut stream).unwrap(),
             b"public-alpha-ack"
+        );
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn block_ack_record_waits_for_bounded_pow_validation_beyond_normal_record_budget() {
+        let network = [0x65; 32];
+        let profile = [0x75; 32];
+        let (server_private, _server_public) = keypair(51);
+        let (client_private, _client_public) = keypair(52);
+        let (listener, address) = listener();
+
+        let server_thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut session = QRunV05NoiseSession::accept_public(
+                &mut stream,
+                &server_private,
+                &network,
+                &profile,
+            )
+            .unwrap();
+            assert_eq!(
+                session.read_record(&mut stream).unwrap(),
+                b"candidate-block-frame"
+            );
+            // Model the peer's bounded PoW/state validation taking slightly longer than the
+            // ordinary record deadline. Its ACK write itself remains on the ordinary budget.
+            thread::sleep(Duration::from_millis(5_200));
+            session.write_record(&mut stream, b"QRA5-accepted").unwrap();
+        });
+
+        let mut stream = TcpStream::connect(address).unwrap();
+        let mut session =
+            QRunV05NoiseSession::connect_public(&mut stream, &client_private, &network, &profile)
+                .unwrap();
+        session
+            .write_record(&mut stream, b"candidate-block-frame")
+            .unwrap();
+        assert_eq!(
+            session.read_block_ack_record(&mut stream).unwrap(),
+            b"QRA5-accepted"
         );
         server_thread.join().unwrap();
     }

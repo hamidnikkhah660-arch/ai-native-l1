@@ -27,7 +27,7 @@ use crate::{
     },
     qrun_v05_genesis_candidate::QRunGenesisV05,
     qrun_v05_history_archive_candidate::{
-        encode_hex, read_regular_file_nofollow, replay_qrun_v05_history_archive,
+        encode_hex, read_regular_file_nofollow, replay_qrun_v05_history_archive_with_genesis,
         verify_qrun_v05_history_archive, QRunHistoryArchiveError,
     },
     state_machine::{LedgerState, TransactionAuthenticator, MAX_TOTAL_SUPPLY_ATOMS},
@@ -172,6 +172,7 @@ fn validate_checkpoint_rooted_manifest(
     journal: &QRunCheckpointMigrationJournal,
     pin: &ExternalCasPin,
     owner_account: [u8; 32],
+    wallet_genesis: &QRunGenesisV05,
     params: &ConsensusParameters,
     active_manifest: &[u8],
 ) -> Result<(), QRunCheckpointMigrationRecoveryError> {
@@ -183,9 +184,10 @@ fn validate_checkpoint_rooted_manifest(
         return Err(QRunCheckpointMigrationRecoveryError::Quarantined);
     }
 
-    let wallet_genesis = QRunGenesisV05::new(pin.network_id, owner_account)
-        .map_err(|_| QRunCheckpointMigrationRecoveryError::GenesisMismatch)?;
-    if wallet_genesis.commitment() != pin.genesis_digest {
+    if wallet_genesis.network_id() != pin.network_id
+        || wallet_genesis.owner_account() != owner_account
+        || wallet_genesis.commitment() != pin.genesis_digest
+    {
         return Err(QRunCheckpointMigrationRecoveryError::GenesisMismatch);
     }
 
@@ -257,8 +259,16 @@ where
     if params.protocol_version != 5 || genesis.network_id() != pin.network_id {
         return Err(QRunCheckpointMigrationRecoveryError::GenesisMismatch);
     }
-    let wallet_genesis = QRunGenesisV05::new(pin.network_id, owner_account)
-        .map_err(|_| QRunCheckpointMigrationRecoveryError::GenesisMismatch)?;
+    let wallet_genesis = if genesis.last_timestamp() == 0 {
+        QRunGenesisV05::new(pin.network_id, owner_account)
+    } else {
+        QRunGenesisV05::new_with_genesis_timestamp(
+            pin.network_id,
+            owner_account,
+            genesis.last_timestamp(),
+        )
+    }
+    .map_err(|_| QRunCheckpointMigrationRecoveryError::GenesisMismatch)?;
     if wallet_genesis.commitment() != pin.genesis_digest
         || wallet_genesis.ledger().state_root() != genesis.state_root()
         || genesis.height() != 0
@@ -300,7 +310,9 @@ where
     // or floor mutation occurs until the opaque QRA1 summary and full replay witness validate it.
     let journal =
         QRunCheckpointMigrationJournal::decode_without_archive(&intent_bytes, pin, params)?;
-    if journal.owner_account != owner_account {
+    if journal.owner_account != owner_account
+        || journal.genesis_timestamp != genesis.last_timestamp()
+    {
         return Err(QRunCheckpointMigrationRecoveryError::GenesisMismatch);
     }
     let previous_manifest_anchor = manifest_anchor_commitment(&journal.previous_manifest);
@@ -321,7 +333,7 @@ where
         params,
     )?;
     journal.validate(pin, params, &archive_summary)?;
-    let replay = replay_qrun_v05_history_archive(
+    let replay = replay_qrun_v05_history_archive_with_genesis(
         &archive_directory,
         pin.network_id,
         pin.genesis_digest,
@@ -329,6 +341,7 @@ where
         old_manifest.genesis_tip,
         previous_manifest_anchor,
         owner_account,
+        wallet_genesis.clone(),
         params,
         authenticator,
         clock,
@@ -429,6 +442,7 @@ where
                     &journal,
                     pin,
                     owner_account,
+                    &wallet_genesis,
                     params,
                     &manifest_final,
                 )?;

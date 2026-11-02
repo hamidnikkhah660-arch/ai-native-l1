@@ -645,6 +645,48 @@ pub fn replay_qrun_v05_history_archive<A: crate::state_machine::TransactionAuthe
     authenticator: &A,
     clock: &dyn crate::chain_admission::ReferenceTimeProvider,
 ) -> Result<QRunHistoryArchiveReplay, QRunHistoryArchiveError> {
+    let genesis = QRunGenesisV05::new(expected_network_id, owner_account)
+        .map_err(|_| QRunHistoryArchiveError::ManifestProfileMismatch)?;
+    replay_qrun_v05_history_archive_with_genesis(
+        archive_directory,
+        expected_network_id,
+        expected_genesis_commitment,
+        expected_profile_fingerprint,
+        expected_genesis_tip,
+        expected_manifest_anchor,
+        owner_account,
+        genesis,
+        params,
+        authenticator,
+        clock,
+    )
+}
+
+/// Replay a QRA1 archive from the exact already-authenticated Genesis object. This variant
+/// preserves Genesis-time anchors and avoids reconstructing a legacy/unanchored Genesis during
+/// checkpoint migration or recovery.
+#[allow(clippy::too_many_arguments)]
+pub fn replay_qrun_v05_history_archive_with_genesis<
+    A: crate::state_machine::TransactionAuthenticator,
+>(
+    archive_directory: impl AsRef<Path>,
+    expected_network_id: [u8; 32],
+    expected_genesis_commitment: [u8; 32],
+    expected_profile_fingerprint: [u8; 32],
+    expected_genesis_tip: [u8; 32],
+    expected_manifest_anchor: [u8; 32],
+    owner_account: [u8; 32],
+    genesis: QRunGenesisV05,
+    params: &ConsensusParameters,
+    authenticator: &A,
+    clock: &dyn crate::chain_admission::ReferenceTimeProvider,
+) -> Result<QRunHistoryArchiveReplay, QRunHistoryArchiveError> {
+    if genesis.network_id() != expected_network_id
+        || genesis.owner_account() != owner_account
+        || genesis.commitment() != expected_genesis_commitment
+    {
+        return Err(QRunHistoryArchiveError::ManifestProfileMismatch);
+    }
     let summary = verify_qrun_v05_history_archive(
         &archive_directory,
         expected_network_id,
@@ -701,9 +743,10 @@ pub fn replay_qrun_v05_history_archive<A: crate::state_machine::TransactionAuthe
     }
     validate_exact_directory_entries(&directory, &expected_names)?;
 
-    let genesis = QRunGenesisV05::new(expected_network_id, owner_account)
-        .map_err(|_| QRunHistoryArchiveError::ManifestProfileMismatch)?;
-    if genesis.commitment() != expected_genesis_commitment {
+    if genesis.network_id() != expected_network_id
+        || genesis.owner_account() != owner_account
+        || genesis.commitment() != expected_genesis_commitment
+    {
         return Err(QRunHistoryArchiveError::ManifestProfileMismatch);
     }
     let genesis_archive =

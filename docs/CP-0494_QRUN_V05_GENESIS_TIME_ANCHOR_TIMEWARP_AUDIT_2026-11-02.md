@@ -35,11 +35,12 @@ The eight-block fixture does not change production parameters. The issue follows
 
 ## Required design before profile freeze
 
-1. Give each QRun network a deterministic, nonzero `genesis_timestamp` (or equivalent not-before time) bound into the Genesis commitment and network/profile identity.
-2. Require the first accepted block timestamp to be strictly greater than that Genesis time. Historical replay and checkpoint restoration must enforce the same rule, not a moving wall clock.
-3. Retain branch-local MTP as an additional deterministic rule only after its exact interaction with Genesis time, checkpoint prefixes, reorgs and cross-language vectors is specified. MTP alone is insufficient.
-4. Update the runtime fingerprint, wallet-bound identity manifest, Genesis/checkpoint codecs, independent Python oracle, public-alpha zero-value profile and all history/replay paths together. Do not silently reuse the existing profile ID or Genesis identity after changing this rule.
-5. Run adversarial tests at the actual 2,016-block production boundary, including delayed launch, first-block backdating, forward jumps before/at/after the retarget boundary, reorgs and checkpoint restart.
+1. Give each QRun network a deterministic, nonzero `genesis_timestamp` bound into the Genesis commitment and network/profile identity. It must represent the actual activation epoch, not an arbitrary build date.
+2. A Genesis lower bound alone is insufficient if the network is activated later than that timestamp. First-block live admission must also require a bounded freshness window against a trusted reference-time source; activation time and its acceptance window must be fixed before launch.
+3. Keep historical replay independent of a moving local clock, but do not treat an arbitrary peer-supplied full-history archive as proof that each block was admitted in its original live-time window. Require authenticated checkpoint/anchor provenance or another independently verifiable launch-history trust path for untrusted bootstrap.
+4. Retain branch-local MTP as an additional deterministic rule only after its exact interaction with Genesis time, checkpoint prefixes, reorgs and cross-language vectors is specified. MTP alone is insufficient.
+5. Update the runtime fingerprint, wallet-bound identity manifest, Genesis/checkpoint codecs, independent Python oracle, public-alpha zero-value profile and all history/replay paths together. Do not silently reuse the existing profile ID or Genesis identity after changing these rules.
+6. Run adversarial tests at the actual 2,016-block production boundary, including delayed activation, first-block backdating, forward jumps before/at/after the retarget boundary, reorgs and checkpoint restart.
 
 No production parameter or Genesis identity is changed in CP-0494. Choosing a deterministic Genesis timestamp is a network-identity decision and must be coordinated across all profile and Genesis commitments before any freeze.
 

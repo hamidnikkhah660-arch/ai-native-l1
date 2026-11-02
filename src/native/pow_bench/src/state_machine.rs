@@ -141,6 +141,10 @@ pub enum StateError {
         previous: u64,
         actual: u64,
     },
+    TimestampTooFarInPast {
+        earliest_allowed: u64,
+        actual: u64,
+    },
     TimestampTooFarInFuture {
         latest_allowed: u64,
         actual: u64,
@@ -539,6 +543,18 @@ impl LedgerState {
         network_id: NetworkId,
         accounts: Vec<(AccountId, u64)>,
     ) -> Result<Self, StateError> {
+        Self::genesis_at(network_id, accounts, 0)
+    }
+
+    /// Build a Genesis ledger whose last timestamp is the network's committed activation time.
+    ///
+    /// A nonzero timestamp is recommended for QRun v0.5 network identity. Legacy/test fixtures
+    /// may continue to use genesis, which preserves the zero-timestamp compatibility behavior.
+    pub fn genesis_at(
+        network_id: NetworkId,
+        accounts: Vec<(AccountId, u64)>,
+        genesis_timestamp: u64,
+    ) -> Result<Self, StateError> {
         if network_id.iter().all(|byte| *byte == 0) {
             return Err(StateError::InvalidNetworkId);
         }
@@ -557,7 +573,7 @@ impl LedgerState {
         let state = Self {
             network_id,
             height: 0,
-            last_timestamp: 0,
+            last_timestamp: genesis_timestamp,
             tip_hash: [0u8; 32],
             fee_pool: 0,
             accounts: map,
@@ -1136,6 +1152,13 @@ impl LedgerState {
                 TimestampPolicyError::NotIncreasing { previous, actual } => {
                     StateError::TimestampNotIncreasing { previous, actual }
                 }
+                TimestampPolicyError::TooFarInPast {
+                    earliest_allowed,
+                    actual,
+                } => StateError::TimestampTooFarInPast {
+                    earliest_allowed,
+                    actual,
+                },
                 TimestampPolicyError::TooFarInFuture {
                     latest_allowed,
                     actual,
@@ -1177,6 +1200,13 @@ impl LedgerState {
                 TimestampPolicyError::NotIncreasing { previous, actual } => {
                     StateError::TimestampNotIncreasing { previous, actual }
                 }
+                TimestampPolicyError::TooFarInPast {
+                    earliest_allowed,
+                    actual,
+                } => StateError::TimestampTooFarInPast {
+                    earliest_allowed,
+                    actual,
+                },
                 TimestampPolicyError::TooFarInFuture {
                     latest_allowed,
                     actual,
@@ -1983,6 +2013,13 @@ impl MonetaryLedgerState {
             TimestampPolicyError::NotIncreasing { previous, actual } => {
                 StateError::TimestampNotIncreasing { previous, actual }
             }
+            TimestampPolicyError::TooFarInPast {
+                earliest_allowed,
+                actual,
+            } => StateError::TimestampTooFarInPast {
+                earliest_allowed,
+                actual,
+            },
             TimestampPolicyError::TooFarInFuture {
                 latest_allowed,
                 actual,
@@ -2041,6 +2078,13 @@ impl MonetaryLedgerState {
             TimestampPolicyError::NotIncreasing { previous, actual } => {
                 StateError::TimestampNotIncreasing { previous, actual }
             }
+            TimestampPolicyError::TooFarInPast {
+                earliest_allowed,
+                actual,
+            } => StateError::TimestampTooFarInPast {
+                earliest_allowed,
+                actual,
+            },
             TimestampPolicyError::TooFarInFuture {
                 latest_allowed,
                 actual,
@@ -2517,6 +2561,25 @@ mod tests {
         let mut state = alice_bob_state();
         let before = state.encode_snapshot().unwrap();
 
+        let mut too_old = block(1, state.tip_hash(), vec![]);
+        too_old.timestamp = 879;
+        too_old.state_root = state
+            .preview_state_root_after(&too_old, &TestOnlyAuthenticator)
+            .unwrap();
+        assert_eq!(
+            state.apply_block_with_timestamp_policy(
+                &too_old,
+                &TestOnlyAuthenticator,
+                1_000,
+                TimestampPolicy::qrun_v05_live(),
+            ),
+            Err(StateError::TimestampTooFarInPast {
+                earliest_allowed: 880,
+                actual: 879,
+            })
+        );
+        assert_eq!(state.encode_snapshot().unwrap(), before);
+
         let mut too_far = block(1, state.tip_hash(), vec![]);
         too_far.timestamp = 1_121;
         too_far.state_root = state
@@ -2527,7 +2590,7 @@ mod tests {
                 &too_far,
                 &TestOnlyAuthenticator,
                 1_000,
-                TimestampPolicy::testnet(),
+                TimestampPolicy::qrun_v05_live(),
             ),
             Err(StateError::TimestampTooFarInFuture {
                 latest_allowed: 1_120,

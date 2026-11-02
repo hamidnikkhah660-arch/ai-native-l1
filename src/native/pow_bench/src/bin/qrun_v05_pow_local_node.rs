@@ -6,7 +6,10 @@
 //! path has additional P2P/identity guards and a source-level release gate that MUST remain closed
 //! until production consensus, full-history recovery and adversarial multi-host operations are proven.
 //! This binary is not a production-certified public-network release.
-use ai_native_l1_pow_bench::chain_admission::SystemClockReferenceTime;
+use ai_native_l1_pow_bench::chain_admission::{
+    ReferenceTimeError, ReferenceTimeProvenance, ReferenceTimeProvider, ReferenceTimeSample,
+    SystemClockReferenceTime,
+};
 use ai_native_l1_pow_bench::consensus::{ConsensusParameters, PowAlgorithm, Uint256};
 use ai_native_l1_pow_bench::external_cas_anchor_candidate::{
     ExternalCasPin, ExternalCasRecord, VerifiedExternalCasClient, EXTERNAL_CAS_RECORD_BYTES,
@@ -30,12 +33,18 @@ use ai_native_l1_pow_bench::qrun_v05_genesis_candidate::QRunGenesisV05;
 use ai_native_l1_pow_bench::qrun_v05_noise_transport_candidate::{
     QRunV05NoiseSession, MAX_NOISE_APPLICATION_RECORD_BYTES,
 };
-use ai_native_l1_pow_bench::qrun_v05_pow_fork_runtime_candidate::QRunV05PowForkRuntime;
-use ai_native_l1_pow_bench::qrun_v05_pow_fork_runtime_candidate::QRunV05RuntimeStore;
+use ai_native_l1_pow_bench::qrun_v05_pow_fork_runtime_candidate::{
+    QRunV05PowForkRuntime, QRunV05PowRuntimeError, QRunV05RuntimeStore,
+};
 use ai_native_l1_pow_bench::qzbe_tx_ingress_candidate::{
     decode_request_header, encode_ack, TxIngressAck, TxIngressStatus, ACK_BYTES,
     REQUEST_HEADER_BYTES,
 };
+use ai_native_l1_pow_bench::reference_time::{
+    AuthenticatedReferenceTimeProvider, VerifiedReferenceTimePolicy, POLICY_WIRE_LEN,
+};
+use ai_native_l1_pow_bench::reference_time_store::ReferenceTimeStateStore;
+use ai_native_l1_pow_bench::reference_time_tcp::TcpReferenceTimeExchange;
 use ai_native_l1_pow_bench::state_machine::{
     decode_transaction, transaction_id, AccountId, NetworkId, MAX_TRANSACTION_BYTES,
 };
@@ -54,8 +63,12 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+#[cfg(test)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_HTTP_REQUEST: usize = 4096;
 const MAX_HTTP_RESPONSE: usize = 16 * 1024;
@@ -68,10 +81,13 @@ const BLOCK_ACK_BYTES: usize = 47;
 const MAX_BLOCK_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const SYNC_REQUEST_MAGIC: &[u8; 4] = b"QRS5";
 const SYNC_RESPONSE_MAGIC: &[u8; 4] = b"QRR5";
-const SYNC_PROTOCOL_VERSION: u16 = 1;
-const SYNC_REQUEST_BYTES: usize = 20;
+const SYNC_PROTOCOL_VERSION: u16 = 2;
+const SYNC_REQUEST_BYTES: usize = 61;
 const SYNC_RESPONSE_HEADER_BYTES: usize = 120;
 const MAX_SYNC_PAGE_BLOCKS: usize = 16;
+// Refresh the authenticated timestamp every bounded Argon2id nonce slice. This keeps a
+// successfully mined header comfortably inside the 300-second live-admission past window.
+const PUBLIC_ALPHA_POW_NONCE_SLICE_ATTEMPTS: u64 = 1_000;
 
 // Fixed wallet-bound Genesis identity for the first QZXB Mainnet.
 const QZXB_MAINNET_NETWORK_ID: NetworkId = [
@@ -287,6 +303,7 @@ fn open_local_node_runtime<A: TransactionAuthenticator>(
     )
 }
 
+#[cfg(test)]
 fn open_node_runtime<A: TransactionAuthenticator>(
     directory: &std::path::Path,
     network_id: NetworkId,
@@ -296,21 +313,63 @@ fn open_node_runtime<A: TransactionAuthenticator>(
     clock: &dyn ai_native_l1_pow_bench::chain_admission::ReferenceTimeProvider,
     external_config: Option<&ExternalCasNodeConfig>,
 ) -> Result<NodeRuntime, String> {
+    open_node_runtime_with_genesis_timestamp(
+        directory,
+        network_id,
+        owner_account,
+        params,
+        authenticator,
+        clock,
+        None,
+        external_config,
+    )
+}
+
+fn open_node_runtime_with_genesis_timestamp<A: TransactionAuthenticator>(
+    directory: &std::path::Path,
+    network_id: NetworkId,
+    owner_account: AccountId,
+    params: ConsensusParameters,
+    authenticator: &A,
+    clock: &dyn ai_native_l1_pow_bench::chain_admission::ReferenceTimeProvider,
+    genesis_timestamp: Option<u64>,
+    external_config: Option<&ExternalCasNodeConfig>,
+) -> Result<NodeRuntime, String> {
+    let genesis = match genesis_timestamp {
+        Some(timestamp) => {
+            QRunGenesisV05::new_with_genesis_timestamp(network_id, owner_account, timestamp)
+        }
+        None => QRunGenesisV05::new(network_id, owner_account),
+    }
+    .map_err(|error| format!("construct wallet-bound QRun Genesis: {error:?}"))?;
+
     let Some(external) = external_config else {
-        let runtime = QRunV05PowForkRuntime::open(
-            directory,
-            network_id,
-            owner_account,
-            params.clone(),
-            authenticator,
-            clock,
-        )
+        let runtime = match genesis_timestamp {
+            Some(timestamp) => QRunV05PowForkRuntime::open_with_genesis_timestamp(
+                directory,
+                network_id,
+                owner_account,
+                params.clone(),
+                authenticator,
+                clock,
+                timestamp,
+            ),
+            None => QRunV05PowForkRuntime::open(
+                directory,
+                network_id,
+                owner_account,
+                params.clone(),
+                authenticator,
+                clock,
+            ),
+        }
         .map_err(|error| format!("open local QRun runtime backend: {error:?}"))?;
-        return QRunV05PowForkRuntime::from_store(
+        return QRunV05PowForkRuntime::from_store_with_genesis(
             network_id,
             owner_account,
             params,
             NodeForkStore::Local(runtime.into_store()),
+            genesis,
         )
         .map_err(|error| format!("bind local QRun runtime backend: {error:?}"));
     };
@@ -318,8 +377,6 @@ fn open_node_runtime<A: TransactionAuthenticator>(
     if params.protocol_version != 5 {
         return Err("external-CAS backend is supported only for the QFP5 fee-only profile".into());
     }
-    let genesis = QRunGenesisV05::new(network_id, owner_account)
-        .map_err(|error| format!("construct wallet-bound QRun Genesis: {error:?}"))?;
     if genesis.commitment() != external.genesis_commitment {
         return Err("external-CAS Genesis pin differs from the node's wallet-bound Genesis".into());
     }
@@ -628,11 +685,12 @@ fn open_node_runtime<A: TransactionAuthenticator>(
         }
         _ => return Err("incomplete recovered/external checkpoint trust tuple".into()),
     };
-    QRunV05PowForkRuntime::from_store(
+    QRunV05PowForkRuntime::from_store_with_genesis(
         network_id,
         owner_account,
         params,
         NodeForkStore::ExternalCas(external_store),
+        genesis,
     )
     .map_err(|error| format!("bind external-CAS QRun runtime backend: {error:?}"))
 }
@@ -642,7 +700,7 @@ struct NodeState {
     public_alpha: bool,
     mainnet: bool,
     authenticator: Ed25519TransactionAuthenticator,
-    clock: SystemClockReferenceTime,
+    clock: NodeReferenceTime,
     receipts: BTreeMap<[u8; 32], Receipt>,
     profile_id: [u8; 32],
     block_peers: Vec<SocketAddr>,
@@ -705,6 +763,7 @@ struct Config {
     owner_account: AccountId,
     producer_account: AccountId,
     owner_public_key: [u8; 32],
+    genesis_timestamp: Option<u64>,
     data_dir: PathBuf,
     rpc_listen: SocketAddr,
     tx_listen: SocketAddr,
@@ -714,6 +773,48 @@ struct Config {
     peer_static_public_keys: Vec<[u8; 32]>,
     sync_on_start: bool,
     external_cas: Option<ExternalCasNodeConfig>,
+    reference_time: Option<ReferenceTimeNodeConfig>,
+}
+
+#[derive(Clone, Debug)]
+struct ReferenceTimeNodeConfig {
+    policy_file: PathBuf,
+    admin_public_key: [u8; 32],
+    address: SocketAddr,
+    state_file: PathBuf,
+}
+
+enum NodeReferenceTime {
+    SystemClock,
+    Authenticated {
+        provider: AuthenticatedReferenceTimeProvider<TcpReferenceTimeExchange>,
+        policy_digest: [u8; 32],
+    },
+}
+
+impl NodeReferenceTime {
+    fn policy_digest(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::SystemClock => None,
+            Self::Authenticated { policy_digest, .. } => Some(*policy_digest),
+        }
+    }
+
+    fn source_label(&self) -> &'static str {
+        match self {
+            Self::SystemClock => "os-system-clock-local-only",
+            Self::Authenticated { .. } => "ed25519-attested-time-v1",
+        }
+    }
+}
+
+impl ReferenceTimeProvider for NodeReferenceTime {
+    fn sample(&self) -> Result<ReferenceTimeSample, ReferenceTimeError> {
+        match self {
+            Self::SystemClock => SystemClockReferenceTime.sample(),
+            Self::Authenticated { provider, .. } => provider.sample(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1034,6 +1135,168 @@ fn parse_external_cas_config(
     }))
 }
 
+fn parse_reference_time_node_config(
+    values: &BTreeMap<String, String>,
+    public_network: bool,
+) -> Result<Option<ReferenceTimeNodeConfig>, String> {
+    const REQUIRED: [&str; 4] = [
+        "--reference-time-policy-file",
+        "--reference-time-admin-public-key-hex",
+        "--reference-time-address",
+        "--reference-time-state-file",
+    ];
+    let present = REQUIRED
+        .iter()
+        .filter(|key| values.contains_key(**key))
+        .count();
+    if present == 0 {
+        if public_network {
+            return Err(
+                "public network modes require the complete authenticated reference-time configuration"
+                    .into(),
+            );
+        }
+        return Ok(None);
+    }
+    if present != REQUIRED.len() {
+        let missing = REQUIRED
+            .iter()
+            .filter(|key| !values.contains_key(**key))
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "authenticated reference-time configuration is all-or-none; missing: {missing}"
+        ));
+    }
+    let required = |key: &str| {
+        values
+            .get(key)
+            .map(String::as_str)
+            .ok_or_else(|| format!("required reference-time option missing: {key}"))
+    };
+    let absolute_path = |key: &str| -> Result<PathBuf, String> {
+        let path = PathBuf::from(required(key)?);
+        if !path.is_absolute() || path.file_name().is_none() {
+            return Err(format!("{key} must be an absolute file path"));
+        }
+        if !path.parent().is_some_and(|parent| parent.is_dir()) {
+            return Err(format!("{key} parent directory must already exist"));
+        }
+        Ok(path)
+    };
+    let admin_public_key = parse_hex32(
+        required("--reference-time-admin-public-key-hex")?,
+        "reference-time policy admin public key",
+    )?;
+    if admin_public_key == [0; 32] {
+        return Err("reference-time policy admin public key must be nonzero".into());
+    }
+    let admin = VerifyingKey::from_bytes(&admin_public_key)
+        .map_err(|_| "reference-time policy admin public key is invalid".to_string())?;
+    if admin.is_weak() {
+        return Err("reference-time policy admin public key must not be weak".into());
+    }
+    let address = required("--reference-time-address")?
+        .parse::<SocketAddr>()
+        .map_err(|_| {
+            "--reference-time-address must be a numeric IP:PORT socket address".to_string()
+        })?;
+    if address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast() {
+        return Err(
+            "--reference-time-address must use a nonzero port and a unicast, specified IP".into(),
+        );
+    }
+    let policy_file = absolute_path("--reference-time-policy-file")?;
+    let state_file = absolute_path("--reference-time-state-file")?;
+    if paths_overlap(&policy_file, &state_file) {
+        return Err(
+            "reference-time high-water state file must be separate from the signed policy file"
+                .into(),
+        );
+    }
+    Ok(Some(ReferenceTimeNodeConfig {
+        policy_file,
+        admin_public_key,
+        address,
+        state_file,
+    }))
+}
+
+fn build_authenticated_node_reference_time(
+    reference_time: &ReferenceTimeNodeConfig,
+    network_id: &NetworkId,
+) -> Result<NodeReferenceTime, String> {
+    let file = fs::File::open(&reference_time.policy_file)
+        .map_err(|error| format!("open signed reference-time policy: {error}"))?;
+    let length = file
+        .metadata()
+        .map_err(|error| format!("inspect signed reference-time policy: {error}"))?
+        .len();
+    if length != POLICY_WIRE_LEN as u64 {
+        return Err(format!(
+            "signed reference-time policy must be exactly {POLICY_WIRE_LEN} bytes"
+        ));
+    }
+    let mut policy_bytes = Vec::with_capacity(POLICY_WIRE_LEN);
+    file.take((POLICY_WIRE_LEN + 1) as u64)
+        .read_to_end(&mut policy_bytes)
+        .map_err(|error| format!("read signed reference-time policy: {error}"))?;
+    if policy_bytes.len() != POLICY_WIRE_LEN {
+        return Err("signed reference-time policy changed length while being read".into());
+    }
+    let store = ReferenceTimeStateStore::open(&reference_time.state_file, network_id)
+        .map_err(|error| format!("open durable reference-time high-water state: {error:?}"))?;
+    let trust_state = store
+        .policy_trust_state()
+        .map_err(|error| format!("restore reference-time policy rollback floor: {error:?}"))?;
+    let policy = VerifiedReferenceTimePolicy::verify(
+        &policy_bytes,
+        network_id,
+        &reference_time.admin_public_key,
+        &trust_state,
+    )
+    .map_err(|error| format!("signed reference-time policy rejected: {error:?}"))?;
+    let policy_digest = *policy.digest();
+    let provider = AuthenticatedReferenceTimeProvider::new_persistent(
+        policy,
+        TcpReferenceTimeExchange::new(reference_time.address),
+        store,
+    )
+    .map_err(|error| format!("initialize authenticated reference-time provider: {error:?}"))?;
+    Ok(NodeReferenceTime::Authenticated {
+        provider,
+        policy_digest,
+    })
+}
+
+fn build_node_reference_time(config: &Config) -> Result<NodeReferenceTime, String> {
+    let Some(reference_time) = config.reference_time.as_ref() else {
+        if config.public_alpha || config.mainnet {
+            return Err(
+                "public QRun mode cannot fall back to the local operating-system clock".into(),
+            );
+        }
+        return Ok(NodeReferenceTime::SystemClock);
+    };
+    build_authenticated_node_reference_time(reference_time, &config.network_id)
+}
+
+fn next_live_block_timestamp(reference_time: u64, previous_timestamp: u64) -> Result<u64, String> {
+    let next_after_previous = previous_timestamp
+        .checked_add(1)
+        .ok_or_else(|| "canonical block timestamp is exhausted".to_string())?;
+    let candidate = reference_time.max(next_after_previous);
+    let latest_allowed = reference_time.saturating_add(120);
+    if candidate > latest_allowed {
+        return Err(format!(
+            "local chain timestamp {} is more than 120 seconds ahead of authenticated reference time {}",
+            candidate, reference_time
+        ));
+    }
+    Ok(candidate)
+}
+
 fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut result = String::with_capacity(bytes.len() * 2);
@@ -1270,14 +1533,45 @@ fn paths_overlap(left: &std::path::Path, right: &std::path::Path) -> bool {
         || right.starts_with(&(left.trim_end_matches('\\').to_string() + "\\"))
 }
 
+fn parse_genesis_timestamp_option(
+    values: &BTreeMap<String, String>,
+    public_alpha_mode: bool,
+    mainnet_mode: bool,
+) -> Result<Option<u64>, String> {
+    let genesis_timestamp = values
+        .get("--genesis-time-unix-secs")
+        .map(|value| {
+            let timestamp = value.parse::<u64>().map_err(|_| {
+                "--genesis-time-unix-secs must be an unsigned Unix timestamp".to_string()
+            })?;
+            if timestamp == 0 {
+                return Err("--genesis-time-unix-secs must be nonzero".to_string());
+            }
+            Ok::<u64, String>(timestamp)
+        })
+        .transpose()?;
+    if (public_alpha_mode || mainnet_mode) && genesis_timestamp.is_none() {
+        let mode = if mainnet_mode {
+            "--mainnet"
+        } else {
+            "--public-alpha"
+        };
+        return Err(format!(
+            "{mode} requires an explicit --genesis-time-unix-secs shared by every node"
+        ));
+    }
+    Ok(genesis_timestamp)
+}
+
 fn parse_config() -> Result<Config, String> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
             "QRun v0.5 node modes\n\
 Local test: qrun_v05_pow_local_node --local-testnet --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH\n\
-Public alpha: qrun_v05_pow_local_node --public-alpha --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH --noise-private-key-file NPK1\n\
-Mainnet: qrun_v05_pow_local_node --mainnet --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --data-dir ABSOLUTE_PATH --noise-private-key-file NPK1 --peer IP:PORT --peer-static-public-key-hex HEX64 --sync-on-start true\n\
+Public alpha: qrun_v05_pow_local_node --public-alpha --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --genesis-time-unix-secs UNIX_SECONDS --data-dir ABSOLUTE_PATH --noise-private-key-file NPK1 --reference-time-policy-file RTP1_FILE --reference-time-admin-public-key-hex HEX64 --reference-time-address IP:PORT --reference-time-state-file ABSOLUTE_FILE\n\
+Mainnet: qrun_v05_pow_local_node --mainnet --network-id-hex HEX64 --owner-account-id-hex HEX64 --owner-public-key-hex HEX64 --genesis-time-unix-secs UNIX_SECONDS --data-dir ABSOLUTE_PATH --noise-private-key-file NPK1 --reference-time-policy-file RTP1_FILE --reference-time-admin-public-key-hex HEX64 --reference-time-address IP:PORT --reference-time-state-file ABSOLUTE_FILE --peer IP:PORT --peer-static-public-key-hex HEX64 --sync-on-start true\n\
+Authenticated public time: every public node must use the same signed RTP1 policy bytes, policy-admin key and numeric authority IP:PORT. Keep the --reference-time-state-file outside --data-dir and the External-CAS floor; it stores a durable sequence rollback floor. The signed TMA1 authority sample is a configured time oracle, not a Byzantine consensus clock. Local-testnet may omit these options and use its OS clock.\n\
 External CAS (QFP5 only): add --external-cas-endpoint IP:PORT --external-cas-provider-id-hex HEX64 --external-cas-genesis-id-hex HEX64 --external-cas-noise-server-static-public-key-hex HEX64 --external-cas-noise-private-key-file NPK1 --external-cas-receipt-key-id-hex HEX64 --external-cas-receipt-public-key-file RAW_MLDSA65_PUBLIC_KEY --external-cas-bootstrap-record-file ECR1_FILE --external-cas-floor-dir ABSOLUTE_SEPARATE_DIRECTORY. Keep the floor directory outside --data-dir and back it up separately. On first install, set --external-cas-initialize-floor true to create the QCF1 floor from the out-of-band generation-zero bootstrap; keep it true on later starts (existing floors are reopened, missing-after-initialization remains fatal). External-CAS options are all-or-none; no local fallback occurs after provider config is supplied. Optional checkpoint bootstrap requires all four: --external-cas-checkpoint-file QRCP_FILE --external-cas-checkpoint-commitment-hex HEX64 --external-cas-checkpoint-min-height HEIGHT --external-cas-checkpoint-parent-commitment-hex HEX64. The ECR1 bootstrap must already anchor the exact checkpoint-rooted PFS2 manifest; this does not perform a live CAS manifest rebase/rollover. Explicit operator recovery is opt-in only: add --external-cas-recover-qrm1 true --external-cas-history-archive-root ABSOLUTE_EXISTING_DIRECTORY. Recovery requires an existing QCF1 floor and derives the replacement checkpoint from the verified QRM1/QRA1 journal; do not pass --external-cas-initialize-floor true or checkpoint bootstrap options in this mode. Ordinary startup never runs QRM1 recovery.\nMainnet also requires --sync-on-start true, non-loopback pinned peers, and frozen identity checks. RPC/transaction ingress stay loopback-only. Optional first migration from an existing Genesis-rooted QFP5 PFS2 store: add --external-cas-migrate-genesis-checkpoint true --external-cas-history-archive-root ABSOLUTE_EXISTING_DIRECTORY --external-cas-checkpoint-output-file ABSOLUTE_QRCP_FILE --external-cas-migration-parent-commitment-hex HEX64. The independent provider and matching generation-zero ECR1/QCF1 bootstrap must already be provisioned. This is a one-time explicit operation; repeated checkpoint rollover is not supported by this command. If recovery is needed after an ambiguous failure, rerun with --external-cas-recover-qrm1 true and the same archive root instead of the migration flag. IMPORTANT: this candidate build keeps --mainnet blocked until production consensus, full-history and repeated-checkpoint recovery, authenticated external peer reachability, and adversarial multi-host transaction/reorg/restart tests are complete."
         );
         return Err("__help__".into());
@@ -1341,6 +1635,7 @@ External CAS (QFP5 only): add --external-cas-endpoint IP:PORT --external-cas-pro
         "--owner-account-id-hex",
         "--producer-account-id-hex",
         "--owner-public-key-hex",
+        "--genesis-time-unix-secs",
         "--data-dir",
         "--rpc-listen",
         "--tx-listen",
@@ -1366,6 +1661,10 @@ External CAS (QFP5 only): add --external-cas-endpoint IP:PORT --external-cas-pro
         "--external-cas-checkpoint-commitment-hex",
         "--external-cas-checkpoint-min-height",
         "--external-cas-checkpoint-parent-commitment-hex",
+        "--reference-time-policy-file",
+        "--reference-time-admin-public-key-hex",
+        "--reference-time-address",
+        "--reference-time-state-file",
     ];
     if let Some(key) = values.keys().find(|key| !allowed.contains(&key.as_str())) {
         return Err(format!("unknown option {key}"));
@@ -1391,6 +1690,9 @@ External CAS (QFP5 only): add --external-cas-endpoint IP:PORT --external-cas-pro
     {
         return Err("network, owner, and producer identifiers must be nonzero".into());
     }
+    // Mainnet remains release-gated above, but its parser contract must already require the
+    // exact shared epoch so opening the release gate cannot silently select legacy Genesis.
+    let genesis_timestamp = parse_genesis_timestamp_option(&values, public_alpha_mode, mainnet)?;
     if account_id_from_public_key(&owner_public_key) != owner_account {
         return Err("owner account ID does not match owner public key".into());
     }
@@ -1508,6 +1810,23 @@ External CAS (QFP5 only): add --external-cas-endpoint IP:PORT --external-cas-pro
         return Err("--peer-static-public-key-hex requires --noise-private-key-file".into());
     }
     let external_cas = parse_external_cas_config(&values, public_network)?;
+    let reference_time = parse_reference_time_node_config(&values, public_network)?;
+    if let Some(reference_time) = &reference_time {
+        if paths_overlap(&data_dir, &reference_time.state_file) {
+            return Err(
+                "--reference-time-state-file must be outside --data-dir so chain rollback cannot roll back the reference-time high-water"
+                    .into(),
+            );
+        }
+        if let Some(external) = &external_cas {
+            if paths_overlap(&external.floor_directory, &reference_time.state_file) {
+                return Err(
+                    "--reference-time-state-file must be separate from the External-CAS QCF1 floor"
+                        .into(),
+                );
+            }
+        }
+    }
     if mainnet && external_cas.is_none() {
         return Err("--mainnet requires an explicitly pinned external-CAS provider".into());
     }
@@ -1526,6 +1845,7 @@ External CAS (QFP5 only): add --external-cas-endpoint IP:PORT --external-cas-pro
         owner_account,
         producer_account,
         owner_public_key,
+        genesis_timestamp,
         data_dir,
         rpc_listen,
         tx_listen,
@@ -1535,6 +1855,7 @@ External CAS (QFP5 only): add --external-cas-endpoint IP:PORT --external-cas-pro
         peer_static_public_keys,
         sync_on_start,
         external_cas,
+        reference_time,
     })
 }
 
@@ -1567,6 +1888,24 @@ fn profile_id(
     hash.finalize().into()
 }
 
+fn profile_id_with_reference_time_policy(
+    network_id: &NetworkId,
+    params: &ConsensusParameters,
+    genesis_commitment: &[u8; 32],
+    reference_time_policy_digest: Option<[u8; 32]>,
+) -> [u8; 32] {
+    let base_profile = profile_id(network_id, params, genesis_commitment);
+    let Some(policy_digest) = reference_time_policy_digest else {
+        return base_profile;
+    };
+    let mut hash = Sha256::new();
+    hash.update(b"QUANTUMZXB-QRUN-V05-TIME-POLICY-BOUND-PROFILE-V1\0");
+    hash.update(base_profile);
+    hash.update(policy_digest);
+    hash.finalize().into()
+}
+
+#[cfg(test)]
 fn now_unix() -> Result<u64, String> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1587,6 +1926,11 @@ fn response_json(value: &Value) -> Vec<u8> {
 }
 
 fn handle_rpc(stream: &mut TcpStream, state: &Arc<Mutex<NodeState>>) -> Result<(), String> {
+    // Listener sockets are nonblocking for the node poll loop. On Windows an accepted
+    // stream can retain that mode, so normalize it before synchronous request reads.
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| error.to_string())?;
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
         .map_err(|error| error.to_string())?;
@@ -1772,6 +2116,7 @@ fn encode_sync_request(
     start_height: u64,
     max_blocks: usize,
     max_bytes: usize,
+    expected_snapshot: Option<(u64, [u8; 32])>,
 ) -> Result<Vec<u8>, String> {
     let max_record_bytes = max_sync_response_block_bytes(max_blocks)?;
     if start_height == 0
@@ -1787,10 +2132,24 @@ fn encode_sync_request(
     request.extend_from_slice(&start_height.to_be_bytes());
     request.extend_from_slice(&(max_blocks as u16).to_be_bytes());
     request.extend_from_slice(&(max_bytes as u32).to_be_bytes());
+    match expected_snapshot {
+        Some((height, tip)) => {
+            request.push(1);
+            request.extend_from_slice(&height.to_be_bytes());
+            request.extend_from_slice(&tip);
+        }
+        None => {
+            request.push(0);
+            request.extend_from_slice(&0u64.to_be_bytes());
+            request.extend_from_slice(&[0u8; 32]);
+        }
+    }
     Ok(request)
 }
 
-fn decode_sync_request(request: &[u8]) -> Result<(u64, usize, usize), String> {
+fn decode_sync_request(
+    request: &[u8],
+) -> Result<(u64, usize, usize, Option<(u64, [u8; 32])>), String> {
     if request.len() != SYNC_REQUEST_BYTES
         || &request[..4] != SYNC_REQUEST_MAGIC
         || u16::from_be_bytes([request[4], request[5]]) != SYNC_PROTOCOL_VERSION
@@ -1798,12 +2157,33 @@ fn decode_sync_request(request: &[u8]) -> Result<(u64, usize, usize), String> {
         return Err("invalid canonical sync request magic/version/length".into());
     }
     let start_height = u64::from_be_bytes(request[6..14].try_into().unwrap());
-    let max_blocks = u16::from_be_bytes(request[14..16].try_into().unwrap()) as usize;
+    let max_blocks = u16::from_be_bytes([request[14], request[15]]) as usize;
     let max_bytes = u32::from_be_bytes(request[16..20].try_into().unwrap()) as usize;
-    encode_sync_request(start_height, max_blocks, max_bytes)?;
-    Ok((start_height, max_blocks, max_bytes))
+    let snapshot_height = u64::from_be_bytes(request[21..29].try_into().unwrap());
+    let snapshot_tip: [u8; 32] = request[29..61].try_into().unwrap();
+    let expected_snapshot = match request[20] {
+        0 if snapshot_height == 0 && snapshot_tip == [0u8; 32] => None,
+        1 => Some((snapshot_height, snapshot_tip)),
+        _ => return Err("canonical sync request has an invalid snapshot pin".into()),
+    };
+    encode_sync_request(start_height, max_blocks, max_bytes, expected_snapshot)?;
+    Ok((start_height, max_blocks, max_bytes, expected_snapshot))
 }
 
+fn validate_sync_snapshot_pin(
+    expected: Option<(u64, [u8; 32])>,
+    actual_height: u64,
+    actual_tip: [u8; 32],
+) -> Result<(), String> {
+    if let Some((expected_height, expected_tip)) = expected {
+        if actual_height != expected_height || actual_tip != expected_tip {
+            return Err(format!(
+                "authenticated sync peer changed canonical snapshot during pagination (expected height {expected_height}, received {actual_height})"
+            ));
+        }
+    }
+    Ok(())
+}
 fn encode_sync_response(
     base_height: u64,
     height: u64,
@@ -1911,21 +2291,41 @@ fn serve_sync_request(
     stream: &mut TcpStream,
     state: &Arc<Mutex<NodeState>>,
 ) -> Result<(), String> {
-    let (start_height, max_blocks, max_bytes) = decode_sync_request(request)?;
+    let (start_height, max_blocks, max_bytes, expected_snapshot) = decode_sync_request(request)?;
     let (base_height, height, base_tip, canonical_tip, state_root, envelopes) = {
         let locked = state
             .lock()
             .map_err(|_| "node state lock poisoned".to_string())?;
+        let (height, canonical_tip, state_root) = match expected_snapshot {
+            Some((expected_height, expected_tip)) => {
+                let (retained_height, retained_state_root, _) = locked
+                    .runtime
+                    .archived_branch_summary(&expected_tip)
+                    .ok_or("requested authenticated sync snapshot is no longer retained")?;
+                if retained_height != expected_height {
+                    return Err(
+                        "requested authenticated sync snapshot height differs from retained branch"
+                            .into(),
+                    );
+                }
+                (retained_height, expected_tip, retained_state_root)
+            }
+            None => (
+                locked.runtime.canonical_height(),
+                locked.runtime.canonical_tip(),
+                locked.runtime.canonical_state_root(),
+            ),
+        };
         let envelopes = locked
             .runtime
-            .canonical_envelopes_range(start_height, max_blocks, max_bytes)
-            .map_err(|error| format!("export canonical sync range: {error:?}"))?;
+            .archived_branch_envelopes_range(&canonical_tip, start_height, max_blocks, max_bytes)
+            .map_err(|error| format!("export retained sync snapshot range: {error:?}"))?;
         (
             locked.runtime.archive_base_height(),
-            locked.runtime.canonical_height(),
+            height,
             locked.runtime.archive_base_tip(),
-            locked.runtime.canonical_tip(),
-            locked.runtime.canonical_state_root(),
+            canonical_tip,
+            state_root,
             envelopes,
         )
     };
@@ -1946,7 +2346,6 @@ fn serve_sync_request(
     );
     Ok(())
 }
-
 fn block_ack(status: u8, height: u64, hash: [u8; 32]) -> [u8; BLOCK_ACK_BYTES] {
     let mut ack = [0u8; BLOCK_ACK_BYTES];
     ack[..4].copy_from_slice(BLOCK_ACK_MAGIC);
@@ -2078,7 +2477,7 @@ fn send_block_to_peer_authenticated(
         .write_record(&mut stream, &frame)
         .map_err(|error| format!("send encrypted block to {peer}: {error}"))?;
     let ack = session
-        .read_record(&mut stream)
+        .read_block_ack_record(&mut stream)
         .map_err(|error| format!("read authenticated block ACK from {peer}: {error}"))?;
     validate_block_ack(peer, &ack, height, expected_hash)
 }
@@ -2121,14 +2520,17 @@ fn send_block_to_peer(
     }
 }
 
-/// Request one bounded canonical page from a statically pinned authenticated peer, then
-/// independently validate and persist every returned PTB2 block before reporting progress.
+/// Request one bounded canonical page from an authenticated peer. Pages are imported into
+/// the durable fork graph (not forced to extend the current canonical tip), allowing a node that
+/// was partitioned onto a competing branch to recover the peer's complete canonical path.
 fn request_sync_page_authenticated(
     peer: SocketAddr,
     state: &Arc<Mutex<NodeState>>,
     max_blocks: usize,
     max_bytes: usize,
-) -> Result<(u64, u64), String> {
+    start_height: u64,
+    expected_snapshot: Option<(u64, [u8; 32])>,
+) -> Result<(u64, u64, usize, [u8; 32], [u8; 32], u64, [u8; 32]), String> {
     let public_alpha = state
         .lock()
         .map_err(|_| "node state lock poisoned".to_string())?
@@ -2141,14 +2543,12 @@ fn request_sync_page_authenticated(
         profile_id,
         local_private_key,
         remote_static_public_key,
-        start_height,
-        local_height,
-        local_tip,
+        local_base_height,
+        local_base_tip,
     ) = {
         let locked = state
             .lock()
             .map_err(|_| "node state lock poisoned".to_string())?;
-        let local_height = locked.runtime.canonical_height();
         let remote_static_key = locked.peer_static_keys_by_addr.get(&peer).copied();
         if remote_static_key.is_none() && !locked.public_alpha {
             return Err(
@@ -2162,14 +2562,16 @@ fn request_sync_page_authenticated(
                 .noise_private_key
                 .ok_or("authenticated sync requires a local Noise key")?,
             remote_static_key,
-            local_height
-                .checked_add(1)
-                .ok_or("local chain height overflow")?,
-            local_height,
-            locked.runtime.canonical_tip(),
+            locked.runtime.archive_base_height(),
+            locked.runtime.archive_base_tip(),
         )
     };
-    let request = encode_sync_request(start_height, max_blocks, max_bytes)?;
+    if start_height <= local_base_height {
+        return Err(
+            "canonical sync cursor must be above the locally trusted checkpoint base".into(),
+        );
+    }
+    let request = encode_sync_request(start_height, max_blocks, max_bytes, expected_snapshot)?;
     let local_private_key = EphemeralNoisePrivateKey(local_private_key);
     let mut stream = TcpStream::connect_timeout(&peer, Duration::from_secs(2))
         .map_err(|error| format!("connect authenticated sync peer {peer}: {error}"))?;
@@ -2210,46 +2612,44 @@ fn request_sync_page_authenticated(
         .map_err(|error| format!("read encrypted canonical sync response: {error}"))?;
     let response = decode_sync_response(&response_bytes, max_blocks, max_bytes)?;
 
-    if response.base_height > local_height {
+    // A peer may share the same trusted Genesis/checkpoint base while having a different
+    // canonical tip. Different or newer bases remain a hard failure: sync never adopts a
+    // peer-supplied checkpoint or silently skips history.
+    if response.base_height != local_base_height || response.base_tip != local_base_tip {
         return Err(format!(
-            "peer checkpoint base {} is ahead of local height {}; obtain an independently authenticated checkpoint first",
-            response.base_height, local_height
+            "peer trusted base differs from local base (peer_height={}, local_height={}); obtain and verify the checkpoint out of band",
+            response.base_height, local_base_height
         ));
     }
-    if response.base_height == local_height && response.base_tip != local_tip {
-        return Err("peer base tip does not match the local canonical tip".into());
+    validate_sync_snapshot_pin(expected_snapshot, response.height, response.canonical_tip)?;
+    if response.height < start_height.saturating_sub(1) && !response.envelopes.is_empty() {
+        return Err("peer returned canonical blocks below the requested sync cursor".into());
     }
-    if response.height < local_height && !response.envelopes.is_empty() {
-        return Err("peer returned blocks despite advertising a lower canonical height".into());
-    }
-    if response.envelopes.len() as u64 > response.height.saturating_sub(local_height) {
+    let maximum_count = response
+        .height
+        .saturating_sub(start_height.saturating_sub(1));
+    if response.envelopes.len() as u64 > maximum_count {
         return Err(
-            "peer returned more blocks than its advertised canonical height permits".into(),
+            "peer returned more canonical blocks than its advertised height permits".into(),
         );
     }
-
-    for envelope in &response.envelopes {
+    for (index, envelope) in response.envelopes.iter().enumerate() {
         let candidate = decode_candidate_network_block(envelope)
             .map_err(|error| format!("decode synced PTB2 block: {error:?}"))?;
+        let expected_height = start_height
+            .checked_add(index as u64)
+            .ok_or("sync block height overflow")?;
+        if candidate.block.height != expected_height {
+            return Err(format!(
+                "peer canonical page is not contiguous: received height {}, expected {expected_height}",
+                candidate.block.height
+            ));
+        }
         let mut locked = state
             .lock()
             .map_err(|_| "node state lock poisoned".to_string())?;
         if candidate.fee_block.is_some() != locked.runtime.is_qrun_v05_fee_only() {
             return Err("sync envelope execution mode differs from the local QRun profile".into());
-        }
-        let expected_height = locked
-            .runtime
-            .canonical_height()
-            .checked_add(1)
-            .ok_or("local chain height overflow")?;
-        if candidate.block.height != expected_height {
-            return Err(format!(
-                "synced block height {} is not the expected next height {expected_height}",
-                candidate.block.height
-            ));
-        }
-        if candidate.header.previous_consensus_hash != locked.runtime.canonical_tip() {
-            return Err("synced block does not extend the local canonical tip".into());
         }
         let previous_count = locked.runtime.retained_branch_count();
         let submit_result = {
@@ -2262,7 +2662,7 @@ fn request_sync_page_authenticated(
             runtime.submit_block(envelope, authenticator, clock)
         };
         submit_result
-            .map_err(|error| format!("local consensus rejected synced block: {error:?}"))?;
+            .map_err(|error| format!("local consensus rejected synced branch block: {error:?}"))?;
         if locked.runtime.retained_branch_count() > previous_count {
             locked.refresh_receipts()?;
         }
@@ -2271,29 +2671,27 @@ fn request_sync_page_authenticated(
     let locked = state
         .lock()
         .map_err(|_| "node state lock poisoned".to_string())?;
-    let current_height = locked.runtime.canonical_height();
-    if current_height < response.height && response.envelopes.is_empty() {
-        return Err("sync peer made no progress while advertising a higher tip".into());
-    }
-    if current_height == response.height
-        && (locked.runtime.canonical_tip() != response.canonical_tip
-            || locked.runtime.canonical_state_root() != response.state_root)
-    {
-        return Err(
-            "local canonical tip/state root does not match the peer's advertised tip".into(),
-        );
-    }
     println!(
-        "qrun_pow_authenticated_sync_page peer={peer} received={} local_height={} peer_height={}",
+        "qrun_pow_authenticated_sync_page peer={peer} start_height={start_height} received={} local_height={} peer_height={}",
         response.envelopes.len(),
-        current_height,
+        locked.runtime.canonical_height(),
         response.height
     );
-    Ok((current_height, response.height))
+    Ok((
+        locked.runtime.canonical_height(),
+        response.height,
+        response.envelopes.len(),
+        response.canonical_tip,
+        response.state_root,
+        response.base_height,
+        response.base_tip,
+    ))
 }
 
-/// Catch up with a pinned peer over bounded authenticated pages. No peer-supplied checkpoint
-/// is adopted automatically; if the advertised trusted base is ahead of our state this fails.
+/// Catch up from the latest trusted base over bounded authenticated pages. The complete peer
+/// canonical path is merged into local fork choice; local branches are retained and the node
+/// selects the greatest cumulative work with the protocol's deterministic tie-break. No
+/// peer-supplied checkpoint is adopted automatically.
 fn sync_from_peer_authenticated(
     peer: SocketAddr,
     state: &Arc<Mutex<NodeState>>,
@@ -2304,30 +2702,113 @@ fn sync_from_peer_authenticated(
         return Err("canonical sync page block count is outside the allowed range".into());
     }
     let max_pages = (1_024usize + max_blocks - 1) / max_blocks + 1;
-    let mut previous_height = state
-        .lock()
-        .map_err(|_| "node state lock poisoned".to_string())?
-        .runtime
-        .canonical_height();
+    let (base_height, base_tip) = {
+        let locked = state
+            .lock()
+            .map_err(|_| "node state lock poisoned".to_string())?;
+        (
+            locked.runtime.archive_base_height(),
+            locked.runtime.archive_base_tip(),
+        )
+    };
+    let mut next_start_height = base_height
+        .checked_add(1)
+        .ok_or("trusted checkpoint base height overflow")?;
+    let mut remote_height = base_height;
+    let mut remote_tip = base_tip;
+    let mut remote_state_root = [0u8; 32];
+    let mut expected_peer_snapshot: Option<(u64, [u8; 32])> = None;
+    let mut complete = false;
 
     for _ in 0..max_pages {
-        let (local_height, peer_height) =
-            request_sync_page_authenticated(peer, state, max_blocks, max_bytes)?;
-        if local_height > peer_height {
-            return Err("pinned sync peer is behind the local canonical chain".into());
+        let (
+            _local_height,
+            page_peer_height,
+            received,
+            page_peer_tip,
+            page_state_root,
+            page_base_height,
+            page_base_tip,
+        ) = request_sync_page_authenticated(
+            peer,
+            state,
+            max_blocks,
+            max_bytes,
+            next_start_height,
+            expected_peer_snapshot,
+        )?;
+        if page_base_height != base_height || page_base_tip != base_tip {
+            return Err(
+                "authenticated sync peer changed its trusted base during pagination".into(),
+            );
         }
-        if local_height == peer_height {
-            return Ok(local_height);
+        let page_snapshot = (page_peer_height, page_peer_tip);
+        validate_sync_snapshot_pin(expected_peer_snapshot, page_peer_height, page_peer_tip)?;
+        expected_peer_snapshot = Some(page_snapshot);
+        remote_height = page_peer_height;
+        remote_tip = page_peer_tip;
+        remote_state_root = page_state_root;
+        if received == 0 {
+            if next_start_height <= remote_height {
+                return Err(
+                    "sync peer advertised a higher tip but returned an empty canonical page".into(),
+                );
+            }
+            complete = true;
+            break;
         }
-        if local_height <= previous_height {
-            return Err("authenticated sync stopped making canonical-height progress".into());
+        next_start_height = next_start_height
+            .checked_add(received as u64)
+            .ok_or("canonical sync cursor overflow")?;
+        if next_start_height > remote_height {
+            complete = true;
+            break;
         }
-        previous_height = local_height;
     }
-    Err("authenticated sync exceeded the bounded catch-up page budget".into())
+    if !complete {
+        return Err("authenticated sync exceeded the bounded catch-up page budget".into());
+    }
+
+    let locked = state
+        .lock()
+        .map_err(|_| "node state lock poisoned".to_string())?;
+    if remote_height == base_height {
+        if remote_tip != base_tip {
+            return Err("empty peer chain tip differs from the trusted checkpoint base".into());
+        }
+        return Ok(locked.runtime.canonical_height());
+    }
+    let (retained_height, retained_state_root, remote_work) = locked
+        .runtime
+        .archived_branch_summary(&remote_tip)
+        .ok_or("authenticated sync did not retain the peer's advertised canonical tip")?;
+    if retained_height != remote_height || retained_state_root != remote_state_root {
+        return Err("retained peer branch height/state root differs from its authenticated sync advertisement".into());
+    }
+    let local_work = locked.runtime.canonical_cumulative_work();
+    let local_tip = locked.runtime.canonical_tip();
+    let remote_should_win =
+        remote_work > local_work || (remote_work == local_work && remote_tip < local_tip);
+    let expected_tip = if remote_should_win {
+        remote_tip
+    } else {
+        local_tip
+    };
+    if locked.runtime.canonical_tip() != expected_tip {
+        return Err("local fork choice did not select the greatest cumulative-work branch/tie-break after sync".into());
+    }
+    println!(
+        "qrun_pow_authenticated_sync_complete peer={peer} peer_height={remote_height} local_height={} selected_peer_branch={}",
+        locked.runtime.canonical_height(),
+        expected_tip == remote_tip
+    );
+    Ok(locked.runtime.canonical_height())
 }
 
 fn handle_block(stream: &mut TcpStream, state: &Arc<Mutex<NodeState>>) -> Result<(), String> {
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| error.to_string())?;
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|error| error.to_string())?;
@@ -2502,6 +2983,9 @@ fn reject_ack(transaction_id: [u8; 32], status: TxIngressStatus, count: usize) -
 
 fn handle_transaction(stream: &mut TcpStream, state: &Arc<Mutex<NodeState>>) -> Result<(), String> {
     stream
+        .set_nonblocking(false)
+        .map_err(|error| error.to_string())?;
+    stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|error| error.to_string())?;
     stream
@@ -2536,48 +3020,118 @@ fn handle_transaction(stream: &mut TcpStream, state: &Arc<Mutex<NodeState>>) -> 
                 format!("duplicate canonical txid={}", hex(&txid)),
             )
         } else {
-            let timestamp = now_unix()?.max(
-                locked
-                    .runtime
-                    .canonical_state()
-                    .last_timestamp()
-                    .saturating_add(1),
-            );
+            let reference_time_sample = locked.clock.sample().map_err(|error| {
+                format!("sample configured block-production reference time: {error:?}")
+            })?;
+            let timestamp = next_live_block_timestamp(
+                reference_time_sample.unix_seconds,
+                locked.runtime.canonical_state().last_timestamp(),
+            )?;
             // Public-alpha uses the calibrated target, so it must allow enough nonce attempts
             // for expected block production. Local-loopback tests keep the single-attempt smoke path.
             let max_nonce_attempts = if locked.public_alpha { 10_000 } else { 1 };
-            let envelope_result = {
-                let auth = &locked.authenticator;
-                locked
-                    .runtime
-                    .mine_candidate(timestamp, vec![tx.clone()], auth, max_nonce_attempts)
-            };
-            match envelope_result {
-                Ok(envelope) => {
-                    let candidate = decode_candidate_network_block(&envelope)
-                        .map_err(|error| format!("decode newly mined QFP5 envelope: {error:?}"))?;
-                    if candidate.fee_block.is_some() != locked.runtime.is_qrun_v05_fee_only() {
-                        return Err(
-                            "mined envelope execution mode differs from the local QRun profile"
-                                .into(),
-                        );
+            let snapshot = locked
+                .runtime
+                .mining_snapshot()
+                .map_err(|error| format!("capture branch-bound QFP5 mining snapshot: {error:?}"))?;
+            let parent_tip = snapshot.parent_tip();
+            let parent_height = snapshot.parent_height();
+            let authenticator = locked.authenticator.clone();
+            // Hash an immutable branch snapshot with the node mutex released. This does not
+            // move StoreWriterLock: the live runtime remains owned by the event-loop thread.
+            drop(locked);
+            // Keep each candidate timestamp fresh even when the complete PoW budget is slow
+            // on a modest host. Every slice hashes a new timestamp-bound header; the total nonce
+            // budget is unchanged, and the parent is rechecked before spending the next slice.
+            let mut candidate_timestamp = timestamp;
+            let mut attempts_used = 0u64;
+            let envelope_result = loop {
+                let attempts_this_slice =
+                    (max_nonce_attempts - attempts_used).min(PUBLIC_ALPHA_POW_NONCE_SLICE_ATTEMPTS);
+                match snapshot.mine_candidate(
+                    candidate_timestamp,
+                    vec![tx.clone()],
+                    &authenticator,
+                    attempts_this_slice,
+                ) {
+                    Ok(envelope) => break Ok(envelope),
+                    Err(QRunV05PowRuntimeError::MiningExhausted { .. }) => {
+                        attempts_used = attempts_used.saturating_add(attempts_this_slice);
+                        if attempts_used >= max_nonce_attempts {
+                            break Err(QRunV05PowRuntimeError::MiningExhausted {
+                                attempts: attempts_used,
+                            });
+                        }
+                        let locked = state.lock().map_err(|_| {
+                            "node state lock poisoned between PoW slices".to_string()
+                        })?;
+                        if locked.runtime.canonical_tip() != parent_tip
+                            || locked.runtime.canonical_height() != parent_height
+                        {
+                            break Err(QRunV05PowRuntimeError::InvalidCandidate(
+                                "mining snapshot parent changed before the next PoW time slice"
+                                    .into(),
+                            ));
+                        }
+                        let refreshed_sample = locked.clock.sample().map_err(|error| {
+                            format!(
+                                "refresh configured reference time between PoW slices: {error:?}"
+                            )
+                        })?;
+                        candidate_timestamp = next_live_block_timestamp(
+                            refreshed_sample.unix_seconds,
+                            candidate_timestamp,
+                        )?;
                     }
-                    let candidate_height = candidate.block.height;
-                    let submit_result = {
-                        let NodeState {
-                            runtime,
-                            authenticator,
-                            clock,
-                            ..
-                        } = &mut *locked;
-                        runtime.submit_block(&envelope, authenticator, clock)
-                    };
-                    match submit_result {
-                        Ok(canonical_tip) => {
-                            locked.refresh_receipts()?;
-                            block_to_broadcast = Some(envelope.clone());
-                            peers_to_broadcast = locked.block_peers.clone();
-                            (
+                    Err(error) => break Err(error),
+                }
+            };
+            let mut locked = state
+                .lock()
+                .map_err(|_| "node state lock poisoned after PoW".to_string())?;
+            if locked.runtime.canonical_tip() != parent_tip
+                || locked.runtime.canonical_height() != parent_height
+            {
+                (
+                    reject_ack(txid, TxIngressStatus::Rejected, 0),
+                    format!(
+                        "stale_mining_parent txid={} snapshot_height={} current_height={} snapshot_tip={} current_tip={}",
+                        hex(&txid),
+                        parent_height,
+                        locked.runtime.canonical_height(),
+                        hex(&parent_tip),
+                        hex(&locked.runtime.canonical_tip())
+                    ),
+                )
+            } else {
+                match envelope_result {
+                    Ok(envelope) => {
+                        let candidate =
+                            decode_candidate_network_block(&envelope).map_err(|error| {
+                                format!("decode newly mined QFP5 envelope: {error:?}")
+                            })?;
+                        if candidate.fee_block.is_some() != locked.runtime.is_qrun_v05_fee_only() {
+                            return Err(
+                                "mined envelope execution mode differs from the local QRun profile"
+                                    .into(),
+                            );
+                        }
+                        let candidate_height = candidate.block.height;
+                        let submit_result = {
+                            let NodeState {
+                                runtime,
+                                authenticator,
+                                clock,
+                                ..
+                            } = &mut *locked;
+                            runtime.submit_block(&envelope, authenticator, clock)
+                        };
+                        match submit_result {
+                            Ok(canonical_tip) => {
+                                locked.refresh_receipts()?;
+                                block_to_broadcast = Some(envelope.clone());
+                                peers_to_broadcast = locked.block_peers.clone();
+                                (
                                 reject_ack(txid, TxIngressStatus::Accepted, 0),
                                 format!(
                                     "accepted_pow_candidate txid={} height={} canonical_height={} canonical_tip={} canonically_included={}",
@@ -2585,17 +3139,21 @@ fn handle_transaction(stream: &mut TcpStream, state: &Arc<Mutex<NodeState>>) -> 
                                     hex(&canonical_tip), locked.receipts.contains_key(&txid)
                                 ),
                             )
+                            }
+                            Err(error) => (
+                                reject_ack(txid, TxIngressStatus::Rejected, 0),
+                                format!(
+                                    "pow_consensus_rejected txid={} error={error:?}",
+                                    hex(&txid)
+                                ),
+                            ),
                         }
-                        Err(error) => (
-                            reject_ack(txid, TxIngressStatus::Rejected, 0),
-                            format!("pow_consensus_rejected txid={} error={error:?}", hex(&txid)),
-                        ),
                     }
+                    Err(error) => (
+                        reject_ack(txid, TxIngressStatus::Rejected, 0),
+                        format!("pow_mining_rejected txid={} error={error:?}", hex(&txid)),
+                    ),
                 }
-                Err(error) => (
-                    reject_ack(txid, TxIngressStatus::Rejected, 0),
-                    format!("pow_mining_rejected txid={} error={error:?}", hex(&txid)),
-                ),
             }
         }
     };
@@ -2643,6 +3201,27 @@ fn run(config: Config) -> Result<(), String> {
         config.block_listen,
         &config.peers,
     )?;
+    let clock = build_node_reference_time(&config)?;
+    let startup_time = clock.sample().map_err(|error| {
+        format!("authenticated reference-time startup sample failed: {error:?}")
+    })?;
+    if (config.public_alpha || config.mainnet)
+        && startup_time.provenance != ReferenceTimeProvenance::ConfiguredProvider
+    {
+        return Err(
+            "public QRun mode requires an authenticated configured reference-time sample".into(),
+        );
+    }
+    println!(
+        "qrun_reference_time_ready source={} provenance={:?} unix_seconds={} policy_digest={}",
+        clock.source_label(),
+        startup_time.provenance,
+        startup_time.unix_seconds,
+        clock
+            .policy_digest()
+            .map(|digest| hex(&digest))
+            .unwrap_or_else(|| "none".into())
+    );
     fs::create_dir_all(&config.data_dir)
         .map_err(|error| format!("create data directory: {error}"))?;
     let authenticator = Ed25519TransactionAuthenticator::select(
@@ -2670,7 +3249,6 @@ fn run(config: Config) -> Result<(), String> {
             "QFP5 peer operation requires the authenticated, pinned Noise transport".into(),
         );
     }
-    let clock = SystemClockReferenceTime;
     let store_dir = if qrun_v05_identity {
         config.data_dir.join("qrun-v05-qfp5-store")
     } else {
@@ -2678,13 +3256,14 @@ fn run(config: Config) -> Result<(), String> {
         // its profile-specific directory so the two modes cannot share a manifest accidentally.
         config.data_dir.join("qrun-v05-pow-fork-store")
     };
-    let mut runtime = open_node_runtime(
+    let mut runtime = open_node_runtime_with_genesis_timestamp(
         &store_dir,
         config.network_id,
         config.owner_account,
         params,
         &authenticator,
         &clock,
+        config.genesis_timestamp,
         config.external_cas.as_ref(),
     )?;
     runtime
@@ -2692,7 +3271,12 @@ fn run(config: Config) -> Result<(), String> {
         .map_err(|error| format!("configure fee-only producer: {error:?}"))?;
     let network_id = runtime.network_id();
     let genesis_id = runtime.genesis_commitment();
-    let profile_id = profile_id(&network_id, &profile_params, &genesis_id);
+    let profile_id = profile_id_with_reference_time_policy(
+        &network_id,
+        &profile_params,
+        &genesis_id,
+        clock.policy_digest(),
+    );
     let root = runtime.canonical_state_root();
     let owner_balance = runtime
         .canonical_state()
@@ -2840,8 +3424,9 @@ fn run(config: Config) -> Result<(), String> {
         }
     }
 
-    // StoreWriterLock is deliberately single-writer. Keep all listener work on this one event
-    // loop rather than moving the OS lock and its Windows OVERLAPPED state between worker threads.
+    // StoreWriterLock remains single-writer: NodeState's mutex serializes every operation that
+    // can mutate the canonical runtime. Mining releases that mutex while hashing its immutable
+    // snapshot, so the authenticated block listener can continue accepting peer blocks meanwhile.
     let rpc_listener =
         TcpListener::bind(config.rpc_listen).map_err(|error| format!("bind RPC: {error}"))?;
     let tx_listener = TcpListener::bind(config.tx_listen)
@@ -2862,6 +3447,53 @@ fn run(config: Config) -> Result<(), String> {
     // an atomic flag; the node thread below owns all service shutdown and joins.
     let shutdown_signal = QRunNodeShutdownSignalCandidate::install()
         .map_err(|error| format!("install QRun process shutdown handlers: {error}"))?;
+
+    // RPC is read-only and owns no store writer lock. Run its listener independently so a
+    // synchronous 64 MiB Argon2id mining attempt cannot starve status/balance/receipt queries.
+    let rpc_shutdown = Arc::new(AtomicBool::new(false));
+    let rpc_worker_shutdown = Arc::clone(&rpc_shutdown);
+    let rpc_worker_state = Arc::clone(&state);
+    let rpc_worker = thread::Builder::new()
+        .name("qrun-read-only-rpc".into())
+        .spawn(move || -> Result<(), String> {
+            loop {
+                if rpc_worker_shutdown.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                match poll_rpc_listener(&rpc_listener, &rpc_worker_state) {
+                    Ok(true) => {}
+                    Ok(false) => thread::sleep(Duration::from_millis(5)),
+                    Err(error) => return Err(error),
+                }
+            }
+        })
+        .map_err(|error| format!("start read-only RPC worker: {error}"))?;
+
+    // Keep authenticated P2P block ingress responsive during local PoW. The worker handles one
+    // inbound connection at a time (bounded back-pressure); canonical writes remain serialized
+    // by NodeState's mutex and therefore cannot race the transaction-mining submit path.
+    let block_shutdown = Arc::new(AtomicBool::new(false));
+    let block_worker_shutdown = Arc::clone(&block_shutdown);
+    let block_worker_state = Arc::clone(&state);
+    let (block_worker_error_tx, block_worker_error_rx) = mpsc::channel::<String>();
+    let block_worker = thread::Builder::new()
+        .name("qrun-authenticated-block-listener".into())
+        .spawn(move || -> Result<(), String> {
+            loop {
+                if block_worker_shutdown.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                match poll_block_listener(&block_listener, &block_worker_state) {
+                    Ok(true) => {}
+                    Ok(false) => thread::sleep(Duration::from_millis(5)),
+                    Err(error) => {
+                        let _ = block_worker_error_tx.send(error.clone());
+                        return Err(error);
+                    }
+                }
+            }
+        })
+        .map_err(|error| format!("start authenticated block listener worker: {error}"))?;
 
     if config.mainnet {
         state
@@ -2896,14 +3528,20 @@ fn run(config: Config) -> Result<(), String> {
             println!("qrun_node_shutdown_requested source=process_signal_or_console_control");
             break Ok(());
         }
+        match block_worker_error_rx.try_recv() {
+            Ok(error) => {
+                break Err(format!(
+                    "authenticated block listener worker failed: {error}"
+                ))
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                break Err("authenticated block listener worker exited unexpectedly".into());
+            }
+        }
 
-        let iteration_result = (|| -> Result<bool, String> {
-            let mut handled = false;
-            handled |= poll_rpc_listener(&rpc_listener, &state)?;
-            handled |= poll_transaction_listener(&tx_listener, &state)?;
-            handled |= poll_block_listener(&block_listener, &state)?;
-            Ok(handled)
-        })();
+        let iteration_result =
+            (|| -> Result<bool, String> { poll_transaction_listener(&tx_listener, &state) })();
 
         match iteration_result {
             Ok(handled) => {
@@ -2914,6 +3552,19 @@ fn run(config: Config) -> Result<(), String> {
             Err(error) => break Err(error),
         }
     };
+
+    // Stop both listener workers before dropping NodeState. A block worker may be finishing
+    // one bounded Noise exchange / block validation / peer forward; no new request is accepted.
+    block_shutdown.store(true, Ordering::Release);
+    rpc_shutdown.store(true, Ordering::Release);
+    let block_worker_result = block_worker
+        .join()
+        .map_err(|_| "authenticated block listener worker panicked".to_string())
+        .and_then(|result| result);
+    let rpc_worker_result = rpc_worker
+        .join()
+        .map_err(|_| "read-only RPC worker panicked".to_string())
+        .and_then(|result| result);
 
     // Join the optional service explicitly while the signal callback is still installed. Dropping
     // NodeState afterwards is idempotent and zeroizes its node-local Noise private key.
@@ -2928,6 +3579,8 @@ fn run(config: Config) -> Result<(), String> {
         .map_err(|error| format!("restore QRun process shutdown handlers: {error}"));
 
     loop_result?;
+    block_worker_result?;
+    rpc_worker_result?;
     shutdown_result?;
     signal_restore_result?;
     println!("qrun_node_lifecycle_cleanup_complete");
@@ -2970,6 +3623,306 @@ mod tests {
     use std::thread;
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn genesis_timestamp_cli_requires_nonzero_shared_epoch_for_public_modes() {
+        let empty = BTreeMap::new();
+        assert_eq!(
+            parse_genesis_timestamp_option(&empty, false, false),
+            Ok(None)
+        );
+        assert!(parse_genesis_timestamp_option(&empty, true, false)
+            .unwrap_err()
+            .contains("--public-alpha requires"));
+        assert!(parse_genesis_timestamp_option(&empty, false, true)
+            .unwrap_err()
+            .contains("--mainnet requires"));
+
+        let valid = BTreeMap::from([(
+            "--genesis-time-unix-secs".to_string(),
+            "1800000000".to_string(),
+        )]);
+        assert_eq!(
+            parse_genesis_timestamp_option(&valid, true, false),
+            Ok(Some(1_800_000_000))
+        );
+        assert_eq!(
+            parse_genesis_timestamp_option(&valid, false, true),
+            Ok(Some(1_800_000_000))
+        );
+        // Isolated loopback compatibility mode may still omit the optional time anchor.
+        assert_eq!(
+            parse_genesis_timestamp_option(&valid, false, false),
+            Ok(Some(1_800_000_000))
+        );
+
+        let zero = BTreeMap::from([("--genesis-time-unix-secs".to_string(), "0".to_string())]);
+        assert!(parse_genesis_timestamp_option(&zero, false, false)
+            .unwrap_err()
+            .contains("must be nonzero"));
+
+        let malformed = BTreeMap::from([(
+            "--genesis-time-unix-secs".to_string(),
+            "not-a-timestamp".to_string(),
+        )]);
+        assert!(parse_genesis_timestamp_option(&malformed, false, false)
+            .unwrap_err()
+            .contains("unsigned Unix timestamp"));
+    }
+
+    #[test]
+    fn qrun_nodes_with_different_signed_time_policies_cannot_complete_noise_handshake() {
+        let network = [0xB8; 32];
+        let params = smoke_params();
+        let genesis = [0xB9; 32];
+        let profile_a =
+            profile_id_with_reference_time_policy(&network, &params, &genesis, Some([0xC1; 32]));
+        let profile_b =
+            profile_id_with_reference_time_policy(&network, &params, &genesis, Some([0xC2; 32]));
+        assert_ne!(profile_a, profile_b);
+
+        let (server_private, _) = test_noise_keypair();
+        let (client_private, _) = test_noise_keypair();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(6)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(6)))
+                .unwrap();
+            QRunV05NoiseSession::accept_public(&mut stream, &server_private, &network, &profile_a)
+                .map(|_| ())
+        });
+
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(6)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(6)))
+            .unwrap();
+        let client =
+            QRunV05NoiseSession::connect_public(&mut stream, &client_private, &network, &profile_b);
+        assert!(
+            client.is_err(),
+            "different signed time-policy digests must fail the Noise prologue authentication"
+        );
+        assert!(
+            server.join().unwrap().is_err(),
+            "the peer must independently reject the mismatched QRun profile"
+        );
+    }
+
+    #[test]
+    fn live_mining_timestamp_uses_reference_sample_and_fails_when_chain_is_too_far_ahead() {
+        assert_eq!(
+            next_live_block_timestamp(1_000, 999),
+            Ok(1_000),
+            "a node must not substitute its raw OS clock after receiving the shared sample"
+        );
+        assert_eq!(
+            next_live_block_timestamp(1_001, 1_000),
+            Ok(1_001),
+            "the first block must advance strictly beyond Genesis"
+        );
+        assert_eq!(
+            next_live_block_timestamp(1_000, 1_119),
+            Ok(1_120),
+            "monotonic advancement at the inclusive +120-second edge is allowed"
+        );
+        assert!(next_live_block_timestamp(1_000, 1_120)
+            .unwrap_err()
+            .contains("more than 120 seconds ahead"));
+        assert!(next_live_block_timestamp(1_000, u64::MAX)
+            .unwrap_err()
+            .contains("timestamp is exhausted"));
+    }
+
+    #[test]
+    fn authenticated_reference_time_cli_is_required_for_public_networks_and_all_or_none() {
+        let empty = BTreeMap::new();
+        assert!(parse_reference_time_node_config(&empty, true)
+            .unwrap_err()
+            .contains("complete authenticated reference-time configuration"));
+        assert!(parse_reference_time_node_config(&empty, false)
+            .unwrap()
+            .is_none());
+
+        let signer = Ed25519TransactionSigner::from_seed([0x72; 32]);
+        let policy_file = std::env::temp_dir().join("qrun-reference-time-policy.rtp1");
+        let state_file = std::env::temp_dir().join("qrun-reference-time-high-water.rts1");
+        let valid = BTreeMap::from([
+            (
+                "--reference-time-policy-file".into(),
+                policy_file.to_string_lossy().into_owned(),
+            ),
+            (
+                "--reference-time-admin-public-key-hex".into(),
+                hex(&signer.public_key()),
+            ),
+            ("--reference-time-address".into(), "192.0.2.81:49550".into()),
+            (
+                "--reference-time-state-file".into(),
+                state_file.to_string_lossy().into_owned(),
+            ),
+        ]);
+        let parsed = parse_reference_time_node_config(&valid, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.policy_file, policy_file);
+        assert_eq!(parsed.state_file, state_file);
+        assert_eq!(parsed.address, "192.0.2.81:49550".parse().unwrap());
+        assert_eq!(parsed.admin_public_key, signer.public_key());
+
+        let mut partial = valid.clone();
+        partial.remove("--reference-time-state-file");
+        assert!(parse_reference_time_node_config(&partial, false)
+            .unwrap_err()
+            .contains("all-or-none"));
+
+        let mut weak_key = valid.clone();
+        weak_key.insert(
+            "--reference-time-admin-public-key-hex".into(),
+            "00".repeat(32),
+        );
+        assert!(parse_reference_time_node_config(&weak_key, false)
+            .unwrap_err()
+            .contains("must be nonzero"));
+
+        let mut invalid_address = valid.clone();
+        invalid_address.insert("--reference-time-address".into(), "0.0.0.0:0".into());
+        assert!(parse_reference_time_node_config(&invalid_address, false)
+            .unwrap_err()
+            .contains("nonzero port"));
+
+        let mut overlapping = valid;
+        overlapping.insert(
+            "--reference-time-state-file".into(),
+            policy_file.to_string_lossy().into_owned(),
+        );
+        assert!(parse_reference_time_node_config(&overlapping, false)
+            .unwrap_err()
+            .contains("separate from the signed policy file"));
+    }
+
+    #[test]
+    fn qrun_node_reference_time_wiring_verifies_network_bound_policy_and_persists_attestation() {
+        use ai_native_l1_pow_bench::reference_time::{
+            ATTESTATION_BODY_LEN, ATTESTATION_DOMAIN, ATTESTATION_MAGIC, POLICY_BODY_LEN,
+            POLICY_DOMAIN, POLICY_MAGIC, WIRE_VERSION,
+        };
+        use ed25519_dalek::{Signer, SigningKey};
+
+        const NETWORK: [u8; 32] = [0xB3; 32];
+        const ADMIN_SEED: [u8; 32] = [0xB4; 32];
+        const AUTHORITY_SEED: [u8; 32] = [0xB5; 32];
+        let dir = TestDir::new();
+        let policy_file = dir.0.join("node-time-policy.rtp1");
+        let state_file = dir.0.join("node-time-state.rts1");
+        let admin = SigningKey::from_bytes(&ADMIN_SEED);
+        let authority = SigningKey::from_bytes(&AUTHORITY_SEED);
+
+        let mut policy_wire = Vec::with_capacity(POLICY_WIRE_LEN);
+        policy_wire.extend_from_slice(POLICY_MAGIC);
+        policy_wire.extend_from_slice(&WIRE_VERSION.to_be_bytes());
+        policy_wire.extend_from_slice(&NETWORK);
+        policy_wire.extend_from_slice(&1u64.to_be_bytes());
+        policy_wire.extend_from_slice(&authority.verifying_key().to_bytes());
+        policy_wire.extend_from_slice(&500u32.to_be_bytes());
+        policy_wire.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert_eq!(policy_wire.len(), POLICY_BODY_LEN);
+        let policy_signature = admin.sign(&[POLICY_DOMAIN, policy_wire.as_slice()].concat());
+        policy_wire.extend_from_slice(&policy_signature.to_bytes());
+        fs::write(&policy_file, &policy_wire).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut frame_length = [0u8; 4];
+            stream.read_exact(&mut frame_length).unwrap();
+            assert_eq!(
+                u32::from_be_bytes(frame_length) as usize,
+                ai_native_l1_pow_bench::reference_time_tcp::REQUEST_BODY_LEN
+            );
+            let mut request =
+                vec![0u8; ai_native_l1_pow_bench::reference_time_tcp::REQUEST_BODY_LEN];
+            stream.read_exact(&mut request).unwrap();
+            assert_eq!(
+                &request[..4],
+                ai_native_l1_pow_bench::reference_time_tcp::REQUEST_MAGIC
+            );
+            assert_eq!(&request[6..38], &NETWORK);
+            let challenge: [u8; 32] = request[38..70].try_into().unwrap();
+            let unix_seconds = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let mut response =
+                Vec::with_capacity(ai_native_l1_pow_bench::reference_time::ATTESTATION_WIRE_LEN);
+            response.extend_from_slice(ATTESTATION_MAGIC);
+            response.extend_from_slice(&WIRE_VERSION.to_be_bytes());
+            response.extend_from_slice(&NETWORK);
+            response.extend_from_slice(&challenge);
+            response.extend_from_slice(&unix_seconds.to_be_bytes());
+            response.extend_from_slice(&1u64.to_be_bytes());
+            assert_eq!(response.len(), ATTESTATION_BODY_LEN);
+            let signature = authority.sign(&[ATTESTATION_DOMAIN, response.as_slice()].concat());
+            response.extend_from_slice(&signature.to_bytes());
+            stream
+                .write_all(&(response.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(&response).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let reference_time_config = ReferenceTimeNodeConfig {
+            policy_file: policy_file.clone(),
+            admin_public_key: admin.verifying_key().to_bytes(),
+            address,
+            state_file: state_file.clone(),
+        };
+        let provider =
+            build_authenticated_node_reference_time(&reference_time_config, &NETWORK).unwrap();
+        let expected_policy_digest: [u8; 32] = Sha256::digest(&policy_wire).into();
+        assert_eq!(provider.policy_digest(), Some(expected_policy_digest));
+        let sample = provider.sample().unwrap();
+        assert_eq!(
+            sample.provenance,
+            ReferenceTimeProvenance::ConfiguredProvider
+        );
+        assert_eq!(sample.source_id, "ed25519-attested-time-v1");
+        assert!(sample.unix_seconds > 0);
+        server.join().unwrap();
+        drop(provider);
+
+        let stored = ReferenceTimeStateStore::open(&state_file, &NETWORK).unwrap();
+        assert_eq!(stored.last_accepted_sequence().unwrap(), 1);
+        assert_eq!(stored.policy_trust_state().unwrap().highest_sequence(), 1);
+        drop(stored);
+
+        let wrong_network_state = dir.0.join("wrong-network-time-state.rts1");
+        let error = match build_authenticated_node_reference_time(
+            &ReferenceTimeNodeConfig {
+                state_file: wrong_network_state,
+                ..reference_time_config
+            },
+            &[0xB6; 32],
+        ) {
+            Ok(_) => panic!("wrong-network reference-time policy unexpectedly verified"),
+            Err(error) => error,
+        };
+        assert!(error.contains("PolicyNetworkMismatch"));
+    }
 
     fn external_cas_cli_values() -> BTreeMap<String, String> {
         // These are parser fixtures, not fixed Windows paths: the parser must accept
@@ -3330,7 +4283,9 @@ mod tests {
         let clock = SystemClockReferenceTime;
         let mut params = smoke_params();
         params.protocol_version = 5;
-        let genesis = QRunGenesisV05::new(network, owner).unwrap();
+        let genesis_timestamp = now_unix().unwrap().saturating_sub(10);
+        let genesis =
+            QRunGenesisV05::new_with_genesis_timestamp(network, owner, genesis_timestamp).unwrap();
 
         // Build a parent-linked height-one checkpoint, then derive the exact empty PFS2 suffix
         // manifest that the independently initialized provider is expected to anchor.
@@ -3354,13 +4309,14 @@ mod tests {
         // Create a real Genesis-rooted PFS2 source store at the exact node data path, with one
         // accepted QFP5 block. The ECR1/QCF1 bootstrap is provisioned out-of-band against this
         // exact active manifest; the migration command itself must not rewrite the bootstrap.
-        let mut source_runtime = QRunV05PowForkRuntime::open(
+        let mut source_runtime = QRunV05PowForkRuntime::open_with_genesis_timestamp(
             &store_dir,
             network,
             owner,
             params.clone(),
             &authenticator,
             &clock,
+            genesis_timestamp,
         )
         .unwrap();
         source_runtime.set_producer_account(owner).unwrap();
@@ -3503,13 +4459,14 @@ mod tests {
         // remain byte-exactly at generation zero after this rejected maintenance request.
         let mut wrong_parent = external.clone();
         wrong_parent.checkpoint_parent_commitment = Some([0xFE; 32]);
-        let rejection = match open_node_runtime(
+        let rejection = match open_node_runtime_with_genesis_timestamp(
             &store_dir,
             network,
             owner,
             params.clone(),
             &authenticator,
             &clock,
+            Some(genesis_timestamp),
             Some(&wrong_parent),
         ) {
             Ok(_) => panic!("Genesis checkpoint migration accepted an unrelated QRCP parent"),
@@ -3525,13 +4482,14 @@ mod tests {
             !floor_dir.exists(),
             "wrong Genesis parent must be rejected before QCF1 initialization"
         );
-        let source_reopened = QRunV05PowForkRuntime::open(
+        let source_reopened = QRunV05PowForkRuntime::open_with_genesis_timestamp(
             &store_dir,
             network,
             owner,
             params.clone(),
             &authenticator,
             &clock,
+            genesis_timestamp,
         )
         .unwrap();
         assert_eq!(source_reopened.canonical_height(), 1);
@@ -3542,13 +4500,14 @@ mod tests {
         // The explicit migration flag now drives the complete signed Noise/TCP -> QRA1 replay
         // -> QRM1/CAS/QCF1 -> QRCP/PFS2 transition, and returns an ordinary checkpoint-rooted
         // runtime. A second Noise client session and QCF1 reopen are performed inside startup.
-        let opened = open_node_runtime(
+        let opened = open_node_runtime_with_genesis_timestamp(
             &store_dir,
             network,
             owner,
             params.clone(),
             &authenticator,
             &clock,
+            Some(genesis_timestamp),
             Some(&external),
         );
         let mut runtime = match opened {
@@ -3607,13 +4566,14 @@ mod tests {
             minimum_height: 1,
             expected_parent_commitment: genesis_checkpoint_commitment,
         });
-        let reopened = open_node_runtime(
+        let reopened = open_node_runtime_with_genesis_timestamp(
             &store_dir,
             network,
             owner,
             params,
             &authenticator,
             &clock,
+            Some(genesis_timestamp),
             Some(&restart_config),
         )
         .unwrap();
@@ -3909,7 +4869,7 @@ mod tests {
             public_alpha: false,
             mainnet: false,
             authenticator,
-            clock,
+            clock: NodeReferenceTime::SystemClock,
             receipts: BTreeMap::new(),
             profile_id,
             block_peers: Vec::new(),
@@ -3952,7 +4912,7 @@ mod tests {
             public_alpha: false,
             mainnet: false,
             authenticator,
-            clock,
+            clock: NodeReferenceTime::SystemClock,
             receipts: BTreeMap::new(),
             profile_id,
             block_peers: Vec::new(),
@@ -4047,13 +5007,25 @@ mod tests {
 
     #[test]
     fn bounded_sync_wire_rejects_bad_versions_trailing_bytes_and_budget_overruns() {
-        let request = encode_sync_request(7, 2, 1_024).unwrap();
-        assert_eq!(decode_sync_request(&request).unwrap(), (7, 2, 1_024));
+        let request = encode_sync_request(7, 2, 1_024, None).unwrap();
+        assert_eq!(decode_sync_request(&request).unwrap(), (7, 2, 1_024, None));
+        let pinned_snapshot = (18, [0xA5; 32]);
+        let pinned_request = encode_sync_request(9, 2, 1_024, Some(pinned_snapshot)).unwrap();
+        assert_eq!(
+            decode_sync_request(&pinned_request).unwrap(),
+            (9, 2, 1_024, Some(pinned_snapshot))
+        );
+        assert!(validate_sync_snapshot_pin(Some(pinned_snapshot), 18, [0xA5; 32]).is_ok());
+        assert!(validate_sync_snapshot_pin(Some(pinned_snapshot), 19, [0xA5; 32]).is_err());
+        assert!(validate_sync_snapshot_pin(Some(pinned_snapshot), 18, [0xA6; 32]).is_err());
+        let mut malformed_pin = request.clone();
+        malformed_pin[20] = 2;
+        assert!(decode_sync_request(&malformed_pin).is_err());
         let mut bad_request = request.clone();
         bad_request[0] ^= 0x40;
         assert!(decode_sync_request(&bad_request).is_err());
-        assert!(encode_sync_request(0, 2, 1_024).is_err());
-        assert!(encode_sync_request(7, 0, 1_024).is_err());
+        assert!(encode_sync_request(0, 2, 1_024, None).is_err());
+        assert!(encode_sync_request(7, 0, 1_024, None).is_err());
 
         let envelope = vec![0xAB; 8];
         let response =
@@ -4091,6 +5063,23 @@ mod tests {
         assert_eq!(
             baseline_fingerprint,
             profile_id(&network, &smoke_params(), &genesis)
+        );
+        assert_eq!(
+            profile_id_with_reference_time_policy(&network, &baseline, &genesis, None),
+            baseline_fingerprint,
+            "local compatibility profiles retain their historical fingerprint"
+        );
+        let time_policy_a =
+            profile_id_with_reference_time_policy(&network, &baseline, &genesis, Some([0x71; 32]));
+        let time_policy_b =
+            profile_id_with_reference_time_policy(&network, &baseline, &genesis, Some([0x72; 32]));
+        assert_ne!(
+            time_policy_a, baseline_fingerprint,
+            "an authenticated public-network time policy must be part of the session profile"
+        );
+        assert_ne!(
+            time_policy_a, time_policy_b,
+            "nodes with different signed time policies must not share a QRun profile identity"
         );
         assert_ne!(
             baseline_fingerprint,
@@ -4345,10 +5334,12 @@ mod tests {
             )
             .unwrap();
             let request = session.read_record(&mut stream).unwrap();
-            let (start_height, max_blocks, max_bytes) = decode_sync_request(&request).unwrap();
+            let (start_height, max_blocks, max_bytes, expected_snapshot) =
+                decode_sync_request(&request).unwrap();
             assert_eq!(start_height, 1);
             assert_eq!(max_blocks, 8);
             assert_eq!(max_bytes, page_budget);
+            assert_eq!(expected_snapshot, None);
             let response = encode_sync_response(
                 base_height,
                 peer_height,
@@ -4402,7 +5393,259 @@ mod tests {
     }
 
     #[test]
-    fn fresh_node_catches_up_multiple_pages_through_authenticated_sync_handler() {
+    fn qrun_v05_partitioned_sync_reorgs_to_peer_cumulative_work_and_recovers_receipts_after_restart(
+    ) {
+        let source_dir = TestDir::new();
+        let receiver_dir = TestDir::new();
+        let network = [0x59; 32];
+        let signer = Ed25519TransactionSigner::from_seed([0x5A; 32]);
+        let owner = signer.account_id();
+        let recipient_a = [0xA1; 32];
+        let recipient_b = [0xB2; 32];
+        let mut params = smoke_params();
+        params.protocol_version = 5;
+
+        // Create two isolated QFP5 runtimes with identical Genesis/profile but no block exchange.
+        let mut source_state =
+            node_state_with_params(&source_dir.0, network, &signer, params.clone());
+        let mut receiver_state =
+            node_state_with_params(&receiver_dir.0, network, &signer, params.clone());
+        source_state.runtime.set_producer_account(owner).unwrap();
+        receiver_state.runtime.set_producer_account(owner).unwrap();
+        let source = Arc::new(Mutex::new(source_state));
+        let receiver = Arc::new(Mutex::new(receiver_state));
+
+        let timestamp = now_unix().unwrap();
+        let mut tx_a = Transaction {
+            network_id: network,
+            sender: owner,
+            recipient: recipient_a,
+            nonce: 1,
+            amount: 111,
+            fee: 1,
+            expires_at: timestamp + 3_600,
+            signature: Vec::new(),
+        };
+        signer.sign_transaction(&mut tx_a).unwrap();
+        let mut tx_b = Transaction {
+            network_id: network,
+            sender: owner,
+            recipient: recipient_b,
+            nonce: 1,
+            amount: 222,
+            fee: 1,
+            expires_at: timestamp + 3_600,
+            signature: Vec::new(),
+        };
+        signer.sign_transaction(&mut tx_b).unwrap();
+        let txid_a = transaction_id(&tx_a).unwrap();
+        let txid_b = transaction_id(&tx_b).unwrap();
+
+        // Partition side A mines a valid height-1 transaction that must become orphaned.
+        let envelope_a = {
+            let node = receiver.lock().unwrap();
+            node.runtime
+                .mine_candidate(timestamp, vec![tx_a], &node.authenticator, 1)
+                .unwrap()
+        };
+        {
+            let mut node = receiver.lock().unwrap();
+            let NodeState {
+                runtime,
+                authenticator,
+                clock,
+                ..
+            } = &mut *node;
+            runtime
+                .submit_block(&envelope_a, authenticator, clock)
+                .unwrap();
+            node.refresh_receipts().unwrap();
+        }
+
+        // Partition side B independently mines a conflicting nonce-1 transaction and extends
+        // that competing branch to height 2. No block from either side has crossed the partition.
+        let envelope_b1 = {
+            let node = source.lock().unwrap();
+            node.runtime
+                .mine_candidate(timestamp + 1, vec![tx_b], &node.authenticator, 1)
+                .unwrap()
+        };
+        {
+            let mut node = source.lock().unwrap();
+            let NodeState {
+                runtime,
+                authenticator,
+                clock,
+                ..
+            } = &mut *node;
+            runtime
+                .submit_block(&envelope_b1, authenticator, clock)
+                .unwrap();
+        }
+        let envelope_b2 = {
+            let node = source.lock().unwrap();
+            node.runtime
+                .mine_candidate(timestamp + 2, Vec::new(), &node.authenticator, 1)
+                .unwrap()
+        };
+        {
+            let mut node = source.lock().unwrap();
+            let NodeState {
+                runtime,
+                authenticator,
+                clock,
+                ..
+            } = &mut *node;
+            runtime
+                .submit_block(&envelope_b2, authenticator, clock)
+                .unwrap();
+            node.refresh_receipts().unwrap();
+        }
+
+        {
+            let node_a = receiver.lock().unwrap();
+            let node_b = source.lock().unwrap();
+            assert_eq!(node_a.runtime.canonical_height(), 1);
+            assert_eq!(node_b.runtime.canonical_height(), 2);
+            assert_ne!(
+                node_a.runtime.canonical_tip(),
+                node_b.runtime.canonical_tip()
+            );
+            assert_eq!(
+                node_a.receipts.get(&txid_a).map(|receipt| receipt.height),
+                Some(1)
+            );
+            assert!(!node_a.receipts.contains_key(&txid_b));
+            assert_eq!(
+                node_b.receipts.get(&txid_b).map(|receipt| receipt.height),
+                Some(1)
+            );
+            assert!(!node_b.receipts.contains_key(&txid_a));
+        }
+
+        // Reconnect through a real Noise XX canonical-sync request. The authenticated peer
+        // serves its complete canonical path from the shared trusted base, not just height+1.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap();
+        let (mut source_private, source_public) = test_noise_keypair();
+        let (mut receiver_private, receiver_public) = test_noise_keypair();
+        {
+            let mut node = source.lock().unwrap();
+            node.noise_private_key = Some(source_private);
+            node.trusted_peer_static_keys = vec![receiver_public];
+        }
+        {
+            let mut node = receiver.lock().unwrap();
+            node.noise_private_key = Some(receiver_private);
+            node.trusted_peer_static_keys = vec![source_public];
+            node.peer_static_keys_by_addr.insert(peer, source_public);
+        }
+        source_private.fill(0);
+        receiver_private.fill(0);
+
+        let accepted = listener.try_clone().unwrap();
+        let sync_source = Arc::clone(&source);
+        let sync_server = std::thread::spawn(move || {
+            let (mut stream, _) = accepted.accept().unwrap();
+            handle_block(&mut stream, &sync_source).unwrap();
+        });
+        let page_budget = max_sync_response_block_bytes(8).unwrap();
+        let synced_height = sync_from_peer_authenticated(peer, &receiver, 8, page_budget).unwrap();
+        sync_server.join().unwrap();
+
+        let (source_tip, source_root, source_balance, source_supply) = {
+            let node = source.lock().unwrap();
+            (
+                node.runtime.canonical_tip(),
+                node.runtime.canonical_state_root(),
+                node.runtime
+                    .canonical_state()
+                    .account(&owner)
+                    .unwrap()
+                    .balance,
+                node.runtime.canonical_state().total_value().unwrap(),
+            )
+        };
+        {
+            let node = receiver.lock().unwrap();
+            assert_eq!(synced_height, 2);
+            assert_eq!(node.runtime.canonical_height(), 2);
+            assert_eq!(node.runtime.canonical_tip(), source_tip);
+            assert_eq!(node.runtime.canonical_state_root(), source_root);
+            assert_eq!(
+                node.runtime
+                    .canonical_state()
+                    .account(&owner)
+                    .unwrap()
+                    .balance,
+                source_balance
+            );
+            assert_eq!(
+                node.runtime
+                    .canonical_state()
+                    .account(&recipient_b)
+                    .unwrap()
+                    .balance,
+                222
+            );
+            assert_eq!(
+                node.runtime.canonical_state().total_value().unwrap(),
+                source_supply
+            );
+            assert_eq!(
+                source_supply,
+                ai_native_l1_pow_bench::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+            );
+            assert!(
+                !node.receipts.contains_key(&txid_a),
+                "orphaned partition-side receipt must be removed"
+            );
+            assert_eq!(
+                node.receipts.get(&txid_b).map(|receipt| receipt.height),
+                Some(1)
+            );
+        }
+
+        // The recovered branch selection and receipt index must survive a durable reopen.
+        drop(receiver);
+        let mut reopened_state = node_state_with_params(&receiver_dir.0, network, &signer, params);
+        reopened_state.runtime.set_producer_account(owner).unwrap();
+        assert_eq!(reopened_state.runtime.canonical_height(), 2);
+        assert_eq!(reopened_state.runtime.canonical_tip(), source_tip);
+        assert_eq!(reopened_state.runtime.canonical_state_root(), source_root);
+        assert!(!reopened_state.receipts.contains_key(&txid_a));
+        assert_eq!(
+            reopened_state
+                .receipts
+                .get(&txid_b)
+                .map(|receipt| receipt.height),
+            Some(1)
+        );
+        assert_eq!(
+            reopened_state
+                .runtime
+                .canonical_state()
+                .account(&recipient_b)
+                .unwrap()
+                .balance,
+            222
+        );
+        assert_eq!(
+            reopened_state
+                .runtime
+                .canonical_state()
+                .total_value()
+                .unwrap(),
+            ai_native_l1_pow_bench::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+        );
+
+        let _ = envelope_a;
+        let _ = envelope_b1;
+        let _ = envelope_b2;
+    }
+
+    #[test]
+    fn authenticated_sync_serves_retained_snapshot_across_competing_reorg_then_catches_up() {
         let source_dir = TestDir::new();
         let receiver_dir = TestDir::new();
         let source_path = source_dir.0.clone();
@@ -4436,7 +5679,8 @@ mod tests {
         let server_params = sync_params.clone();
         let server = std::thread::spawn(move || {
             let signer = Ed25519TransactionSigner::from_seed(seed);
-            let mut source = node_state_with_params(&source_path, network, &signer, server_params);
+            let mut source =
+                node_state_with_params(&source_path, network, &signer, server_params.clone());
             source.noise_private_key = Some(server_private);
             source.trusted_peer_static_keys = vec![receiver_public];
             server_private.fill(0);
@@ -4516,25 +5760,101 @@ mod tests {
             }
 
             source.lock().unwrap().refresh_receipts().unwrap();
-            // The handshake deadline starts only after PoW fixture construction is complete.
+
+            // Pre-build the rival branch before starting the Noise handshake deadline. Its
+            // envelopes are imported only after the first snapshot page has been served.
+            let rival_dir = TestDir::new();
+            let rival_signer = Ed25519TransactionSigner::from_seed(seed);
+            let mut rival =
+                node_state_with_params(&rival_dir.0, network, &rival_signer, server_params.clone());
+            let mut competing_envelopes = Vec::new();
+            for height in 1..=19u64 {
+                let envelope = {
+                    let auth = &rival.authenticator;
+                    rival
+                        .runtime
+                        .mine_candidate(timestamp + height, Vec::new(), auth, 1)
+                        .unwrap()
+                };
+                {
+                    let NodeState {
+                        runtime,
+                        authenticator,
+                        clock,
+                        ..
+                    } = &mut rival;
+                    runtime
+                        .submit_block(&envelope, authenticator, clock)
+                        .unwrap();
+                }
+                competing_envelopes.push(envelope);
+            }
+
+            // The handshake deadline starts only after all PoW fixtures are constructed.
             ready_sender.send(()).unwrap();
-            // Serve three 8-block-bounded requests through the real authenticated node handler.
-            for _ in 0..3 {
+            // The first request pins canonical height 18. A separate node then builds a
+            // genuinely competing 19-block branch from Genesis and wins fork choice.
+            let (mut first_stream, _) = listener.accept().unwrap();
+            handle_block(&mut first_stream, &source).unwrap();
+            let snapshot = {
+                let node = source.lock().unwrap();
+                assert_eq!(node.runtime.canonical_height(), 18);
+                (
+                    node.runtime.canonical_height(),
+                    node.runtime.canonical_tip(),
+                )
+            };
+
+            for envelope in competing_envelopes {
+                let mut node = source.lock().unwrap();
+                let NodeState {
+                    runtime,
+                    authenticator,
+                    clock,
+                    ..
+                } = &mut *node;
+                runtime
+                    .submit_block(&envelope, authenticator, clock)
+                    .unwrap();
+            }
+            source.lock().unwrap().refresh_receipts().unwrap();
+            let retained_old_snapshot = {
+                let node = source.lock().unwrap();
+                assert_eq!(node.runtime.canonical_height(), 19);
+                node.runtime
+                    .archived_branch_summary(&snapshot.1)
+                    .map(|(height, _, _)| height)
+                    == Some(snapshot.0)
+            };
+            assert!(
+                retained_old_snapshot,
+                "the previous canonical branch must remain available"
+            );
+
+            // Finish the original height-18 snapshot after the actual competing reorganization.
+            for _ in 0..2 {
                 let (mut stream, _) = listener.accept().unwrap();
                 handle_block(&mut stream, &source).unwrap();
             }
 
+            // A second sync attempt observes and imports the new canonical 19-block branch.
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                handle_block(&mut stream, &source).unwrap();
+            }
             let node = source.lock().unwrap();
             (
                 txid,
+                snapshot,
+                retained_old_snapshot,
                 node.runtime.canonical_height(),
                 node.runtime.canonical_tip(),
                 node.runtime.canonical_state_root(),
                 node.runtime
                     .canonical_state()
                     .account(&recipient)
-                    .unwrap()
-                    .balance,
+                    .map(|account| account.balance)
+                    .unwrap_or(0),
                 node.runtime.canonical_state().total_value().unwrap(),
                 node.receipts.get(&txid).map(|receipt| receipt.height),
             )
@@ -4544,9 +5864,27 @@ mod tests {
             .recv_timeout(Duration::from_secs(30))
             .expect("PoW fixture and authenticated sync listener should become ready");
         let page_budget = max_sync_response_block_bytes(8).unwrap();
+        let first_synced_height =
+            sync_from_peer_authenticated(peer, &receiver, 8, page_budget).unwrap();
+        assert_eq!(first_synced_height, 18);
+        {
+            let node = receiver.lock().unwrap();
+            assert_eq!(node.runtime.canonical_height(), 18);
+            assert_eq!(
+                node.runtime
+                    .canonical_state()
+                    .account(&recipient)
+                    .unwrap()
+                    .balance,
+                2_500
+            );
+        }
+
         let synced_height = sync_from_peer_authenticated(peer, &receiver, 8, page_budget).unwrap();
         let (
             txid,
+            initial_snapshot,
+            retained_old_snapshot,
             source_height,
             source_tip,
             source_root,
@@ -4556,8 +5894,8 @@ mod tests {
         ) = server.join().unwrap();
         let receiver = receiver.lock().unwrap();
 
-        assert_eq!(synced_height, 18);
-        assert_eq!(source_height, 18);
+        assert_eq!(synced_height, 19);
+        assert_eq!(source_height, 19);
         assert_eq!(receiver.runtime.canonical_height(), source_height);
         assert_eq!(receiver.runtime.canonical_tip(), source_tip);
         assert_eq!(receiver.runtime.canonical_state_root(), source_root);
@@ -4566,17 +5904,17 @@ mod tests {
                 .runtime
                 .canonical_state()
                 .account(&recipient)
-                .unwrap()
-                .balance,
-            2_500
+                .map(|account| account.balance)
+                .unwrap_or(0),
+            0
         );
         assert_eq!(
             receiver
                 .runtime
                 .canonical_state()
                 .account(&recipient)
-                .unwrap()
-                .balance,
+                .map(|account| account.balance)
+                .unwrap_or(0),
             source_balance
         );
         assert_eq!(
@@ -4589,9 +5927,12 @@ mod tests {
         );
         assert_eq!(
             receiver.receipts.get(&txid).map(|receipt| receipt.height),
-            Some(2)
+            None
         );
-        assert_eq!(source_receipt, Some(2));
+        assert_eq!(source_receipt, None);
+        assert!(retained_old_snapshot);
+        assert_eq!(initial_snapshot.0, 18);
+        assert_ne!(initial_snapshot.1, source_tip);
     }
 
     #[test]
@@ -4686,7 +6027,7 @@ mod tests {
             )
         };
         let page_bytes = max_sync_response_block_bytes(MAX_SYNC_PAGE_BLOCKS).unwrap();
-        let request = encode_sync_request(1, MAX_SYNC_PAGE_BLOCKS, page_bytes).unwrap();
+        let request = encode_sync_request(1, MAX_SYNC_PAGE_BLOCKS, page_bytes, None).unwrap();
         let client = std::thread::spawn(move || {
             let private_key = EphemeralNoisePrivateKey(client_private);
             let mut stream =
@@ -4811,9 +6152,13 @@ mod tests {
         let envelope = {
             let mut node = source.lock().unwrap();
             let auth = &node.authenticator;
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
             let envelope = node
                 .runtime
-                .mine_candidate(100, Vec::new(), auth, 1)
+                .mine_candidate(timestamp, Vec::new(), auth, 1)
                 .unwrap();
             let NodeState {
                 runtime,
@@ -5018,6 +6363,8 @@ mod tx_ingress_tests {
 
     fn test_params() -> ConsensusParameters {
         let mut params = ConsensusParameters::candidate_testnet().unwrap();
+        // This binary's signed transaction ingress mines QRun v0.5 QFP5 fee-only blocks.
+        params.protocol_version = 5;
         params.initial_target = Uint256::MAX;
         params.pow_limit = Uint256::MAX;
         params.pow.memory_kib = 8 * 1024;
@@ -5052,7 +6399,7 @@ mod tx_ingress_tests {
             public_alpha: false,
             mainnet: false,
             authenticator,
-            clock,
+            clock: NodeReferenceTime::SystemClock,
             receipts: BTreeMap::new(),
             profile_id,
             block_peers: Vec::new(),

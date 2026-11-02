@@ -196,6 +196,97 @@ where
     }
 }
 
+/// Immutable, branch-bound mining inputs that can be hashed without holding the node's
+/// mutable runtime/store lock. The eventual envelope must still be submitted through the live
+/// runtime, which revalidates the parent, target, timestamp and state before committing.
+#[derive(Debug, Clone)]
+pub struct QRunV05PowMiningSnapshot {
+    network_id: NetworkId,
+    params: ConsensusParameters,
+    chain: PrivateTestnetChain,
+    producer_account: AccountId,
+}
+
+impl QRunV05PowMiningSnapshot {
+    pub fn parent_tip(&self) -> [u8; 32] {
+        self.chain.chain_tip().tip_hash
+    }
+
+    pub fn parent_height(&self) -> u64 {
+        self.chain.state().height()
+    }
+
+    pub fn mine_candidate<A: TransactionAuthenticator>(
+        &self,
+        timestamp: u64,
+        transactions: Vec<Transaction>,
+        authenticator: &A,
+        max_attempts: u64,
+    ) -> Result<Vec<u8>, QRunV05PowRuntimeError> {
+        if max_attempts == 0 {
+            return Err(QRunV05PowRuntimeError::MiningExhausted { attempts: 0 });
+        }
+        if self.producer_account == [0; 32] {
+            return Err(QRunV05PowRuntimeError::InvalidCandidate(
+                "producer account must be nonzero".into(),
+            ));
+        }
+        if timestamp <= self.chain.state().last_timestamp() {
+            return Err(QRunV05PowRuntimeError::InvalidCandidate(
+                "candidate timestamp must exceed parent timestamp".into(),
+            ));
+        }
+        let height =
+            self.chain.state().height().checked_add(1).ok_or_else(|| {
+                QRunV05PowRuntimeError::InvalidCandidate("height overflow".into())
+            })?;
+        let mut fee_block = QRunV05FeeBlock {
+            body: Block {
+                height,
+                timestamp,
+                parent_hash: self.chain.state().tip_hash(),
+                state_root: [0; 32],
+                transactions,
+            },
+            producer: self.producer_account,
+        };
+        fee_block.body.state_root = self
+            .chain
+            .state()
+            .preview_qrun_v05_fee_state_root_after(&fee_block, authenticator)?;
+        let commitment = qrun_v05_fee_pow_state_commitment(&fee_block).map_err(|error| {
+            QRunV05PowRuntimeError::InvalidCandidate(format!("QFP5 commitment: {error:?}"))
+        })?;
+        let target = self
+            .chain
+            .expected_target(None)
+            .map_err(|error| QRunV05PowRuntimeError::InvalidCandidate(error.to_string()))?;
+        let mut header = PowHeader {
+            protocol_version: self.params.protocol_version,
+            network_id: self.network_id,
+            height,
+            timestamp,
+            parent_hash: fee_block.body.parent_hash,
+            previous_consensus_hash: self.chain.chain_tip().tip_hash,
+            state_root: commitment,
+            target,
+            nonce: 0,
+        };
+        for nonce in 0..max_attempts {
+            header.nonce = nonce;
+            let digest = pow_digest(&header, self.params.pow)?;
+            if Uint256::from_be_bytes(digest) <= target {
+                return encode_qrun_v05_fee_pow_block(&header, &fee_block).map_err(|error| {
+                    QRunV05PowRuntimeError::InvalidCandidate(format!("encode QFP5: {error:?}"))
+                });
+            }
+        }
+        Err(QRunV05PowRuntimeError::MiningExhausted {
+            attempts: max_attempts,
+        })
+    }
+}
+
 /// QRun Genesis + deterministic PoW validation + persisted branch selection.
 /// Network listeners should submit complete PTB2 envelopes through submit_block.
 pub struct QRunV05PowForkRuntime<S = PrivateTestnetForkStore> {
@@ -226,6 +317,31 @@ impl QRunV05PowForkRuntime<PrivateTestnetForkStore> {
             clock,
             None,
             None,
+            None,
+        )
+    }
+
+    /// Open a new runtime whose Genesis commits an explicit, nonzero network activation time.
+    /// Every node sharing this network identity must use the exact same timestamp.
+    pub fn open_with_genesis_timestamp<A: TransactionAuthenticator>(
+        directory: impl AsRef<Path>,
+        network_id: NetworkId,
+        owner_account: AccountId,
+        params: ConsensusParameters,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+        genesis_timestamp: u64,
+    ) -> Result<Self, QRunV05PowRuntimeError> {
+        Self::open_inner(
+            directory,
+            network_id,
+            owner_account,
+            params,
+            authenticator,
+            clock,
+            None,
+            None,
+            Some(genesis_timestamp),
         )
     }
 
@@ -334,6 +450,7 @@ impl QRunV05PowForkRuntime<PrivateTestnetForkStore> {
             clock,
             expected_manifest_anchor,
             Some(base_chain),
+            None,
         )
     }
 
@@ -356,6 +473,7 @@ impl QRunV05PowForkRuntime<PrivateTestnetForkStore> {
             clock,
             Some(expected_manifest_anchor),
             None,
+            None,
         )
     }
 
@@ -368,6 +486,7 @@ impl QRunV05PowForkRuntime<PrivateTestnetForkStore> {
         clock: &dyn ReferenceTimeProvider,
         anchor: Option<[u8; 32]>,
         base_chain: Option<PrivateTestnetChain>,
+        genesis_timestamp: Option<u64>,
     ) -> Result<Self, QRunV05PowRuntimeError> {
         params.validate()?;
         if params.issuance.maximum_supply() != MAX_TOTAL_SUPPLY_ATOMS
@@ -379,7 +498,12 @@ impl QRunV05PowForkRuntime<PrivateTestnetForkStore> {
         {
             return Err(QRunV05PowRuntimeError::WrongSupplyProfile);
         }
-        let genesis = QRunGenesisV05::new(network_id, owner_account)?;
+        let genesis = match genesis_timestamp {
+            Some(timestamp) => {
+                QRunGenesisV05::new_with_genesis_timestamp(network_id, owner_account, timestamp)?
+            }
+            None => QRunGenesisV05::new(network_id, owner_account)?,
+        };
         let actual = genesis.total_supply_atoms()?;
         if actual != MAX_TOTAL_SUPPLY_ATOMS {
             return Err(QRunV05PowRuntimeError::SupplyMismatch {
@@ -476,6 +600,21 @@ where
         params: ConsensusParameters,
         store: S,
     ) -> Result<Self, QRunV05PowRuntimeError> {
+        let genesis = QRunGenesisV05::new(network_id, owner_account)?;
+        Self::from_store_with_genesis(network_id, owner_account, params, store, genesis)
+    }
+
+    /// Bind an already-opened backend to an exact Genesis object, including its activation time.
+    pub fn from_store_with_genesis(
+        network_id: NetworkId,
+        owner_account: AccountId,
+        params: ConsensusParameters,
+        store: S,
+        genesis: QRunGenesisV05,
+    ) -> Result<Self, QRunV05PowRuntimeError> {
+        if genesis.network_id() != network_id || genesis.owner_account() != owner_account {
+            return Err(QRunV05PowRuntimeError::WrongNetwork);
+        }
         params.validate()?;
         if params.issuance.maximum_supply() != MAX_TOTAL_SUPPLY_ATOMS
             || params
@@ -486,7 +625,6 @@ where
         {
             return Err(QRunV05PowRuntimeError::WrongSupplyProfile);
         }
-        let genesis = QRunGenesisV05::new(network_id, owner_account)?;
         let fee_only = params.protocol_version == 5;
         if store.genesis_state() != genesis.ledger()
             || store.is_qrun_v05_fee_only() != fee_only
@@ -561,6 +699,21 @@ where
 
     pub fn is_qrun_v05_fee_only(&self) -> bool {
         self.fee_only
+    }
+
+    /// Capture the exact current QFP5 branch and profile for off-lock PoW calculation.
+    /// Submission still goes through this live runtime, so stale or invalid candidates are
+    /// revalidated against the current store before any durable state transition.
+    pub fn mining_snapshot(&self) -> Result<QRunV05PowMiningSnapshot, QRunV05PowRuntimeError> {
+        if !self.fee_only {
+            return Err(QRunV05PowRuntimeError::UnsupportedEnvelopeMode);
+        }
+        Ok(QRunV05PowMiningSnapshot {
+            network_id: self.network_id,
+            params: self.params.clone(),
+            chain: self.store.archive().canonical_chain().clone(),
+            producer_account: self.producer_account,
+        })
     }
 
     pub fn mine_candidate_for_producer<A: TransactionAuthenticator>(
@@ -776,6 +929,23 @@ where
     pub fn canonical_state_root(&self) -> [u8; 32] {
         self.store.archive().canonical_chain().state().state_root()
     }
+
+    /// Read-only summary for an already validated retained branch. The node sync layer uses
+    /// this to confirm the authenticated peer tip was imported and compare cumulative work
+    /// without exposing or mutating the underlying fork-choice graph.
+    pub fn archived_branch_summary(&self, tip: &[u8; 32]) -> Option<(u64, [u8; 32], Uint256)> {
+        let branch = self.store.archive().branch_chain(tip)?;
+        Some((
+            branch.state().height(),
+            branch.state().state_root(),
+            branch.cumulative_work(),
+        ))
+    }
+
+    pub fn canonical_cumulative_work(&self) -> Uint256 {
+        self.store.archive().canonical_chain().cumulative_work()
+    }
+
     pub fn canonical_state(&self) -> &LedgerState {
         self.store.archive().canonical_chain().state()
     }
@@ -801,6 +971,20 @@ where
         self.store
             .archive()
             .canonical_envelopes_range(start_height, max_blocks, max_bytes)
+            .map_err(|error| QRunV05PowRuntimeError::InvalidCandidate(error.to_string()))
+    }
+
+    /// Export a bounded page from a previously validated retained branch snapshot.
+    pub fn archived_branch_envelopes_range(
+        &self,
+        tip: &[u8; 32],
+        start_height: u64,
+        max_blocks: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<Vec<u8>>, QRunV05PowRuntimeError> {
+        self.store
+            .archive()
+            .branch_envelopes_range_for_tip(tip, start_height, max_blocks, max_bytes)
             .map_err(|error| QRunV05PowRuntimeError::InvalidCandidate(error.to_string()))
     }
 
@@ -892,9 +1076,20 @@ mod tests {
     impl ReferenceTimeProvider for FixedClock {
         fn sample(&self) -> Result<ReferenceTimeSample, ReferenceTimeError> {
             Ok(ReferenceTimeSample {
-                unix_seconds: 1_000_000,
+                unix_seconds: 100,
                 provenance: ReferenceTimeProvenance::ConfiguredProvider,
                 source_id: "qrun-pow-runtime-test-clock",
+            })
+        }
+    }
+
+    struct ClockAt(u64);
+    impl ReferenceTimeProvider for ClockAt {
+        fn sample(&self) -> Result<ReferenceTimeSample, ReferenceTimeError> {
+            Ok(ReferenceTimeSample {
+                unix_seconds: self.0,
+                provenance: ReferenceTimeProvenance::ConfiguredProvider,
+                source_id: "qrun-pow-runtime-dynamic-test-clock",
             })
         }
     }
@@ -905,6 +1100,73 @@ mod tests {
         params.pow.memory_kib = 8 * 1024;
         params.pow.iterations = 1;
         params
+    }
+
+    #[test]
+    fn time_anchored_runtime_reopens_only_with_the_same_genesis_timestamp() {
+        let dir = TestDir::new();
+        let network = [0x61; 32];
+        let owner = [0x62; 32];
+        let genesis_timestamp = 1_800_000_000;
+        let params = params();
+
+        let genesis =
+            QRunGenesisV05::new_with_genesis_timestamp(network, owner, genesis_timestamp).unwrap();
+        let runtime = QRunV05PowForkRuntime::open_with_genesis_timestamp(
+            &dir.0,
+            network,
+            owner,
+            params.clone(),
+            &EmptyAuthenticator,
+            &ClockAt(genesis_timestamp),
+            genesis_timestamp,
+        )
+        .unwrap();
+        assert_eq!(runtime.genesis_commitment(), genesis.commitment());
+        assert_eq!(runtime.canonical_state_root(), genesis.state_root());
+        assert_eq!(
+            runtime.canonical_state().last_timestamp(),
+            genesis_timestamp
+        );
+
+        let store = runtime.into_store();
+        let rebound = QRunV05PowForkRuntime::from_store_with_genesis(
+            network,
+            owner,
+            params.clone(),
+            store,
+            genesis.clone(),
+        )
+        .unwrap();
+        assert_eq!(rebound.genesis_commitment(), genesis.commitment());
+        drop(rebound);
+
+        let reopened = QRunV05PowForkRuntime::open_with_genesis_timestamp(
+            &dir.0,
+            network,
+            owner,
+            params.clone(),
+            &EmptyAuthenticator,
+            &ClockAt(genesis_timestamp + 1),
+            genesis_timestamp,
+        )
+        .unwrap();
+        assert_eq!(reopened.genesis_commitment(), genesis.commitment());
+        drop(reopened);
+
+        assert!(
+            QRunV05PowForkRuntime::open_with_genesis_timestamp(
+                &dir.0,
+                network,
+                owner,
+                params,
+                &EmptyAuthenticator,
+                &ClockAt(genesis_timestamp + 1),
+                genesis_timestamp + 1,
+            )
+            .is_err(),
+            "the same data directory must not reopen under a different anchored Genesis"
+        );
     }
 
     fn make_qfp5_fee_envelope(
@@ -1041,8 +1303,9 @@ mod tests {
             .mine_candidate(1, Vec::new(), &EmptyAuthenticator, 1)
             .unwrap();
         assert!(envelope.starts_with(b"QFP5"));
+        let first_block_clock = ClockAt(1);
         runtime
-            .submit_block(&envelope, &EmptyAuthenticator, &clock)
+            .submit_block(&envelope, &EmptyAuthenticator, &first_block_clock)
             .unwrap();
         assert_eq!(runtime.canonical_height(), 1);
         assert_eq!(
@@ -1248,6 +1511,44 @@ mod tests {
             MAX_TOTAL_SUPPLY_ATOMS
         );
         assert_ne!(winner_txid, loser_txid);
+
+        // A canonical reorg must persist the rebuilt transaction index and winning ledger,
+        // not merely update the in-memory view. Reopen the durable runtime and verify both.
+        let committed_tip = runtime.canonical_tip();
+        let committed_state_root = runtime.canonical_state_root();
+        drop(runtime);
+        let reopened =
+            QRunV05PowForkRuntime::open(&dir.0, network, owner, params, &authenticator, &clock)
+                .unwrap();
+        assert_eq!(reopened.canonical_height(), 2);
+        assert_eq!(reopened.canonical_tip(), committed_tip);
+        assert_eq!(reopened.canonical_state_root(), committed_state_root);
+        assert_eq!(
+            reopened.canonical_transaction_locations().unwrap(),
+            vec![(loser_txid, 1)],
+            "the losing branch's receipt must not reappear after restart"
+        );
+        assert_eq!(
+            reopened.canonical_state().total_value().unwrap(),
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
+        let losing_recipient = decode_candidate_network_block(loser)
+            .unwrap()
+            .block
+            .transactions[0]
+            .recipient;
+        assert_eq!(
+            reopened
+                .canonical_state()
+                .account(&losing_recipient)
+                .unwrap()
+                .balance,
+            if loser_txid == transaction_id(&tx_a).unwrap() {
+                111
+            } else {
+                222
+            }
+        );
     }
 
     #[test]
@@ -1719,11 +2020,13 @@ mod tests {
         // Keep a Genesis-rooted archive (rather than relying on a checkpoint) and exercise the
         // same QFP5 producer/importer path that the full-history restart must replay.
         for height in 1..=32u64 {
+            let timestamp = 100_000 + height;
             let envelope = runtime
-                .mine_candidate(100_000 + height, Vec::new(), &EmptyAuthenticator, 1)
+                .mine_candidate(timestamp, Vec::new(), &EmptyAuthenticator, 1)
                 .unwrap();
+            let block_clock = ClockAt(timestamp);
             runtime
-                .submit_block(&envelope, &EmptyAuthenticator, &clock)
+                .submit_block(&envelope, &EmptyAuthenticator, &block_clock)
                 .unwrap();
             assert_eq!(runtime.canonical_height(), height);
             assert_eq!(
@@ -1835,9 +2138,11 @@ mod tests {
             QRunV05PowCheckpoint::commitment_for_bytes(&genesis_checkpoint_bytes);
 
         for height in 1..=1_024u64 {
-            let envelope = fee_envelope(archive.canonical_chain(), &params, owner, height * 15, 1);
+            let timestamp = height * 15;
+            let envelope = fee_envelope(archive.canonical_chain(), &params, owner, timestamp, 1);
+            let block_clock = ClockAt(timestamp);
             archive
-                .insert_encoded(&envelope, &EmptyAuthenticator, &FixedClock)
+                .insert_encoded(&envelope, &EmptyAuthenticator, &block_clock)
                 .unwrap();
         }
         assert_eq!(archive.canonical_chain().state().height(), 1_024);
@@ -1879,9 +2184,11 @@ mod tests {
         // Roll the archive forward once more, retaining the complete 2,016-block
         // retarget window across the checkpoint boundary.
         for height in 1_025..=2_016u64 {
-            let envelope = fee_envelope(archive.canonical_chain(), &params, owner, height * 15, 1);
+            let timestamp = height * 15;
+            let envelope = fee_envelope(archive.canonical_chain(), &params, owner, timestamp, 1);
+            let block_clock = ClockAt(timestamp);
             archive
-                .insert_encoded(&envelope, &EmptyAuthenticator, &FixedClock)
+                .insert_encoded(&envelope, &EmptyAuthenticator, &block_clock)
                 .unwrap();
         }
         assert_eq!(archive.canonical_chain().state().height(), 2_016);
@@ -1942,8 +2249,9 @@ mod tests {
         let decoded = decode_candidate_network_block(&retarget_envelope).unwrap();
         assert_eq!(decoded.header.height, 2_017);
         assert_eq!(decoded.header.target, expected_target);
+        let retarget_clock = ClockAt(2_017 * 15);
         suffix
-            .submit_block(&retarget_envelope, &EmptyAuthenticator, &FixedClock)
+            .submit_block(&retarget_envelope, &EmptyAuthenticator, &retarget_clock)
             .unwrap();
         assert_eq!(suffix.canonical_height(), 2_017);
 

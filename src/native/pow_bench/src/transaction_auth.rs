@@ -128,6 +128,8 @@ impl Ed25519TransactionSigner {
 
 /// Immutable selected verifier. Construct explicitly with an algorithm identifier and
 /// a complete account/public-key binding set; there is no test-fixture fallback.
+/// Cloning duplicates only public verification keys and the immutable verification scope.
+#[derive(Clone)]
 pub struct Ed25519TransactionAuthenticator {
     selected_kind: TransactionAuthenticatorKind,
     keys: BTreeMap<AccountId, VerifyingKey>,

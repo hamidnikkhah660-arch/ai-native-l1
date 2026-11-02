@@ -65,6 +65,36 @@ class OptimizedCheckerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("manifest/runtime mismatch for network_id_hex", result.stderr)
 
+    def test_unselected_genesis_epoch_is_fail_closed_with_python_optimization(self) -> None:
+        path = self.root / "profiles" / CURRENT_MANIFEST
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest["genesis_time_anchor"]["timestamp_unix_seconds"] = 1_800_000_000
+        path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+        result = self.run_checker()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("no Mainnet Genesis epoch may be invented", result.stderr)
+
+    def test_attested_time_provider_is_not_claimed_as_bft_consensus_clock(self) -> None:
+        path = self.root / "profiles" / CURRENT_MANIFEST
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest["genesis_time_anchor"]["reference_time_authority_is_bft_consensus"] = True
+        path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+        result = self.run_checker()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("without claiming a BFT consensus clock", result.stderr)
+
+    def test_public_profile_must_bind_exact_signed_time_policy_digest(self) -> None:
+        path = self.root / "profiles" / CURRENT_MANIFEST
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest["genesis_time_anchor"]["public_profile_id_binds_reference_time_policy_digest"] = False
+        path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+        result = self.run_checker()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("bind one exact authenticated time policy", result.stderr)
+
     def test_open_mainnet_gate_fails_with_python_optimization(self) -> None:
         path = self.root / RUNTIME_RELATIVE
         source = path.read_text(encoding="utf-8")

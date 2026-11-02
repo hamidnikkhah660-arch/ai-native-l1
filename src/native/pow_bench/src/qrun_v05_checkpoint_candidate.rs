@@ -593,4 +593,48 @@ mod tests {
             Err(QRunCheckpointError::ProfileMismatch)
         );
     }
+
+    #[test]
+    fn qrun_checkpoint_restore_preserves_genesis_time_anchor_and_rejects_other_epoch() {
+        let network = [0x53; 32];
+        let owner = [0x2c; 32];
+        let genesis_timestamp = 1_800_000_000;
+        let genesis =
+            QRunGenesisV05::new_with_genesis_timestamp(network, owner, genesis_timestamp).unwrap();
+        let params = ConsensusParameters::candidate_testnet().unwrap();
+        let chain = PrivateTestnetChain::new(genesis.ledger().clone(), params.clone()).unwrap();
+        let record =
+            QRunV05PowCheckpoint::capture(network, genesis.commitment(), &params, &chain, [0; 32])
+                .unwrap();
+        let bytes = record.encode(&params).unwrap();
+        let commitment = QRunV05PowCheckpoint::commitment_for_bytes(&bytes);
+
+        let restored = QRunV05PowCheckpoint::restore_chain_anchored(
+            &bytes,
+            &network,
+            &genesis.commitment(),
+            &params,
+            commitment,
+            0,
+        )
+        .unwrap();
+        assert_eq!(restored.state().height(), 0);
+        assert_eq!(restored.state().last_timestamp(), genesis_timestamp);
+        assert_eq!(restored.state().state_root(), genesis.state_root());
+
+        let different_epoch =
+            QRunGenesisV05::new_with_genesis_timestamp(network, owner, genesis_timestamp + 1)
+                .unwrap();
+        assert!(matches!(
+            QRunV05PowCheckpoint::restore_chain_anchored(
+                &bytes,
+                &network,
+                &different_epoch.commitment(),
+                &params,
+                commitment,
+                0,
+            ),
+            Err(QRunCheckpointError::WrongGenesis)
+        ));
+    }
 }

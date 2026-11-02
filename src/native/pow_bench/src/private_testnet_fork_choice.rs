@@ -289,6 +289,27 @@ impl PrivateTestnetForkChoice {
         max_blocks: usize,
         max_bytes: usize,
     ) -> Result<Vec<Vec<u8>>, ForkChoiceError> {
+        self.branch_envelopes_range_for_tip(
+            &self.canonical.chain_tip().tip_hash,
+            start_height,
+            max_blocks,
+            max_bytes,
+        )
+    }
+
+    /// Export a bounded page from a specific retained branch snapshot.
+    ///
+    /// The tip must already exist in this validated fork graph. This allows an authenticated
+    /// sync session to keep reading its original snapshot even if fork choice selects a newer
+    /// canonical branch between page requests. If the snapshot has been pruned or is unknown,
+    /// the request fails closed rather than silently switching branches.
+    pub fn branch_envelopes_range_for_tip(
+        &self,
+        branch_tip: &[u8; 32],
+        start_height: u64,
+        max_blocks: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<Vec<u8>>, ForkChoiceError> {
         if start_height == 0
             || max_blocks == 0
             || max_blocks > MAX_FORK_ARCHIVE_BLOCKS
@@ -301,7 +322,7 @@ impl PrivateTestnetForkChoice {
         }
 
         let mut selected_reversed: Vec<&[u8]> = Vec::new();
-        let mut tip = self.canonical.chain_tip().tip_hash;
+        let mut tip = *branch_tip;
         while tip != self.genesis_tip {
             if selected_reversed.len() >= MAX_FORK_ARCHIVE_HEIGHT as usize {
                 return Err(ForkChoiceError::ReplayIncomplete);
@@ -345,7 +366,6 @@ impl PrivateTestnetForkChoice {
         }
         Ok(output)
     }
-
     pub fn archive_envelopes_bounded(
         &self,
         max_blocks: usize,
@@ -728,7 +748,7 @@ mod tests {
             &self,
         ) -> Result<ReferenceTimeSample, crate::chain_admission::ReferenceTimeError> {
             Ok(ReferenceTimeSample {
-                unix_seconds: 1_000_000,
+                unix_seconds: 100,
                 provenance: ReferenceTimeProvenance::ConfiguredProvider,
                 source_id: "fork-choice-test-clock",
             })
@@ -1085,6 +1105,18 @@ mod tests {
         assert_eq!(page, accepted[..2]);
         let last_page = archive.canonical_envelopes_range(3, 2, usize::MAX).unwrap();
         assert_eq!(last_page, vec![accepted[2].clone()]);
+        let last_candidate = decode_candidate_network_block(accepted.last().unwrap()).unwrap();
+        let retained_tip = pow_digest(&last_candidate.header, params.pow).unwrap();
+        assert_eq!(
+            archive
+                .branch_envelopes_range_for_tip(&retained_tip, 1, 2, usize::MAX)
+                .unwrap(),
+            accepted[..2]
+        );
+        assert_eq!(
+            archive.branch_envelopes_range_for_tip(&[0xFF; 32], 1, 1, usize::MAX),
+            Err(ForkChoiceError::UnknownParent)
+        );
         assert_eq!(
             archive.canonical_envelopes_range(1, 2, accepted[0].len() - 1),
             Err(ForkChoiceError::ArchiveExportLimitExceeded)

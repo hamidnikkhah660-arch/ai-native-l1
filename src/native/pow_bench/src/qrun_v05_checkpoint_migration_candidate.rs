@@ -27,12 +27,14 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 
 pub const QRM1_MAGIC: [u8; 4] = *b"QRM1";
-pub const QRM1_VERSION: u16 = 2;
+pub const QRM1_VERSION: u16 = 3;
+const QRM1_LEGACY_VERSION: u16 = 2;
 pub const QRM1_CHECKSUM_BYTES: usize = 32;
-pub const QRM1_CHECKSUM_DOMAIN: &[u8] = b"QRUN-V05-LIVE-CAS-REBASE-JOURNAL-V2\0";
+pub const QRM1_CHECKSUM_DOMAIN: &[u8] = b"QRUN-V05-LIVE-CAS-REBASE-JOURNAL-V3\0";
+const QRM1_LEGACY_CHECKSUM_DOMAIN: &[u8] = b"QRUN-V05-LIVE-CAS-REBASE-JOURNAL-V2\0";
 pub const QRM1_ARCHIVE_ID_DOMAIN: &[u8] = b"QRUN-V05-QRM1-HISTORY-ARCHIVE-ID-V1\0";
 
-const FIXED_BYTES: usize = 4
+const LEGACY_FIXED_BYTES: usize = 4
     + 2
     + 2
     + 8
@@ -44,6 +46,7 @@ const FIXED_BYTES: usize = 4
     + 4
     + 4
     + QRM1_CHECKSUM_BYTES;
+const FIXED_BYTES: usize = LEGACY_FIXED_BYTES + 8;
 
 /// Bound includes the exact QRCP bytes, old PFS2 manifest and new PFS2 manifest.
 /// QRM1 encode/decode additionally require an opaque, fully verified QRA1 archive summary.
@@ -100,6 +103,8 @@ pub struct QRunCheckpointMigrationJournal {
     /// Exact challenge nonce persisted so crash recovery can reconstruct the identical CAS write.
     pub cas_request_nonce: [u8; 32],
     pub owner_account: [u8; 32],
+    /// Exact nonzero activation epoch committed into the original Genesis; zero marks legacy fixtures.
+    pub genesis_timestamp: u64,
     pub receipt_key_id: [u8; 32],
     pub receipt_public_key_hash: [u8; 32],
     pub checkpoint_commitment: [u8; 32],
@@ -288,8 +293,13 @@ pub(crate) fn prepare_qrun_v05_checkpoint_migration_from_archive(
         .validate()
         .map_err(|_| QRunCheckpointMigrationError::ProfileMismatch)?;
 
-    let genesis = QRunGenesisV05::new(pin.network_id, owner_account)
-        .map_err(|_| QRunCheckpointMigrationError::GenesisMismatch)?;
+    let genesis_timestamp = source_store.genesis_state().last_timestamp();
+    let genesis = if genesis_timestamp == 0 {
+        QRunGenesisV05::new(pin.network_id, owner_account)
+    } else {
+        QRunGenesisV05::new_with_genesis_timestamp(pin.network_id, owner_account, genesis_timestamp)
+    }
+    .map_err(|_| QRunCheckpointMigrationError::GenesisMismatch)?;
     if genesis.commitment() != pin.genesis_digest
         || genesis.ledger() != source_store.genesis_state()
         || !source_store.matches_qrun_v05_genesis_and_profile(genesis.ledger(), params)
@@ -415,6 +425,7 @@ pub(crate) fn prepare_qrun_v05_checkpoint_migration_from_archive(
         next_object_generation,
         cas_request_nonce,
         owner_account,
+        genesis_timestamp,
         receipt_key_id: pin.receipt_key_id,
         receipt_public_key_hash,
         checkpoint_commitment,
@@ -582,8 +593,16 @@ impl QRunCheckpointMigrationJournal {
             return Err(QRunCheckpointMigrationError::InvalidBinding);
         }
 
-        let genesis = QRunGenesisV05::new(pin.network_id, self.owner_account)
-            .map_err(|_| QRunCheckpointMigrationError::GenesisMismatch)?;
+        let genesis = if self.genesis_timestamp == 0 {
+            QRunGenesisV05::new(pin.network_id, self.owner_account)
+        } else {
+            QRunGenesisV05::new_with_genesis_timestamp(
+                pin.network_id,
+                self.owner_account,
+                self.genesis_timestamp,
+            )
+        }
+        .map_err(|_| QRunCheckpointMigrationError::GenesisMismatch)?;
         if genesis.commitment() != pin.genesis_digest {
             return Err(QRunCheckpointMigrationError::GenesisMismatch);
         }
@@ -755,6 +774,7 @@ impl QRunCheckpointMigrationJournal {
         bytes.extend_from_slice(&previous);
         bytes.extend_from_slice(&next);
         bytes.extend_from_slice(&self.owner_account);
+        bytes.extend_from_slice(&self.genesis_timestamp.to_be_bytes());
         bytes.extend_from_slice(&self.receipt_key_id);
         bytes.extend_from_slice(&self.receipt_public_key_hash);
         bytes.extend_from_slice(&self.checkpoint_commitment);
@@ -797,7 +817,7 @@ impl QRunCheckpointMigrationJournal {
         pin: &ExternalCasPin,
         params: &ConsensusParameters,
     ) -> Result<Self, QRunCheckpointMigrationError> {
-        if bytes.len() > MAX_QRM1_BYTES || bytes.len() < FIXED_BYTES {
+        if bytes.len() > MAX_QRM1_BYTES || bytes.len() < LEGACY_FIXED_BYTES {
             return Err(QRunCheckpointMigrationError::Oversize);
         }
         if bytes.get(..4) != Some(QRM1_MAGIC.as_slice()) {
@@ -810,8 +830,16 @@ impl QRunCheckpointMigrationJournal {
                 .try_into()
                 .map_err(|_| QRunCheckpointMigrationError::Malformed)?,
         );
-        if version != QRM1_VERSION {
+        if version != QRM1_VERSION && version != QRM1_LEGACY_VERSION {
             return Err(QRunCheckpointMigrationError::UnsupportedVersion(version));
+        }
+        let (checksum_domain, minimum_length) = if version == QRM1_VERSION {
+            (QRM1_CHECKSUM_DOMAIN, FIXED_BYTES)
+        } else {
+            (QRM1_LEGACY_CHECKSUM_DOMAIN, LEGACY_FIXED_BYTES)
+        };
+        if bytes.len() < minimum_length {
+            return Err(QRunCheckpointMigrationError::Oversize);
         }
         if take_u16(bytes, 6)? != 0 {
             return Err(QRunCheckpointMigrationError::Malformed);
@@ -821,9 +849,8 @@ impl QRunCheckpointMigrationJournal {
             .len()
             .checked_sub(QRM1_CHECKSUM_BYTES)
             .ok_or(QRunCheckpointMigrationError::Malformed)?;
-        let mut checksum_preimage =
-            Vec::with_capacity(QRM1_CHECKSUM_DOMAIN.len() + checksum_offset);
-        checksum_preimage.extend_from_slice(QRM1_CHECKSUM_DOMAIN);
+        let mut checksum_preimage = Vec::with_capacity(checksum_domain.len() + checksum_offset);
+        checksum_preimage.extend_from_slice(checksum_domain);
         checksum_preimage.extend_from_slice(&bytes[..checksum_offset]);
         if Sha256::digest(&checksum_preimage).as_slice() != &bytes[checksum_offset..] {
             return Err(QRunCheckpointMigrationError::ChecksumMismatch);
@@ -845,6 +872,11 @@ impl QRunCheckpointMigrationJournal {
             EXTERNAL_CAS_RECORD_BYTES,
         )?)?;
         let owner_account = take_array::<32>(payload, &mut cursor)?;
+        let genesis_timestamp = if version == QRM1_VERSION {
+            take_u64(payload, &mut cursor)?
+        } else {
+            0
+        };
         let receipt_key_id = take_array::<32>(payload, &mut cursor)?;
         let receipt_public_key_hash = take_array::<32>(payload, &mut cursor)?;
         let checkpoint_commitment = take_array::<32>(payload, &mut cursor)?;
@@ -882,6 +914,7 @@ impl QRunCheckpointMigrationJournal {
             next_object_generation,
             cas_request_nonce,
             owner_account,
+            genesis_timestamp,
             receipt_key_id,
             receipt_public_key_hash,
             checkpoint_commitment,
@@ -894,9 +927,11 @@ impl QRunCheckpointMigrationJournal {
             archive_commitment,
         };
         journal.validate_without_archive(pin, params)?;
-        let canonical = journal.encode_without_archive(pin, params)?;
-        if canonical.as_slice() != bytes {
-            return Err(QRunCheckpointMigrationError::Malformed);
+        if version == QRM1_VERSION {
+            let canonical = journal.encode_without_archive(pin, params)?;
+            if canonical.as_slice() != bytes {
+                return Err(QRunCheckpointMigrationError::Malformed);
+            }
         }
         Ok(journal)
     }
@@ -1155,6 +1190,7 @@ pub(crate) mod tests {
             next_object_generation: 9,
             cas_request_nonce,
             owner_account: owner,
+            genesis_timestamp: 0,
             receipt_key_id,
             receipt_public_key_hash: key_hash,
             checkpoint_commitment,
@@ -1314,6 +1350,35 @@ pub(crate) mod tests {
             journal.previous_record.next_state_digest
         );
         assert_eq!(request.next_record, journal.next_record);
+    }
+
+    #[test]
+    fn qrm1_v2_legacy_journal_decodes_as_unanchored_genesis() {
+        let (journal, pin, params) = fixture();
+        assert_eq!(journal.genesis_timestamp, 0);
+        let current = journal.encode_without_archive(&pin, &params).unwrap();
+
+        // QRM1 v2 placed receipt_key_id immediately after owner_account. Reconstruct those
+        // exact legacy bytes and authenticate them with the v2 checksum domain.
+        let timestamp_offset = 8 + 8 + 8 + 32 + (EXTERNAL_CAS_RECORD_BYTES * 2) + 32;
+        let checksum_offset = current.len() - QRM1_CHECKSUM_BYTES;
+        assert_eq!(&current[timestamp_offset..timestamp_offset + 8], &[0; 8]);
+
+        let mut legacy = Vec::with_capacity(current.len() - 8);
+        legacy.extend_from_slice(&current[..timestamp_offset]);
+        legacy.extend_from_slice(&current[timestamp_offset + 8..checksum_offset]);
+        legacy[4..6].copy_from_slice(&QRM1_LEGACY_VERSION.to_be_bytes());
+
+        let mut checksum_preimage =
+            Vec::with_capacity(QRM1_LEGACY_CHECKSUM_DOMAIN.len() + legacy.len());
+        checksum_preimage.extend_from_slice(QRM1_LEGACY_CHECKSUM_DOMAIN);
+        checksum_preimage.extend_from_slice(&legacy);
+        legacy.extend_from_slice(&Sha256::digest(&checksum_preimage));
+
+        let decoded =
+            QRunCheckpointMigrationJournal::decode_without_archive(&legacy, &pin, &params).unwrap();
+        assert_eq!(decoded, journal);
+        assert_eq!(decoded.genesis_timestamp, 0);
     }
 
     #[test]

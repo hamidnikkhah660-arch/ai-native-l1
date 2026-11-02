@@ -830,7 +830,7 @@ impl PrivateTestnetChain {
         let next_cumulative_work =
             checked_cumulative_work_after_block(self.cumulative_work, pow_header.target)?;
         let digest = verify_pow(pow_header, &self.target_history.params)?;
-        let receipt = ChainAdmissionBoundary::testnet()
+        let receipt = ChainAdmissionBoundary::qrun_v05_live()
             .admit_live_qrun_v05_fee(&mut self.state, block, authenticator, clock)
             .map_err(PrivateConsensusError::Admission)?;
 
@@ -1435,7 +1435,73 @@ mod tests {
     }
 
     #[test]
-    fn qrun_v05_first_window_accepts_stale_epoch_and_eases_target_to_max_clamp() {
+    fn qrun_v05_live_chain_enforces_the_committed_genesis_time_floor() {
+        let mut params = params();
+        params.difficulty_window_blocks = 8;
+        params.target_block_time_secs = 30;
+        params.pow.memory_kib = 8;
+        let genesis_timestamp = 1_800_000_000;
+        let genesis =
+            crate::qrun_v05_genesis_candidate::QRunGenesisV05::new_with_genesis_timestamp(
+                [0x51; 32],
+                [0x2a; 32],
+                genesis_timestamp,
+            )
+            .unwrap();
+        let mut chain = PrivateTestnetChain::new(genesis.ledger().clone(), params.clone()).unwrap();
+
+        let mut rejected_block = qrun_fee_block(chain.state(), genesis_timestamp + 1, [0x77; 32]);
+        // Build a fully formed block, then backdate only its timestamp to exercise live admission.
+        rejected_block.body.timestamp = genesis_timestamp;
+        let mut rejected_header = qrun_fee_header(&chain, &rejected_block, &params, 0);
+        while Uint256::from_be_bytes(
+            crate::consensus::pow_digest(&rejected_header, params.pow).unwrap(),
+        ) > rejected_header.target
+        {
+            rejected_header.nonce = rejected_header.nonce.checked_add(1).expect("nonce budget");
+        }
+        let before = chain.clone();
+        assert_eq!(
+            chain.append_qrun_v05_fee_live(
+                &rejected_block,
+                &rejected_header,
+                None,
+                &EmptyAuthenticator,
+                &ClockAt(genesis_timestamp),
+            ),
+            Err(PrivateConsensusError::Admission(
+                ChainAdmissionError::State(StateError::TimestampNotIncreasing {
+                    previous: genesis_timestamp,
+                    actual: genesis_timestamp,
+                })
+            ))
+        );
+        assert_eq!(chain, before, "the Genesis time floor rejects atomically");
+
+        let first_valid_timestamp = genesis_timestamp + 1;
+        let valid_block = qrun_fee_block(chain.state(), first_valid_timestamp, [0x77; 32]);
+        let mut valid_header = qrun_fee_header(&chain, &valid_block, &params, 0);
+        while Uint256::from_be_bytes(
+            crate::consensus::pow_digest(&valid_header, params.pow).unwrap(),
+        ) > valid_header.target
+        {
+            valid_header.nonce = valid_header.nonce.checked_add(1).expect("nonce budget");
+        }
+        chain
+            .append_qrun_v05_fee_live(
+                &valid_block,
+                &valid_header,
+                None,
+                &EmptyAuthenticator,
+                &ClockAt(first_valid_timestamp),
+            )
+            .unwrap();
+        assert_eq!(chain.state().height(), 1);
+        assert_eq!(chain.state().last_timestamp(), first_valid_timestamp);
+    }
+
+    #[test]
+    fn qrun_v05_live_time_window_rejects_backdating_and_bounds_first_retarget_warp() {
         let mut params = params();
         params.difficulty_window_blocks = 8;
         params.target_block_time_secs = 30;
@@ -1444,31 +1510,60 @@ mod tests {
         params.pow.memory_kib = 8;
 
         let initial_target = params.initial_target;
-        let expected_eased_target = initial_target.mul_div_u64(4, 1).unwrap();
-        let mut chain = PrivateTestnetChain::new(state(), params.clone()).unwrap();
 
-        // The first block may be backdated to Unix second 1. The node-local future guard
-        // has no lower/past-time bound, so a stale but increasing prefix is admitted.
+        // A block timestamped far behind the local reference clock is rejected before
+        // the ledger, target history, cumulative work or consensus tip can advance.
+        let mut stale_chain = PrivateTestnetChain::new(state(), params.clone()).unwrap();
+        let stale_block = qrun_fee_block(stale_chain.state(), 1, [0x77; 32]);
+        let mut stale_header = qrun_fee_header(&stale_chain, &stale_block, &params, 0);
+        while Uint256::from_be_bytes(
+            crate::consensus::pow_digest(&stale_header, params.pow).unwrap(),
+        ) > stale_header.target
+        {
+            stale_header.nonce = stale_header.nonce.checked_add(1).expect("nonce budget");
+        }
+        let stale_before = stale_chain.clone();
+        assert_eq!(
+            stale_chain.append_qrun_v05_fee_live(
+                &stale_block,
+                &stale_header,
+                None,
+                &EmptyAuthenticator,
+                &ClockAt(1_000_000),
+            ),
+            Err(PrivateConsensusError::Admission(
+                ChainAdmissionError::State(StateError::TimestampTooFarInPast {
+                    earliest_allowed: 999_700,
+                    actual: 1,
+                })
+            ))
+        );
+        assert_eq!(
+            stale_chain, stale_before,
+            "stale timestamp rejection is atomic"
+        );
+
+        // The longer mining-latency allowance widens the local backdate envelope, but
+        // the future edge remains 120 seconds. Across this eight-block fixture the maximum
+        // derived retarget observation is 660s (2.75x the nominal 240s), still below the
+        // configured 4x clamp. This is a node-local Public Alpha admission bound, not a
+        // canonical Mainnet timestamp rule.
+        let mut chain = PrivateTestnetChain::new(state(), params.clone()).unwrap();
         for height in 1..=8 {
             let reference_time = 1_000_000 + (height - 1) * params.target_block_time_secs;
+            let policy = crate::timestamp_policy::TimestampPolicy::qrun_v05_live();
             let timestamp = if height == 8 {
-                // At the retarget boundary, jump to the inclusive local future-time ceiling.
-                reference_time
-                    + crate::timestamp_policy::TimestampPolicy::testnet().max_future_drift_secs
+                reference_time + policy.max_future_drift_secs
             } else {
-                height
+                reference_time - policy.max_past_drift_secs.unwrap()
             };
             let block = qrun_fee_block(chain.state(), timestamp, [0x77; 32]);
             let mut header = qrun_fee_header(&chain, &block, &params, 0);
-
-            // Find a valid nonce under the candidate target; target is intentionally easy
-            // enough that this loop is deterministic and short in the test fixture.
             while Uint256::from_be_bytes(crate::consensus::pow_digest(&header, params.pow).unwrap())
                 > header.target
             {
                 header.nonce = header.nonce.checked_add(1).expect("nonce budget");
             }
-
             chain
                 .append_qrun_v05_fee_live(
                     &block,
@@ -1481,42 +1576,8 @@ mod tests {
         }
 
         let observed = chain.expected_target(None).unwrap();
-        assert_eq!(
-            observed,
-            expected_eased_target,
-            "a stale first-block timestamp followed by a boundary jump can ease the next target by 4x"
-        );
-        assert!(chain.target_history.timestamps[0].unwrap() < 1_000_000);
+        assert_eq!(observed, initial_target.mul_div_u64(11, 4).unwrap());
         assert_eq!(chain.state().height(), 8);
-
-        // The repository's research-only 11-block MTP rule would also accept this jump:
-        // it constrains a candidate relative to the recent median, not relative to the
-        // network's creation time. A Genesis-time floor is a separate requirement.
-        let mtp_history: Vec<_> = (0..8u64)
-            .map(
-                |height| crate::asert_anchor_policy_candidate::HeaderTimeSample {
-                    height,
-                    timestamp: height as i128,
-                    bits: 0x207f_ffff,
-                    parent_hash: if height == 0 {
-                        [0; 32]
-                    } else {
-                        [(height - 1) as u8; 32]
-                    },
-                    block_hash: [height as u8; 32],
-                },
-            )
-            .collect();
-        assert_eq!(
-            crate::asert_anchor_policy_candidate::validate_candidate_mtp(
-                &mtp_history,
-                8,
-                mtp_history.last().unwrap().block_hash,
-                chain.target_history.timestamps[7].unwrap() as i128,
-            ),
-            Ok(()),
-            "MTP alone does not prevent a forward jump after a backdated first block"
-        );
     }
 
     #[test]

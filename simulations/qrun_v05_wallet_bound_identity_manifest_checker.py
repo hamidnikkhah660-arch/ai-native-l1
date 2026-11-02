@@ -77,6 +77,41 @@ approved = re.search(
 require(approved is not None, "Rust source missing Mainnet release gate")
 require(approved.group(1) == "false", "Mainnet release gate must remain closed")
 require(manifest["mainnet_activated"] is False, "manifest must not claim Mainnet activation")
+time_anchor = manifest["genesis_time_anchor"]
+require(
+    time_anchor["proposal_status"] == "candidate_policy_not_frozen",
+    "Genesis-time launch policy must remain explicitly candidate-only",
+)
+require(
+    time_anchor["timestamp_unix_seconds"] is None,
+    "no Mainnet Genesis epoch may be invented before the identity freeze",
+)
+require(
+    time_anchor["activation_policy"] == "earliest_activation_only_no_expiry"
+    and time_anchor["delayed_launch_allowed"] is True,
+    "candidate launch policy must preserve delayed-launch semantics without an expiry",
+)
+require(
+    time_anchor["first_block_timestamp_rule"] == "strictly_greater_than_genesis_timestamp",
+    "first live block must advance strictly beyond the committed Genesis timestamp",
+)
+require(
+    time_anchor["genesis_commitment_binds_timestamp"] is True
+    and time_anchor["profile_id_binds_genesis_commitment"] is True
+    and time_anchor["anchored_identity_regenerated"] is False,
+    "anchored time must flow through Genesis/profile identity before identity regeneration",
+)
+require(
+    time_anchor["live_timestamp_freshness_window_seconds_each_side"] == 120
+    and time_anchor["live_timestamp_reference"]
+    == "network_bound_ed25519_attested_reference_time_provider"
+    and time_anchor["all_public_nodes_must_share_exact_reference_time_policy_digest"] is True
+    and time_anchor["public_profile_id_binds_reference_time_policy_digest"] is True
+    and time_anchor["reference_time_authority_is_bft_consensus"] is False
+    and time_anchor["cross_node_consensus_time_source_frozen"] is False
+    and time_anchor["local_testnet_clock_fallback_only"] is True,
+    "public nodes must bind one exact authenticated time policy in their profile without claiming a BFT consensus clock",
+)
 require(
     manifest["post_genesis_minting_enabled"] is False,
     "post-Genesis minting must remain disabled",
