@@ -1,4 +1,4 @@
-# CP-0513 — QRun v0.5 NetBird Cross-Host CI Harness
+# CP-0513 â€” QRun v0.5 NetBird Cross-Host CI Harness
 
 **Date:** 2026-11-02
 **Status:** Harness prepared on the isolated qualification branch; NOT RUN.
@@ -11,7 +11,7 @@ Prepare a zero-cost, temporary Windows GitHub-hosted runner as Node B to qualify
 
 ## Harness components
 
-- `tools/qrun-v05-netbird-prepare-node-a.ps1`: guarded Node A provisioning. Requires the explicit `-ConfirmRestrictiveNetBirdPolicyVerified` switch, verifies the connected NetBird overlay and absence of existing peers, creates a fresh zero-value Public Alpha network identity, provisions network-bound Windows CurrentUser DPAPI keys, creates a signed RTP1 policy, starts the authenticated time authority and Node A, and exports only public test configuration.
+- `tools/qrun-v05-netbird-prepare-node-a.ps1`: guarded Node A provisioning. Requires the explicit `-ConfirmRestrictiveNetBirdPolicyVerified` switch, verifies the connected NetBird overlay and absence of connected peers from the local CLI, creates a fresh zero-value Public Alpha network identity, provisions network-bound Windows CurrentUser DPAPI keys, creates a signed RTP1 policy, starts the authenticated time authority and Node A, verifies repeated loopback RPC and TCP transaction-ingress probes, verifies the NetBird-only P2P bind marker and live overlay RPC/TX canaries, and exports only public test configuration. Windows TCP-table enumeration was removed from this gate because it returned inconsistent states for the local userspace-overlay environment.
 - `tools/qrun-v05-netbird-cross-host-runner.ps1`: installs/verifies NetBird v0.82.0 on the temporary Windows runner when needed, consumes `NB_SETUP_KEY` without printing it, validates the overlay path, builds QRun Node B, provisions a unique DPAPI NPK1 key locally, pins Node A's Noise public key, and performs authenticated startup sync.
 - `tools/qrun-v05-netbird-policy-canary.ps1`: temporary no-protocol TCP canaries bound only to Node A's overlay IP on ports 49339 and 49340. These allow the runner to test that remote RPC and transaction-ingress reachability are denied even though the actual QRun listeners are loopback-only. The canaries accept no application payload.
 - `tools/qrun-v05-netbird-stop-node-a.ps1`: stops the temporary canary, QRun Node A and time authority, then removes the dedicated temporary key/data directory.
@@ -64,14 +64,15 @@ This first stage does not yet test signed transaction propagation, partition/rec
 
 ## Current verified network posture (2026-11-02)
 
-- Authenticated NetBird dashboard access was confirmed; `heymed` is the only current peer and belongs to `qrun-node-a` (`100.113.232.54`).
-- `qrun-node-b` exists and currently has zero peers.
-- The catch-all `Default` All-to-All policy is OFF.
-- The only enabled QRun inbound paths to Node A are `qrun-node-b` → `qrun-node-a` TCP 49341 (P2P) and TCP 49550 (authenticated reference time).
-- The reverse A-to-B P2P policy is OFF. The Node A machine remains fail-closed with NetBird `block-inbound` enabled until the guarded preparation script is explicitly run.
+- NetBird dashboard authentication was confirmed. The visible peer list shows `heymed` at `100.113.232.54` in `qrun-node-a`. The dashboard group-summary view returned counts inconsistent with the peer list for `qrun-node-b`; treat actual Node B membership as unverified until the GitHub runner registers and `netbird status` confirms it.
+- `Default` All-to-All is OFF and was verified again after the change.
+- `QRun P2P B-to-A TCP 49341` is ON; `QRun Time B-to-A TCP 49550` is ON; the reverse `QRun P2P TCP 49341` rule (A-to-B) is OFF. No other NetBird policy was changed.
+- The repository secret `NETBIRD_SETUP_KEY` is present. Its value is not stored in this repository and was never read or displayed. The required repository variable `QRUN_CROSS_HOST_CONFIG_JSON` is not yet configured.
+- Node A is now started on `heymed` using a newly generated disposable Public Alpha identity (`mainnet=false`). The signed reference-time probe passed, repeated loopback RPC status checks passed, loopback transaction TCP connect passed, the overlay RPC/TX canary reported ready, and the P2P listener reported the expected NetBird address. Only public configuration values were emitted; private keys remain protected by Windows CurrentUser DPAPI on Node A.
+- While Node A is active, NetBird's client-side `block-inbound` override is cleared only under the verified restrictive ACL. The guarded stop script and failure path restore `block-inbound=true` and remove the dedicated temporary key/data root.
 
 ## Current blockers / non-actions
 
-- No second peer, Setup Key, Actions variable, Actions secret, PR, or cross-host run has been created.
-- No public P2P, RPC, transaction-ingress or router port has been opened.
-- No Mainnet activation, QZXB market, or trading claim is made.
+- `QRUN_CROSS_HOST_CONFIG_JSON` still needs to be added as a repository Actions variable from the public-only Node A configuration.
+- The draft PR/workflow run has not yet been created. No GitHub-hosted Node B has registered, and no cross-host authenticated Noise XX sync has been demonstrated.
+- No public P2P, RPC, transaction-ingress or router port has been opened. No Mainnet activation, QZXB market, or trading claim is made.

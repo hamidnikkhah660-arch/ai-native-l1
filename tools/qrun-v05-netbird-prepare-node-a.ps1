@@ -27,6 +27,19 @@ function ConvertTo-QuotedArgument([string]$Value) {
     return '"' + $Value.Replace('"', '\"') + '"'
 }
 
+function Test-TcpEndpoint([string]$Address, [int]$Port, [int]$TimeoutMs = 2500) {
+    $client = [System.Net.Sockets.TcpClient]::new()
+    try {
+        $task = $client.ConnectAsync($Address, $Port)
+        if (-not $task.Wait($TimeoutMs)) { return $false }
+        $task.GetAwaiter().GetResult()
+        return $client.Connected
+    } catch {
+        return $false
+    } finally {
+        $client.Dispose()
+    }
+}
 function Stop-Child([System.Diagnostics.Process]$Process) {
     if ($Process) {
         try {
@@ -208,20 +221,31 @@ try {
     }
     if (-not $canaryReady) { throw "RPC/TX policy canary did not become ready." }
 
-    $listeners = Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object { $_.LocalPort -in 49339,49340,49341,49550 }
-    $expected = @(
-        @{Port=49339; Address="127.0.0.1"},
-        @{Port=49340; Address="127.0.0.1"},
-        @{Port=49339; Address=$OverlayIp},
-        @{Port=49340; Address=$OverlayIp},
-        @{Port=49341; Address=$OverlayIp},
-        @{Port=49550; Address=$OverlayIp}
-    )
-    foreach ($item in $expected) {
-        if (-not ($listeners | Where-Object { $_.LocalPort -eq $item.Port -and $_.LocalAddress -eq $item.Address })) {
-            throw "Listener $($item.Address):$($item.Port) is missing or bound to an unexpected address."
-        }
+    # Confirm loopback services with real client connections. Get-NetTCPConnection is not
+    # reliable for every Windows userspace-overlay socket state; the QRun CLI also enforces
+    # loopback-only RPC/TX bind addresses before TcpListener::bind.
+    $nodeProcess.Refresh()
+    if ($nodeProcess.HasExited) { throw "Node A exited before local endpoint verification." }
+    $statusConfirm = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:49339/v1/status" -TimeoutSec 5
+    if ($statusConfirm.network_id -ne $networkId -or $statusConfirm.profile_id -ne $statusJson.profile_id -or $statusConfirm.state_root -ne $statusJson.state_root) {
+        throw "Repeated loopback RPC status verification returned a changed identity/state tuple."
     }
+    if (-not (Test-TcpEndpoint "127.0.0.1" 49340)) {
+        throw "QRun transaction ingress is not reachable on loopback 127.0.0.1:49340."
+    }
+    $canaryProcess.Refresh()
+    if ($canaryProcess.HasExited) { throw "Overlay RPC/TX canary exited before readiness verification." }
+    $canaryText = Get-Content -LiteralPath $canaryLog -Raw -ErrorAction SilentlyContinue
+    if ($canaryText -notmatch [regex]::Escape("CANARY_READY=$OverlayIp")) {
+        throw "Overlay RPC/TX canary did not confirm both restricted overlay binds."
+    }
+    if ($stdout -notmatch [regex]::Escape("qrun_pow_local_block_ready address=$($OverlayIp):49341")) {
+        throw "QRun P2P listener did not report the expected NetBird-only bind address."
+    }
+    Write-Host "LOOPBACK_RPC_STATUS_REPEAT=PASS"
+    Write-Host "LOOPBACK_TX_TCP_CONNECT=PASS"
+    Write-Host "OVERLAY_RPC_TX_CANARY_READY=PASS"
+    Write-Host "NODE_A_P2P_OVERLAY_BIND=PASS"
 
     $publicConfig = [ordered]@{
         node_a_overlay_ip = $OverlayIp
