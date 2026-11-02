@@ -1,4 +1,4 @@
-# CP-0513 â€” QRun v0.5 NetBird Cross-Host CI Harness
+# CP-0513 Ã¢â‚¬â€ QRun v0.5 NetBird Cross-Host CI Harness
 
 **Date:** 2026-11-02
 **Status:** Harness prepared on the isolated qualification branch; NOT RUN.

@@ -179,7 +179,8 @@ try {
             throw "Node B exited during startup. STDERR=$errorText STDOUT=$outputText"
         }
         $stdout = Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue
-        if ($stdout -match "pinned_peer_sync_verified=true" -and
+        # Public Alpha reports authenticated sync completion; pinned_peer_sync_verified is Mainnet-only.
+        if ($stdout -match "qrun_pow_authenticated_startup_sync_complete peer=" -and
             $stdout -match "qrun_reference_time_ready source=ed25519-attested-time-v1 provenance=ConfiguredProvider" -and
             $stdout -match "network_class=public_alpha_experimental_not_mainnet" -and
             $stdout -match "mainnet=false") {
