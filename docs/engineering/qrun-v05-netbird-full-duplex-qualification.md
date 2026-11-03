@@ -54,3 +54,22 @@ D2 is separate from D1. Once both peers are configured, a one-way B-to-A firewal
 ## Rollback requirements
 
 If bootstrap authentication or Node A's pinned restart fails, close the listener, remove temporary firewall rules, stop any partially started process and restore Node A using the original startup arguments against the same durable data directory. Preserve C1/C2 evidence and do not merge the qualification branch to `main` as part of D1.
+
+## D1 operator runbook (implementation in progress)
+
+The following sequence is required when the D1 code has passed CI and the repository Actions settings are available:
+
+1. On Node A, first prepare the isolated Public Alpha node with the existing qrun-v05-netbird-prepare-node-a.ps1 script. Retain the exact PUBLIC_CONFIG_PATH emitted by that script.
+2. In NetBird, verify that the dedicated temporary Node B enrollment group is the only source permitted to reach Node A TCP/49342. Permit the two intended P2P peers on TCP/49341 and the required Node B to Node A reference-time path on TCP/49550. Do not enable default all-to-all. Keep TCP/49339 and TCP/49340 inaccessible remotely.
+3. In a separate elevated PowerShell window on Node A, start the D1 controller using the emitted path:
+
+    .\tools\qrun-v05-netbird-node-a-full-duplex-controller.ps1 -PublicConfigPath "<PUBLIC_CONFIG_PATH>" -ConfirmBootstrapAclRestricted -PublishBootstrapSecret
+
+   The controller creates a one-use random token, protects the Node A copy with DPAPI, publishes only the matching GitHub Actions secret, and opens a temporary firewall allowance bound to the Node A overlay address. It waits for authenticated Node B enrollment.
+4. Only after the controller reports D1_BOOTSTRAP_LISTENER_READY=PASS, dispatch .github/workflows/qrun-v05-netbird-cross-host-qualification.yml on the qualification branch with stage d1.
+5. Keep the Node A controller window open until it reports D1_NODE_A_FULL_DUPLEX_CONTROLLER=PASS. The workflow must independently report Node B received Node A's reciprocal block, with matching network/profile and expected ledger balances.
+6. On successful qualification, the controller removes the local DPAPI token, temporary firewall rule and one-shot GitHub secret. If the workflow fails before completion, inspect the controller output and rotate/remove the one-shot secret before retrying.
+
+Before dispatch, the workflow also requires the existing repository variable QRUN_CROSS_HOST_CONFIG_JSON and repository secret NETBIRD_SETUP_KEY. The D1 controller creates only QRUN_PEER_BOOTSTRAP_TOKEN; it does not fabricate or replace the other two settings.
+
+This runbook does not authorize a live run by itself. Do not dispatch D1 until the CI parse/self-tests are green and the restrictive NetBird ACL has been checked in the NetBird control plane.

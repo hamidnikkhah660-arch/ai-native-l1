@@ -8,7 +8,8 @@ param(
     [Parameter(Mandatory)][string]$NodeANoisePublicKeyHex,
     [Parameter(Mandatory)][string]$ReferenceTimeAdminPublicKeyHex,
     [Parameter(Mandatory)][string]$ReferenceTimePolicyBase64,
-    [switch]$StagePartitionReconnectReorg
+    [switch]$StagePartitionReconnectReorg,
+    [switch]$StageFullDuplex
 )
 
 $ErrorActionPreference = "Stop"
@@ -49,6 +50,9 @@ function ConvertTo-QuotedArgument([string]$Value) {
 }
 
 try {
+    if ($StagePartitionReconnectReorg -and $StageFullDuplex) {
+        throw "Stage C2 and Stage D1 cannot be combined in one runner invocation."
+    }
     Assert-Hex32 "NetworkIdHex" $NetworkIdHex
     Assert-Hex32 "OwnerAccountIdHex" $OwnerAccountIdHex
     Assert-Hex32 "OwnerPublicKeyHex" $OwnerPublicKeyHex
@@ -241,6 +245,19 @@ try {
     }
 
     $startupProfileId = [string]$statusJson.profile_id
+    if ($StageFullDuplex) {
+        if ([string]::IsNullOrWhiteSpace($env:QRUN_PEER_BOOTSTRAP_TOKEN)) {
+            throw "Stage D1 requires the dedicated GitHub Actions secret QRUN_PEER_BOOTSTRAP_TOKEN."
+        }
+        $bootstrapScript = Join-Path $PSScriptRoot "qrun-v05-netbird-peer-bootstrap.ps1"
+        if (-not (Test-Path -LiteralPath $bootstrapScript)) { throw "The D1 peer bootstrap client script is missing." }
+        Write-Host "=== Stage D1: authenticate Node B metadata and await Node A reverse pinned startup sync ==="
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $bootstrapScript -Mode Enroll -NodeAIp $NodeAOverlayIp -NodeBIp $nodeBIp -NetworkIdHex $NetworkIdHex -NodeBNoisePublicKeyHex $nodeBNoisePublic
+        if ($LASTEXITCODE -ne 0) {
+            throw "Stage D1 peer bootstrap or Node A reverse pinned startup sync failed."
+        }
+        Write-Host "D1_NODE_B_ENROLLED_AND_NODE_A_REVERSE_SYNC_ACKNOWLEDGED=PASS"
+    }
     # Stage C1: have Node B originate a signed test-only transaction on this disposable Public Alpha network.
     # This helper embeds the documented TEST_ONLY_SEED and is permitted only on this
     # freshly generated Public Alpha network; it is never a wallet or Mainnet key.
@@ -551,6 +568,41 @@ try {
         throw "Node B did not log the signed transaction as canonically included in its height-1 candidate."
     }
 
+    if ($StageFullDuplex) {
+        Write-Host "=== Stage D1: wait for Node A-originated reciprocal QFP5 block ==="
+        $reverseDeadline = [DateTimeOffset]::UtcNow.AddSeconds(900)
+        $reverseReceived = $false
+        while ([DateTimeOffset]::UtcNow -lt $reverseDeadline) {
+            try {
+                $reverseStatus = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:49339/v1/status" -TimeoutSec 5
+                $reverseOwner = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:49339/v1/balance/$OwnerAccountIdHex" -TimeoutSec 5
+                $reverseB = Invoke-RestMethod -Method Get -Uri ("http://127.0.0.1:49339/v1/balance/" + ("78" * 32)) -TimeoutSec 5
+                $reverseA = Invoke-RestMethod -Method Get -Uri ("http://127.0.0.1:49339/v1/balance/" + ("7a" * 32)) -TimeoutSec 5
+                if ([uint64]$reverseStatus.height -ge 2 -and
+                    [uint64]$reverseOwner.nonce -eq 2 -and
+                    [uint64]$reverseB.balance_atoms -eq 1000 -and
+                    [uint64]$reverseA.balance_atoms -eq 3000) {
+                    $reverseReceived = $true
+                    break
+                }
+            } catch {}
+            Start-Sleep -Milliseconds 500
+        }
+        if (-not $reverseReceived) {
+            throw "Node B did not receive Node A's reciprocal block and canonical ledger update within 900 seconds."
+        }
+        if ($reverseStatus.network_id -ne $NetworkIdHex.ToLowerInvariant() -or
+            $reverseStatus.profile_id -ne $startupProfileId -or
+            $reverseStatus.mainnet -ne $false) {
+            throw "Node B network/profile identity changed during reciprocal full-duplex gossip."
+        }
+        Write-Host "D1_NODE_A_TO_NODE_B_RECIPROCAL_BLOCK=PASS"
+        Write-Host "D1_BOTH_DIRECTIONS_CANONICAL_LEDGER=PASS"
+        Write-Host "D1_NODE_B_FINAL_HEIGHT=$($reverseStatus.height)"
+        Write-Host "D1_NODE_B_FINAL_TIP=$($reverseStatus.tip)"
+        Write-Host "D1_NODE_B_FINAL_STATE_ROOT=$($reverseStatus.state_root)"
+    }
+
     Write-Host "CROSS_HOST_SIGNED_QZTS_TX_ACCEPTED=PASS"
     Write-Host "CROSS_HOST_NODE_B_CANONICAL_RECEIPT=PASS"
     Write-Host "CROSS_HOST_NODE_B_RECIPIENT_BALANCE=PASS"
@@ -585,6 +637,7 @@ finally {
     }
     Remove-Item Env:NB_SETUP_KEY -ErrorAction SilentlyContinue
     Remove-Item Env:NETBIRD_SETUP_KEY -ErrorAction SilentlyContinue
+    Remove-Item Env:QRUN_PEER_BOOTSTRAP_TOKEN -ErrorAction SilentlyContinue
     if (Test-Path $tempRoot) {
         Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
     }

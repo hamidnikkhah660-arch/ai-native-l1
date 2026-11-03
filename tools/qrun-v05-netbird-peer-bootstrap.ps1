@@ -5,6 +5,7 @@ param(
     [string]$Mode,
     [string]$TokenFile,
     [string]$OutputFile,
+    [string]$AckFile,
     [string]$BindIp,
     [string]$NodeAIp,
     [string]$NodeBIp,
@@ -302,7 +303,26 @@ function Invoke-Serve {
         finally {
             Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
         }
-        Write-JsonLine $stream ([ordered]@{ accepted = $true; protocol_version = 1 })
+
+        $enrollmentAccepted = $true
+        if (-not [string]::IsNullOrWhiteSpace($AckFile)) {
+            $ackDeadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
+            $ackValue = $null
+            while ([DateTimeOffset]::UtcNow -lt $ackDeadline) {
+                if (Test-Path -LiteralPath $AckFile -PathType Leaf) {
+                    $ackValue = (Get-Content -LiteralPath $AckFile -Raw).Trim()
+                    break
+                }
+                Start-Sleep -Milliseconds 250
+            }
+            if ($ackValue -ne "PASS") {
+                $enrollmentAccepted = $false
+            }
+        }
+        Write-JsonLine $stream ([ordered]@{ accepted = $enrollmentAccepted; protocol_version = 1 })
+        if (-not $enrollmentAccepted) {
+            throw "Node A did not complete its reverse pinned startup sync."
+        }
         Write-Output "PEER_BOOTSTRAP_HMAC_VERIFIED=PASS"
         Write-Output "PEER_BOOTSTRAP_SOURCE_IP_PINNED=PASS"
         Write-Output "PEER_BOOTSTRAP_PUBLIC_KEY_RECEIVED=PASS"
