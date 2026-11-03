@@ -2840,7 +2840,10 @@ fn handle_block(stream: &mut TcpStream, state: &Arc<Mutex<NodeState>>) -> Result
         )
     };
     let mut noise_session = if let Some(mut private_key) = local_private_key {
-        let result = if public_alpha {
+        // Public Alpha may accept unpinned Noise XX peers only when the operator has
+        // deliberately configured no static-key trust pins. Once one or more pins are
+        // configured, inbound sessions must prove one of those identities too.
+        let result = if public_alpha && trusted_peer_static_keys.is_empty() {
             QRunV05NoiseSession::accept_public(stream, &private_key, &network_id, &profile_id)
         } else {
             QRunV05NoiseSession::accept(
@@ -6229,6 +6232,140 @@ mod tests {
         );
     }
 
+    #[test]
+    fn public_alpha_nodes_enforce_configured_noise_static_key_pins() {
+        let source_dir = TestDir::new();
+        let receiver_dir = TestDir::new();
+        let signer = Ed25519TransactionSigner::from_seed([0x51; 32]);
+        let source = Arc::new(Mutex::new(qrun_v05_node_state(&source_dir.0, &signer)));
+        let receiver = Arc::new(Mutex::new(qrun_v05_node_state(&receiver_dir.0, &signer)));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap();
+        let (mut source_private, source_public) = test_noise_keypair();
+        let (mut receiver_private, receiver_public) = test_noise_keypair();
+        let (mut wrong_private, wrong_public) = test_noise_keypair();
+        assert_ne!(wrong_public, source_public);
+
+        {
+            let mut node = source.lock().unwrap();
+            node.public_alpha = true;
+            node.noise_private_key = Some(source_private);
+            node.peer_static_keys_by_addr.insert(peer, receiver_public);
+            node.block_peers = vec![peer];
+            source_private.fill(0);
+        }
+        {
+            let mut node = receiver.lock().unwrap();
+            node.public_alpha = true;
+            node.noise_private_key = Some(receiver_private);
+            node.trusted_peer_static_keys = vec![source_public];
+            receiver_private.fill(0);
+        }
+
+        let envelope = {
+            let mut node = source.lock().unwrap();
+            let auth = &node.authenticator;
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let envelope = node
+                .runtime
+                .mine_candidate(timestamp, Vec::new(), auth, 1)
+                .unwrap();
+            let NodeState {
+                runtime,
+                authenticator,
+                clock,
+                ..
+            } = &mut *node;
+            runtime
+                .submit_block(&envelope, authenticator, clock)
+                .unwrap();
+            envelope
+        };
+
+        let (network_id, profile_id, mut sender_key) = {
+            let node = source.lock().unwrap();
+            (
+                node.runtime.network_id(),
+                node.profile_id,
+                node.noise_private_key.unwrap(),
+            )
+        };
+        let outbound = envelope.clone();
+        let expected_receiver = receiver_public;
+        let good_sender = std::thread::spawn(move || {
+            let result = send_block_to_peer_authenticated(
+                peer,
+                &outbound,
+                &network_id,
+                &profile_id,
+                sender_key,
+                Some(&expected_receiver),
+                true,
+            );
+            sender_key.fill(0);
+            result
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        handle_block(&mut stream, &receiver).unwrap();
+        good_sender.join().unwrap().unwrap();
+        {
+            let node = receiver.lock().unwrap();
+            assert_eq!(node.runtime.canonical_height(), 1);
+        }
+
+        // A Public Alpha inbound connection with an unconfigured static key must not
+        // bypass an explicit pin merely because the node runs in Public Alpha mode.
+        let bad_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bad_peer = bad_listener.local_addr().unwrap();
+        let bad_payload = {
+            let mut node = source.lock().unwrap();
+            let auth = &node.authenticator;
+            node.runtime
+                .mine_candidate(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                        + 1,
+                    Vec::new(),
+                    auth,
+                    1,
+                )
+                .unwrap()
+        };
+        let bad_network = network_id;
+        let bad_profile = profile_id;
+        let bad_sender = std::thread::spawn(move || {
+            let result = (|| {
+                let mut stream = TcpStream::connect(bad_peer).ok()?;
+                stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .ok()?;
+                let mut session = QRunV05NoiseSession::connect_public(
+                    &mut stream,
+                    &wrong_private,
+                    &bad_network,
+                    &bad_profile,
+                )
+                .ok()?;
+                session
+                    .write_qfp5_block_record(&mut stream, &bad_payload)
+                    .ok()?;
+                session.read_block_ack_record(&mut stream).ok()
+            })();
+            wrong_private.fill(0);
+            result.is_none()
+        });
+        let (mut bad_stream, _) = bad_listener.accept().unwrap();
+        assert!(handle_block(&mut bad_stream, &receiver).is_err());
+        assert!(bad_sender.join().unwrap());
+        let node = receiver.lock().unwrap();
+        assert_eq!(node.runtime.canonical_height(), 1);
+    }
     #[test]
     fn two_qrun_nodes_sync_signed_transfer_over_authenticated_noise_xx() {
         let first_dir = TestDir::new();
