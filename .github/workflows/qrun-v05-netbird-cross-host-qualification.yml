@@ -1,20 +1,29 @@
 name: QRun v0.5 NetBird cross-host qualification
 
-# Manual only: this workflow consumes a one-off NetBird Setup Key and opens
-# narrowly scoped private-overlay listeners on the owner's workstation.
+# Manual only: this workflow consumes a one-off NetBird Setup Key. C2 adds a
+# narrowly scoped temporary outbound TCP partition on the ephemeral Node B VM.
 on:
   workflow_dispatch:
+    inputs:
+      stage:
+        description: "Qualification stage to run"
+        required: true
+        type: choice
+        options:
+          - c1
+          - c2
+        default: c1
 
 permissions:
   contents: read
 
 concurrency:
-  group: qrun-v05-netbird-cross-host-${{ github.ref }}
+  group: qrun-v05-netbird-cross-host-${{ github.ref }}-${{ inputs.stage }}
   cancel-in-progress: false
 
 jobs:
   cross-host-public-alpha:
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/feat/qrun-v05-netbird-cross-host-qualification-20261102'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/feat/qrun-v05-netbird-cross-host-qualification-20261102' && inputs.stage == 'c1'
     runs-on: windows-latest
     timeout-minutes: 35
     steps:
@@ -75,5 +84,73 @@ jobs:
             NodeANoisePublicKeyHex = [string]$cfg.node_a_noise_public_key_hex
             ReferenceTimeAdminPublicKeyHex = [string]$cfg.reference_time_admin_public_key_hex
             ReferenceTimePolicyBase64 = [string]$cfg.reference_time_policy_base64
+          }
+          & .\tools\qrun-v05-netbird-cross-host-runner.ps1 @runnerArgs
+
+  cross-host-partition-reorg:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/feat/qrun-v05-netbird-cross-host-qualification-20261102' && inputs.stage == 'c2'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout the exact qualification branch revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify runner toolchain and public configuration
+        shell: pwsh
+        env:
+          QRUN_CROSS_HOST_CONFIG_JSON: ${{ vars.QRUN_CROSS_HOST_CONFIG_JSON }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:QRUN_CROSS_HOST_CONFIG_JSON)) {
+            throw 'Repository variable QRUN_CROSS_HOST_CONFIG_JSON is not configured.'
+          }
+          $cfg = $env:QRUN_CROSS_HOST_CONFIG_JSON | ConvertFrom-Json
+          $required = @(
+            'node_a_overlay_ip',
+            'network_id_hex',
+            'owner_account_id_hex',
+            'owner_public_key_hex',
+            'genesis_time_unix_secs',
+            'node_a_noise_public_key_hex',
+            'reference_time_admin_public_key_hex',
+            'reference_time_policy_base64',
+            'qrun_profile_id',
+            'local_secure_root'
+          )
+          foreach ($name in $required) {
+            $property = $cfg.PSObject.Properties[$name]
+            if (-not $property -or [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+              throw "Cross-host configuration is missing: $name"
+            }
+          }
+          rustc --version
+          cargo --version
+          Write-Host 'RUNNER_CONFIG_VALID=PASS'
+          Write-Host 'mainnet=false'
+
+      - name: Run authenticated cross-host partition, reconnect and reorg
+        shell: pwsh
+        env:
+          NETBIRD_SETUP_KEY: ${{ secrets.NETBIRD_SETUP_KEY }}
+          QRUN_CROSS_HOST_CONFIG_JSON: ${{ vars.QRUN_CROSS_HOST_CONFIG_JSON }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:NETBIRD_SETUP_KEY)) {
+            throw 'Repository Actions secret NETBIRD_SETUP_KEY is not configured.'
+          }
+          $cfg = $env:QRUN_CROSS_HOST_CONFIG_JSON | ConvertFrom-Json
+          $runnerArgs = @{
+            NodeAOverlayIp = [string]$cfg.node_a_overlay_ip
+            NetworkIdHex = [string]$cfg.network_id_hex
+            OwnerAccountIdHex = [string]$cfg.owner_account_id_hex
+            OwnerPublicKeyHex = [string]$cfg.owner_public_key_hex
+            GenesisTimeUnixSecs = [string]$cfg.genesis_time_unix_secs
+            NodeANoisePublicKeyHex = [string]$cfg.node_a_noise_public_key_hex
+            ReferenceTimeAdminPublicKeyHex = [string]$cfg.reference_time_admin_public_key_hex
+            ReferenceTimePolicyBase64 = [string]$cfg.reference_time_policy_base64
+            StagePartitionReconnectReorg = $true
           }
           & .\tools\qrun-v05-netbird-cross-host-runner.ps1 @runnerArgs

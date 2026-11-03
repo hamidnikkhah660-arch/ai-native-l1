@@ -199,10 +199,10 @@ Scope and limitations:
 
 ## Stage C2 preparation: cross-host partition, reconnect, reorg and durable reopen (2026-11-03)
 
-**Status: HARNESS PREPARED; NOT RUN.** This is a separate manual-only workflow and does not alter the already-passed Stage C1 workflow.
+**Status: HARNESS PREPARED; NOT RUN.** Stage C2 is a separate manually selected job in the existing registered cross-host qualification workflow; it does not alter the already-passed Stage C1 behavior.
 
 Files:
-- `.github/workflows/qrun-v05-netbird-cross-host-partition-reorg.yml`: manual `workflow_dispatch` only, exact-branch guard, read-only contents permission, ephemeral Windows runner, and the same disposable public-only config plus one-off `NETBIRD_SETUP_KEY`.
+- `.github/workflows/qrun-v05-netbird-cross-host-qualification.yml`: the already registered manual-only workflow now has an explicit `stage` choice (`c1` or `c2`) and mutually exclusive exact-branch-guarded jobs. This keeps GitHub's existing dispatch entry point and avoids adding a separate workflow file that is not registered on the default branch. Both jobs use read-only contents permission, ephemeral Windows runners, and the same disposable public-only config plus one-off `NETBIRD_SETUP_KEY`.
 - `tools/qrun-v05-netbird-partition-controller.ps1`: runs on Node A after the guarded prepare script. It waits for all stale peers to disappear, then requires exactly one stable directly connected P2P Node B peer. After a bounded delay it submits Node A's nonce-1 and nonce-2 test transactions locally, confirms height 2 and the expected receipt/balance state, and logs Node A's canonical tip/state root under the dedicated temporary root.
 - `tools/qrun-v05-netbird-cross-host-runner.ps1`: gained an opt-in `-StagePartitionReconnectReorg` mode. The original Stage C1 behavior remains the default. The C2 mode prebuilds the Node B release binaries before NetBird enrollment, completes pinned startup sync at Genesis, then adds a temporary Windows Firewall **outbound-only** block rule restricted to Node A's exact overlay IP and TCP 49341. It proves TCP 49341 is blocked while authenticated-time TCP 49550 and NetBird Management/Signal remain reachable.
 
@@ -219,7 +219,7 @@ Safety / execution boundary:
 - Node A continues to bind RPC/TX to loopback and P2P/reference-time to its existing private overlay addresses. Port 49550 remains reachable during the P2P partition for authenticated time.
 - The Node A preparation/stop scripts retain the existing fail-closed lifecycle: temporary keys/data are disposable, and `block-inbound=true` is restored after the run.
 - A **fresh** one-off ephemeral Setup Key and regenerated public runner config are required because C1 cleanup intentionally deleted both the old `NETBIRD_SETUP_KEY` Secret and `QRUN_CROSS_HOST_CONFIG_JSON` Variable.
-- Before dispatch, start the Node A partition controller and confirm its `NODE_A_CONTROLLER_READY=PASS` / `NETBIRD_PRETEST_PEERS_CLEAR=PASS` log markers. Dispatch only after the controller is waiting for the single Node B peer. After any runner conclusion, execute the guarded Node A stop script and delete the consumed Secret and temporary Variable.
+- Before dispatch, start the Node A partition controller and confirm its `NODE_A_CONTROLLER_READY=PASS` / `NETBIRD_PRETEST_PEERS_CLEAR=PASS` log markers. Dispatch the existing registered workflow on the exact qualification branch with `stage=c2`, only after the controller is waiting for the single Node B peer. After any runner conclusion, execute the guarded Node A stop script and delete the consumed Secret and temporary Variable.
 - The runner and controller PowerShell files passed the PowerShell parser; the workflow YAML parsed; `git diff --check` passed. These are harness validations, not a Stage C2 execution result.
 
 **Scope remains explicitly unqualified:** no cross-host partition/reconnect/reorg or durable-reopen PASS is claimed until a real Stage C2 workflow run and matching Node A controller evidence are recorded. `mainnet=false`; `QRUN_MAINNET_RELEASE_APPROVED=false`.
