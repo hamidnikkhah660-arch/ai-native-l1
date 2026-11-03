@@ -283,3 +283,30 @@ Regression executed locally:
 The guarded Node A stop script completed with exit code 0. It restored the restrictive NetBird inbound policy, stopped Node A and the reference-time Authority, removed temporary keys/data, removed and verified absence of NETBIRD_SETUP_KEY and QRUN_CROSS_HOST_CONFIG_JSON, and confirmed no listeners or test processes remained on ports 49339, 49340, 49341 and 49550. NetBird Management/Signal remain connected; the temporary runner peer is disconnected.
 
 Next gate: run the same Stage C2 scenario on the updated feature branch. A fresh one-off ephemeral Setup Key and new disposable Node A config will be needed only after the code fix passes the full local Rust checks. Until the repeat host run proves canonical branch selection, orphan-receipt removal and durable reopen, cross-host reorg remains unqualified. Main remains unchanged; PR #132 remains Draft and unmerged; QRUN_MAINNET_RELEASE_APPROVED=false.
+
+## Stage C2 final cross-host run — partition, authenticated reorg and durable reopen PASS (2026-11-03)
+
+GitHub Actions [run 41556590085](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/41556590085) completed with conclusion **success** on exact HEAD commit `66b5349c2014c2cb7384fed67d81061d56d26039`. Job `cross-host-partition-reorg` completed successfully; the C1-only job was intentionally skipped by the `stage=c2` selector.
+
+### Execution evidence
+
+- Runner public configuration validated. Node B prebuilt the QRun binary before NetBird enrollment.
+- Node B enrolled as a temporary peer and established the NetBird tunnel. Its NPK1 Noise private key remained protected by CurrentUser DPAPI and was not exported; the deterministic test-only signer matched the disposable Genesis owner.
+- Pinned Noise XX startup sync completed at Genesis.
+- Immediately before partition, Node B could reach Node A TCP 49341. The runner then blocked only Node B outbound TCP 49341 to Node A's exact overlay IP. Authenticated reference-time TCP 49550 remained reachable and NetBird Management/Signal stayed connected.
+- Node B independently accepted its conflicting signed nonce-1 transaction at height 1, with its branch receipt and 2,000-atom recipient balance confirmed. Transaction ID: `684f0c91e32e247f4944c21b6ae23b1d9a764b503645a8f9e3d1c09c92d37f63`.
+- During the controlled 600-second partition, Node A accepted nonce-1 and nonce-2 transactions and reached canonical height 2. Node A tip: `002c4fde5f181eaa952a138a3b50536425acc9d3d2718612dd20b9f6b58006e8`; state root: `d244141b8918f3c8f6fcab67e517cd0e680c02679a259ec358cf32f240242b68`; owner nonce: 2; owner balance: `999999999999996000` atoms; recipient balances: 1,000 and 3,000 atoms.
+- The runner healed the P2P partition and emitted `CROSS_HOST_PARTITION_RECONNECTED=PASS`. Node B then restarted with pinned authenticated sync. The runner emitted `CROSS_HOST_AUTHENTICATED_RECONNECT_REORG=PASS`, `CROSS_HOST_ORPHAN_RECEIPT_REMOVED=PASS`, and `CROSS_HOST_CANONICAL_RECEIPTS_AND_BALANCES=PASS`.
+- Node B converged to height 2, the exact Node A tip and state root, owner nonce 2, and owner balance `999999999999996000` atoms. The losing transaction receipt returned `not_found_in_canonical_chain`; the losing recipient balance was zero in the canonical state.
+- Node B restarted a second time without startup sync. `CROSS_HOST_DURABLE_REOPEN_AFTER_REORG=PASS`; final height, tip and state root exactly matched the post-reorg durable state.
+- Final runner marker: `CROSS_HOST_PARTITION_RECONNECT_REORG=PASS`; the workflow/job conclusion was success.
+
+### Historical-sync correction exercised
+
+This run exercised commit `66b5349c2014c2cb7384fed67d81061d56d26039`: the pinned QFP5 authenticated historical-sync importer routes already-mined canonical history through deterministic historical validation rather than the live wall-clock freshness admission path. Live QFP5 gossip/local submission retain live freshness limits; parent timestamp monotonicity, PoW/target, ancestry, state/fee/supply checks and durable commit remain enforced. This resolved the earlier run's `TimestampTooFarInPast` rejection during a 600-second partition/reconnect scenario.
+
+### Cleanup and scope
+
+Node A stop script completed successfully, stopped Node A and the reference-time authority, restored NetBird Block Inbound, and removed the dedicated temporary key/data root. The consumed one-off `NETBIRD_SETUP_KEY` Secret and temporary `QRUN_CROSS_HOST_CONFIG_JSON` Variable were deleted and verified absent. The GitHub-hosted Node B runner uses a failure-safe finalization path to remove its temporary firewall block, stop QRun and run `netbird down`.
+
+This is evidence for controlled two-host cross-host recovery using the owner's workstation plus a disposable GitHub-hosted Windows runner. It is **not** independent-operator evidence and does not establish native public Internet reachability, public RPC/TX availability, BFT/time consensus, or Mainnet readiness. The independent-operator runbook remains NOT RUN. `mainnet=false`; `QRUN_MAINNET_RELEASE_APPROVED=false`.
