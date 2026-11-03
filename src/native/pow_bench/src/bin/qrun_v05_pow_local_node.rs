@@ -87,7 +87,7 @@ const SYNC_RESPONSE_HEADER_BYTES: usize = 120;
 const MAX_SYNC_PAGE_BLOCKS: usize = 16;
 // Refresh the authenticated timestamp every bounded Argon2id nonce slice. This keeps a
 // successfully mined header comfortably inside the 300-second live-admission past window.
-const PUBLIC_ALPHA_POW_NONCE_SLICE_ATTEMPTS: u64 = 1_000;
+const PUBLIC_ALPHA_POW_NONCE_SLICE_ATTEMPTS: u64 = 16;
 
 // Fixed wallet-bound Genesis identity for the first QZXB Mainnet.
 const QZXB_MAINNET_NETWORK_ID: NetworkId = [
@@ -3638,6 +3638,14 @@ mod tests {
     use std::thread;
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(1);
+    #[test]
+    fn public_alpha_pow_nonce_slice_size_is_bounded_for_live_timestamp_freshness() {
+        assert!(PUBLIC_ALPHA_POW_NONCE_SLICE_ATTEMPTS > 0);
+        assert!(
+            PUBLIC_ALPHA_POW_NONCE_SLICE_ATTEMPTS <= 16,
+            "PoW slices must stay short enough to refresh the live timestamp during slow mining"
+        );
+    }
 
     #[test]
     fn genesis_timestamp_cli_requires_nonzero_shared_epoch_for_public_modes() {
