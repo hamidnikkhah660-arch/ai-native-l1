@@ -18,6 +18,7 @@ $newNodeProcess = $null
 $firewallRuleName = $null
 $oldNodeStopped = $false
 $bootstrapComplete = $false
+$d1Passed = $false
 $tokenFile = $null
 $recordFile = $null
 $ackFile = $null
@@ -352,13 +353,14 @@ try {
     Write-Output "D1_NODE_A_RECIPROCAL_TXID=$nodeATxid"
     Write-Output "D1_NODE_A_RECEIVED_NODE_B_QFP5_ACK=PASS"
     Write-Output "mainnet=false"
+    $d1Passed = $true
     Write-Output "D1_NODE_A_FULL_DUPLEX_CONTROLLER=PASS"
 }
 catch {
     if ($ackFile -and (Test-Path -LiteralPath $ackFile)) {
         Set-Content -LiteralPath $ackFile -Value "FAIL" -Encoding ASCII -ErrorAction SilentlyContinue
     }
-    if (-not $bootstrapComplete) {
+    if (-not $d1Passed -and $oldNodeStopped) {
         try { Restore-NodeAWithoutPeer } catch {
             Write-Warning "Node A automatic rollback failed; inspect the dedicated secure root and restart Node A using the original no-peer arguments."
         }
