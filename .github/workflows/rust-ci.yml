@@ -173,6 +173,25 @@ jobs:
         shell: pwsh
         run: ./tools/qrun-v05-netbird-peer-bootstrap.ps1 -Mode SelfTest
 
+      - name: Parse QRun NetBird full-duplex controller and runner scripts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $paths = @(
+            './tools/qrun-v05-netbird-peer-bootstrap.ps1',
+            './tools/qrun-v05-netbird-node-a-full-duplex-controller.ps1',
+            './tools/qrun-v05-netbird-cross-host-runner.ps1'
+          )
+          foreach ($path in $paths) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $path), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              throw "PowerShell parse failed for $path : $($errors[0].Message)"
+            }
+            Write-Host "POWERSHELL_PARSE_PASS=$path"
+          }
+
       - name: Run QRun external-CAS DPAPI startup and floor integration tests
         shell: pwsh
         run: cargo +stable test --manifest-path src/native/pow_bench/Cargo.toml --locked --bin qrun_v05_pow_local_node -- --test-threads=1
