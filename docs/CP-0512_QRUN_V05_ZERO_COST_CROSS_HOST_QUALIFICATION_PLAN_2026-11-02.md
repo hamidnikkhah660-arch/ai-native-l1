@@ -1,6 +1,6 @@
 # CP-0512 — QRun v0.5 Zero-Cost Cross-Host Qualification Plan
 Date: 2026-11-02
-Status: **Stage B authenticated cross-host startup PASS (run 41540604143); Stage C1 signed transaction and QFP5 block-gossip PASS (run 41546003659). Stage C2 cross-host partition/reconnect/reorg harness prepared and parser/YAML-validated, NOT RUN pending a fresh one-off Setup Key and Node A controller launch. No VPS purchased.**
+Status: **Stage B authenticated cross-host startup PASS (run 41540604143); Stage C1 signed transaction/QFP5 block-gossip PASS (run 41546003659). Stage C2 partition and divergent branches observed (run 41549751666), but reconnect/reorg/durable-reopen NOT RUN. The first C2 attempt was cancelled after an incorrect owner-balance assertion was identified and corrected. No VPS purchased.**
 
 ## Objective
 Qualify QRun from the owner's existing Windows laptop against a second, temporary Windows VM without purchasing a VPS or using the old/infected computer. The first target is a real cross-host authenticated P2P test over a private overlay. This is not yet independent-operator or native public-Internet qualification.
@@ -126,3 +126,13 @@ Stage C1 is now executed and passed in GitHub Actions run [41546003659](https://
 Stage C2 is now prepared as a manual-only `stage=c2` job in the already registered cross-host qualification workflow, together with the Node A partition controller. It will block only Node B outbound TCP 49341 to Node A while preserving TCP 49550 authenticated time, build competing nonce-1 branches (Node B) and nonce-1/nonce-2 branches (Node A), heal the P2P path, restart Node B with pinned authenticated sync, verify the losing receipt is removed and the winning balances restored, then perform a durable reopen without sync. Its PowerShell scripts passed parser validation, the workflow YAML parsed, and the Git diff check passed. **Stage C2 is NOT RUN**; it requires a fresh one-off ephemeral NETBIRD_SETUP_KEY, regeneration of Node A's disposable public configuration, and launch of the Node A partition controller before manual dispatch.
 
 This remains temporary hosted-runner qualification, not independent-operator or native public-Internet qualification. QRUN_MAINNET_RELEASE_APPROVED=false.
+
+## Stage C2 first execution result (2026-11-03)
+
+GitHub Actions run [41549751666](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/41549751666) established a direct NetBird P2P peer, completed pinned Noise startup sync at Genesis, verified the Node B outbound TCP 49341 partition while TCP 49550 authenticated time remained reachable, and created divergent branches on both hosts. Node B reached height 1 with a confirmed competing nonce-1 receipt and 2,000-atom recipient balance; Node A independently reached height 2 with two confirmed receipts and its own canonical ledger.
+
+Node A local RPC showed tip `003b74e5dcce3efe39b7b135401ad53a25a64128180fd70975f31317d98f8737`, state root `ba30be0acbb61f5eb33726296deb989261a28c4e5070047a983fa682c5266b60`, owner nonce 2, owner balance `999999999999996000` atoms, recipient balances 1,000 and 3,000 atoms, and the competing recipient at zero. Node A transaction IDs were `daa5ecc5de15512400b498512f504458a9f046e6a8a421f76b4c53c5a8faa6f2` and `4ecaa56be31fba62de10728b5d30d8d157d94d1c1421bf6889fab85c2c4b4897`. Node B's competing transaction ID was `dbc6918ba4734208939f0cc4d3e598d0fd8b8755f847a5958475c6fbdb891f50`.
+
+The controller initially failed because the harness expected `999999999999995998` atoms, incorrectly subtracting two one-atom fees even though the test producer account is the same as the owner account and those fees return to that account. Direct RPC established the actual canonical value `999999999999996000`; the harness assertions were corrected. The workflow was cancelled during its 600-second partition hold, before P2P healing and Node B authenticated reorg/durable-reopen stages. Those stages remain NOT RUN and no reorg PASS is claimed.
+
+Cleanup restored Node A `block-inbound=true`, stopped Node A/time/canary, removed temporary keys/data, deleted the consumed Actions Secret and temporary Variable, and verified no QRun listeners remained. A fresh one-off Setup Key and new disposable Node A config are required to rerun C2 after the assertion correction.

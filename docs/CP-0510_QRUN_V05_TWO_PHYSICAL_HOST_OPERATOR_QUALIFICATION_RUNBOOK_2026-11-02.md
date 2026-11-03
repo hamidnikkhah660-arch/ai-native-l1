@@ -1,5 +1,5 @@
 # CP-0510 — QRun v0.5 Two-Physical-Host Operator Qualification Runbook
-**Status:** Independent-operator/LAN runbook remains NOT RUN. Temporary GitHub-hosted Windows runner has passed Stage B authenticated startup and Stage C1 signed transaction/QFP5 block propagation. Stage C2 cross-host partition/reconnect/reorg harness is prepared but not yet run.
+**Status:** Independent-operator/LAN runbook remains NOT RUN. Temporary GitHub-hosted Windows runner has passed Stage B authenticated startup and Stage C1 signed transaction/QFP5 block propagation. A first Stage C2 attempt verified the P2P partition and divergent branches on both hosts, but was cancelled before reconnect/reorg/durable-reopen; that gate remains unqualified.
 **Date:** 2026-11-02
 **Scope:** Public Alpha/test-only, private LAN first; no Mainnet or public QZXB trading.
 
@@ -58,3 +58,9 @@ Stop immediately on Noise pin mismatch, Genesis/profile/time-policy mismatch, un
 The temporary GitHub-hosted Windows runner is a second physical virtual machine and completed authenticated NetBird/Noise XX startup qualification against Node A. It is not an independently administered volunteer operator and does not complete this runbook.
 
 The CI runner's signed transaction/QFP5 block-gossip stage (Stage C1) is now PASS, independently confirmed by Node A's local canonical height/tip/state-root and receipt/balance queries. A separate Stage C2 partition/reconnect/reorg/durable-reopen harness is prepared and parser/YAML-validated but **NOT RUN**. This operator runbook still requires a separately administered second computer for the LAN phase, followed by the separately controlled routed-network phase. Do not describe temporary CI execution as independent-operator evidence. QRUN_MAINNET_RELEASE_APPROVED=false.
+
+## Stage C2 partial cross-host qualification result (2026-11-03)
+
+Run [41549751666](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/41549751666) verified the private P2P data-path partition and divergent branch creation on both hosts: Node B's outbound TCP 49341 was blocked to Node A while authenticated time TCP 49550 and NetBird itself remained connected; Node B reached canonical height 1 with its conflicting receipt, while Node A independently reached height 2 with nonce-1/nonce-2 receipts. Node A's canonical tip/state root and balances were independently read through loopback RPC.
+
+The first run did not reach reconnect/reorg/durable reopen. A test-only owner-balance expectation was wrong by two atoms because the test producer is also the owner; the one-atom fees are credited back to the same account. The correct canonical owner balance is 999999999999996000 atoms, and the controller/runner assertions are corrected in the working tree. The workflow was cancelled before the reconnect stage. Do not treat this partial run as cross-host reorg or durable-recovery evidence. The independent-operator LAN/routed runbook remains NOT RUN.

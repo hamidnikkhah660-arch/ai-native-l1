@@ -1,7 +1,7 @@
 # CP-0513 ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â QRun v0.5 NetBird Cross-Host CI Harness
 
 **Date:** 2026-11-02
-**Status:** Cross-host authenticated startup PASS (run 41540604143). Stage C1 signed transaction and QFP5 block-gossip PASS (run 41546003659). Cross-host partition/reorg and independent-operator gates remain unqualified.
+**Status:** Stage B authenticated cross-host startup PASS (run 41540604143). Stage C1 signed transaction/QFP5 block-gossip PASS (run 41546003659). Stage C2 partition and divergent-branch setup observed in run 41549751666; reconnect/reorg/durable-reopen NOT RUN. Independent-operator gates remain unqualified.
 **Branch:** `feat/qrun-v05-netbird-cross-host-qualification-20261102`
 **Last verified implementation commit before this harness:** `38df9662baa457e4b2a2ca98d9797e87cf0a11fd`
 
@@ -199,19 +199,18 @@ Scope and limitations:
 
 ## Stage C2 preparation: cross-host partition, reconnect, reorg and durable reopen (2026-11-03)
 
-**Status: HARNESS PREPARED; NOT RUN.** Stage C2 is a separate manually selected job in the existing registered cross-host qualification workflow; it does not alter the already-passed Stage C1 behavior.
+**Status: PARTIAL EXECUTION.** The first Stage C2 run verified the private P2P partition and divergent branches on both hosts, then was cancelled before reconnect/reorg/durable-reopen. The incorrect owner-balance assertion is corrected in the working tree.
 
 Files:
 - `.github/workflows/qrun-v05-netbird-cross-host-qualification.yml`: the already registered manual-only workflow now has an explicit `stage` choice (`c1` or `c2`) and mutually exclusive exact-branch-guarded jobs. This keeps GitHub's existing dispatch entry point and avoids adding a separate workflow file that is not registered on the default branch. Both jobs use read-only contents permission, ephemeral Windows runners, and the same disposable public-only config plus one-off `NETBIRD_SETUP_KEY`.
 - `tools/qrun-v05-netbird-partition-controller.ps1`: runs on Node A after the guarded prepare script. It waits for all stale peers to disappear, then requires exactly one stable directly connected P2P Node B peer. After a bounded delay it submits Node A's nonce-1 and nonce-2 test transactions locally, confirms height 2 and the expected receipt/balance state, and logs Node A's canonical tip/state root under the dedicated temporary root.
 - `tools/qrun-v05-netbird-cross-host-runner.ps1`: gained an opt-in `-StagePartitionReconnectReorg` mode. The original Stage C1 behavior remains the default. The C2 mode prebuilds the Node B release binaries before NetBird enrollment, completes pinned startup sync at Genesis, then adds a temporary Windows Firewall **outbound-only** block rule restricted to Node A's exact overlay IP and TCP 49341. It proves TCP 49341 is blocked while authenticated-time TCP 49550 and NetBird Management/Signal remain reachable.
 
-Planned C2 evidence:
-1. Node B submits a signed conflicting nonce-1 transaction while P2P is isolated and must reach canonical height 1 with its own confirmed receipt and recipient balance.
-2. Node B's attempted P2P block broadcast must appear as a failed send on stderr; no successful broadcast marker may exist for the isolated competing block.
-3. Node A independently builds a nonce-1/nonce-2 branch while Node B's outbound P2P path is blocked. Node A must reach canonical height 2 with owner nonce 2, owner balance `999999999999995998` atoms, and only the two Node A test-recipient balances.
-4. The runner removes only its temporary TCP 49341 outbound block, proves P2P and authenticated-time connectivity recovered, then restarts Node B with the same DPAPI key/data and pinned `--sync-on-start true`. Node B must select Node A's higher-work height-2 branch, remove the losing Node B receipt from canonical view, and reproduce the expected owner/recipient balances.
-5. Node B is restarted once more without startup sync and must preserve the post-reorg canonical tip, state root, orphan receipt status, nonce and balances from durable storage.
+C2 remaining evidence after the partial partition run:
+1. Remove the temporary Node B outbound TCP 49341 block and prove the QRun P2P path is restored while authenticated time remains reachable.
+2. Restart Node B with its same DPAPI key/data and pinned `--sync-on-start true`. Prove it selects Node A's higher-work height-2 branch with the exact same canonical tip and state root.
+3. Confirm the losing Node B nonce-1 receipt disappears from canonical view, owner nonce/balance and the winning recipients match Node A, and the losing recipient returns to zero.
+4. Restart Node B again without startup sync and prove the post-reorg canonical tip, state root, orphan receipt status, nonce and balances survive durable reopen.
 
 Safety / execution boundary:
 - Only Node B's temporary Windows Firewall outbound TCP 49341 rule is added. It is restricted to Node A's private overlay IP and is removed on the normal path and in the runner's `finally` path.
@@ -223,3 +222,27 @@ Safety / execution boundary:
 - The runner and controller PowerShell files passed the PowerShell parser; the workflow YAML parsed; `git diff --check` passed. These are harness validations, not a Stage C2 execution result.
 
 **Scope remains explicitly unqualified:** no cross-host partition/reconnect/reorg or durable-reopen PASS is claimed until a real Stage C2 workflow run and matching Node A controller evidence are recorded. `mainnet=false`; `QRUN_MAINNET_RELEASE_APPROVED=false`.
+
+
+## Stage C2 first execution — partition and branch divergence observed; reconnect/reorg not run (2026-11-03)
+
+GitHub Actions [run 41549751666](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/41549751666) checked out commit `570dafe47e2182fd334ed3f9da1a4ddfd418fa1e`. The Stage C2 job verified the following before its controlled cancellation:
+
+- Node B release prebuild passed; the temporary peer established a direct NetBird WireGuard P2P tunnel with nonzero transfer counters.
+- Pinned Noise startup sync at Genesis completed. Node B's private Noise key was protected with CurrentUser DPAPI and not exported; its test-only signer matched the disposable Genesis owner.
+- Immediately before the partition, Node B could reach Node A TCP 49341. The Runner then proved outbound TCP 49341 blocked to the exact Node A overlay IP while authenticated-time TCP 49550 remained reachable and NetBird Management/Signal stayed connected.
+- Node B created its competing nonce-1 branch at canonical height 1. The Runner emitted `CROSS_HOST_PARTITION_NODE_B_BRANCH_HEIGHT1=PASS`, `CROSS_HOST_PARTITION_NODE_B_CANONICAL_RECEIPT=PASS`, and `CROSS_HOST_PARTITION_NODE_B_RECIPIENT_BALANCE=PASS`. Competing transaction ID: `dbc6918ba4734208939f0cc4d3e598d0fd8b8755f847a5958475c6fbdb891f50`. Node B tip: `008fe6b2669d6ae4de53adfee293ee48920e6c8dccad5f58883e27be991075cb`.
+- Node A independently created nonce-1 and nonce-2 transactions while its Node B P2P path was isolated. Both transactions received Accepted QZTA acknowledgements and their receipts were confirmed. Transaction IDs: `daa5ecc5de15512400b498512f504458a9f046e6a8a421f76b4c53c5a8faa6f2` and `4ecaa56be31fba62de10728b5d30d8d157d94d1c1421bf6889fab85c2c4b4897`.
+- Node A local RPC independently showed canonical height 2, tip `003b74e5dcce3efe39b7b135401ad53a25a64128180fd70975f31317d98f8737`, state root `ba30be0acbb61f5eb33726296deb989261a28c4e5070047a983fa682c5266b60`, owner nonce 2, recipient `78…78` balance 1,000 atoms, recipient `7a…7a` balance 3,000 atoms, and competing recipient `79…79` balance 0. The owner balance was `999999999999996000` atoms.
+
+The Node A controller initially reported FAIL because its test expected owner balance `999999999999995998`, subtracting both one-atom transaction fees. The observed test configuration sets the producer account equal to the owner account; the one-atom fees therefore return to the same account, so the net owner decrease is the two transfer amounts only. Direct RPC confirmed the canonical balances, nonce and receipts above. This was a test-harness expectation error, not a canonical ledger or receipt failure.
+
+The Runner had reached its planned 600-second partition hold when the run was cancelled, before the P2P path was reopened. Therefore **Stage C2 reconnect, authenticated reorg, orphan-receipt removal and durable reopen were NOT RUN and are NOT claimed as PASS**.
+
+Cleanup evidence:
+- The guarded Node A stop script exited 0, stopped Node A, the time authority and canary, restored `block-inbound=true`, and removed the dedicated temporary key/data root.
+- The one-off `NETBIRD_SETUP_KEY` Secret and temporary `QRUN_CROSS_HOST_CONFIG_JSON` Variable were deleted and verified absent.
+- Post-cleanup checks found no QRun process/listener on 49339, 49340, 49341 or 49550. NetBird Management/Signal remain connected; the temporary peer is offline and subject to ephemeral cleanup.
+- `mainnet=false`; `main` was unchanged; PR #132 remains Draft and unmerged.
+
+**Correction in working tree:** The Node A controller and Node B reorg assertions now expect owner balance `999999999999996000` atoms for this test topology. A fresh one-off Setup Key and fresh disposable Node A configuration are required to rerun C2 and complete reconnect/reorg/durable-reopen qualification.

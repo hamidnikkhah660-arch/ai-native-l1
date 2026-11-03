@@ -162,7 +162,7 @@ try {
         $statusA2.profile_id -ne [string]$cfg.qrun_profile_id -or
         $statusA2.mainnet -ne $false -or
         [uint64]$owner.nonce -ne 2 -or
-        [uint64]$owner.balance_atoms -ne 999999999999995998 -or
+        [uint64]$owner.balance_atoms -ne 999999999999996000 -or
         [uint64]$recipientA1.balance_atoms -ne 1000 -or
         [uint64]$recipientA2.balance_atoms -ne 3000 -or
         [uint64]$recipientB.balance_atoms -ne 0) {

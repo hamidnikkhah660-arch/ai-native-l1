@@ -417,7 +417,7 @@ try {
         $reorgB = Invoke-RestMethod -Method Get -Uri ("http://127.0.0.1:49339/v1/balance/" + ("79" * 32)) -TimeoutSec 5
         if ($orphanReceipt.status -ne "not_found_in_canonical_chain" -or
             [uint64]$reorgOwner.nonce -ne 2 -or
-            [uint64]$reorgOwner.balance_atoms -ne 999999999999995998 -or
+            [uint64]$reorgOwner.balance_atoms -ne 999999999999996000 -or
             [uint64]$reorgA1.balance_atoms -ne 1000 -or
             [uint64]$reorgA2.balance_atoms -ne 3000 -or
             [uint64]$reorgB.balance_atoms -ne 0) {
@@ -475,6 +475,7 @@ try {
         $durableB = Invoke-RestMethod -Method Get -Uri ("http://127.0.0.1:49339/v1/balance/" + ("79" * 32)) -TimeoutSec 5
         if ($durableOrphan.status -ne "not_found_in_canonical_chain" -or
             [uint64]$durableOwner.nonce -ne 2 -or
+            [uint64]$durableOwner.balance_atoms -ne 999999999999996000 -or
             [uint64]$durableA1.balance_atoms -ne 1000 -or
             [uint64]$durableA2.balance_atoms -ne 3000 -or
             [uint64]$durableB.balance_atoms -ne 0) {
