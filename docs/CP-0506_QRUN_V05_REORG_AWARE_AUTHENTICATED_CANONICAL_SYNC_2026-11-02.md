@@ -34,7 +34,7 @@ Each response must advertise the exact same trusted base height and base tip as 
 Each envelope must:
 - appear at its exact contiguous absolute height for that page;
 - match the local QFP5/legacy execution mode;
-- pass the existing runtime's full block/PoW/ancestry/state-transition admission through `submit_block`.
+- pass the existing runtime's full block/PoW/ancestry/state-transition admission through the authenticated-sync-only runtime entrypoint submit_authenticated_sync_block.
 
 The client no longer insists that the block extends the current canonical tip. The fork runtime must already know its authenticated parent branch, so a valid competing branch can be retained and evaluated by the existing cumulative-work fork-choice implementation. Canonical transaction receipts are rebuilt whenever a new branch is retained.
 
@@ -48,6 +48,14 @@ After all advertised pages are imported, the node verifies that:
 - the local canonical branch is the greatest cumulative-work branch, with the existing deterministic lexicographic tip-hash tie-break applied for equal work.
 
 The runtime exposes only a small read-only `archived_branch_summary` (height, state root, cumulative work) and `canonical_cumulative_work` to the node layer. It does not expose a mutable fork-choice graph API.
+
+### 3. Separate authenticated historical sync from live admission
+
+Canonical sync now enters the explicitly named submit_authenticated_sync_block runtime method. The method accepts QFP5 only and forwards through the storage contract's submit_historical operation to PrivateTestnetForkChoice::insert_encoded_historical. That path uses the existing append_qrun_v05_fee_historical / ChainAdmissionBoundary::testnet().replay_qrun_v05_fee implementation.
+
+Historical admission still checks the envelope/profile, exact height and parent linkage, previous consensus hash, target history, PoW digest, fee-only state commitment, complete fee/state transition and branch supply. Parent timestamp monotonicity remains enforced by the state transition; target history is also updated from the block timestamps. It does not compare an already-mined historical block with the receiver's present-day wall clock or sample a moving freshness window.
+
+This entrypoint is used only by the pinned Noise XX authenticated canonical-sync importer after the peer and common trusted base have been authenticated and the bounded response page has been validated. For QFP5, live P2P gossip, local block submissions and newly mined candidates continue through submit_block / insert_encoded / append_qrun_v05_fee_live, preserving the existing 300-second past and 120-second future live-admission bounds. Authenticated legacy/PTB2 sync retains its prior submit path; the historical timestamp bypass is QFP5-only. The change does not globally relax live timestamp admission. The External-CAS backend uses the same historical validation mode but retains its signed atomic-CAS commit, pending-intent recovery and independent floor checks.
 
 ### 4. Preserve fail-closed checkpoint behavior
 
@@ -89,3 +97,11 @@ Result: **PASS**. The server emitted `qrun_pow_local_canonical_sync_served start
 - `QRUN_MAINNET_RELEASE_APPROVED = false` remains unchanged. No Mainnet launch, public-value QZXB trading, liquidity or exchange readiness is claimed.
 
 **Decision:** retain reorg-aware canonical sync as a QRun v0.5 Public Alpha candidate. Next, qualify the same scenario with two separate node processes and then two independent hosts before reconsidering any release gate.
+
+## Cross-host timestamp admission correction (2026-11-03)
+
+The first full Stage C2 cross-host reconnect run demonstrated why this split is required. The Node B P2P partition healed and CROSS_HOST_PARTITION_RECONNECTED=PASS was emitted, but the first historical Node A branch block was submitted through the live submit_block path. Its timestamp was 185 seconds older than the receiver's calculated earliest_allowed value, so the receiver correctly rejected it under the live 300-second freshness policy even though the block was part of the authenticated, already-mined canonical history.
+
+The sync importer now calls submit_authenticated_sync_block; live P2P gossip remains on submit_block. A targeted regression proves that the same stale QFP5 envelope is rejected by live admission, accepted by authenticated historical replay after full PoW/ancestry/state validation, and survives durable reopen with an identical canonical tip, state root and total supply.
+
+Focused regression: 1 passed, 0 failed. A second physical-host C2 run is still required to verify that this fix completes cross-host fork choice, orphan-receipt removal and durable reopen. No cross-host reorg PASS is claimed yet.

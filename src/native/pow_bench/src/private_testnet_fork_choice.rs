@@ -402,6 +402,24 @@ impl PrivateTestnetForkChoice {
         self.insert_encoded_internal(envelope, authenticator, clock, false)
     }
 
+    /// Import a QFP5 envelope from an authenticated canonical-sync snapshot.
+    ///
+    /// This uses deterministic historical admission: PoW, target, ancestry, state transition,
+    /// producer/fee rules and profile checks remain mandatory, while the present-day live
+    /// freshness window is not applied to an already-mined historical block. Callers must only
+    /// use this after authenticating and pinning the canonical-sync peer and trusted base.
+    pub fn insert_encoded_historical(
+        &mut self,
+        envelope: &[u8],
+        authenticator: &impl TransactionAuthenticator,
+        clock: &dyn ReferenceTimeProvider,
+    ) -> Result<ForkChoiceOutcome, ForkChoiceError> {
+        if !envelope.starts_with(b"QFP5") {
+            return Err(ForkChoiceError::ExecutionModeMismatch);
+        }
+        self.insert_encoded_internal(envelope, authenticator, clock, true)
+    }
+
     /// Historical QFP5 replay does not sample wall-clock time, but still verifies PoW, ancestry,
     /// difficulty, canonical fee execution and the frozen execution mode.
     fn insert_encoded_internal<A: TransactionAuthenticator>(

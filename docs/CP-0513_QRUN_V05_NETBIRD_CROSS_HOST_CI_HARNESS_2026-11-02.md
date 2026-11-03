@@ -246,3 +246,40 @@ Cleanup evidence:
 - `mainnet=false`; `main` was unchanged; PR #132 remains Draft and unmerged.
 
 **Correction in working tree:** The Node A controller and Node B reorg assertions now expect owner balance `999999999999996000` atoms for this test topology. A fresh one-off Setup Key and fresh disposable Node A configuration are required to rerun C2 and complete reconnect/reorg/durable-reopen qualification.
+
+## Stage C2 second execution: P2P partition and reconnect PASS; historical sync timestamp gate identified (2026-11-03)
+
+GitHub Actions run 41551873878, on qualification branch commit 393b1ac9797e567e92601e8fc24dd268fa970f04, ran the full two-host partition/reconnect harness with a fresh one-off NetBird Setup Key and newly generated disposable Node A configuration.
+
+Verified before the sync failure:
+
+- Node B enrolled as an ephemeral peer and established direct NetBird WireGuard P2P; Node A independently observed a fresh handshake and nonzero transfer counters.
+- The pinned Noise XX startup sync completed at Genesis. Node B's private Noise key remained protected by CurrentUser DPAPI and was not exported; the test signer matched the disposable Genesis owner.
+- Node B reached Node A TCP 49341 before partition. The runner then blocked only outbound TCP 49341 to Node A's exact overlay IP, while authenticated-time TCP 49550 and NetBird Management/Signal remained reachable.
+- Node B created its conflicting nonce-1 branch; the competing transaction ID was e29c784038fa53e5e7eb951a5c0e3f5cbcc85fc14f0814030e5e176cf9dcb981. The branch reached height 1 and its receipt and recipient balance were independently checked.
+- Node A created its independent nonce-1 and nonce-2 branches. Its canonical height-2 tip was 00a1299affbddd76bdc1610b8b35e4c21b012483ef154d010e3ca4c62a184e79, state root a6893082452a1b7d968cc14f05c28127715e33cc711b16c5cc78e91090447001, owner nonce 2 and owner balance 999999999999996000 atoms. The two Node A test transaction IDs were 1d601a359792a2cd661cf3189b2f2d77d3e856bee9be3a64ac260501b4fa9e98 and 4ec36145c865819c4ee19f36bc33442d5e65502d519b31e000e853d23816af7f. The first and second recipients had 1,000 and 3,000 atoms; the competing recipient remained at zero.
+- The 600-second partition hold completed and the runner emitted CROSS_HOST_PARTITION_RECONNECTED=PASS. The failure occurred only after Node B restarted and began authenticated canonical sync.
+
+Exact failure:
+- earliest_allowed = 1793665551
+- historical Node A block timestamp actual = 1793665366
+- difference: 185 seconds
+- Node B rejected the block with TimestampTooFarInPast because authenticated sync reused the live submit_block freshness check.
+- Therefore authenticated branch import, reorg selection, orphan-receipt removal and durable reopen did not complete in this run. Stage C2 result: FAIL, not PASS.
+
+### Corrective implementation
+
+The runtime now exposes submit_authenticated_sync_block for QFP5 envelopes obtained by the pinned Noise XX canonical-sync importer. It routes through submit_historical on both local PFS2 and External-CAS stores, and through insert_encoded_historical in fork choice, using the existing deterministic QFP5 historical validator. PoW, target, height/parent/consensus linkage, fee-only execution, state commitment, receipt/state transition, branch supply and durable atomic commit remain checked. Historical parent-timestamp monotonicity remains enforced. The current-time past/future freshness policy is not disabled globally: live QFP5 peer gossip and local candidate submission still use submit_block. Legacy/PTB2 sync preserves its pre-existing submit behavior and does not enter the QFP5 historical method.
+
+Regression executed locally:
+- Same QFP5 envelope submitted at reference time 1,000 with block timestamp 1.
+- Live submit_block rejected it with TimestampTooFarInPast.
+- Authenticated historical sync import accepted it after consensus checks.
+- Durable reopen retained the exact canonical height, tip, state root and full supply.
+- Result: 1 passed, 0 failed.
+
+### Cleanup
+
+The guarded Node A stop script completed with exit code 0. It restored the restrictive NetBird inbound policy, stopped Node A and the reference-time Authority, removed temporary keys/data, removed and verified absence of NETBIRD_SETUP_KEY and QRUN_CROSS_HOST_CONFIG_JSON, and confirmed no listeners or test processes remained on ports 49339, 49340, 49341 and 49550. NetBird Management/Signal remain connected; the temporary runner peer is disconnected.
+
+Next gate: run the same Stage C2 scenario on the updated feature branch. A fresh one-off ephemeral Setup Key and new disposable Node A config will be needed only after the code fix passes the full local Rust checks. Until the repeat host run proves canonical branch selection, orphan-receipt removal and durable reopen, cross-host reorg remains unqualified. Main remains unchanged; PR #132 remains Draft and unmerged; QRUN_MAINNET_RELEASE_APPROVED=false.

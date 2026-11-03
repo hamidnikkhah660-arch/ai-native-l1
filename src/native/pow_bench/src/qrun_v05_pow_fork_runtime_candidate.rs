@@ -104,6 +104,12 @@ pub trait QRunV05RuntimeStore {
         authenticator: &A,
         clock: &dyn ReferenceTimeProvider,
     ) -> Result<ForkChoiceOutcome, ForkStoreError>;
+    fn submit_historical<A: TransactionAuthenticator>(
+        &mut self,
+        envelope: &[u8],
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+    ) -> Result<ForkChoiceOutcome, ForkStoreError>;
 }
 
 impl QRunV05RuntimeStore for PrivateTestnetForkStore {
@@ -146,6 +152,15 @@ impl QRunV05RuntimeStore for PrivateTestnetForkStore {
         clock: &dyn ReferenceTimeProvider,
     ) -> Result<ForkChoiceOutcome, ForkStoreError> {
         PrivateTestnetForkStore::submit(self, envelope, authenticator, clock)
+    }
+
+    fn submit_historical<A: TransactionAuthenticator>(
+        &mut self,
+        envelope: &[u8],
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+    ) -> Result<ForkChoiceOutcome, ForkStoreError> {
+        PrivateTestnetForkStore::submit_historical(self, envelope, authenticator, clock)
     }
 }
 
@@ -193,6 +208,15 @@ where
         clock: &dyn ReferenceTimeProvider,
     ) -> Result<ForkChoiceOutcome, ForkStoreError> {
         QRunV05ExternalCasForkStore::submit(self, envelope, authenticator, clock)
+    }
+
+    fn submit_historical<A: TransactionAuthenticator>(
+        &mut self,
+        envelope: &[u8],
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+    ) -> Result<ForkChoiceOutcome, ForkStoreError> {
+        QRunV05ExternalCasForkStore::submit_historical(self, envelope, authenticator, clock)
     }
 }
 
@@ -879,6 +903,32 @@ where
         Ok(outcome.canonical_tip)
     }
 
+    /// Import a block received through the pinned, authenticated canonical-sync protocol.
+    /// QFP5 uses deterministic historical admission; legacy mode retains its existing submit
+    /// behavior. Live P2P gossip and newly mined candidates continue to use submit_block.
+    pub fn submit_authenticated_sync_block<A: TransactionAuthenticator>(
+        &mut self,
+        envelope: &[u8],
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+    ) -> Result<[u8; 32], QRunV05PowRuntimeError> {
+        let candidate = decode_candidate_network_block(envelope)?;
+        if candidate.fee_block.is_some() != self.fee_only {
+            return Err(QRunV05PowRuntimeError::UnsupportedEnvelopeMode);
+        }
+        if candidate.header.network_id != self.network_id {
+            return Err(QRunV05PowRuntimeError::WrongNetwork);
+        }
+        let outcome = if self.fee_only {
+            self.store
+                .submit_historical(envelope, authenticator, clock)?
+        } else {
+            self.store.submit(envelope, authenticator, clock)?
+        };
+        self.validate_all_branch_supplies()?;
+        Ok(outcome.canonical_tip)
+    }
+
     fn validate_all_branch_supplies(&self) -> Result<(), QRunV05PowRuntimeError> {
         let canonical_supply = self
             .store
@@ -1240,6 +1290,66 @@ mod tests {
             nonce,
         };
         encode_candidate_network_block(&header, &block).unwrap()
+    }
+
+    #[test]
+    fn authenticated_sync_historical_import_rejects_live_stale_block_then_replays_and_reopens() {
+        let dir = TestDir::new();
+        let network = PROPOSED_QRUN_V05_NETWORK_ID;
+        let owner = PROPOSED_OWNER_ACCOUNT_ID;
+        let mut params = params();
+        params.protocol_version = 5;
+        let clock = ClockAt(1_000);
+
+        let mut runtime = QRunV05PowForkRuntime::open(
+            &dir.0,
+            network,
+            owner,
+            params.clone(),
+            &EmptyAuthenticator,
+            &clock,
+        )
+        .unwrap();
+        let genesis_tip = runtime.canonical_tip();
+        let envelope = make_qfp5_fee_envelope(network, owner, &params);
+
+        let live_error = runtime
+            .submit_block(&envelope, &EmptyAuthenticator, &clock)
+            .expect_err("live admission must retain its present-time freshness bound");
+        assert!(
+            format!("{live_error:?}").contains("TimestampTooFarInPast"),
+            "expected the live-only stale timestamp rejection, got {live_error:?}"
+        );
+        assert_eq!(runtime.canonical_height(), 0);
+        assert_eq!(runtime.canonical_tip(), genesis_tip);
+
+        let synced_tip = runtime
+            .submit_authenticated_sync_block(&envelope, &EmptyAuthenticator, &clock)
+            .expect("authenticated QFP5 history must use deterministic historical replay");
+        assert_eq!(runtime.canonical_height(), 1);
+        assert_eq!(runtime.canonical_tip(), synced_tip);
+        assert_ne!(synced_tip, genesis_tip);
+        let committed_root = runtime.canonical_state_root();
+        let committed_supply = runtime.canonical_state().total_value().unwrap();
+        assert_eq!(committed_supply, MAX_TOTAL_SUPPLY_ATOMS);
+        drop(runtime);
+
+        let reopened = QRunV05PowForkRuntime::open(
+            &dir.0,
+            network,
+            owner,
+            params,
+            &EmptyAuthenticator,
+            &clock,
+        )
+        .unwrap();
+        assert_eq!(reopened.canonical_height(), 1);
+        assert_eq!(reopened.canonical_tip(), synced_tip);
+        assert_eq!(reopened.canonical_state_root(), committed_root);
+        assert_eq!(
+            reopened.canonical_state().total_value().unwrap(),
+            MAX_TOTAL_SUPPLY_ATOMS
+        );
     }
 
     #[test]

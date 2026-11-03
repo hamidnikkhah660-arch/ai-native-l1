@@ -206,6 +206,18 @@ impl QRunV05RuntimeStore for NodeForkStore {
             Self::ExternalCas(store) => store.submit(envelope, authenticator, clock),
         }
     }
+
+    fn submit_historical<A: TransactionAuthenticator>(
+        &mut self,
+        envelope: &[u8],
+        authenticator: &A,
+        clock: &dyn ai_native_l1_pow_bench::chain_admission::ReferenceTimeProvider,
+    ) -> Result<ForkChoiceOutcome, ForkStoreError> {
+        match self {
+            Self::Local(store) => store.submit_historical(envelope, authenticator, clock),
+            Self::ExternalCas(store) => store.submit_historical(envelope, authenticator, clock),
+        }
+    }
 }
 
 type NodeRuntime = QRunV05PowForkRuntime<NodeForkStore>;
@@ -2659,7 +2671,7 @@ fn request_sync_page_authenticated(
                 clock,
                 ..
             } = &mut *locked;
-            runtime.submit_block(envelope, authenticator, clock)
+            runtime.submit_authenticated_sync_block(envelope, authenticator, clock)
         };
         submit_result
             .map_err(|error| format!("local consensus rejected synced branch block: {error:?}"))?;

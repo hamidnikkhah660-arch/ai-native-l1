@@ -983,6 +983,30 @@ impl PrivateTestnetForkStore {
         authenticator: &A,
         clock: &dyn ReferenceTimeProvider,
     ) -> Result<ForkChoiceOutcome, ForkStoreError> {
+        self.submit_with_replay_mode(envelope, authenticator, clock, false)
+    }
+
+    /// Persist a QFP5 block imported from an authenticated canonical-sync snapshot.
+    /// The same bounded archive checks and atomic PFS2 manifest commit are retained.
+    pub fn submit_historical<A: TransactionAuthenticator>(
+        &mut self,
+        envelope: &[u8],
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+    ) -> Result<ForkChoiceOutcome, ForkStoreError> {
+        if !envelope.starts_with(b"QFP5") {
+            return Err(ForkStoreError::Fork(ForkChoiceError::ExecutionModeMismatch));
+        }
+        self.submit_with_replay_mode(envelope, authenticator, clock, true)
+    }
+
+    fn submit_with_replay_mode<A: TransactionAuthenticator>(
+        &mut self,
+        envelope: &[u8],
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+        historical_replay: bool,
+    ) -> Result<ForkChoiceOutcome, ForkStoreError> {
         if qrun_migration_intent_exists(&self.directory)? {
             return Err(ForkStoreError::MigrationRecoveryRequired);
         }
@@ -993,7 +1017,11 @@ impl PrivateTestnetForkStore {
         // Validate into an isolated clone first. No durable bytes or visible in-memory state
         // change if consensus/fork-choice validation fails.
         let mut candidate_archive = self.archive.clone();
-        let outcome = candidate_archive.insert_encoded(envelope, authenticator, clock)?;
+        let outcome = if historical_replay {
+            candidate_archive.insert_encoded_historical(envelope, authenticator, clock)?
+        } else {
+            candidate_archive.insert_encoded(envelope, authenticator, clock)?
+        };
         let digest = outcome.block_digest;
         let branch_path = self.directory.join(branch_file_name(&digest));
 
@@ -1909,6 +1937,29 @@ where
         authenticator: &A,
         clock: &dyn ReferenceTimeProvider,
     ) -> Result<ForkChoiceOutcome, ForkStoreError> {
+        self.submit_with_replay_mode(envelope, authenticator, clock, false)
+    }
+
+    /// Apply an authenticated QFP5 sync import through the same signed external-CAS transaction.
+    pub fn submit_historical<A: TransactionAuthenticator>(
+        &mut self,
+        envelope: &[u8],
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+    ) -> Result<ForkChoiceOutcome, ForkStoreError> {
+        if !envelope.starts_with(b"QFP5") {
+            return Err(ForkStoreError::Fork(ForkChoiceError::ExecutionModeMismatch));
+        }
+        self.submit_with_replay_mode(envelope, authenticator, clock, true)
+    }
+
+    fn submit_with_replay_mode<A: TransactionAuthenticator>(
+        &mut self,
+        envelope: &[u8],
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+        historical_replay: bool,
+    ) -> Result<ForkChoiceOutcome, ForkStoreError> {
         if !self.store.profile.is_qrun_fee_only() {
             return Err(ForkStoreError::ManifestProfileMismatch);
         }
@@ -1942,7 +1993,11 @@ where
         }
 
         let mut candidate_archive = self.store.archive.clone();
-        let outcome = candidate_archive.insert_encoded(envelope, authenticator, clock)?;
+        let outcome = if historical_replay {
+            candidate_archive.insert_encoded_historical(envelope, authenticator, clock)?
+        } else {
+            candidate_archive.insert_encoded(envelope, authenticator, clock)?
+        };
         let digest = outcome.block_digest;
         let branch_path = self.store.directory.join(branch_file_name(&digest));
 
