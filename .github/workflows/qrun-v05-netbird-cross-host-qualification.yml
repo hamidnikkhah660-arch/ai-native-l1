@@ -19,7 +19,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: qrun-v05-netbird-cross-host-${{ github.ref }}-${{ inputs.stage }}
+  group: qrun-v05-netbird-cross-host-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:

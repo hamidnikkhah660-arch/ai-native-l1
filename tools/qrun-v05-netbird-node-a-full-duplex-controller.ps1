@@ -222,6 +222,9 @@ try {
 
     Stop-Process -Id $oldPid -Force -ErrorAction Stop
     Wait-Process -Id $oldPid -Timeout 15 -ErrorAction SilentlyContinue
+    if (Get-Process -Id $oldPid -ErrorAction SilentlyContinue) {
+        throw "Node A's original process did not exit; refusing to start a second process against the same durable data directory."
+    }
     $oldNodeStopped = $true
     Write-Output "D1_NODE_A_CONTROLLED_RESTART=PASS"
 
@@ -265,7 +268,6 @@ try {
     Write-Output "D1_NODE_A_AUTHENTICATED_SYNC_FROM_NODE_B=PASS"
     Write-Output "D1_NODE_A_PROFILE_AND_NETWORK_ID_PRESERVED=PASS"
     Set-Content -LiteralPath $ackFile -Value "PASS" -Encoding ASCII
-    $bootstrapComplete = $true
 
     if (-not $serverProcess.WaitForExit(15000)) {
         throw "Bootstrap server did not close after the Node A reverse-sync acknowledgement."
@@ -274,6 +276,7 @@ try {
     if ($serverText -notmatch "PEER_BOOTSTRAP_ONE_SHOT_COMPLETE=PASS") {
         throw "Bootstrap server did not report one-shot completion."
     }
+    $bootstrapComplete = $true
     Remove-Item -LiteralPath $tokenFile -Force -ErrorAction SilentlyContinue
     Write-Output "D1_BOOTSTRAP_TOKEN_REMOVED_FROM_NODE_A=PASS"
 
@@ -338,16 +341,6 @@ try {
     Write-Output "D1_NODE_A_RECIPROCAL_TXID=$nodeATxid"
     Write-Output "D1_NODE_A_RECEIVED_NODE_B_QFP5_ACK=PASS"
     Write-Output "mainnet=false"
-    $gh = Get-Command gh -ErrorAction SilentlyContinue
-    if ($gh) {
-        & $gh.Source secret delete QRUN_PEER_BOOTSTRAP_TOKEN 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
-            Write-Output "D1_GITHUB_BOOTSTRAP_SECRET_DELETED=PASS"
-        }
-        else {
-            Write-Warning "One-shot bootstrap completed, but GitHub secret deletion did not succeed. Delete or rotate QRUN_PEER_BOOTSTRAP_TOKEN manually."
-        }
-    }
     Write-Output "D1_NODE_A_FULL_DUPLEX_CONTROLLER=PASS"
 }
 catch {
@@ -373,7 +366,19 @@ finally {
     if ($firewallRuleName) {
         Remove-NetFirewallRule -DisplayName $firewallRuleName -ErrorAction SilentlyContinue
     }
-    if ($bootstrapComplete -and (Test-Path -LiteralPath $tokenFile)) {
-        Remove-Item -LiteralPath $tokenFile -Force -ErrorAction SilentlyContinue
+    if ($bootstrapComplete) {
+        if (Test-Path -LiteralPath $tokenFile) {
+            Remove-Item -LiteralPath $tokenFile -Force -ErrorAction SilentlyContinue
+        }
+        $gh = Get-Command gh -ErrorAction SilentlyContinue
+        if ($gh) {
+            & $gh.Source secret delete QRUN_PEER_BOOTSTRAP_TOKEN 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Output "D1_GITHUB_BOOTSTRAP_SECRET_DELETED=PASS"
+            }
+            else {
+                Write-Warning "The one-shot GitHub bootstrap secret was not deleted. Remove or rotate QRUN_PEER_BOOTSTRAP_TOKEN manually before another run."
+            }
+        }
     }
 }

@@ -11,7 +11,7 @@ param(
     [string]$NodeBIp,
     [string]$NetworkIdHex,
     [string]$NodeBNoisePublicKeyHex,
-    [int]$TimeoutSeconds = 180,
+    [int]$TimeoutSeconds = 600,
     [switch]$PublishGitHubSecret
 )
 $ErrorActionPreference = "Stop"
@@ -271,6 +271,9 @@ function Invoke-Serve {
             throw "Advertised Node B overlay address does not match the authenticated TCP source address."
         }
         [void](Assert-OverlayIPv4 "Node B overlay address" $advertisedIp)
+        if ($advertisedIp -eq $bind.ToString()) {
+            throw "Node A and Node B must be distinct NetBird overlay hosts."
+        }
         $publicKey = [string]$request.node_b_noise_public_key_hex
         Assert-Hex32 "Node B Noise public key" $publicKey
         $providedMac = [string]$request.mac_hex
@@ -344,6 +347,8 @@ function Invoke-Enroll {
     }
     $nodeA = Assert-OverlayIPv4 "NodeAIp" $NodeAIp
     $nodeB = Assert-OverlayIPv4 "NodeBIp" $NodeBIp
+    if ($nodeA -eq $nodeB) { throw "Node A and Node B must be distinct NetBird overlay hosts." }
+    if ($TimeoutSeconds -lt 10 -or $TimeoutSeconds -gt 900) { throw "TimeoutSeconds must be between 10 and 900." }
     Assert-Hex32 "NetworkIdHex" $NetworkIdHex
     Assert-Hex32 "NodeBNoisePublicKeyHex" $NodeBNoisePublicKeyHex
     $token = Get-TokenBytesFromBase64 $env:QRUN_PEER_BOOTSTRAP_TOKEN
@@ -352,8 +357,9 @@ function Invoke-Enroll {
         $connect = $client.ConnectAsync($nodeA, 49342)
         if (-not $connect.Wait(10000)) { throw "Timed out connecting to Node A peer bootstrap listener." }
         $connect.GetAwaiter().GetResult()
-        $client.ReceiveTimeout = 5000
-        $client.SendTimeout = 5000
+        $ackTimeoutMilliseconds = [Math]::Min($TimeoutSeconds, 900) * 1000
+        $client.ReceiveTimeout = $ackTimeoutMilliseconds
+        $client.SendTimeout = 10000
         $stream = $client.GetStream()
         $challenge = (Read-BoundedJsonLine $stream) | ConvertFrom-Json
         if ([int]$challenge.version -ne 1 -or
