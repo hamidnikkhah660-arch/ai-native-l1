@@ -191,7 +191,15 @@ try {
     }
     $nodeBIp = Assert-OverlayIPv4 "Node B overlay IP" ([string]$peer.node_b_overlay_ip)
     Assert-Hex32 "Node B Noise public key" ([string]$peer.node_b_noise_public_key_hex)
+
+    $bootstrapRule = Get-NetFirewallRule -DisplayName $firewallRuleName -ErrorAction Stop
+    $bootstrapRule | Get-NetFirewallAddressFilter | Set-NetFirewallAddressFilter -RemoteAddress $nodeBIp
+    $verifiedBootstrapAddress = $bootstrapRule | Get-NetFirewallAddressFilter
+    if (@($verifiedBootstrapAddress.RemoteAddress) -notcontains $nodeBIp) {
+        throw "Temporary Node A bootstrap firewall rule did not narrow to the authenticated Node B overlay IP."
+    }
     Write-Output "D1_NODE_B_PUBLIC_METADATA_VALIDATED=PASS"
+    Write-Output "D1_BOOTSTRAP_FIREWALL_NARROWED_TO_NODE_B=PASS"
 
     $pidPath = Join-Path $root "node-a.pid"
     if (-not (Test-Path -LiteralPath $pidPath -PathType Leaf)) { throw "Node A process PID marker is missing." }
@@ -279,6 +287,9 @@ try {
     $bootstrapComplete = $true
     Remove-Item -LiteralPath $tokenFile -Force -ErrorAction SilentlyContinue
     Write-Output "D1_BOOTSTRAP_TOKEN_REMOVED_FROM_NODE_A=PASS"
+    Remove-NetFirewallRule -DisplayName $firewallRuleName -ErrorAction Stop
+    $firewallRuleName = $null
+    Write-Output "D1_BOOTSTRAP_FIREWALL_CLOSED=PASS"
 
     Write-Output "=== Waiting for Node B's first canonical block ==="
     $transactionDeadline = [DateTimeOffset]::UtcNow.AddSeconds($TransactionTimeoutSeconds)
