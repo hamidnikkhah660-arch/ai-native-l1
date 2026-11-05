@@ -59,6 +59,19 @@ impl IssuanceParameters {
         })
     }
 
+    /// Construct a fixed-cap, fee-only schedule: the Genesis may already contain the full supply,
+    /// while every post-Genesis nominal subsidy remains exactly zero.
+    pub fn fee_only(maximum_supply: u128) -> Result<Self, IssuanceError> {
+        if maximum_supply == 0 {
+            return Err(IssuanceError::ZeroMaximumSupply);
+        }
+        Ok(Self {
+            maximum_supply,
+            initial_subsidy: 0,
+            blocks_per_halving: 1,
+        })
+    }
+
     pub fn maximum_supply(&self) -> u128 {
         self.maximum_supply
     }
@@ -137,6 +150,24 @@ impl IssuanceParameters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fee_only_schedule_never_issues_post_genesis_subsidy() {
+        let maximum = 10_000_000_000u128 * 100_000_000;
+        let params = IssuanceParameters::fee_only(maximum).unwrap();
+        assert_eq!(params.maximum_supply(), maximum);
+        assert_eq!(params.initial_subsidy(), 0);
+        assert_eq!(params.nominal_subsidy_at_height(0), 0);
+        assert_eq!(params.nominal_subsidy_at_height(1), 0);
+        assert_eq!(params.nominal_subsidy_at_height(u64::MAX), 0);
+        assert_eq!(params.reward_for_block(0, maximum), Ok(0));
+        assert_eq!(params.cumulative_issuance_after_blocks(u64::MAX), 0);
+        assert_eq!(params.remaining_supply(maximum), Ok(0));
+        assert_eq!(
+            IssuanceParameters::fee_only(0),
+            Err(IssuanceError::ZeroMaximumSupply)
+        );
+    }
 
     #[test]
     fn integer_halving_has_exact_inclusive_boundaries() {
