@@ -1,0 +1,161 @@
+name: QFP6 QAP1 NetBird cross-host qualification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qfp6-qap1-cross-host-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  qfp6-qap1-cross-host:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/feat/qzxb-usdt-trading-gate-20261104'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact dispatched revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (immutable upstream commit)
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Validate private one-shot configuration
+        shell: pwsh
+        env:
+          NETBIRD_SETUP_KEY: ${{ secrets.QRUN_CP0566C_NETBIRD_SETUP_KEY }}
+          QRUN_QFP6_QAP1_RUNNER_CONFIG_JSON: ${{ secrets.QRUN_QFP6_QAP1_RUNNER_CONFIG_JSON }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:NETBIRD_SETUP_KEY)) {
+            throw 'NETBIRD_SETUP_KEY is not configured as a repository Actions secret.'
+          }
+          $setupKey = $env:NETBIRD_SETUP_KEY.Trim()
+          if ($setupKey.Length -lt 1 -or $setupKey.Length -gt 256 -or $setupKey -match '\s') {
+            throw 'The one-off NetBird Setup Key must be a bounded non-whitespace token.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:QRUN_QFP6_QAP1_RUNNER_CONFIG_JSON)) {
+            throw 'QRUN_QFP6_QAP1_RUNNER_CONFIG_JSON is not configured as a repository Actions secret.'
+          }
+          $cfg = $env:QRUN_QFP6_QAP1_RUNNER_CONFIG_JSON | ConvertFrom-Json
+          $required = @(
+            'node_a_provider_address',
+            'node_a_anchor_address',
+            'node_a_callback_address',
+            'callback_nonce_hex',
+            'node_b_listener_port',
+            'node_b_listener_private_hex',
+            'node_b_listener_public_hex',
+            'node_a_peer_public_hex',
+            'provider_client_private_hex',
+            'provider_server_public_hex',
+            'anchor_client_private_hex',
+            'anchor_server_public_hex',
+            'provider_receipt_public_hex',
+            'anchor_receipt_public_hex'
+          )
+          foreach ($name in $required) {
+            $property = $cfg.PSObject.Properties[$name]
+            if (-not $property -or [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+              throw "Runner configuration is missing field: $name"
+            }
+          }
+          Write-Host 'QFP6_QAP1_RUNNER_SECRET_CONFIG_PRESENT=PASS'
+          Write-Host 'Secrets are validated but never printed.'
+
+      - name: Install pinned NetBird client
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $netbirdExe = 'C:\Program Files\NetBird\netbird.exe'
+          $installRequired = $true
+          if (Test-Path $netbirdExe) {
+            $currentVersion = (& $netbirdExe version 2>&1 | Out-String)
+            $currentSignature = Get-AuthenticodeSignature -FilePath $netbirdExe
+            if (
+              $LASTEXITCODE -eq 0 -and
+              $currentVersion -match '0\.82\.0' -and
+              $currentSignature.Status -eq 'Valid' -and
+              $currentSignature.SignerCertificate.Subject -match 'NetBird GmbH'
+            ) {
+              $installRequired = $false
+            }
+          }
+          if ($installRequired) {
+            $temp = Join-Path $env:TEMP 'qfp6-qap1-netbird-install'
+            New-Item -ItemType Directory -Force -Path $temp | Out-Null
+            $msi = Join-Path $temp 'netbird_installer_0.82.0_windows_amd64.msi'
+            $url = 'https://github.com/netbirdio/netbird/releases/download/v0.82.0/netbird_installer_0.82.0_windows_amd64.msi'
+            Invoke-WebRequest -Uri $url -OutFile $msi
+            $expected = '8155544c557676069c49d43ccf2c62a5ccb2fefec9d92ec58fa6920db8bc43e9'
+            $actual = (Get-FileHash -Path $msi -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $expected) { throw 'NetBird MSI SHA-256 verification failed.' }
+            $signature = Get-AuthenticodeSignature -FilePath $msi
+            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'NetBird GmbH') {
+              throw 'NetBird MSI Authenticode verification failed.'
+            }
+            $install = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i',$msi,'/qn','/norestart') -Wait -PassThru
+            if ($install.ExitCode -notin @(0,3010)) { throw 'NetBird MSI installation failed.' }
+          }
+          if (-not (Test-Path $netbirdExe)) { throw 'NetBird CLI is unavailable after installation.' }
+          $installedVersion = (& $netbirdExe version 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0 -or $installedVersion -notmatch '0\.82\.0') {
+            throw 'NetBird Runner client version is not exactly 0.82.0.'
+          }
+          Write-Host 'NETBIRD_PINNED_CLIENT_READY=PASS'
+
+      - name: Enroll ephemeral Runner into private NetBird overlay
+        shell: pwsh
+        env:
+          NETBIRD_SETUP_KEY: ${{ secrets.QRUN_CP0566C_NETBIRD_SETUP_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $service = Get-Service -Name NetBird -ErrorAction Stop
+          if ($service.Status -ne 'Running') { Start-Service -Name NetBird }
+          $env:NB_SETUP_KEY = $env:NETBIRD_SETUP_KEY.Trim()
+          Remove-Item Env:NETBIRD_SETUP_KEY -ErrorAction SilentlyContinue
+          & 'C:\Program Files\NetBird\netbird.exe' up
+          $code = $LASTEXITCODE
+          Remove-Item Env:NB_SETUP_KEY -ErrorAction SilentlyContinue
+          if ($code -ne 0) { throw 'NetBird Runner enrollment failed.' }
+          $connected = $false
+          for ($i=0; $i -lt 90; $i++) {
+            $status = (& 'C:\Program Files\NetBird\netbird.exe' status 2>&1 | Out-String)
+            if ($LASTEXITCODE -eq 0 -and $status -match 'Management:\s+Connected' -and $status -match 'Signal:\s+Connected') {
+              $match = [regex]::Match($status,'NetBird IP:\s+([0-9]{1,3}(?:\.[0-9]{1,3}){3})')
+              if ($match.Success) {
+                $ip = [System.Net.IPAddress]::Parse($match.Groups[1].Value)
+                $octets = $ip.GetAddressBytes()
+                if ($octets[0] -ne 100 -or $octets[1] -lt 64 -or $octets[1] -gt 127) {
+                  throw 'NetBird assigned an address outside 100.64.0.0/10.'
+                }
+                Write-Host ("NETBIRD_RUNNER_OVERLAY_IP=" + $ip.ToString())
+                $connected = $true
+                break
+              }
+            }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $connected) { throw 'NetBird did not reach Management/Signal Connected state.' }
+
+      - name: Run remote QFP6 admission and second-process recovery
+        shell: pwsh
+        env:
+          QRUN_QFP6_QAP1_RUNNER_CONFIG_JSON: ${{ secrets.QRUN_QFP6_QAP1_RUNNER_CONFIG_JSON }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustc --version
+          cargo --version
+          & .\tools\qrun-v06-qfp6-qap1-runner.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Remote QFP6/QAP1 runner script failed.' }
+
+      - name: Disconnect ephemeral NetBird peer
+        if: always()
+        shell: pwsh
+        run: |
+          $netbirdExe = 'C:\Program Files\NetBird\netbird.exe'
+          if (Test-Path $netbirdExe) {
+            & $netbirdExe down 2>&1 | Out-Null
+          }
