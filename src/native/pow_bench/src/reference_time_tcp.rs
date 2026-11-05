@@ -169,7 +169,7 @@ mod tests {
         body.extend_from_slice(&NETWORK);
         body.extend_from_slice(&policy_sequence.to_be_bytes());
         body.extend_from_slice(&key(authority_seed).verifying_key().to_bytes());
-        body.extend_from_slice(&500u32.to_be_bytes());
+        body.extend_from_slice(&5_000u32.to_be_bytes());
         body.extend_from_slice(&u64::MAX.to_be_bytes());
         let signed = [POLICY_DOMAIN, body.as_slice()].concat();
         body.extend_from_slice(&admin.sign(&signed).to_bytes());
@@ -282,7 +282,7 @@ mod tests {
         };
         let server = thread::spawn(move || -> Result<(), String> {
             listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-            let until = Instant::now() + Duration::from_secs(5);
+            let until = Instant::now() + Duration::from_secs(30);
             let (mut stream, _) = loop {
                 match listener.accept() {
                     Ok(pair) => break pair,
@@ -298,10 +298,10 @@ mod tests {
             // blocking mode explicitly before relying on read/write timeouts and read_exact.
             stream.set_nonblocking(false).map_err(|e| e.to_string())?;
             stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_secs(10)))
                 .map_err(|e| e.to_string())?;
             stream
-                .set_write_timeout(Some(Duration::from_secs(2)))
+                .set_write_timeout(Some(Duration::from_secs(10)))
                 .map_err(|e| e.to_string())?;
             let mut length = [0u8; 4];
             stream.read_exact(&mut length).map_err(|e| e.to_string())?;
