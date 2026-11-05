@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param()
 
 $ErrorActionPreference = 'Stop'
@@ -180,6 +180,34 @@ try {
     $compileCode = $LASTEXITCODE
     $compileOutput | ForEach-Object { Write-Output $_ }
     if ($compileCode -ne 0) { throw "QFP6 worker precompile failed with code $compileCode." }
+
+    # CP-0566C diagnostic: capture Node B ICE/STUN/relay state before the callback.
+    # Deliberately omit public keys and all secret-bearing configuration values.
+    $netbirdDetail = (& $netbirdExe status -d 2>&1 | Out-String)
+    $netbirdDetailExit = $LASTEXITCODE
+    Write-Output 'QFP6_QAP1_RUNNER_NETBIRD_DIAGNOSTICS_BEGIN'
+    $netbirdDetail -split '\r?\n' | Where-Object {
+        $_ -match '^\s*(Management:|Signal:|Relays:|NetBird IP:|Status:|Connection type:|ICE candidate|Relay server address:|Last connection update:|Last WireGuard handshake:|Transfer status|Peers count:)' -or
+        $_ -match '^\s*\[(stun:|turn:|turns:|rels://)'
+    } | ForEach-Object { Write-Output $_ }
+    Write-Output ("QFP6_QAP1_RUNNER_NETBIRD_STATUS_EXIT=" + $netbirdDetailExit)
+    try {
+        $routeCandidates = Find-NetRoute -RemoteIPAddress $callbackEndpoint.Address -ErrorAction Stop
+        foreach ($candidate in $routeCandidates) {
+            if ($candidate.PSObject.Properties.Name -contains 'InterfaceAlias') {
+                Write-Output ("QFP6_QAP1_CALLBACK_ROUTE_INTERFACE=" + $candidate.InterfaceAlias)
+                if ($candidate.PSObject.Properties.Name -contains 'DestinationPrefix') {
+                    Write-Output ("QFP6_QAP1_CALLBACK_ROUTE_PREFIX=" + $candidate.DestinationPrefix)
+                }
+                if ($candidate.PSObject.Properties.Name -contains 'NextHop') {
+                    Write-Output ("QFP6_QAP1_CALLBACK_ROUTE_NEXTHOP=" + $candidate.NextHop)
+                }
+            }
+        }
+    } catch {
+        Write-Output ("QFP6_QAP1_CALLBACK_ROUTE_ERROR=" + $_.Exception.Message)
+    }
+    Write-Output 'QFP6_QAP1_RUNNER_NETBIRD_DIAGNOSTICS_END'
 
     $callbackClient = [System.Net.Sockets.TcpClient]::new()
     $callbackClient.Connect($callbackEndpoint.Address, $callbackEndpoint.Port)
