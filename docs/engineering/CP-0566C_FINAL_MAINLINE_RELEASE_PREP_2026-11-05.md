@@ -26,3 +26,6 @@ On the same 1,268-test Rust source:
 - The required technical branch does not yet exist on origin.
 - CP-0566C remains NOT RUN until Node A is remotely admitted, replay is rejected, and Node B second-process restart continuity is proven using two physical hosts.
 - No public Devnet/Mainnet, public RPC, real USDT liquidity, cross-chain bridge or real QZXB trade is claimed.
+## Controller clean-worktree branch identity hardening (2026-11-05)
+The Node A Controller now accepts any named local branch for its clean isolated worktree, while retaining the strict checks that matter for identity: the worktree must be clean and the exact local HEAD SHA must equal the GitHub technical branch SHA feat/qzxb-usdt-trading-gate-20261104. Detached HEAD remains rejected. The remote target ref, default-branch Workflow presence, feature-branch Runner presence, explicit -AclReviewed gate, one-off Setup Key prompt, temporary secrets and cleanup behavior remain unchanged.
+This permits use of the dedicated clean prep worktree without renaming or disturbing the user's original dirty local feature worktree.

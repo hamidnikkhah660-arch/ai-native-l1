@@ -53,10 +53,12 @@ function Get-LocalNetBirdIPv4 {
 function Assert-RemoteRevisionReady {
     Set-Location $repoRoot
     $localBranch = (git branch --show-current).Trim()
-    $localSha = (git rev-parse HEAD).Trim()
-    if ($localBranch -ne $branchExpected) {
-        throw "Expected branch $branchExpected, found $localBranch."
+    if ([string]::IsNullOrWhiteSpace($localBranch)) {
+        throw 'The local qualification checkout must use a named branch; detached HEAD is not permitted.'
     }
+    $localSha = (git rev-parse HEAD).Trim()
+    # A dedicated clean worktree may use a local alias branch. The remote branch
+    # name/ref below is fixed; exact local HEAD == remote branch SHA is authoritative.
     if ((git status --porcelain) -ne $null -and (git status --porcelain | Measure-Object -Line).Lines -gt 0) {
         throw 'The local worktree is not clean. Review and commit the intended qualification files before dispatch.'
     }
