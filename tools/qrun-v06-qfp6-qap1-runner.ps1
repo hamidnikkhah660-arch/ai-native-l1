@@ -176,7 +176,7 @@ try {
     Write-Output 'QFP6_QAP1_RUNNER_OVERLAY_READY=PASS'
     Write-Output 'QFP6_QAP1_CONFIG_SECRET_NOT_LOGGED=PASS'
 
-    $compileOutput = & cargo test --locked --manifest-path $manifest --lib qrun_v06_node_runtime_candidate::tests::qfp6_qap1_process_worker -- --no-run 2>&1
+    $compileOutput = & cargo test --locked --no-run --manifest-path $manifest --lib qrun_v06_node_runtime_candidate::tests::qfp6_qap1_process_worker 2>&1
     $compileCode = $LASTEXITCODE
     $compileOutput | ForEach-Object { Write-Output $_ }
     if ($compileCode -ne 0) { throw "QFP6 worker precompile failed with code $compileCode." }
