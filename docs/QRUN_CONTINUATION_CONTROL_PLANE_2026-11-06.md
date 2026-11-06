@@ -14,19 +14,19 @@
 
 - Working checkout last verified at `D:\Temp\ASUS\QRUN_CP0566C_FINAL_MAINLINE_PREP_20261105` on authorized machine `heymed`.
 - Branch: `docs/qrun-master-roadmap-20261106`.
-- Last verified HEAD: `8d3b8c46bef530d0a9faae52fcffbcf71865e123` (`docs(qrun): define PFM5 checkpoint authenticity gate`).
+- Last pre-continuity-documentation baseline: `b4758e0cf1a6eb19cde63ed880109c96e4c7922a`. The PFM5 stack source review and integration-gap update are recorded in commit `9265479bb5666cc195132db98cd6aa69cf8abe85`; this handoff metadata is subsequently refreshed in a documentation-only commit. Always query the live PR head before continuing.
 - Worktree was clean and branch matched its origin tracking branch at that check.
 - Active documentation PR: [#138](https://github.com/hamidnikkhah660-arch/ai-native-l1/pull/138), open and unmerged. Do not merge without explicit owner approval.
-- CI run [42233317891](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/42233317891), for exact HEAD `8d3b8c46bef530d0a9faae52fcffbcf71865e123`, was **in progress** at last check. Formatting, target checks, independent monetary Genesis oracle, issuance schedule oracle, TXN4 submit/signature-rejection/peer-propagation/replay step, and EVM/wallet/dependency job had passed; Rust all-target tests and Windows PFM4 paged archive sync/reorg/stale-cursor step were still running. Recheck; do not infer final CI success.
+- CI run [42234319470](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/42234319470), for exact HEAD `b4758e0cf1a6eb19cde63ed880109c96e4c7922a`, completed successfully across all three jobs. The subsequent PFM5 review commit `9265479bb5666cc195132db98cd6aa69cf8abe85` triggered run [42235844835](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/42235844835), which was queued at the time of the check. This handoff metadata refresh itself is another documentation-only commit; always query PR #138 and CI for its exact live head before continuing.
 
 ## 2. What this PR #138 documentation set records
 
 - Master strategy: **Verifiable AI-Native Blockchain Infrastructure**, organized into ten layers (L1/network; cryptography/PQ transition; privacy; performance/reliability; developer platform; monetary policy/mining; payments; DeFi/tokenization/RWA; bounded AI-agent economy; ecosystem/operations).
-- Evidence vocabulary is mandatory: Proposed → Designed → In progress → Implemented → Tested → Independently verified → Production deployed → Released. A feature must not be described at a stronger state than its evidence supports.
+- Evidence vocabulary is mandatory: Proposed â†’ Designed â†’ In progress â†’ Implemented â†’ Tested â†’ Independently verified â†’ Production deployed â†’ Released. A feature must not be described at a stronger state than its evidence supports.
 - CP-0567 A0/A1/A1B/A1C records cover AI-agent payment authorization, dependency/source audit, PMT4 runtime boundary, and proposed atomic capability-state execution. These are design/audit records, not a shipped capability.
-- A1C sections 11.12–11.14 document PR #60 PFM5 checkpoint replay review, the PMT4 node-to-store startup gap, and checkpoint authenticity as distinct from anti-rollback.
+- A1C sections 11.12â€“11.14 document PR #60 PFM5 checkpoint replay review, the PMT4 node-to-store startup gap, and checkpoint authenticity as distinct from anti-rollback.
 
-## 3. Critical engineering findings — do not regress these distinctions
+## 3. Critical engineering findings â€” do not regress these distinctions
 
 ### 3.1 PFM5 checkpoint replay and authenticity
 
@@ -45,7 +45,7 @@
 
 ### 3.3 QVAAC / CP-0567 reuse rule
 
-- Existing QVAAC candidate code is in PR #93 (stacked on #92; dependency chain #90 → #91 → #92 → #93). Reuse and extend its grant/escrow work; do not create a parallel agent-grant or escrow module.
+- Existing QVAAC candidate code is in PR #93 (stacked on #92; dependency chain #90 â†’ #91 â†’ #92 â†’ #93). Reuse and extend its grant/escrow work; do not create a parallel agent-grant or escrow module.
 - Existing candidate escrow includes useful deterministic checks and injected verifier boundaries, but injected test verifiers are not proof of production cryptographic verification. Candidate spend counters are not yet a canonical global ledger registry.
 - CP-0567 still needs a canonical QZXB capability registry, owner-authorized register/revoke transitions, per-capability nonce/replay protection, fee and aggregate spend accounting, atomic execution, state-root/snapshot commitment, and fork/reorg/recovery semantics. Do not alter fixed-width TXN4 casually; evaluate a separate TXN5 or versioned block-action envelope. No consensus change without explicit approval and decision record.
 
@@ -67,9 +67,9 @@
 | #137 | Public website/economics/wallet/PQC status update; open | Not live until approved merge/deploy |
 | #135 | Draft QFP6/QAP1 runtime and cross-host qualification (despite branch name, not a live USDT market) | Preserve Draft; verify dependencies |
 | #132 | Draft older v0.5 private NetBird qualification | Keep separate from QFP6/QAP1 evidence |
-| #93 | Draft QVAAC; stacked #90 → #91 → #92 → #93 | Do not merge out of order; reuse candidate semantics |
+| #93 | Draft QVAAC; stacked #90 â†’ #91 â†’ #92 â†’ #93 | Do not merge out of order; reuse candidate semantics |
 | #60 | PFM5 checkpoint replay candidate | Review evidence; no blind merge |
-| #124–#128 | PFM5 store/CAS candidate stack | Inspect base/head/dependencies and test evidence before any action |
+| #124â€“#128 | PFM5 store/CAS candidate stack | Inspect base/head/dependencies and test evidence before any action |
 
 This table is intentionally selective, not a complete PR inventory. Always query GitHub for the live list and dependency graph before work.
 
@@ -80,7 +80,7 @@ This table is intentionally selective, not a complete PR inventory. Always query
 3. Inspect source and tests on the actual base/head commits before proposing code. Do not infer integration from module existence or unit tests.
 4. Label every result by scope: unit test, local node, loopback, private overlay, independent operator, public network, production deployment.
 5. Update this handoff and the relevant canonical technical record in the same documentation PR when a material decision/status changes. Include exact commit, test command, environment, result, limitations, next blocker, and rollback/safety notes.
-6. Keep superseded decisions as history and mark them superseded; do not silently erase them or maintain competing “current” summaries.
+6. Keep superseded decisions as history and mark them superseded; do not silently erase them or maintain competing â€œcurrentâ€ summaries.
 7. Do not invent success. If a process is still running, poll it; if CI is pending, say pending; if a step was not run, say not tested.
 8. Do not merge PRs, change Draft state, deploy, publish the website, approve brand/economics/release policy, change Genesis/consensus/economics/cryptographic trust, or enable public minting without explicit owner approval.
 9. Do not alter VPN, NetBird policy, routes, firewall, adapters, DNS, or network services absent concrete evidence and explicit approval. Connectivity was previously restored; preserve it.
@@ -89,7 +89,7 @@ This table is intentionally selective, not a complete PR inventory. Always query
 ## 7. Next engineering sequence (not authorization to bypass gates)
 
 1. Recheck PR #138 CI for exact HEAD `8d3b8c46...`; record final result.
-2. Inspect existing PFM5 PR stack #124–#128 and External-CAS client/store APIs against PR #60 replay; map what is implemented, tested, integrated, and missing. Do not create a second fork-choice engine.
+2. Inspect existing PFM5 PR stack #124â€“#128 and External-CAS client/store APIs against PR #60 replay; map what is implemented, tested, integrated, and missing. Do not create a second fork-choice engine.
 3. Produce a precise PFM5 integration sequence covering remote anchor read, local/remote generation reconciliation, independent anti-rollback floor, checkpoint authenticity, bounded suffix replay, atomic publication, crash recovery, and actual PMT4 node startup.
 4. Define the checkpoint-authenticity policy separately from provider CAS anti-rollback.
 5. Continue CP-0567 only after the QVAAC gap matrix and canonical state-transition design are reconciled; no consensus code until explicit design approval.
