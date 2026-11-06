@@ -5,7 +5,20 @@
 //! unattended public peer discovery or post-quantum/hybrid claims. The caller must keep public
 //! bind disabled until identity rotation/revocation, ingress budgets and independent review exist.
 
-use crate::private_testnet_wire::MAX_PRIVATE_TESTNET_ENVELOPE_BYTES;
+use crate::{
+    monetary_pow_v04_candidate::MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES,
+    private_testnet_wire::MAX_PRIVATE_TESTNET_ENVELOPE_BYTES,
+};
+
+/// Largest bounded application frame accepted by the shared Noise transport.
+/// QZBE has a larger fixed envelope than PTB2, so using the legacy PTB2 cap truncates
+/// valid maximum-size QZBE blocks before the QZBE decoder can apply its own bounds.
+pub const MAX_NOISE_APPLICATION_RECORD_BYTES: usize =
+    if MAX_PRIVATE_TESTNET_ENVELOPE_BYTES > MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES {
+        MAX_PRIVATE_TESTNET_ENVELOPE_BYTES
+    } else {
+        MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES
+    };
 use snow::{params::NoiseParams, Builder, TransportState};
 use std::{
     io::{self, Read, Write},
@@ -16,7 +29,7 @@ use std::{
 const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
 const PROLOGUE_DOMAIN: &[u8] = b"QANVORYX-ZERO-VALUE-DEVNET-NOISE-XX-V1\0";
 const MAX_HANDSHAKE_MESSAGE: usize = 1024;
-const MAX_RECORD_CIPHERTEXT: usize = MAX_PRIVATE_TESTNET_ENVELOPE_BYTES + 128;
+const MAX_RECORD_CIPHERTEXT: usize = MAX_NOISE_APPLICATION_RECORD_BYTES + 128;
 const MIN_RECORD_CIPHERTEXT: usize = 16;
 const HANDSHAKE_BUDGET: Duration = Duration::from_secs(5);
 const RECORD_BUDGET: Duration = Duration::from_secs(5);
@@ -220,7 +233,7 @@ impl DevnetNoiseSession {
         stream: &mut TcpStream,
         plaintext: &[u8],
     ) -> Result<(), DevnetNoiseError> {
-        if plaintext.len() > MAX_PRIVATE_TESTNET_ENVELOPE_BYTES {
+        if plaintext.len() > MAX_NOISE_APPLICATION_RECORD_BYTES {
             return Err(DevnetNoiseError::RecordTooLarge(plaintext.len()));
         }
         let deadline = Instant::now() + RECORD_BUDGET;
@@ -257,7 +270,7 @@ impl DevnetNoiseSession {
             .read_message(&ciphertext, &mut plaintext)
             .map_err(|_| DevnetNoiseError::RecordAuthentication)?;
         plaintext.truncate(plaintext_len);
-        if plaintext.len() > MAX_PRIVATE_TESTNET_ENVELOPE_BYTES {
+        if plaintext.len() > MAX_NOISE_APPLICATION_RECORD_BYTES {
             return Err(DevnetNoiseError::RecordTooLarge(plaintext.len()));
         }
         Ok(plaintext)
@@ -453,6 +466,14 @@ mod tests {
         (listener, address)
     }
 
+    #[test]
+    fn application_record_budget_covers_the_largest_canonical_candidate_envelope() {
+        assert_eq!(
+            MAX_NOISE_APPLICATION_RECORD_BYTES,
+            MAX_PRIVATE_TESTNET_ENVELOPE_BYTES.max(MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES)
+        );
+        assert!(MAX_NOISE_APPLICATION_RECORD_BYTES >= MAX_ENCODED_V04_EXECUTION_POW_ENVELOPE_BYTES);
+    }
     #[test]
     fn noise_xx_binds_network_and_pins_both_sides_then_encrypts_ptb2_payload_and_ack() {
         let network = [0x61; 32];

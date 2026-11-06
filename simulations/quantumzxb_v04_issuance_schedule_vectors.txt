@@ -1,0 +1,19 @@
+# CP-0397 candidate vectors; inherited legacy parameters are a comparison only.
+# These values are NOT approved/frozen v0.4 consensus or Genesis parameters.
+profile_label=REFERENCE_ONLY_INHERITED_LEGACY_PARAMETERS_NOT_FROZEN
+policy_fingerprint=e5fbf5eaeae909515c823f675121c69546e35418cc0f121acc770fad24010c89
+mining_budget_atoms=300000000000000000
+initial_subsidy_atoms=35673515981
+blocks_per_halving=4204800
+first_eligible_height=1
+reward_height_1=35673515981
+reward_height_4204800=35673515981
+reward_height_4204801=17836757990
+reward_height_8409600=17836757990
+reward_height_8409601=8918378995
+reward_height_u64_max=0
+reward_with_one_atom_left=1
+reward_at_budget=0
+cumulative_issuance_after_all_nonzero_eras_atoms=299999999913926400
+unissued_mining_budget_atoms=86073600
+schedule_fingerprint=66eabae69492330dd1203cff7e6a3175b8068de80d137b3f8aa65f8a331d6f66

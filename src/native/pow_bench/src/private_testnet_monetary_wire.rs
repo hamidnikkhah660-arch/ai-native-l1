@@ -455,6 +455,10 @@ mod tests {
         let (header, block) = fixture();
         let bytes = encode_candidate_monetary_network_block(&header, &block).unwrap();
         assert_eq!(&bytes[..4], b"PMT3");
+        assert_eq!(
+            decode_candidate_v4_hybrid_monetary_network_block(&bytes),
+            Err(V4HybridMonetaryWireError::BadMagic)
+        );
         let decoded = decode_candidate_monetary_network_block(&bytes).unwrap();
         assert_eq!(decoded.header, header);
         assert_eq!(decoded.block, block);
@@ -548,6 +552,10 @@ mod pmt4_tests {
         let (header, block) = fixture();
         let encoded = encode_candidate_v4_hybrid_monetary_network_block(&header, &block).unwrap();
         assert_eq!(&encoded[..4], b"PMT4");
+        assert_eq!(
+            decode_candidate_monetary_network_block(&encoded),
+            Err(MonetaryWireError::BadMagic)
+        );
         assert_eq!(
             u16::from_be_bytes([encoded[4], encoded[5]]),
             PRIVATE_TESTNET_V4_HYBRID_MONETARY_WIRE_VERSION
