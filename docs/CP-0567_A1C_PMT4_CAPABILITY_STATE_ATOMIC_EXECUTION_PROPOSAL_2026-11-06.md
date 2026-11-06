@@ -138,3 +138,36 @@ Every rejected block must preserve prior state root, account balances/nonces, fe
 A1C is a proposal only. The next implementation step, if separately approved, is a pure Rust capability policy/state-transition module with typed errors and deterministic vectors, independent of node CLI, peer protocol, wire format, Genesis and live monetary state. It must operate on cloned candidate state and return a new state plus execution summary; no I/O, clocks, network calls, or mutable global state. Only after that module passes adversarial/property tests should the team decide the canonical wire envelope and integration into PMT4 block execution.
 
 No production code, consensus behavior, Genesis, supply schedule, wallet, node flags, network configuration, or live balance was changed in this proposal.
+
+## 11. Source-backed implementation seam (read-only audit, 2026-11-06)
+
+This section records a focused inspection of the pinned `origin/main` source baseline `c536caec696217234d6b35582663c0aa58652b9c`. It refines the integration plan without changing source code.
+
+### 11.1 Monetary state boundary
+
+`src/native/pow_bench/src/state_machine.rs` defines `MonetaryLedgerState` with exactly two stored fields: `ledger: LedgerState` and `total_mined_atoms: u128` (around lines 950-953). Its monetary `state_root()` commits the monetary policy fingerprint, `LedgerState::state_root()`, and cumulative mined atoms (around lines 1294-1301). No capability registry, capability-use nonce, spend counters, revocation tombstone, or delegated-payment state is currently represented in this state object or root.
+
+The TXN4 candidate transition `prepare_v4_hybrid_monetary_candidate` (around lines 1370-1487) clones the account ledger, validates each TXN4 authorization, projects the signed transfer into the existing account transaction checks, and returns the candidate ledger plus issuance and fee totals. `apply_v4_hybrid_block_candidate` (around lines 1508-1541) checks the committed root before publishing the candidate ledger and issuance counter. This is a useful atomic-execution pattern, but it has no capability authorization or capability state transition today.
+
+### 11.2 Snapshot boundary
+
+`MonetaryLedgerState::encode_snapshot` / `decode_snapshot` (around lines 1681-1755) persist the monetary policy fingerprint, cumulative mined atoms, and encoded `LedgerState`, protected by a checksum and invariant validation. The snapshot is explicitly not an anti-rollback mechanism. Capability records, counters, nonces, and revocation tombstones are absent. Any future capability-state integration therefore requires a versioned monetary snapshot format and restore-time root/invariant checks; merely adding a process-local registry would be incorrect.
+
+### 11.3 Fork-choice behavior that can be reused
+
+`PrivateTestnetV4HybridForkChoice` stores each accepted branch as a `StoredV4HybridBranch` containing the encoded envelope and its fully replayed `PrivateTestnetChain`. On insertion it clones the selected parent chain, appends and validates the candidate, stores that branch-local chain, and selects the best tip. This means that if capability state becomes part of `MonetaryLedgerState` and its deterministic block transition, the existing branch-clone/replay model can carry independent capability state per branch. Reorg correctness should be achieved by deriving the selected chain's complete state, not by manually undoing global capability counters.
+
+### 11.4 PFM4 durability and external-CAS boundary
+
+`PrivateTestnetV4HybridForkStore::submit` clones the fork-choice archive, inserts/validates the candidate, writes the branch envelope and atomically publishes a manifest before replacing its in-memory archive. The separate `submit_with_external_anchor` API implements an external-CAS pending-manifest/verified-receipt sequence. The current PMT4 peer-smoke node path calls the local `store.submit` API; the existence of the anchored API alone does not prove end-to-end external anti-rollback protection in that node runtime.
+
+### 11.5 Consequence for the implementation sequence
+
+The safest next coding boundary is now more precise:
+
+1. Build a pure, deterministic capability policy/state module and adversarial vectors without modifying `MonetaryLedgerState`, TXN4, PMT4, PFM4, wire formats, CLI, or consensus.
+2. Separately design the versioned monetary-state/root/snapshot extension that would carry capability registry state. Define canonical serialization, limits, state-root domain separation, migration/activation and recovery behavior before integrating it.
+3. Reuse the existing branch-local replay model only after capability state is part of the canonical monetary state transition; add reorg/switch-back tests proving counters and revocations follow the selected branch.
+4. Treat external-CAS integration as a separate end-to-end deployment gate: node startup, submit, crash recovery, restart and operator-held anchor must use the anchored API and be independently tested.
+
+**Audit conclusion:** QRun already has useful candidate machinery for atomic state transitions, branch-local replay/reorg, durable PFM4 manifests and a separate external-CAS API. The missing capability is not generic fork-choice from scratch; it is deterministic, committed and persisted agent-capability state plus its execution semantics and production wiring. This section is a source audit, not implementation evidence or launch approval.
