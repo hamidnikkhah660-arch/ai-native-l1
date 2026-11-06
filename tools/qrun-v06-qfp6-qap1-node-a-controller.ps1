@@ -2,8 +2,8 @@
 param(
     [switch]$Dispatch,
     [switch]$AclReviewed,
-    [ValidateRange(49664,49664)]
-    [int]$RunnerPort = 49664,
+    [ValidateRange(48664,48664)]
+    [int]$RunnerPort = 48664,
     [string]$Repository = 'hamidnikkhah660-arch/ai-native-l1'
 )
 

@@ -171,6 +171,28 @@ try {
     }
     $listenAddress = $nodeBAddress + ':' + $listenerPort
 
+    Write-Output ('QFP6_QAP1_NODE_B_LISTENER_ENDPOINT=' + $listenAddress)
+    Write-Output 'QFP6_QAP1_WINDOWS_TCP_DYNAMIC_RANGE_BEGIN'
+    netsh interface ipv4 show dynamicport tcp 2>&1 | ForEach-Object { Write-Output $_ }
+    Write-Output 'QFP6_QAP1_WINDOWS_TCP_EXCLUDED_RANGES_BEGIN'
+    netsh interface ipv4 show excludedportrange protocol=tcp 2>&1 | ForEach-Object { Write-Output $_ }
+    Write-Output 'QFP6_QAP1_WINDOWS_TCP_EXCLUDED_RANGES_END'
+    $listenerProbe = [System.Net.Sockets.TcpListener]::new(
+        [System.Net.IPAddress]::Parse($nodeBAddress),
+        $listenerPort
+    )
+    try {
+        $listenerProbe.Start()
+        Write-Output 'QFP6_QAP1_NODE_B_BIND_PREFLIGHT=PASS'
+    }
+    catch {
+        Write-Output ('QFP6_QAP1_NODE_B_BIND_PREFLIGHT=FAIL;ERROR=' + $_.Exception.GetBaseException().Message)
+        throw
+    }
+    finally {
+        $listenerProbe.Stop()
+    }
+
     New-Item -ItemType Directory -Path $tempRoot | Out-Null
     $nodeDirectory = Join-Path $tempRoot 'qfp6-node'
     $floorDirectory = Join-Path $tempRoot 'provider-floor'
