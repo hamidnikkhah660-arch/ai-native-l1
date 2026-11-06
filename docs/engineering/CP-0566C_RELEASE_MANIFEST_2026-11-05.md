@@ -172,25 +172,24 @@ These are filtered library tests, not the complete Crate test suite. Two-process
 - The old 259-commit divergent history is not merged into main as a shortcut.
 - No AWS resource, paid service, public RPC, public listener, production secret, real-money trade, QZXB market listing or liquidity operation is part of this CP-0566C qualification.
 
-## Publication and execution blockers
+## Initial publication and execution blockers (historical, 2026-11-05)
 
-1. The default-branch copy of the workflow is not yet published.
-2. The feature qualification branch name expected by the Controller does not yet exist on origin.
-3. NetBird on Node A is NeedsLogin; no second authenticated peer is connected.
-4. The exact two-peer NetBird ACL and host firewall rules have not been reviewed/applied.
-5. A clean release branch, commit set, and independent review have not been finalized.
+The following blockers were true when this manifest was first prepared. They were subsequently resolved for the scoped CP-0566C candidate qualification: the workflow was available on main, the technical branch was published, Node A reconnected to NetBird, the reviewed narrow peer policies were used, and a clean feature commit was dispatched.
 
-## Safety record
+## Original preparation safety record (historical, 2026-11-05)
 
 - Main worktree: retained at the original HEAD with its existing change entries; no cleanup, staging, reset or commit.
 - Clean mainline baseline worktree: detached at ba120c1191956468a1106daff6a915c155f50f8a, zero changes.
 - Integration trial worktree: detached at the same SHA, with local changes representing the validated transplant.
 - No commit, push, merge, remote branch creation, workflow dispatch, GitHub secret write, NetBird login, ACL change, public listener, cloud provisioning or real transaction was performed.
 
-## Current qualification status
+## Cross-host qualification status update (2026-11-06)
 
-CP-0566C remains BLOCKED / NOT RUN. The validated mainline-based Crate test set is ready for independent review. Cross-host execution may start only after the publication blockers above have been resolved and the exact branch/workflow content has been inspected.
+CP-0566C candidate cross-host qualification PASSED on exact feature commit `30bd6a19da87a991b51feed4a7a76aebf1895bff` in GitHub Actions run [42205440686](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/42205440686). The job completed successfully; the ephemeral NetBird peer disconnect/cleanup step also succeeded. See `CP-0566C_FINAL_MAINLINE_RELEASE_PREP_2026-11-05.md` for exact evidence, state commitments and limits.
 
+This is a private-overlay, two-host candidate qualification using Node A on the user's Windows host and an ephemeral GitHub-hosted Windows Runner as Node B. It is not a public Devnet/Mainnet, independent-operator qualification, production security approval or real-value transaction. PR #135 remains OPEN and Draft.
+
+A separate policy-reconciliation gate is tracked in [issue #136](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/136): the QFP6 CP-0528 candidate uses a 1B Founder Genesis and 3B mining/security budget, while the current CP-0437 Mainnet direction specifies 10B to one owner at Genesis with zero subsequent issuance/subsidy. CP-0528 must not be treated as the production monetary policy until that version/economics boundary is explicitly resolved.
 ## Integrity / counts
 
 Historical Crate diff paths (origin/main to local candidate HEAD): 83.
@@ -211,4 +210,9 @@ If that check fails, the workflow downloads the pinned MSI and verifies both its
 ### Mainline-based feature preparation update (2026-11-05)
 The security fix PR #134 is merged. The current mainline base for the isolated QRun feature preparation worktree is 8de9812e7d1a49020f1a7fc169c40d4b8a72a144. A 114-file feature overlay was applied with an exact Git status path-set match and zero unexpected paths. On this base, cargo fmt passed; focused QAP1 passed 24/24 and focused QFP6 passed 37/37; Controller/Runner PowerShell AST, Workflow YAML and policy marker checks passed. See CP-0566C_MAINLINE_FEATURE_PREP_2026-11-05.md for the complete evidence and limits. Full all-target testing and actual two-host qualification remain separate open gates.
 ### Full all-target validation completed (2026-11-05)
-The mainline-based feature preparation worktree passed cargo test --all-targets --locked --offline with exit code 0 in 510.33 seconds: 1,268 library tests passed, zero failed, and every binary/integration target completed successfully. Existing compiler warnings concerned unused imports, unused mutability and dead code only. Full evidence is recorded in CP-0566C_MAINLINE_FEATURE_PREP_2026-11-05.md. This is still single-host local evidence; CP-0566C cross-host NetBird remains NOT RUN.
+The mainline-based feature preparation worktree passed cargo test --all-targets --locked --offline with exit code 0 in 510.33 seconds: 1,268 library tests passed, zero failed, and every binary/integration target completed successfully. Existing compiler warnings concerned unused imports, unused mutability and dead code only. Full evidence is recorded in CP-0566C_MAINLINE_FEATURE_PREP_2026-11-05.md. At the time of this 2026-11-05 entry, this was single-host local evidence; the subsequent 2026-11-06 cross-host outcome is recorded in the qualification update above.
+### Two-host execution evidence (2026-11-06)
+- Rust validation CI run `42203421682` on `30bd6a1`: all three jobs passed.
+- QFP6/QAP1 cross-host run `42205440686`: workflow conclusion SUCCESS; Node B server and restart workers passed; exact Manifest Anchor, State Root, Height and Generation continuity was verified by the controller; ephemeral peer cleanup passed.
+- Temporary Actions secrets were deleted after the run. The local NetBird control plane remained connected; no VPN route, firewall or ACL changes were performed during cleanup.
+- This update supersedes the initial NOT RUN status above only for the stated private-overlay qualification scope. It does not close the remaining public Mainnet gates.
