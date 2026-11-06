@@ -42,6 +42,8 @@ pub enum V4HybridForkChoiceError {
     Pfm5Manifest(Pfm5ManifestError),
     BranchSetMismatch,
     CanonicalTipMismatch,
+    Pfm5ArchiveBaseMismatch,
+    Pfm5ManifestGenerationOverflow,
 }
 
 impl std::fmt::Display for V4HybridForkChoiceError {
@@ -86,6 +88,13 @@ impl std::fmt::Display for V4HybridForkChoiceError {
             ),
             Self::CanonicalTipMismatch => {
                 write!(f, "PFM5 canonical tip differs from checkpoint-based replay")
+            }
+            Self::Pfm5ArchiveBaseMismatch => write!(
+                f,
+                "replayed PMT4 archive is not rooted in the supplied PFM5 checkpoint/profile"
+            ),
+            Self::Pfm5ManifestGenerationOverflow => {
+                write!(f, "PFM5 manifest generation cannot be incremented")
             }
         }
     }
@@ -519,6 +528,130 @@ impl PrivateTestnetV4HybridForkChoice {
     }
 }
 
+/// Build the next linear PFM5 manifest after replaying a freshly fetched parent generation and
+/// applying a locally held candidate branch. This is the deterministic rebase step a stale
+/// writer performs after its external-CAS compare-and-swap loses to another node.
+///
+/// The caller MUST have obtained the current manifest and its exact commitment from a freshly
+/// authenticated external read. This helper does not perform provider I/O or claim durable commit.
+/// It refuses to drop any branch already named by the parent manifest, derives the complete new
+/// branch digest set from replayed PMT4 envelopes, and binds the selected cumulative-work tip.
+pub fn next_pfm5_manifest_after_replay(
+    current_manifest: &Pfm5CheckpointManifest,
+    checkpoint: &Pcp4CheckpointRecord,
+    context: &Pcp4ValidationContext<'_>,
+    expected_current_commitment: [u8; 32],
+    minimum_generation: u64,
+    minimum_checkpoint_height: u64,
+    archive: &PrivateTestnetV4HybridForkChoice,
+) -> Result<Pfm5CheckpointManifest, V4HybridForkChoiceError> {
+    current_manifest
+        .validate_checkpoint(checkpoint, context)
+        .map_err(V4HybridForkChoiceError::Pfm5Manifest)?;
+    let current_commitment = current_manifest
+        .commitment()
+        .map_err(V4HybridForkChoiceError::Pfm5Manifest)?;
+    if current_commitment != expected_current_commitment {
+        return Err(V4HybridForkChoiceError::CheckpointRestore(
+            Pfm5CheckpointRestoreError::ManifestAnchorMismatch,
+        ));
+    }
+    if current_manifest.generation < minimum_generation {
+        return Err(V4HybridForkChoiceError::CheckpointRestore(
+            Pfm5CheckpointRestoreError::ManifestGenerationRollback,
+        ));
+    }
+    if current_manifest.checkpoint_height < minimum_checkpoint_height {
+        return Err(V4HybridForkChoiceError::CheckpointRestore(
+            Pfm5CheckpointRestoreError::CheckpointHeightRollback,
+        ));
+    }
+
+    let configured_profile =
+        crate::private_testnet_checkpoint_candidate::consensus_profile_fingerprint(context.params)
+            .map_err(|_| V4HybridForkChoiceError::Pfm5ArchiveBaseMismatch)?;
+    let base_tip = archive.base_chain.chain_tip();
+    if archive.expected_manifest_id != checkpoint.transaction_manifest_id
+        || archive.genesis_tip != checkpoint.consensus_tip_digest
+        || base_tip.height != checkpoint.logical_height
+        || base_tip.tip_hash != checkpoint.consensus_tip_digest
+        || configured_profile != checkpoint.consensus_profile_fingerprint
+        || archive
+            .profile_fingerprint()
+            .map_err(|_| V4HybridForkChoiceError::Pfm5ArchiveBaseMismatch)?
+            != checkpoint.consensus_profile_fingerprint
+    {
+        return Err(V4HybridForkChoiceError::Pfm5ArchiveBaseMismatch);
+    }
+
+    let envelopes = archive.archive_envelopes_bounded(
+        MAX_V4_HYBRID_FORK_ARCHIVE_BLOCKS,
+        MAX_V4_HYBRID_FORK_ARCHIVE_BYTES,
+    )?;
+    let mut branch_digests = Vec::with_capacity(envelopes.len());
+    for envelope in &envelopes {
+        let decoded = decode_candidate_v4_hybrid_monetary_network_block(envelope)
+            .map_err(V4HybridForkChoiceError::Wire)?;
+        if decoded.header.network_id != *context.network_id
+            || decoded.header.height <= checkpoint.logical_height
+        {
+            return Err(V4HybridForkChoiceError::BranchHeightExceeded);
+        }
+        let digest = pow_digest(&decoded.header, context.params.pow)
+            .map_err(V4HybridForkChoiceError::InvalidPow)?;
+        branch_digests.push(digest);
+    }
+    branch_digests.sort_unstable();
+    if branch_digests.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(V4HybridForkChoiceError::BranchSetMismatch);
+    }
+    // PFM5 is append-only within one checkpoint generation: a stale writer may add branches,
+    // but may not silently prune a sibling that was already durably published by its peer.
+    if current_manifest
+        .branch_digests
+        .iter()
+        .any(|digest| branch_digests.binary_search(digest).is_err())
+    {
+        return Err(V4HybridForkChoiceError::BranchSetMismatch);
+    }
+
+    let tip = archive.canonical_chain().chain_tip();
+    if tip.height < checkpoint.logical_height
+        || (tip.height == checkpoint.logical_height
+            && tip.tip_hash != checkpoint.consensus_tip_digest)
+    {
+        return Err(V4HybridForkChoiceError::CanonicalTipMismatch);
+    }
+    let generation = current_manifest
+        .generation
+        .checked_add(1)
+        .ok_or(V4HybridForkChoiceError::Pfm5ManifestGenerationOverflow)?;
+    let next = Pfm5CheckpointManifest {
+        network_id: current_manifest.network_id,
+        consensus_profile_fingerprint: current_manifest.consensus_profile_fingerprint,
+        genesis_fingerprint: current_manifest.genesis_fingerprint,
+        generation,
+        parent_manifest_commitment: current_commitment,
+        checkpoint_height: current_manifest.checkpoint_height,
+        checkpoint_record_commitment: current_manifest.checkpoint_record_commitment,
+        checkpoint_record_len: current_manifest.checkpoint_record_len,
+        checkpoint_consensus_tip_digest: current_manifest.checkpoint_consensus_tip_digest,
+        checkpoint_ledger_tip_hash: current_manifest.checkpoint_ledger_tip_hash,
+        checkpoint_state_root: current_manifest.checkpoint_state_root,
+        checkpoint_total_mined_atoms: current_manifest.checkpoint_total_mined_atoms,
+        checkpoint_cumulative_chainwork: current_manifest.checkpoint_cumulative_chainwork,
+        canonical_tip_height: tip.height,
+        canonical_tip_digest: tip.tip_hash,
+        branch_digests,
+    };
+    next.validate_checkpoint(checkpoint, context)
+        .map_err(V4HybridForkChoiceError::Pfm5Manifest)?;
+    // Force canonical schema/length checks before the caller stages any branch or manifest file.
+    next.encode()
+        .map_err(V4HybridForkChoiceError::Pfm5Manifest)?;
+    Ok(next)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -836,7 +969,7 @@ mod tests {
             parent_manifest_commitment: previous_manifest.commitment().unwrap(),
             canonical_tip_height: RETARGET_HEIGHT,
             canonical_tip_digest: selected_tip,
-            branch_digests,
+            branch_digests: branch_digests.clone(),
             ..previous_manifest
         };
         let manifest_commitment = manifest.commitment().unwrap();
@@ -868,6 +1001,192 @@ mod tests {
                 .cumulative_chainwork
                 .checked_add(crate::consensus::block_work(expected_retarget).unwrap())
                 .unwrap()
+        );
+
+        // Simulate two independently running writers which both started from the same
+        // checkpoint. Node A wins the external CAS with branch A. Node B's branch-B CAS is now
+        // stale, so it must fetch A's exact manifest, replay A, append its locally held B, and
+        // publish generation 3 as a child of A's generation-2 manifest.
+        let parent_commitment = previous_manifest.commitment().unwrap();
+        let manifest_a = Pfm5CheckpointManifest {
+            generation: 2,
+            parent_manifest_commitment: parent_commitment,
+            canonical_tip_height: RETARGET_HEIGHT,
+            canonical_tip_digest: digest_a,
+            branch_digests: vec![digest_a],
+            ..previous_manifest.clone()
+        };
+        let manifest_b_stale = Pfm5CheckpointManifest {
+            generation: 2,
+            parent_manifest_commitment: parent_commitment,
+            canonical_tip_height: RETARGET_HEIGHT,
+            canonical_tip_digest: digest_b,
+            branch_digests: vec![digest_b],
+            ..previous_manifest.clone()
+        };
+        let manifest_a_commitment = manifest_a.commitment().unwrap();
+        let stale_b_commitment = manifest_b_stale.commitment().unwrap();
+        assert_ne!(manifest_a_commitment, stale_b_commitment);
+
+        let node_a_after_commit = PrivateTestnetV4HybridForkChoice::rebuild_from_pfm5_checkpoint(
+            &manifest_a,
+            &checkpoint,
+            &context,
+            manifest_a_commitment,
+            2,
+            2_016,
+            vec![bytes_a.clone()],
+            &verifier,
+        )
+        .unwrap();
+        assert_eq!(
+            node_a_after_commit.canonical_chain().chain_tip().tip_hash,
+            digest_a
+        );
+
+        // Node B's stale local state is not used as the next manifest parent. It performs a
+        // fresh replay of the winning manifest A, then re-applies only its still-valid local
+        // block B through the exact same branch validator.
+        let mut node_b_rebased = PrivateTestnetV4HybridForkChoice::rebuild_from_pfm5_checkpoint(
+            &manifest_a,
+            &checkpoint,
+            &context,
+            manifest_a_commitment,
+            2,
+            2_016,
+            vec![bytes_a.clone()],
+            &verifier,
+        )
+        .unwrap();
+        node_b_rebased
+            .insert_encoded_inner(&bytes_b, &verifier, None)
+            .unwrap();
+        let merged_manifest = next_pfm5_manifest_after_replay(
+            &manifest_a,
+            &checkpoint,
+            &context,
+            manifest_a_commitment,
+            2,
+            2_016,
+            &node_b_rebased,
+        )
+        .unwrap();
+        assert_eq!(merged_manifest.generation, 3);
+        assert_eq!(
+            merged_manifest.parent_manifest_commitment,
+            manifest_a_commitment
+        );
+        assert_eq!(merged_manifest.branch_digests, branch_digests);
+        assert_eq!(merged_manifest.canonical_tip_height, RETARGET_HEIGHT);
+        assert_eq!(merged_manifest.canonical_tip_digest, selected_tip);
+        assert!(merged_manifest.commitment().unwrap() != stale_b_commitment);
+
+        assert_eq!(
+            next_pfm5_manifest_after_replay(
+                &manifest_a,
+                &checkpoint,
+                &context,
+                [0xEE; 32],
+                2,
+                2_016,
+                &node_b_rebased,
+            ),
+            Err(V4HybridForkChoiceError::CheckpointRestore(
+                Pfm5CheckpointRestoreError::ManifestAnchorMismatch
+            ))
+        );
+        assert_eq!(
+            next_pfm5_manifest_after_replay(
+                &manifest_a,
+                &checkpoint,
+                &context,
+                manifest_a_commitment,
+                3,
+                2_016,
+                &node_b_rebased,
+            ),
+            Err(V4HybridForkChoiceError::CheckpointRestore(
+                Pfm5CheckpointRestoreError::ManifestGenerationRollback
+            ))
+        );
+        assert_eq!(
+            next_pfm5_manifest_after_replay(
+                &manifest_a,
+                &checkpoint,
+                &context,
+                manifest_a_commitment,
+                2,
+                2_017,
+                &node_b_rebased,
+            ),
+            Err(V4HybridForkChoiceError::CheckpointRestore(
+                Pfm5CheckpointRestoreError::CheckpointHeightRollback
+            ))
+        );
+
+        // After publishing the merged generation, both independent replicas replay the exact
+        // same branch set in different arrival orders and converge on all canonical state fields.
+        let converged_node_a = PrivateTestnetV4HybridForkChoice::rebuild_from_pfm5_checkpoint(
+            &merged_manifest,
+            &checkpoint,
+            &context,
+            merged_manifest.commitment().unwrap(),
+            3,
+            2_016,
+            vec![bytes_a.clone(), bytes_b.clone()],
+            &verifier,
+        )
+        .unwrap();
+        let converged_node_b = PrivateTestnetV4HybridForkChoice::rebuild_from_pfm5_checkpoint(
+            &merged_manifest,
+            &checkpoint,
+            &context,
+            merged_manifest.commitment().unwrap(),
+            3,
+            2_016,
+            vec![bytes_b.clone(), bytes_a.clone()],
+            &verifier,
+        )
+        .unwrap();
+        assert_eq!(
+            converged_node_a.canonical_chain().chain_tip(),
+            converged_node_b.canonical_chain().chain_tip()
+        );
+        assert_eq!(
+            converged_node_a.canonical_chain().monetary_state(),
+            converged_node_b.canonical_chain().monetary_state()
+        );
+        assert_eq!(
+            converged_node_a.canonical_chain().cumulative_work(),
+            converged_node_b.canonical_chain().cumulative_work()
+        );
+        assert_eq!(
+            converged_node_a.archive_envelopes().len(),
+            converged_node_b.archive_envelopes().len()
+        );
+
+        // A stale writer cannot silently erase a previously committed parent branch during rebase.
+        assert_eq!(
+            next_pfm5_manifest_after_replay(
+                &manifest_a,
+                &checkpoint,
+                &context,
+                manifest_a_commitment,
+                2,
+                2_016,
+                &PrivateTestnetV4HybridForkChoice::rebuild_from_pfm5_checkpoint(
+                    &manifest_b_stale,
+                    &checkpoint,
+                    &context,
+                    stale_b_commitment,
+                    2,
+                    2_016,
+                    vec![bytes_b.clone()],
+                    &verifier,
+                )
+                .unwrap(),
+            ),
+            Err(V4HybridForkChoiceError::BranchSetMismatch)
         );
 
         assert_eq!(
