@@ -192,3 +192,7 @@ This document establishes strategy and coverage, not a certification. Current br
 
 **Canonical short identity:** QRun Blockchain — Verifiable AI-Native Blockchain Infrastructure.  
 **Primary long-term differentiator to engineer:** verifiable, bounded AI-agent authorization and settlement, backed by independently verifiable ledger state, explicit cryptographic trust boundaries, and reproducible evidence.
+
+## 10. Repository continuity and handoff control
+
+The dated living continuation handoff is [`QRUN_CONTINUATION_CONTROL_PLANE_2026-11-06.md`](QRUN_CONTINUATION_CONTROL_PLANE_2026-11-06.md). Every new session, contributor, or AI assistant must read it, verify the live repository/PR/CI state, and update it alongside the relevant technical record when material status changes. The handoff is not live telemetry: exact branch heads, CI outcomes, PR dependencies, and deployment status must always be rechecked. If a conflict exists, source code, reproducible tests, and exact commit/run evidence outrank chat history and stale handoff text.
