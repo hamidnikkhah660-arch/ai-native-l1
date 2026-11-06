@@ -308,3 +308,12 @@ Passing one row must never be reported as passing either of the other two.
 - Windows PMT4/TXN4 two-node loopback: success, including signed TXN4 submission, invalid-signature rejection, peer propagation, replay check, PFM4 paged archive sync, inter-page reorg and stale-cursor rejection.
 - Rust validation: success, including independent Genesis monetary snapshot oracle, candidate issuance schedule oracle, formatting, all-target check and all-target tests.
 - PR #138 is OPEN, non-Draft, and reports merge state CLEAN at the time of inspection. It remains unmerged. CI success is not a security audit, public-mainnet approval, external-host qualification, or authorization to merge.
+
+### CP-0567 / PR #138 documentation-head CI completion (2026-11-06)
+
+- Workflow run `42245842802` completed with overall conclusion **success** on exact head `0cb09625ee26630101a5566a6e065b04da99f205`.
+- Rust validation: success. Independent Genesis monetary snapshot oracle, candidate issuance schedule oracle, formatting, `Check every target`, and `Test every target` all completed successfully. The all-target test step completed at 2026-11-06T15:52:22Z.
+- EVM contract, wallet console and dependency audit: success.
+- Windows PMT4/TXN4 two-node loopback: success, including signed TXN4 submission, invalid-signature rejection, peer propagation, replay check, PFM4 paged archive sync, inter-page reorg and stale-cursor rejection.
+- PR #138 was OPEN, non-Draft and reported merge state CLEAN at inspection. It remains unmerged. This is exact-head CI evidence only; it is not an independent security audit, public-mainnet approval, live external-CAS/high-water qualification, or authorization to merge/deploy.
+- Run: https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/42245842802
