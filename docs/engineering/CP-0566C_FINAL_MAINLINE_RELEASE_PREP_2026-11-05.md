@@ -35,7 +35,7 @@ The test demonstrates authenticated candidate admission, replay rejection checke
 
 ## Remaining production gates
 - At least three independent node/benchmark operators across separate hosts/providers and external-network reachability.
-- One canonical monetary/Genesis policy must be selected and integrated consistently across producer, importer, replay, fork-choice, persistence, snapshots and external trust. In particular, issue [#136](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/136) records the unresolved difference between current CP-0437 (10B owner Genesis, zero future issuance/subsidy) and the QFP6 candidate's CP-0528 (1B founder Genesis plus mining/category ceilings). Do not select the latter as Mainnet without an explicit policy decision.
+- The owner-confirmed target is now CP-0566D: 1B owner Genesis (10%), up to 3B PoW mining/security (30%), and six 1B conditional reserves (10% each). CP-0566D supersedes CP-0437 for future production design; preserve CP-0437 as historical evidence. QFP6 CP-0528 is a candidate implementation of this target, not frozen production consensus. Issue [#136](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/136) tracks policy/source/docs integration, mining-schedule remainder semantics and full lifecycle invariants.
 - Full-history replay or an independently verifiable checkpoint rollover and monotonic anti-rollback trust model, end to end.
 - Independent protocol/cryptography/security review, remediation and reproducible signed release artifacts.
 - Public devnet operation, native wallet/restore qualification, public explorer/read-only API, monitoring and incident/reorg procedures.
