@@ -219,3 +219,13 @@ A future caller must explicitly own and test the whole lifecycle: authenticate t
 ### Recovery consequence
 
 The high-water record stores monotonic sequence plus ECR1 record and object generation, not the full serialized PFI1 intent. If local PFJ1 is rolled back to a Ready snapshot after the independent high-water has advanced to Prepared, the state cannot safely be reconstructed from the floor alone. Fail closed and quarantine for operator-assisted recovery; never synthesize a replacement intent or reset the high-water authority. If PFJ1 remains Prepared and the floor proves the exact finalized successor, recovery may proceed only after validating the pending intent and fresh authenticated ECR1/object state, then completing the idempotent local/floor transitions.
+
+## 9.3 Exact-head CI completion (2026-11-06)
+
+- GitHub Actions run [42238982273](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/42238982273) completed with conclusion **SUCCESS** for exact head `76dffc48156a7b291c29e4225b9355f16acf5ba6`.
+- Rust `Format, check, and test`: formatting, all-target check, and `Test every target` all passed.
+- Windows PMT4/TXN4 two-node loopback: signed TXN4 submission, invalid-signature rejection, peer propagation/replay checks, and PFM4 paged archive synchronization with inter-page reorg and stale-cursor rejection all passed.
+- EVM contract, wallet console, and dependency audit: all steps passed.
+- This is CI evidence for the exact documentation commit and the exercised existing PMT4/PFM4/EVM paths. It does **not** qualify PFM5 production adapters, PFM5 node-startup integration, independent public hosts, public Mainnet readiness, or a QZXB/USDT market.
+- PR #138 remains OPEN, non-Draft, unmerged; merge state was `UNSTABLE` at the last check. No merge or deployment was performed.
+- Worktree was clean and synchronized with `origin/docs/qrun-master-roadmap-20261106` before this checkpoint update. Re-verify branch, worktree, PR and the new exact-head CI after committing this documentation update.
