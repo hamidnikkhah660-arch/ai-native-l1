@@ -100,7 +100,7 @@ This table is intentionally selective, not a complete PR inventory. Always query
 3. Inspect source and tests on the actual base/head commits before proposing code. Do not infer integration from module existence or unit tests.
 4. Label every result by scope: unit test, local node, loopback, private overlay, independent operator, public network, production deployment.
 5. Update this handoff and the relevant canonical technical record in the same documentation PR when a material decision/status changes. Include exact commit, test command, environment, result, limitations, next blocker, and rollback/safety notes.
-6. Keep superseded decisions as history and mark them superseded; do not silently erase them or maintain competing â€œcurrentâ€ summaries.
+6. Keep superseded decisions as history and mark them superseded; do not silently erase them or maintain competing 'current' summaries.
 7. Do not invent success. If a process is still running, poll it; if CI is pending, say pending; if a step was not run, say not tested.
 8. Do not merge PRs, change Draft state, deploy, publish the website, approve brand/economics/release policy, change Genesis/consensus/economics/cryptographic trust, or enable public minting without explicit owner approval.
 9. Do not alter VPN, NetBird policy, routes, firewall, adapters, DNS, or network services absent concrete evidence and explicit approval. Connectivity was previously restored; preserve it.
