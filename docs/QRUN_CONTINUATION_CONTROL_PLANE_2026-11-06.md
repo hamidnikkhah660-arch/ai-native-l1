@@ -279,3 +279,32 @@ Source reviewed: `src/native/pow_bench/src/external_cas_offhost_anchor_aws_dynam
 ### Next safe step
 
 Complete the source-to-contract mapping and write the adapter qualification/test plan first. Do not provision cloud resources, request credentials, add secrets, select a paid topology, or wire a provider into PMT4 startup without explicit owner authorization. Keep PFM5 integration and checkpoint historical authenticity as separate release gates; a monotonic ECR1/high-water floor does not prove omitted checkpoint ancestry.
+
+### CP-0485 AWS KMS Anchor signer: role separation from CP-0396
+
+Source reviewed from PR #116 (`external_cas_aws_kms_signer_candidate.rs` and CP-0485):
+
+- The candidate adds `AwsKmsCliOffhostAnchorReceiptSigner`, implementing `OffhostAnchorReceiptSigner`. Its constructor requires both the distinct `ExternalCasOffhostAnchorPin` and the matching `ExternalCasPin`; it validates their shared provider/network/Genesis domain and takes the expected signing key only from the Anchor pin.
+- Startup obtains KMS public-key metadata and requires `ML_DSA_65`, `SIGN_VERIFY`, and `ML_DSA_SHAKE_256`; it extracts the raw key from SPKI DER and compares it byte-for-byte with the independently pinned Anchor public key. A domain-separated challenge binds Anchor ID, provider/network/Genesis and both receipt-key identities. Startup and each returned digest signature are locally verified.
+- The AWS CLI is invoked directly without a shell, with bounded CLI connect/read timeouts. The private key remains KMS-side; runtime credentials are expected to come from the normal AWS provider chain, preferably a narrowly scoped workload role rather than long-lived keys.
+- PR #116 reports local `cargo test --lib --locked --offline` (1,013 passed), `cargo check --all-targets --locked --offline`, formatting and diff checks. Its GitHub CI matrix checks are green. PR #116 remains OPEN and Draft; no AWS request, KMS key, account, IAM role or independent Anchor operator has been provisioned.
+- **Critical role boundary:** this signer signs off-host Anchor receipts. It does not implement `Pfm5ExternalCasHighWaterProvider`, does not perform CP-0396 monotonic compare-and-advance, and does not by itself make an ECR1/PFJ1 transition atomic or rollback-resistant. A KMS-backed signature is not a substitute for a linearizable high-water store.
+- Potential reuse is limited to a separately pinned signing primitive if the eventual CP-0396 authority protocol explicitly adopts it. The authority state machine, canonical state digest, monotonic CAS, independent read trust, recovery and two-host concurrency proof remain separate requirements.
+
+### Provider/Anchor/high-water acceptance separation
+
+Keep three independent questions in the qualification matrix:
+
+1. **Provider receipt signer:** can the provider sign its own exact object/receipt claims under its own pinned key?
+2. **Off-host Anchor receipt signer:** can an independently administered Anchor sign its own attestation with a distinct key and independently verified KMS identity?
+3. **PFM5 high-water authority:** can an independently trusted service atomically advance and authenticate the complete monotonic CP-0396 state across competing hosts and rollback/recovery events?
+
+Passing one row must never be reported as passing either of the other two.
+
+### CP-0567 / PR #138 exact-head CI completion (2026-11-06)
+
+- Workflow run `42244338895` completed with overall conclusion **success** on exact head `f39239f5bc1e402e2860e5e7b4f377481eb3ac39`.
+- EVM contract, wallet console and dependency audit: success.
+- Windows PMT4/TXN4 two-node loopback: success, including signed TXN4 submission, invalid-signature rejection, peer propagation, replay check, PFM4 paged archive sync, inter-page reorg and stale-cursor rejection.
+- Rust validation: success, including independent Genesis monetary snapshot oracle, candidate issuance schedule oracle, formatting, all-target check and all-target tests.
+- PR #138 is OPEN, non-Draft, and reports merge state CLEAN at the time of inspection. It remains unmerged. CI success is not a security audit, public-mainnet approval, external-host qualification, or authorization to merge.
