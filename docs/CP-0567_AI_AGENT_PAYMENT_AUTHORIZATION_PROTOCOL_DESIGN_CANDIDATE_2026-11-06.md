@@ -1,4 +1,4 @@
-﻿# CP-0567 — AI-Agent Payment Authorization: Protocol Design Candidate
+# CP-0567 — AI-Agent Payment Authorization: Protocol Design Candidate
 
 **Document ID:** CP-0567  
 **Version:** 0.2 (design candidate; not consensus-frozen)  
@@ -220,4 +220,3 @@ The strongest future public claim should be narrow and testable, for example: �
 ---
 
 **Decision requested:** review this candidate architecture and resolve the open decisions before any consensus or production-runtime implementation begins.
-
