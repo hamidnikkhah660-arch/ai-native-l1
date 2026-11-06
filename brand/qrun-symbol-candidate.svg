@@ -1,0 +1,17 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">QRun symbol candidate</title>
+  <desc id="desc">A geometric blue Q with an orbital network stroke and two connected nodes.</desc>
+  <defs>
+    <linearGradient id="qrunBlue" x1="35" y1="25" x2="220" y2="230" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#22D3EE"/>
+      <stop offset="0.52" stop-color="#2563EB"/>
+      <stop offset="1" stop-color="#7DD3FC"/>
+    </linearGradient>
+  </defs>
+  <circle cx="116" cy="116" r="72" fill="none" stroke="url(#qrunBlue)" stroke-width="20" stroke-linecap="round" stroke-dasharray="390 64" transform="rotate(-42 116 116)"/>
+  <path d="M145 145 L196 196" fill="none" stroke="url(#qrunBlue)" stroke-width="19" stroke-linecap="round"/>
+  <path d="M25 155 C73 205 164 208 224 116" fill="none" stroke="#22D3EE" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="25" cy="155" r="9" fill="#22D3EE"/>
+  <circle cx="224" cy="116" r="9" fill="#7DD3FC"/>
+  <rect x="185" y="184" width="23" height="23" rx="4" transform="rotate(45 196.5 195.5)" fill="#07152F" stroke="#22D3EE" stroke-width="4"/>
+</svg>
