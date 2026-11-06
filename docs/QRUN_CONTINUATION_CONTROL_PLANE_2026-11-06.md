@@ -241,3 +241,41 @@ The high-water record stores monotonic sequence plus ECR1 record and object gene
 - Scope limitation remains: this CI does not qualify a real PFM5 high-water adapter, authenticated external authority, production object/ECR1 providers, PFJ1/high-water orchestration in PMT4 node startup, independent operator hosts, public Mainnet readiness, or a QZXB/USDT market.
 - No merge, deployment, publication, consensus/Genesis/economic change, release-gate change, or network configuration change was performed.
 - Next safe engineering task: specify and qualify the real PFM5 provider boundary (out-of-band authority pin, durable monotonic state, linearizable CAS, concurrent independent-host behavior, ambiguous replies, rollback/restart/partition tests) before selecting or wiring a production adapter. Provider choice, credential provisioning, and any live service creation require owner authorization.
+
+## 9.5 Exact-head CI completion and AWS high-water adapter qualification boundary (2026-11-06)
+
+### Exact-head CI result
+
+- GitHub Actions run [42242916185](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/42242916185) completed **SUCCESS** for exact head `2f8c47596bfcf7d43b6fc429621ec1b18ce3f59a`.
+- Rust `Format, check, and test`: formatting, `Check every target`, and `Test every target` all passed.
+- Windows PMT4/TXN4 two-node loopback: signed TXN4 submission, invalid-signature rejection, peer propagation/replay, and PFM4 paged archive synchronization with inter-page reorg and stale-cursor rejection all passed.
+- EVM contract, wallet console, and dependency audit: all steps passed.
+- PR #138 remains OPEN, non-Draft, unmerged. Its exact head is `2f8c47596bfcf7d43b6fc429621ec1b18ce3f59a`; GitHub reports `mergeStateStatus=CLEAN`. CLEAN is a GitHub merge-state observation, not authorization to merge.
+- This run qualifies only the exact commit and listed CI paths. It does not prove PFM5 production integration, independent public-host operation, public Mainnet readiness, post-quantum security of the whole network, or a QZXB/USDT market.
+
+### CP-0396 AWS DynamoDB candidate: compatibility and security boundary
+
+Source reviewed: `src/native/pow_bench/src/external_cas_offhost_anchor_aws_dynamodb_candidate.rs` from the CP-0483 candidate in PR #113, together with the CP-0396 PFM5 high-water contract.
+
+- The existing DynamoDB candidate is an **off-host anchor adapter candidate**, not yet a production-qualified CP-0396 high-water authority. Its current item model includes an anchor ID, provider/network/Genesis identifiers, receipt key identifiers and hashes, policy version, sequence, provider object generation, state digest and encoded state.
+- Its conditional write compares the expected sequence and state digest and advances by one; its read path requests a strongly consistent GetItem. A conditional conflict is followed by a fresh consistent read. These are useful primitives, but they do not by themselves prove the full CP-0396 authority contract.
+- CP-0396 requires an independently authenticated and pinned authority identity, binding to provider/network/Genesis, journal sequence, exact ECR1 predecessor/successor and object generation, plus a durable monotonic compare-and-advance operation. The adapter must not silently accept an anchor identity as a substitute for the pinned high-water authority identity.
+- A future adapter may reuse the DynamoDB request runner and conditional-write mechanics, but must define a new canonical item/state encoding and digest that binds the complete CP-0396 state. The condition must compare the expected sequence **and** the complete canonical predecessor-state digest; the successor must be exactly the allowed next transition. Authentication and trust pinning must be verified independently of mutable table contents.
+- Strongly consistent reads are available for DynamoDB tables and local secondary indexes; successful writes are documented as durably persisted. This is useful service documentation, not a substitute for our own real-service, two-host qualification.
+- Do not treat default multi-region eventual replication / last-writer-wins global-table behavior as a linearizable cross-region CAS authority. The safe first candidate architecture, if later authorized, is a single-region table with every writer and recovery reader routed to that same region. Multi-region strong consistency is a separate design: MRSC global tables require three regions (two replicas plus a witness, or three replicas), have additional latency and feature/operational constraints, and require their own qualification. No global-table topology is selected here.
+- The current candidate tests use scripted runner doubles. No AWS account, table, IAM role, KMS key, credential, or live cloud resource was provisioned or tested in this work.
+
+### Mandatory real-provider qualification before production use
+
+1. Pin authority identity out of band; bind provider ID, network ID and Genesis digest; define key rotation and emergency recovery without allowing silent authority substitution.
+2. Define canonical, versioned CP-0396 state bytes and digest covering sequence, exact ECR1 predecessor/successor, object generation and all identity fields.
+3. Enforce a single atomic conditional successor; deny delete/reset/overwrite paths to ordinary writers. Define IAM separation for writer, verifier, backup and operator roles.
+4. Test two independently administered hosts racing from the same expected state; exactly one may advance, and the loser must reread authenticated state and fail/rebase safely.
+5. Test lost acknowledgement after commit, timeout before commit, conditional conflict, unavailable read, partition, process restart, credential denial, stale authority pin, object-generation mismatch and wrong Genesis/network/provider.
+6. Test local disk snapshot rollback while the independent floor is ahead; test service backup/restore and any table recovery path for sequence rollback. Fail closed and quarantine on mismatch; never reset the floor or synthesize a missing PFJ1 intent.
+7. Verify durable-before-success and read-after-write behavior using the real service and independent hosts. Capture sanitized evidence, exact software versions, region/topology, IAM policy hashes and test timestamps without committing secrets.
+8. Only if multi-region operation is required, separately qualify the chosen MRSC topology and failure/recovery behavior. Do not assume default MREC replication is safe for monotonic CAS.
+
+### Next safe step
+
+Complete the source-to-contract mapping and write the adapter qualification/test plan first. Do not provision cloud resources, request credentials, add secrets, select a paid topology, or wire a provider into PMT4 startup without explicit owner authorization. Keep PFM5 integration and checkpoint historical authenticity as separate release gates; a monotonic ECR1/high-water floor does not prove omitted checkpoint ancestry.
