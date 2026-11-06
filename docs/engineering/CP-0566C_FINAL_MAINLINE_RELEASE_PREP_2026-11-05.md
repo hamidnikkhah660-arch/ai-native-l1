@@ -1,31 +1,45 @@
 # CP-0566C final mainline release preparation
 
-Date: 2026-11-05
-Current main base: c536caec696217234d6b35582663c0aa58652b9c
-Local-only branch: prep/qrun-final-mainline-20261105
-Expected technical ref for the manual workflow: feat/qzxb-usdt-trading-gate-20261104
+Original preparation date: 2026-11-05
+Qualification update: 2026-11-06
+Current main base: `c536caec696217234d6b35582663c0aa58652b9c`
+Technical branch: `feat/qzxb-usdt-trading-gate-20261104`
+Qualified feature commit: `30bd6a19da87a991b51feed4a7a76aebf1895bff`
 
 ## Release source reconciliation
-- Feature overlay paths: 114.
-- Exactly matched against the previously full-tested mainline worktree after line-ending normalization: 114/114.
-- 29 paths were transplanted from the tested worktree; 85 were already byte-equivalent after newline normalization, including the merged Workflow.
-- The only GitHub mainline change after the full all-target test was the Workflow merge; the Rust crate had zero changed paths between base 8de9812e7d1a49020f1a7fc169c40d4b8a72a144 and current main c536caec696217234d6b35582663c0aa58652b9c.
-- The merged main Workflow was never overwritten.
-- The final worktree is local-only, uncommitted and unpushed.
+- The integration package began as a 114-path feature overlay on the mainline-based preparation worktree; subsequent qualification fixes are recorded as exact commits on the technical branch.
+- The default-branch workflow was preserved and invoked manually against the exact feature SHA.
+- PR #135 is still OPEN and Draft. No merge or production release was performed.
 
 ## Test evidence
-On the same 1,268-test Rust source:
-- cargo test --all-targets --locked --offline: exit 0; 1,268 library tests passed, zero failed; all binary/integration targets completed.
-- cargo fmt --check: to be validated on this final worktree below.
-- Focused QAP1: 24/24 PASS; focused QFP6: 37/37 PASS.
-- Workflow YAML and policy checks, Controller and Runner PowerShell AST checks passed on the tested source.
-- GitHub Actions PR #133 Run #482: all three jobs passed (Format/Check/Test, EVM/Audit, Windows PMT4/TXN4 two-node loopback).
+- Local `cargo fmt --manifest-path src/native/pow_bench/Cargo.toml -- --check`: PASS.
+- Local targeted QAP1 Node A driver compile (`cargo test --locked --no-run ... qfp6_qap1_node_a_driver`): PASS.
+- GitHub Actions Rust validation run [42203421682](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/42203421682), exact head `30bd6a19da87a991b51feed4a7a76aebf1895bff`: all 3 jobs PASS, including Format/Check/Test, Windows PMT4/TXN4 two-node loopback, and EVM/wallet/dependency audit.
+- Actual QFP6/QAP1 cross-host run [42205440686](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/42205440686), same exact head: conclusion SUCCESS; the cross-host job and ephemeral-peer cleanup both succeeded.
 
-## Current gates
-- Workflow exists on main but is manual-only; no workflow_dispatch run has occurred.
-- The required technical branch does not yet exist on origin.
-- CP-0566C remains NOT RUN until Node A is remotely admitted, replay is rejected, and Node B second-process restart continuity is proven using two physical hosts.
-- No public Devnet/Mainnet, public RPC, real USDT liquidity, cross-chain bridge or real QZXB trade is claimed.
-## Controller clean-worktree branch identity hardening (2026-11-05)
-The Node A Controller now accepts any named local branch for its clean isolated worktree, while retaining the strict checks that matter for identity: the worktree must be clean and the exact local HEAD SHA must equal the GitHub technical branch SHA feat/qzxb-usdt-trading-gate-20261104. Detached HEAD remains rejected. The remote target ref, default-branch Workflow presence, feature-branch Runner presence, explicit -AclReviewed gate, one-off Setup Key prompt, temporary secrets and cleanup behavior remain unchanged.
-This permits use of the dedicated clean prep worktree without renaming or disturbing the user's original dirty local feature worktree.
+## Cross-host qualification result — 2026-11-06
+The test paired Node A on the user's Windows host with an ephemeral GitHub-hosted Windows Runner (Node B) enrolled in the private NetBird overlay. It is a two-host candidate qualification, not an independently operated public network or Mainnet deployment.
+
+Verified evidence from run `42205440686`:
+- `QFP6_QAP1_NODE_B_BIND_PREFLIGHT=PASS` and `QFP6_QAP1_RUNNER_OVERLAY_READY=PASS`.
+- Node A callback readiness and the Node B server worker completed successfully.
+- `QFP6_QAP1_PROCESS_SERVER=PASS`.
+- The separate restart process emitted `QFP6_QAP1_RESTART_SERVER=PASS`.
+- `QFP6_QAP1_REMOTE_NODE_ADMISSION_AND_RESTART=PASS` and the authenticated Node A restart callback was sent.
+- Manifest Anchor: `e736515927f69406d12eda1d0fa76328578d34aecb9fd00a8ba312ac89ef79d1`.
+- State Root: `e5c5a9ac79379adb090caf9bd1f798e27556a5b4ecdb9b612d91e8d418330363`.
+- Height: `1`; Generation: `1`. The restart process reported the same values.
+- Workflow cleanup disconnected the ephemeral NetBird peer. After completion, the GitHub Actions secret list was empty; Node A remained connected to its own NetBird control plane.
+
+The test demonstrates authenticated candidate admission, replay rejection checked by the Node A driver, and second-process QAP1 state continuity for the tested fixture. It does not establish public inbound reachability, independent operator diversity, full-history public sync, production consensus calibration, public RPC/explorer operations, external security review, or real-value transfers.
+
+## Remaining production gates
+- At least three independent node/benchmark operators across separate hosts/providers and external-network reachability.
+- One canonical monetary/Genesis policy must be selected and integrated consistently across producer, importer, replay, fork-choice, persistence, snapshots and external trust. In particular, issue [#136](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/136) records the unresolved difference between current CP-0437 (10B owner Genesis, zero future issuance/subsidy) and the QFP6 candidate's CP-0528 (1B founder Genesis plus mining/category ceilings). Do not select the latter as Mainnet without an explicit policy decision.
+- Full-history replay or an independently verifiable checkpoint rollover and monotonic anti-rollback trust model, end to end.
+- Independent protocol/cryptography/security review, remediation and reproducible signed release artifacts.
+- Public devnet operation, native wallet/restore qualification, public explorer/read-only API, monitoring and incident/reorg procedures.
+- A genuine, independently verifiable settlement and market path before any QZXB/USDT trade claim.
+
+## Non-claims
+No value-bearing Mainnet, public RPC, public explorer, real USDT liquidity, cross-chain bridge, exchange listing, public QZXB price or real-money QZXB trade is claimed. PR #135 remains Draft; its feature qualification is not a production approval.
