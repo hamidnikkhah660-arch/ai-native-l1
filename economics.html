@@ -3,24 +3,24 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="Read QRun's current owner-directed 10 billion QZXB Genesis target, zero post-Genesis minting and zero subsidy policy, and why neither public balances nor a market are live yet.">
+<meta name="description" content="The selected QZXB tokenomics target: 10B maximum supply, 1B owner Genesis, 3B proof-of-work mining and six conditional 1B reserves.">
 <meta name="robots" content="index,follow,max-image-preview:large">
 <link rel="canonical" href="https://hamidnikkhah660-arch.github.io/ai-native-l1/economics.html">
 <meta name="theme-color" content="#0b1220">
 <meta property="og:type" content="article">
 <meta property="og:site_name" content="QRun Blockchain">
-<meta property="og:title" content="QZXB Supply Policy | 10 Billion Genesis Target and Release Status">
-<meta property="og:description" content="Read QRun's current owner-directed 10 billion QZXB Genesis target, zero post-Genesis minting and zero subsidy policy, and why neither public balances nor a market are live yet.">
+<meta property="og:title" content="QZXB Tokenomics | 10B Eight-Bucket Supply Policy">
+<meta property="og:description" content="10% owner Genesis, 30% PoW mining/security and six 10% conditional reserves, with exact release and Mainnet qualification boundaries.">
 <meta property="og:url" content="https://hamidnikkhah660-arch.github.io/ai-native-l1/economics.html">
 <meta property="og:image" content="https://hamidnikkhah660-arch.github.io/ai-native-l1/assets/qrun-social-card.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="QZXB Supply Policy | 10 Billion Genesis Target and Release Status">
-<meta name="twitter:description" content="Read QRun's current owner-directed 10 billion QZXB Genesis target, zero post-Genesis minting and zero subsidy policy, and why neither public balances nor a market are live yet.">
+<meta name="twitter:title" content="QZXB Tokenomics | 10B Eight-Bucket Supply Policy">
+<meta name="twitter:description" content="Selected 10B supply model: 1B owner Genesis, 3B mining and six conditional 1B reserves.">
 <meta name="twitter:image" content="https://hamidnikkhah660-arch.github.io/ai-native-l1/assets/qrun-social-card.png">
-<title>QZXB Supply Policy | 10 Billion Genesis Target and Release Status</title>
-<script type="application/ld+json">{"@context":"https://schema.org","@type":"WebPage","name":"QZXB Supply Policy | 10 Billion Genesis Target and Release Status","url":"https://hamidnikkhah660-arch.github.io/ai-native-l1/economics.html","description":"Read QRun's current owner-directed 10 billion QZXB Genesis target, zero post-Genesis minting and zero subsidy policy, and why neither public balances nor a market are live yet.","isPartOf":{"@type":"WebSite","name":"QRun Blockchain","url":"https://hamidnikkhah660-arch.github.io/ai-native-l1/"},"about":{"@type":"SoftwareSourceCode","name":"QRun Blockchain","codeRepository":"https://github.com/hamidnikkhah660-arch/ai-native-l1","programmingLanguage":"Rust","license":"https://www.apache.org/licenses/LICENSE-2.0","keywords":["QZXB supply","10 billion Genesis","fixed supply blockchain","zero post-Genesis minting","fee-only block production","QRun economics"],"description":"Experimental open-source Layer-1 protocol research; not a production Mainnet."}}</script>
+<title>QZXB Tokenomics | 10B Eight-Bucket Supply Policy</title>
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"WebPage","name":"QZXB Tokenomics | 10B Eight-Bucket Supply Policy","url":"https://hamidnikkhah660-arch.github.io/ai-native-l1/economics.html","description":"The selected QZXB tokenomics target: 10B maximum supply, 1B owner Genesis, 3B proof-of-work mining and six conditional 1B reserves.","isPartOf":{"@type":"WebSite","name":"QRun Blockchain","url":"https://hamidnikkhah660-arch.github.io/ai-native-l1/"},"about":{"@type":"SoftwareSourceCode","name":"QRun Blockchain","codeRepository":"https://github.com/hamidnikkhah660-arch/ai-native-l1","programmingLanguage":"Rust","license":"https://www.apache.org/licenses/LICENSE-2.0","keywords":["QZXB supply","10 billion Genesis","fixed supply blockchain","zero post-Genesis minting","fee-only block production","QRun economics"],"description":"Experimental open-source Layer-1 protocol research; not a production Mainnet."}}</script>
 <style>
 :root{color-scheme:dark;--bg:#09111f;--panel:#101d30;--text:#edf4ff;--muted:#b4c2d6;--line:#2a3b54;--accent:#8be0ff;--accent2:#b4a2ff;--good:#a7f3d0}
 *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.7;background:radial-gradient(ellipse at 50% -10%,#1e3656 0,transparent 52%),var(--bg);color:var(--text)}
@@ -28,24 +28,28 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}.wr
 </style>
 </head>
 <body>
-<header><div class="wrap nav"><a class="brand" href="index.html">QRun Blockchain · QZXB</a><nav aria-label="Guide navigation"><a href="index.html">Home</a><a href="technology.html">Technology</a><a href="cryptography.html">Cryptography</a><a href="economics.html">Supply</a><a href="status.html">Status</a><a href="contribute.html">Contribute</a><a href="https://github.com/hamidnikkhah660-arch/ai-native-l1">Source</a></nav></div></header>
+<header><div class="wrap nav"><a class="brand" href="index.html">QRun Blockchain · QZXB</a><nav aria-label="Guide navigation"><a href="index.html">Home</a><a href="technology.html">Technology</a><a href="cryptography.html">Cryptography</a><a href="economics.html">Supply</a><a href="wallet.html">Wallet</a><a href="status.html">Status</a><a href="contribute.html">Contribute</a><a href="https://github.com/hamidnikkhah660-arch/ai-native-l1">Source</a></nav></div></header>
 <main class="wrap">
 <div class="eyebrow">Open-source project guide · Experimental public-alpha</div>
-<h1>QZXB Supply Policy: The 10 Billion Genesis Target</h1>
-<p class="lead">The latest owner-directed policy records one simple target: 10,000,000,000 native QZXB at Genesis, all assigned to one owner account, with no further minting and no block subsidy. It is a design target, not a launched monetary system.</p>
-<h2>Current owner-directed target (CP-0437)</h2>
-<table><thead><tr><th>Parameter</th><th>Current direction</th><th>Release status</th></tr></thead><tbody>
-<tr><td>Genesis issuance cap</td><td>10,000,000,000 QZXB</td><td>Specification/candidate only; no production Mainnet issuance.</td></tr>
-<tr><td>Initial owner balance</td><td>10,000,000,000 QZXB (100%)</td><td>Candidate Genesis is not yet integrated into every production path.</td></tr>
-<tr><td>Post-Genesis minting</td><td>Zero</td><td>Must be enforced through import, replay, fork-choice, persistence and recovery.</td></tr>
-<tr><td>Block subsidy</td><td>Zero</td><td>Fee-only block production requires additional security/economic qualification.</td></tr>
+<h1>QZXB Tokenomics: The 10 Billion Eight-Bucket Policy</h1>
+<p class="lead">The owner-confirmed CP-0566D direction sets one maximum gross issuance of 10,000,000,000 native QZXB: 1B (10%) to the owner at Genesis, up to 3B (30%) earned through proof-of-work mining/security, and six conditional reserves of 1B (10%) each. This is the selected economic target, not a claim that Mainnet coins are already live or spendable.</p>
+<h2>Selected allocation — CP-0566D (6 November 2026)</h2>
+<table><thead><tr><th>Allocation bucket</th><th>Share</th><th>Maximum ceiling</th><th>Release / status</th></tr></thead><tbody>
+<tr><td>Mining / network security</td><td>30%</td><td>3,000,000,000 QZXB</td><td>Consensus-issued only under the frozen proof-of-work reward schedule; no pre-mined miner balance.</td></tr>
+<tr><td>Community airdrop</td><td>10%</td><td>1,000,000,000 QZXB</td><td>Eligibility, anti-Sybil controls, claim window and recipient verification required before release.</td></tr>
+<tr><td>Exchange / market integration / liquidity partnerships</td><td>10%</td><td>1,000,000,000 QZXB</td><td>Conditional on real, documented integrations or liquidity arrangements; no listing is guaranteed.</td></tr>
+<tr><td>Marketing / promotional partners</td><td>10%</td><td>1,000,000,000 QZXB</td><td>Written scope, measurable delivery, transparent disclosures and staged acceptance required.</td></tr>
+<tr><td>Developers / security contributors</td><td>10%</td><td>1,000,000,000 QZXB</td><td>Accepted work and recorded evidence; does not replace independent audit.</td></tr>
+<tr><td>Financial / strategic supporters</td><td>10%</td><td>1,000,000,000 QZXB</td><td>Conditional on written terms and verified support; no sponsor is implied to be secured.</td></tr>
+<tr><td>Protocol burn reserve</td><td>10%</td><td>1,000,000,000 QZXB</td><td>Separate one-way burn mechanism required; not called burned until an on-chain proof exists.</td></tr>
+<tr><td>Owner / founder Genesis allocation</td><td>10%</td><td>1,000,000,000 QZXB</td><td>Intended Genesis credit, subject to ordinary transaction authentication; not yet publicly issued.</td></tr>
+<tr><td><strong>Total</strong></td><td><strong>100%</strong></td><td><strong>10,000,000,000 QZXB</strong></td><td>One inclusive gross-issuance cap.</td></tr>
 </tbody></table>
-<h2>What has been superseded?</h2>
-<p>The earlier v0.4 proposal split the same 10B cap into a 3B mining envelope and several 1B reserves. That plan, including its 356.73515981-coin starting subsidy and halving model, is historical and is superseded for the current QRun Genesis direction by CP-0437. Old simulations are retained for audit history and must not be presented as the current emission schedule.</p>
-<h2>Why this does not mean the coins are live</h2>
-<p>A candidate Genesis state or local wallet balance is not the same as issuance on a production network. The project still needs a frozen consensus and network identity, consistent zero-mint enforcement, full-history validation/recovery, multiple independently operated nodes and outside verification of transactions and balances. The owner allocation is also highly concentrated; it should be described plainly, not buried in technical wording.</p>
-<p>No public QZXB market price, public native QZXB/USDT pool, exchange listing or liquid reserve is claimed. USDT cannot be created on QRun merely by copying the ticker. A real market requires actual counterparties, genuine quote assets, verifiable reserves and a supported settlement route.</p>
-<h2>Funding and sponsorship are separate</h2>
+<div class="note">The six 1B reserves are issuance ceilings, not balances automatically credited at Genesis. Unused category allocations remain unissued. Gross issuance, circulating supply, restricted balances and actual burns must be disclosed separately.</div><h2>Historical policy boundary</h2>
+<p>CP-0437 (28 October 2026) recorded a later alternative that placed all 10B QZXB with one owner at Genesis and set zero future minting/subsidy. The owner-confirmed CP-0566D direction dated 6 November 2026 now supersedes that alternative for future QRun production design. CP-0437 and its associated 10B single-owner candidate are retained as historical records; old commits and snapshots are not rewritten.</p>
+<p>The CP-0528 QFP6 code contains candidate accounting for the selected eight-bucket model, but it is not yet frozen production consensus. The inherited research mining schedule currently emits 2,999,999,999.139264 QZXB across its integer-halving arithmetic, leaving 0.860736 QZXB of the 3B ceiling unissued. This must be documented as permanent rounding dust or corrected with independent vectors before consensus is frozen.</p>
+<p>The 10B cap is not a price guarantee. A hypothetical $1 per QZXB implies a $10B fully diluted valuation; reaching any market price depends on actual demand, usage, liquidity, confidence and counterparties. No price, listing, revenue or investment return is promised.</p>
+<p>Primary records: <a href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/feat/qzxb-usdt-trading-gate-20261104/docs/CP-0566D_QZXB_EIGHT_BUCKET_TOKENOMICS_DIRECTION_2026-11-06.md">CP-0566D selected owner policy</a>, <a href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/docs/CP-0437_QRUN_FULL_SUPPLY_GENESIS_DIRECTION_2026-10-28.md">CP-0437 historical direction</a>, and <a href="https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/136">implementation gates</a>.</p><h2>Why this does not mean the coins are live</h2><p>The QFP6 Genesis/accounting path and wallet tools are candidate code, not public issuance. The production profile, account-bound Genesis commitment, reward schedule, signed category-release rules, complete supply invariants, independent nodes and recovery path still need end-to-end qualification.</p><p>No public QZXB market price, native QZXB/USDT pool, exchange listing or liquid reserve is claimed. USDT is not created on QRun by copying its ticker. A real market requires actual counterparties, genuine quote assets, verifiable reserves and a supported settlement route.</p><h2>Funding and sponsorship are separate</h2>
 <p>QZXB allocations are not cash, a signed sponsorship agreement or a guaranteed reward. Current practical funding options are voluntary open-source donations (if the external campaign remains active), grant applications, in-kind support, and written milestone-based engineering contracts. A funding proposal should state deliverables, budget and currency, milestones, timetable, acceptance criteria and payment terms. No sponsor or revenue is claimed as secured.</p>
 <p>Primary records: <a href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/docs/CP-0437_QRUN_FULL_SUPPLY_GENESIS_DIRECTION_2026-10-28.md">CP-0437 current direction</a>, <a href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/docs/CP-0465_QRUN_MAINNET_PUBLIC_TRADING_NO_GO_2026-10-29.md">CP-0465 release decision</a>, and <a href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/main/docs/FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V04_2026-10-24.md">v0.4 historical allocation proposal</a>.</p>
 <div class="panel"><strong>Project status:</strong> QRun is experimental public-alpha, not production Mainnet. No public native QZXB market or price is claimed. <p><a href="status.html">See the current release gates</a> · <a href="contribute.html">Contribute or propose a funded milestone</a>.</p></div>
