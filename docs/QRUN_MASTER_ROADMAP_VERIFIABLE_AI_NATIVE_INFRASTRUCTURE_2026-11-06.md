@@ -192,3 +192,8 @@ This document establishes strategy and coverage, not a certification. QRun has e
 
 **Canonical short identity:** QRun Blockchain — Verifiable AI-Native Blockchain Infrastructure.  
 **Primary long-term differentiator to engineer:** verifiable, bounded AI-agent authorization and settlement, backed by independently verifiable ledger state, explicit cryptographic trust boundaries, and reproducible evidence.
+
+## 10. Continuity handoff and supporting implementation records
+
+The repository-root [PROJECT_START_HERE.md](../PROJECT_START_HERE.md) is the mandatory first-read handoff for new developers and AI assistants. It links this roadmap, the CP-0567 A0/A1/A1B/A1C records, current PRs, point-in-time status, operating guardrails, and next engineering sequence. The A1B source-path reconciliation supersedes any broader inference in the initial A1 audit that TXN4 has no node peer-smoke integration; it confirms a loopback-only diagnostic path, not a public production runtime. The A1C proposal is design-only and does not implement delegated agent authorization. Keep these distinctions intact in future revisions.
+
