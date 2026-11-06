@@ -1,0 +1,140 @@
+﻿# CP-0567 — A1C PMT4 Capability State and Atomic Execution Proposal
+
+Date: 2026-11-06  
+Status: DESIGN PROPOSAL ONLY — not implemented, not consensus-approved, not a public-network feature.
+
+## 1. Source baseline and verified execution boundary
+
+This proposal is based on `origin/main` commit `c536caec696217234d6b35582663c0aa58652b9c` and the source reconciliation in `CP-0567_A1B_SOURCE_PATH_RECONCILIATION_2026-11-06.md`.
+
+The PMT4 node import path decodes a PMT4 candidate and calls `PrivateTestnetV4HybridForkStore::submit`. The fork store validates/inserts the candidate into a cloned candidate archive before publishing the new manifest/archive state. PMT4 monetary execution is performed through the candidate monetary state transition; the transaction loop verifies each TXN4 envelope, projects its account transfer, applies nonce/balance/fee checks to a cloned ledger, then validates subsidy/supply and state root before publishing the resulting state. The fork store's fork-choice archive is the place where branch-specific state is replayed and canonical selection/reorganization occurs.
+
+This is the right conceptual boundary for CP-0567. It is not permission to add capability state directly to production consensus today: the current PMT4 node harness is loopback-only and local PFM4 persistence is used in its peer-smoke path.
+
+## 2. Non-negotiable invariants
+
+1. No delegated payment may be authorized solely by RPC, mempool admission, or an agent-held account key. The canonical block state transition must enforce the capability.
+2. Capability state, account balances/nonces, fees, transaction replay protection, and capability spend counters must commit or reject as one deterministic state transition.
+3. A failed block candidate must leave the prior state byte-for-byte/logically unchanged.
+4. Replaying the same canonical history must produce the same capability registry root and monetary state root on every conforming node.
+5. Fork choice/reorg must select capability state by replaying the selected branch, not by retaining mutable side effects from a previously canonical branch.
+6. A revoked, expired, exhausted, wrong-network, wrong-asset, wrong-recipient, wrong-agent, wrong-service, or over-fee capability must fail closed.
+7. No capability can mint, alter issuance, bypass ordinary account nonce rules, or bypass ordinary fee/balance checks.
+8. Initial scope is QZXB only and one explicit network/manifest domain. No implicit multi-asset or cross-chain authority.
+
+## 3. Proposed state model (conceptual Rust types)
+
+`CapabilityId = Hash(domain || network_id || owner_id || owner_nonce || canonical_policy_bytes)`.
+
+`AgentCapability` immutable fields:
+- capability_id, network_id, manifest_id, owner_account_id;
+- agent_key_id / agent public-key commitment and authorization scheme;
+- asset_id (initially the one native QZXB asset identifier only);
+- max_amount_per_payment, max_total_amount;
+- max_fee_per_payment, max_total_fee;
+- allowed_recipient_set (sorted, unique, bounded);
+- allowed_service_action_set (canonical identifiers, sorted, unique, bounded);
+- not_before and exclusive expiry (unit must be fixed before wire-format approval);
+- policy_version, owner_nonce, optional approval threshold;
+- canonical policy digest.
+
+Mutable consensus state:
+- capability record or tombstone;
+- amount_spent_total and fee_spent_total;
+- next capability-use nonce (or a separately domain-separated per-capability sequence);
+- revoked flag / revocation height and policy epoch;
+- deterministic registry commitment included in the monetary state root.
+
+Do not store an unbounded list of every historical payment in the capability record. Use monotonic counters and existing transaction/block history for auditability; define pruning only after snapshot/recovery rules are specified.
+
+## 4. Proposed action semantics
+
+The block's ordered action stream needs three semantic operations:
+
+A. `RegisterCapability`: owner-authenticated; validates owner account nonce, policy bounds, canonical encoding, unique capability ID, owner/agent separation, expiry range, and network/manifest binding. Registration initializes counters to zero.
+
+B. `RevokeCapability`: owner-authenticated; validates owner nonce and capability ownership; creates a deterministic revocation state/tombstone. Revocation is irreversible for a capability ID. Re-authorization creates a new ID and policy version; no silent mutation of an existing signed policy.
+
+C. `DelegatedPayment`: agent-authenticated; binds capability ID, policy version, agent identity, capability-use nonce, asset, recipient, amount, fee, service/action ID, network, manifest and expiry. It checks the stored capability and atomically increments amount/fee counters while applying the ordinary account transfer and fee debit.
+
+The action stream must preserve canonical block order. A capability registered earlier in a block may be usable later in that same block only if this is explicitly adopted; otherwise all registrations become effective at the next block. A revocation earlier in the block must invalidate later uses in that same block. This proposal recommends ordered same-block semantics because the existing candidate transition iterates block transactions in vector order, but this must be verified against all block encoding/decoding and producer/import paths before protocol freeze.
+
+## 5. Atomic delegated-payment transition
+
+For each delegated payment, in canonical action order:
+
+1. Verify exact network and manifest; reject wrong asset or unsupported scheme.
+2. Resolve capability ID; require active, correct policy version, not revoked, within validity interval.
+3. Verify agent signature over a domain-separated canonical digest containing every payment field and the capability ID/version.
+4. Require capability-use nonce exactly previous + 1; reject duplicate/replayed transaction/action IDs.
+5. Check recipient and service/action allowlists.
+6. Check per-payment amount and fee caps.
+7. Checked-add amount and fee to aggregate counters; reject overflow or cap exceedance.
+8. Apply ordinary sender/owner escrow or debit semantics, recipient credit, ordinary account nonce rules and fee-pool accounting. Exact debit model must be selected: owner-paid from owner account is preferred for initial design; agent must never gain independent spending power over owner funds outside the capability.
+9. Publish the cloned candidate state only after the complete block, subsidy, supply and state-root checks pass.
+
+Concurrency: two candidate payments against one capability in the same block are processed in canonical order against the evolving cloned state. Across competing branches, each branch gets independent replayed counters; only the selected branch is canonical. Mempool prechecks are advisory and must never reserve or authorize spend by themselves.
+
+## 6. Wire-format recommendation
+
+Do not mutate the fixed-width TXN4 encoding in place. It currently binds network/manifest, sender/recipient, nonce, amount, fee, expiry, identity scheme, and the Ed25519/ML-DSA-65 key/signature tuple; it has no capability ID, service scope, asset ID, or delegated-agent binding.
+
+Before selecting TXN5 versus a versioned block action envelope, write a separate wire-format decision with:
+- exact domain separators and canonical byte layout;
+- version/suite negotiation and downgrade rejection;
+- bounded lengths and canonical sorted allowlists;
+- signature coverage for every policy/payment field;
+- transaction/action IDs and replay domains;
+- backward compatibility and activation rules;
+- independent encode/decode test vectors.
+
+No silent projection from a delegated envelope to TXN4 is allowed because it would discard delegation authority fields.
+
+## 7. Fork choice, reorg, persistence and external anchoring
+
+- Capability registry and counters must be part of the branch's monetary state and state root, not a process-global side database.
+- Branch insertion/replay must derive capability state from the branch's parent state and ordered actions.
+- On reorg, canonical capability state becomes exactly the state derived from the newly selected branch. A payment that existed only on the abandoned branch must not remain counted or permanently consume a capability nonce on the new canonical branch.
+- Snapshot format/version must persist the capability registry root and all live capability records/counters/tombstones. Recovery must validate the complete state commitment against the selected chain tip and manifest.
+- If external CAS anti-rollback is adopted, the PFM4 pending-manifest/verified-receipt protocol must cover the exact manifest that commits both monetary and capability state. The current PMT4 peer-smoke runtime calls local `store.submit`; external-CAS store APIs exist separately and are not wired into that runtime. Do not claim external anti-rollback protection for this path until node startup, commit, restart and recovery use the anchored API end-to-end.
+- Provider ambiguity, crash between pending-manifest sync and CAS, crash after CAS before local publication, stale signed anchor, and full-disk rollback all need deterministic recovery tests.
+
+## 8. Mandatory deterministic test vectors before implementation approval
+
+Positive cases:
+- owner registers; authorized agent pays allowed recipient within caps;
+- multiple payments consume aggregate budget exactly to the boundary;
+- valid fee boundary and expiry just before exclusive expiry;
+- same-block ordering if adopted; persistence/restart; archive replay; fork switch and switch-back.
+
+Negative/adversarial cases:
+- wrong owner, agent key, network, manifest, asset, recipient, service/action, policy version;
+- altered amount/fee/recipient/service/nonce after signature;
+- duplicate capability ID, duplicate payment ID, replayed capability nonce;
+- amount/fee one atom above per-payment and aggregate caps;
+- integer overflow; zero/invalid limits; oversized allowlists; duplicate/noncanonical entries;
+- expired and not-yet-valid boundaries;
+- revoke then spend; spend then revoke; duplicate revocation; unauthorized revocation;
+- two simultaneous submissions racing for final budget; deterministic canonical ordering;
+- reorg removes registration, payment, or revocation; abandoned-branch counters and nonce do not leak;
+- crash at each persistence/CAS boundary; restart with stale or mismatched anchor; corrupted snapshot; rollback to older disk image;
+- downgrade to TXN4 or legacy TXN2; malformed version/suite; signature suite mismatch.
+
+Every rejected block must preserve prior state root, account balances/nonces, fee pool, capability counters, registry commitment and selected tip.
+
+## 9. Open decisions (must be resolved before wire format or consensus code)
+
+1. Owner-paid transfer model versus a dedicated owner escrow account. Recommendation: owner-paid direct debit with a capability-specific allowance counter, not transferable agent-held owner keys.
+2. Block-height versus timestamp validity. Recommendation: block-height after a reliable production clock/finality contract exists; until then do not freeze semantics. TXN4 currently uses block timestamp for exclusive `expires_at`.
+3. Same-block registration/revocation effectiveness. Recommendation: ordered block action semantics with revoke immediately effective for later actions; confirm all producer/import code preserves the same order.
+4. Per-capability nonce versus owner account nonce for capability management. Recommendation: owner account nonce for register/revoke plus independent capability-use nonce for agent payments.
+5. Native protocol action versus smart-contract implementation. Recommendation: keep policy enforcement in the ledger for v1; do not trust an off-chain agent gateway or ordinary smart-contract caller to enforce the spending ceiling.
+6. Asset ID representation and future multi-asset scope. Initial implementation must remain native QZXB only.
+7. State growth, tombstone retention, capability limits per owner, maximum allowlist sizes and pruning proofs.
+8. Finality and revocation UX: no claim that a revocation is irreversible until the chain's finality/reorg contract is specified.
+
+## 10. Implementation gate
+
+A1C is a proposal only. The next implementation step, if separately approved, is a pure Rust capability policy/state-transition module with typed errors and deterministic vectors, independent of node CLI, peer protocol, wire format, Genesis and live monetary state. It must operate on cloned candidate state and return a new state plus execution summary; no I/O, clocks, network calls, or mutable global state. Only after that module passes adversarial/property tests should the team decide the canonical wire envelope and integration into PMT4 block execution.
+
+No production code, consensus behavior, Genesis, supply schedule, wallet, node flags, network configuration, or live balance was changed in this proposal.
