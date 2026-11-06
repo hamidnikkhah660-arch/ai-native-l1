@@ -38,7 +38,7 @@
 
 ## 4. Mining schedule qualification
 
-The QFP6 CP-0528 candidate currently carries the inherited research values of 35.673515981 QZXB initial subsidy and 4,204,800 blocks per halving. Its deterministic integer-halving test totals 2,999,999,999.139264 QZXB, leaving **0.860736 QZXB** of the 3B ceiling unissued because rewards are rounded down to base units. Before a production profile is frozen, explicitly choose either:
+The QFP6 CP-0528 candidate currently carries the inherited research values of 356.73515981 QZXB initial subsidy (35,673,515,981 base units at 8 decimals) and 4,204,800 blocks per halving. Its deterministic integer-halving test totals 2,999,999,999.139264 QZXB, leaving **0.860736 QZXB** of the 3B ceiling unissued because rewards are rounded down to base units. Before a production profile is frozen, explicitly choose either:
 
 - retain the 3B amount as a **maximum ceiling**, with the 0.860736 QZXB dust permanently unissued and documented; or
 - revise the deterministic schedule and independent reference vectors so the intended issuance amount is reached exactly without exceeding the ceiling.
