@@ -262,9 +262,9 @@ This section supersedes the narrower PR90-93-only dependency reference in 11.7 i
 
 A direct tree comparison against `origin/main` confirms:
 
-- Already present on `main`: `external_cas_anchor_candidate.rs`, `store_writer_lock.rs`, `private_testnet_fork_store.rs`, `devnet_node.rs`, and `private_testnet_node.rs`.
+- Already present on `main`: `external_cas_anchor_candidate.rs`, `store_writer_lock.rs`, `private_testnet_fork_store.rs`, `devnet_node.rs`, and `bin/private_testnet_node.rs`.
 - Not present on `main`: `qrun_v05_pow_local_node.rs` and `qrun_v05_pow_fork_runtime_candidate.rs`, which are introduced/extended by the PR #87/#90 candidate stack.
-- The current PMT4 peer-smoke entrypoint is `run_monetary_v4_hybrid_peer_smoke` in `private_testnet_node.rs`; it is the current integration target, not the absent v0.5 local-node binary.
+- The current PMT4 peer-smoke entrypoint is `run_monetary_v4_hybrid_peer_smoke` in `bin/private_testnet_node.rs`; it is the current integration target, not the absent v0.5 local-node binary.
 
 Therefore PR #90's node-startup wiring cannot be cherry-picked into current `main` as-is. PR #87's disk provider, PR #89's floor store, and PR #91's KMS signer are useful source references, but their adapters and dependencies must be reviewed against the existing `ExternalCasPin` / `ExternalCasRecord` contract and then integrated deliberately into the PMT4/PFM4 path. Do not revive the old v0.5 binary merely to make the stacked PR compile. The next safe engineering task is a narrow mainline compatibility design for provider open/verify/commit, floor advancement, startup fail-closed behavior, and restart/recovery tests, with independent provider deployment kept as a separate release gate.
 ### 11.12 PR #60 PFM5 checkpoint replay source review
@@ -286,3 +286,8 @@ Reviewed PR #60 (`work/cp0390-pfm5-checkpoint-fork-choice`, head `9206f545926d6c
 5. The focused new regression checks the valid sibling case and incomplete digest-set rejection. Before production integration, add adversarial checkpoint/replay vectors for invalid parent/height, wrong network/profile/manifest, malformed and oversized envelopes, invalid post-checkpoint PoW/target, missing parent, duplicate digest, replayed or omitted branch, canonical-tip mismatch, rollback of anchor/generation/height, and restart/power-loss around durable publication.
 
 **Decision:** retain PR #60 as the preferred existing checkpoint-replay primitive and do not write a second checkpoint fork-choice implementation. Do not merge it solely on CI. The next implementation proposal should be a mainline PFM5 durable-store/recovery adapter that reuses this method, defines the independently administered monotonic anchor/floor contract, and is tested against the current PMT4/PFM4 node path. Keep that integration separate from Genesis, monetary-policy and TXN4 wire changes.
+### 11.13 Current PMT4 node-to-store startup boundary
+
+A direct call-site inspection of `src/native/pow_bench/src/bin/private_testnet_node.rs` confirms that `run_monetary_v4_hybrid_peer_smoke` currently opens `PrivateTestnetV4HybridForkStore` with the local-only `open(...)` API. The peer-smoke runtime does not call `open_with_external_cas(...)`; `open_anchored(...)` occurrences in this binary are in test/recovery paths, not the live peer-smoke startup path. The store module exposes the external-CAS API and extensive unit coverage, but the current node startup does not yet require a fresh independently verified remote anchor before serving PMT4 state.
+
+This makes the integration gap concrete: (1) provider and independent-floor adapters, (2) protected operator configuration/credentials and remote monotonic trust source, (3) a fail-closed PMT4 node startup path using `open_with_external_cas`, and (4) restart/crash/reorg/recovery tests through the actual node entrypoint. Do not describe external-CAS API unit tests as proof that the PMT4 peer node is already externally anchored.
