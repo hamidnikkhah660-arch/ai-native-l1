@@ -90,6 +90,31 @@ Live GitHub review of PRs #123-#128 confirms a strict six-branch Draft stack; ea
 - The Windows job specifically passed signed TXN4 submission, invalid-signature rejection, peer propagation/replay, and PFM4 paged archive sync with inter-page reorg and stale-cursor rejection. Scope is the workflow's two-node loopback test, not public-network qualification.
 - Prior exact-head run [42235955343](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/42235955343) for `faef79f...` was CANCELLED/superseded; it is not a failed test and not a passing complete run. Run [42234319470](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/42234319470) passed only for its own earlier commit `b4758e0...`.
 
+## 3.7 Required PFJ1 / high-water / ECR1 caller state machine (design only)
+
+The source APIs inspected on PR #126-#128 imply this ordering. This is an integration contract for the future caller, not an implemented or production-qualified workflow.
+
+**Explicit bootstrap:** obtain a fresh authenticated ECR1 record and object-generation observation from the pinned provider; independently establish the external high-water authority identity/trust material; initialize PFJ1 exactly once from that verified record; initialize the independent high-water state to the exact PFJ1 Ready snapshot. Missing/corrupt local state, missing authority state, identity mismatch or uncertain bootstrap must stop. Never recreate either floor automatically from the current local disk.
+
+**New publication transaction:**
+
+1. Read authenticated high-water state and load PFJ1 with its sequence, ECR1 generation and object-generation floors. Require `verify_ready_snapshot` to prove exact equality before preparing a new operation.
+2. Build the complete PFM5 immutable bundle only from the trusted checkpoint context and a branch archive that has already passed bounded consensus replay and checkpoint-authenticity policy. Prepare one deterministic `Pfm5ExternalCasIntent` against the exact Ready ECR1 predecessor/object generation.
+3. Call PFJ1 `stage_intent` and durably read back the exact Prepared intent. Before any object publication or ECR1 CAS, call `advance_prepared_snapshot` against the independent authority. If this step cannot be authenticated and reconciled, do not call CP-0394.
+4. Call CP-0394 `execute_intent` with that exact persisted intent and bundle. It performs a fresh signed ECR1 read, immutable object publication/read-back and exact CAS; on ambiguous CAS reply it performs another fresh signed read. Never generate a replacement intent merely because the result is ambiguous.
+5. For `Committed`, `AlreadyCommitted` or `CommittedAfterAmbiguousReply`, finalize PFJ1 with the exact successor record and observed advanced object generation using `mark_committed`; then advance the independent authority using `advance_finalized_snapshot`. If either operation is ambiguous, reread the independent authority and reconcile exact states; do not admit a new transaction.
+6. For `RetrySameIntent`, leave PFJ1 Prepared and the high-water Prepared floor intact; retry only the same byte-identical intent after a fresh authenticated reconciliation. For competing successor, wrong domain, missing object, invalid receipt, rollback, unresolved read or any ambiguous trust state, preserve evidence and fail closed.
+
+**Crash/restart recovery matrix:**
+
+- Crash after PFJ1 staging but before Prepared high-water advance: PFJ1 is Prepared while authority is still the exact prior Ready state. Re-authenticate both and advance only that exact Prepared state; no remote publication may have happened yet.
+- Crash after Prepared high-water advance but before/during object publication or ECR1 CAS: load the exact Prepared intent, prove the authority matches it, reconstruct/fetch the referenced bundle and replay it, then retry only that same intent through CP-0394's fresh signed read.
+- Crash after ECR1 CAS commit but before PFJ1 finalization: PFJ1 remains Prepared; CP-0394's fresh read must identify the exact successor, after which PFJ1 can be finalized.
+- Crash after PFJ1 finalization but before Finalized high-water advance: PFJ1 is Ready at the successor while authority remains at the exact Prepared predecessor. Advance the Finalized authority transition; do not incorrectly require `verify_ready_snapshot` first.
+- Local journal rollback while authority already records the exact finalized successor: use `observe_finalized_floor_for_prepared_intent` only for the exact pending intent and then repair PFJ1 from that independently authenticated evidence. Any other sequence/record/object-generation combination is a conflict and fails closed.
+
+**Important implementation checks before coding:** the current PR #126 `execute_intent` may republish/read back objects on exact-successor recovery; provider create-if-absent and byte-exact read-back must be truly idempotent. Define how the caller obtains a verified bundle when recovering a Prepared intent (manifest commitment is not enough without fetching every referenced PCP4/envelope and replaying). Define resource ownership/lifetimes for all three provider clients and ensure no locks are held across remote network calls unless explicitly designed. Add crash injection at every boundary above, lost replies at both ECR1 and high-water CAS, concurrent writers, partition/reconnect, local disk rollback, provider object-generation mismatch and key/identity rotation. Do not implement production wiring until concrete independently administered provider adapters and checkpoint authenticity are approved.
+
 ## 4. Other important evidence and project constraints
 
 - **QFP6/QAP1:** workflow run [42205440686](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/42205440686) passed a private NetBird cross-host admission/restart qualification. State root, height, and generation matched across restart. It used a private overlay; it is not public-Internet convergence or Mainnet proof. Do not claim replay rejection passed unless a specific passing marker/test is verified.
