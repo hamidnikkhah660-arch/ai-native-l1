@@ -4072,8 +4072,13 @@ mod tests {
             watchdog_flag.store(true, std::sync::atomic::Ordering::Release);
         });
 
+        // NetBird can lazily re-activate an idle peer between the admission and
+        // restart processes. Use the supported 30-second connection ceiling for
+        // this cross-host qualification worker instead of the 5-second default.
+        let remote_connect_timeout = Duration::from_secs(30);
+        println!("QFP6_QAP1_REMOTE_CONNECT_TIMEOUT_SECONDS=30");
         let mut coordinator = {
-            let provider_transport = NoiseTcpExternalCasProviderTransport::new(
+            let provider_transport = NoiseTcpExternalCasProviderTransport::with_timeout(
                 provider_address,
                 provider_client_private,
                 provider_server_public,
@@ -4084,6 +4089,7 @@ mod tests {
                     receipt_key_id: [0xE8; 32],
                     receipt_public_key: provider_receipt_public,
                 },
+                remote_connect_timeout,
             )
             .unwrap();
             let provider_pin = ExternalCasPin {
@@ -4093,12 +4099,13 @@ mod tests {
                 receipt_key_id: [0xE8; 32],
                 receipt_public_key: provider_receipt_public,
             };
-            let anchor_transport = NoiseTcpOffhostAnchorTransport::new(
+            let anchor_transport = NoiseTcpOffhostAnchorTransport::with_timeout(
                 anchor_address,
                 anchor_client_private,
                 anchor_server_public,
                 anchor_pin.clone(),
                 provider_pin.clone(),
+                remote_connect_timeout,
             )
             .unwrap();
             let floor =
