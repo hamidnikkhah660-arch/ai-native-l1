@@ -103,6 +103,11 @@ Therefore the AWS adapter must define a separate, versioned storage/authenticati
 Private signing keys or other secret authentication material must remain outside DynamoDB items and outside node-readable configuration. A key ID is metadata, not a substitute for proof verification. `read_authenticated` must verify the envelope/proof and all domain bindings before constructing and returning the Rust state. `compare_and_advance` must independently validate both caller states, enforce the CP-0396 transition rules, compute canonical digests, perform the single conditional write, and authenticate the fresh readback before returning success or classifying an ambiguous outcome.
 
 The exact canonical encoding, digest domain tag, proof mechanism, key bootstrap ceremony, and key-rotation state machine remain explicit design decisions to freeze before implementation. Until then, the document specifies acceptance properties, not a complete interoperable wire protocol. Conformance tests must include cross-version canonicalization rejection, tampered envelope/proof, wrong key ID, revoked key, and authority-key rotation.
+
+### 7.1 Additional caller-side recovery review finding
+
+A source review of `observe_finalized_floor_for_prepared_intent` found that the current helper checks for a pending intent, the expected next journal sequence, the successor ECR1 record, and an increased object generation. Before this helper can be treated as a recovery authorization boundary, it should also validate the complete retained prepared snapshot against that intent: require the snapshot to be in the Prepared state, require `last_record == intent.expected_current`, require `object_generation == intent.expected_object_generation`, and run `intent.validate(pin)`. The present unit tests cover a successful prepared-to-finalized observation but do not exercise these malformed-predecessor cases. Add negative regression tests proving each mismatch fails closed and performs no provider write; until that is done and reviewed, this helper's returned floor must not be treated as sufficient evidence to finalize a rolled-back journal.
+
 ## 8. Implementation sequence and gates
 
 1. Review CP-0396 caller ordering and CP-0395 journal rollback semantics together.
