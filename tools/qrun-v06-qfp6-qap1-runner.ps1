@@ -71,14 +71,33 @@ function Invoke-Qfp6Worker([string]$Role, [string]$ExpectedAnchor, [string]$Expe
         $env:QRUN_QFP6_QAP1_EXPECTED_GENERATION = $ExpectedGeneration
         $env:QRUN_QFP6_QAP1_EXPECTED_STATE_ROOT = $ExpectedStateRoot
     }
-    $output = & cargo test --locked --manifest-path $manifest --lib qrun_v06_node_runtime_candidate::tests::qfp6_qap1_process_worker -- --exact --nocapture 2>&1
-    $exitCode = $LASTEXITCODE
-    $text = ($output | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
-    if ($exitCode -ne 0) {
-        Write-Output $text
-        throw "QFP6 QAP1 worker role '$Role' exited with code $exitCode."
+    $workerLog = Join-Path $env:TEMP ('qfp6-qap1-worker-' + $Role + '-' + [guid]::NewGuid().ToString('N') + '.log')
+    $previousBacktrace = $env:RUST_BACKTRACE
+    $env:RUST_BACKTRACE = '1'
+    try {
+        Write-Host ('QFP6_WORKER_ROLE_START=' + $Role)
+        Write-Host ('QFP6_WORKER_LOG_PATH=' + $workerLog)
+        & cargo test --locked --manifest-path $manifest --lib qrun_v06_node_runtime_candidate::tests::qfp6_qap1_process_worker -- --exact --nocapture 2>&1 | ForEach-Object {
+            $line = [string]$_
+            [System.IO.File]::AppendAllText($workerLog, $line + [Environment]::NewLine)
+            Write-Host ('QFP6_WORKER_LOG: ' + $line)
+        }
+        $exitCode = $LASTEXITCODE
+        $text = if (Test-Path -LiteralPath $workerLog) { [System.IO.File]::ReadAllText($workerLog) } else { '' }
+        Write-Host ('QFP6_WORKER_ROLE_EXIT=' + $Role + ';CODE=' + $exitCode)
+        if ($exitCode -ne 0) {
+            if ([string]::IsNullOrWhiteSpace($text)) { Write-Host 'QFP6_WORKER_LOG_EMPTY=True' }
+            throw "QFP6 QAP1 worker role '$Role' exited with code $exitCode."
+        }
+        return $text
     }
-    return $text
+    finally {
+        if ($null -eq $previousBacktrace) {
+            Remove-Item Env:RUST_BACKTRACE -ErrorAction SilentlyContinue
+        } else {
+            $env:RUST_BACKTRACE = $previousBacktrace
+        }
+    }
 }
 
 try {
