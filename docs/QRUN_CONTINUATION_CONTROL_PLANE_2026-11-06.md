@@ -229,3 +229,15 @@ The high-water record stores monotonic sequence plus ECR1 record and object gene
 - This is CI evidence for the exact documentation commit and the exercised existing PMT4/PFM4/EVM paths. It does **not** qualify PFM5 production adapters, PFM5 node-startup integration, independent public hosts, public Mainnet readiness, or a QZXB/USDT market.
 - PR #138 remains OPEN, non-Draft, unmerged; merge state was `UNSTABLE` at the last check. No merge or deployment was performed.
 - Worktree was clean and synchronized with `origin/docs/qrun-master-roadmap-20261106` before this checkpoint update. Re-verify branch, worktree, PR and the new exact-head CI after committing this documentation update.
+
+## 9.4 Exact-head CI and PR recheck (2026-11-06, 18:18 Europe/Warsaw)
+
+- Documentation commit `87c669bce33c20aeaed5b6717e80651895381d6c` (`docs(qrun): record exact-head CI success`) was checked against GitHub Actions run [42240814998](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/42240814998). The run completed **SUCCESS** for this exact head.
+- Rust `Format, check, and test`: formatting, all-target check, and `Test every target` all passed.
+- Windows PMT4/TXN4 two-node loopback: signed TXN4 submission, invalid-signature rejection, peer propagation/replay, and PFM4 paged archive sync with inter-page reorg and stale-cursor rejection all passed.
+- EVM contract, wallet console, and dependency audit: all steps passed.
+- `gh pr view 138` confirms PR #138 remains OPEN, non-Draft and unmerged; exact head is `87c669bce33c20aeaed5b6717e80651895381d6c`; all three required checks are SUCCESS; `mergeStateStatus=CLEAN`. CLEAN means GitHub currently reports no merge conflict/blocking state; it is not owner authorization to merge.
+- Local branch `docs/qrun-master-roadmap-20261106` was clean and synchronized with its origin tracking branch at verification.
+- Scope limitation remains: this CI does not qualify a real PFM5 high-water adapter, authenticated external authority, production object/ECR1 providers, PFJ1/high-water orchestration in PMT4 node startup, independent operator hosts, public Mainnet readiness, or a QZXB/USDT market.
+- No merge, deployment, publication, consensus/Genesis/economic change, release-gate change, or network configuration change was performed.
+- Next safe engineering task: specify and qualify the real PFM5 provider boundary (out-of-band authority pin, durable monotonic state, linearizable CAS, concurrent independent-host behavior, ambiguous replies, rollback/restart/partition tests) before selecting or wiring a production adapter. Provider choice, credential provisioning, and any live service creation require owner authorization.
