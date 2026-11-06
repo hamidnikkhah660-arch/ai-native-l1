@@ -88,7 +88,22 @@ The High-Water authority is not a journal backup and does not contain the full P
 
 If PFJ1 remains `Prepared` and the floor indicates the exact finalized successor, recovery still requires validation of the retained exact pending intent, a fresh authenticated ECR1 read, and independent verification of the referenced immutable objects/generation before idempotently reconciling local journal and floor state. A greater object-generation number alone is not proof that the correct objects exist.
 
-## 7. Implementation sequence and gates
+## 7. Contract-to-storage mapping and authentication boundary
+
+The current CP-0396 Rust contract is the logical state boundary, not a finalized AWS wire format. `Pfm5ExternalCasHighWaterState` currently carries the authority ID, provider ID, network ID, Genesis digest, journal sequence, complete `ExternalCasRecord`, and object generation. The provider trait receives the authority pin and `ExternalCasPin` separately. The current authority pin contains an authority ID; it does not itself carry a public key, signature, schema version, or caller-supplied state digest.
+
+Therefore the AWS adapter must define a separate, versioned storage/authentication envelope without pretending those fields already exist in the Rust state type. At minimum, the envelope design must specify:
+
+- a canonical encoding/version for every logical state field, including the complete ECR1 record;
+- a domain-separated digest computed by the adapter from the canonical bytes (never accepted as an unverified caller assertion);
+- a key identifier and authenticated response proof, or an equivalently reviewed authenticated transport tied to an out-of-band authority pin;
+- an explicit mapping from the pinned authority ID to the independently provisioned verification identity and its rotation/revocation policy;
+- the exact DynamoDB key and conditional-expression attributes needed to compare the full expected predecessor, including sequence, state digest, provider/network/Genesis identity and object generation.
+
+Private signing keys or other secret authentication material must remain outside DynamoDB items and outside node-readable configuration. A key ID is metadata, not a substitute for proof verification. `read_authenticated` must verify the envelope/proof and all domain bindings before constructing and returning the Rust state. `compare_and_advance` must independently validate both caller states, enforce the CP-0396 transition rules, compute canonical digests, perform the single conditional write, and authenticate the fresh readback before returning success or classifying an ambiguous outcome.
+
+The exact canonical encoding, digest domain tag, proof mechanism, key bootstrap ceremony, and key-rotation state machine remain explicit design decisions to freeze before implementation. Until then, the document specifies acceptance properties, not a complete interoperable wire protocol. Conformance tests must include cross-version canonicalization rejection, tampered envelope/proof, wrong key ID, revoked key, and authority-key rotation.
+## 8. Implementation sequence and gates
 
 1. Review CP-0396 caller ordering and CP-0395 journal rollback semantics together.
 2. Freeze the canonical High-Water wire schema, digest domain separation and authority authentication/rotation policy.
@@ -99,7 +114,7 @@ If PFJ1 remains `Prepared` and the floor indicates the exact finalized successor
 7. Run two-host concurrency, lost-ack, partition, crash, disk rollback and authority-restore drills.
 8. Wire the qualified adapter into the PFM5 caller only after independent review; keep public launch and mint gates closed until all other launch criteria are independently satisfied.
 
-## 8. Explicitly not completed / not authorized
+## 9. Explicitly not completed / not authorized
 
 - No AWS account, DynamoDB table, KMS key, IAM role, secret or credential was created or accessed.
 - No cloud cost was incurred or authorized.
