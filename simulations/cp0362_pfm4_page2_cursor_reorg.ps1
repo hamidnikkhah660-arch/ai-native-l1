@@ -114,11 +114,17 @@ try {
     if (-not (Wait-Pattern $logC 'event=monetary_v4_archive_range_item_imported.*status=ACCEPTED height=1 ' 12000)) {
         throw ("CP-0362 client did not accept the first baseline page: " + (Get-Text $logC) + (Get-Text $logB))
     }
-    Assert-Log $logB 'event=devnet_archive_range_page_served.*page=1 .*items=1' 'first range page sent from the old snapshot'
+    if (-not (Wait-Pattern $logB 'event=devnet_archive_range_page_served.*page=1 .*items=1' 12000)) {
+        throw ("CP-0362 source did not log page 1 after client acceptance: " + (Get-Text $logB))
+    }
     if (-not (Wait-Pattern $logC 'event=monetary_v4_archive_range_item_imported.*status=ACCEPTED height=2 ' 12000)) {
         throw ("CP-0362 client did not accept the second page before the reorg: " + (Get-Text $logC) + (Get-Text $logB))
     }
-    Assert-Log $logB 'event=devnet_archive_range_page_served.*page=2 .*items=1' 'second range page sent from the old snapshot'
+    # The receiver can import the encrypted page just before the sender's stderr event is flushed.
+    # Wait for the sender-side evidence instead of racing an immediate log assertion.
+    if (-not (Wait-Pattern $logB 'event=devnet_archive_range_page_served.*page=2 .*items=1' 12000)) {
+        throw ("CP-0362 source did not log page 2 after client acceptance: " + (Get-Text $logB))
+    }
     if (-not (Wait-Pattern $logB 'event=test_fault_reorg_after_pfm4_archive_page old_tip=[0-9a-f]{64} new_tip=[0-9a-f]{64} canonical_height=4 trigger_page=2' 12000)) {
         throw ("CP-0362 source did not reorg after sending page 2: " + (Get-Text $logB))
     }
