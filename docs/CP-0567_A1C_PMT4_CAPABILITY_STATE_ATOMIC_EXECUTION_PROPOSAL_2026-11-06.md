@@ -171,3 +171,30 @@ The safest next coding boundary is now more precise:
 4. Treat external-CAS integration as a separate end-to-end deployment gate: node startup, submit, crash recovery, restart and operator-held anchor must use the anchored API and be independently tested.
 
 **Audit conclusion:** QRun already has useful candidate machinery for atomic state transitions, branch-local replay/reorg, durable PFM4 manifests and a separate external-CAS API. The missing capability is not generic fork-choice from scratch; it is deterministic, committed and persisted agent-capability state plus its execution semantics and production wiring. This section is a source audit, not implementation evidence or launch approval.
+
+### 11.6 Existing QVAAC agent-capability implementation — mandatory reuse check
+
+A broader repository/branch audit on 2026-11-06 found an important pre-existing implementation that was not included in the first CP-0567 source-path review. Before writing any new agent-capability Rust module, reuse and reconcile this work:
+
+- PR #93, `feat/qrun-qvap-offline-prototype-20261030`, commit `801471c90b307a5c12f6785173d2d8986ffb74d3`, adds `src/native/pow_bench/src/qrun_verifiable_agentic_settlement_candidate.rs` (1,478 lines) and `src/native/pow_bench/src/qrun_verifiable_asset_passport_candidate.rs` (1,594 lines), plus CP-0474/CP-0475 product/design records.
+- The existing `QvaacAgentCapabilityGrant` already binds network, grant ID, principal/owner, agent ID/key ID, intent digest, asset class, counterparty, allowed-action mask, per-transaction spend cap, cumulative spend cap, prior-spend value, not-before/expiry, sequence, revocation epoch, signature algorithm and signature.
+- The existing `QvaacEscrowCandidate` has deterministic shape/digest checks, injected grant/evidence/fulfilment verifier interfaces, rechecks grant and evidence at funding, enforces per-transaction and cumulative spend limits, models escrow funding, independent evaluator fulfilment/rejection, timeout refund, and hash-linked event/receipt verification. PR #93 records 15 QVAP tests and 16 QVAAC tests passing in its isolated Windows validation.
+
+This is substantial prior art and overlaps the proposed CP-0567 agent grant/policy model. **Do not create a second standalone capability-policy module or duplicate QVAAC grant/escrow state machine.** The next engineering step must be a focused gap analysis and adaptation plan against this existing candidate.
+
+Important gaps remain, so PR #93 is not equivalent to CP-0567 ledger enforcement:
+
+1. PR #93 is still Draft and stacked on PR #92; its own body says the PR90 → PR91 → PR92 dependency chain must be reviewed first. It is not part of `main` and is not production-integrated.
+2. Grant cryptographic verification is an injected adapter contract; the test verifier is deliberately non-cryptographic. No production AAP/wallet signature, key-status, or durable revocation-registry adapter is connected.
+3. `spent_before` and `spent_after` belong to the isolated escrow candidate. There is no canonical global capability registry, atomic shared counter across multiple transactions, block ordering, or concurrency-safe reservation/consumption in `MonetaryLedgerState`.
+4. The candidate does not wire capability state into TXN4/PMT4 consensus execution, monetary state root, durable monetary snapshot, branch replay/reorg, node/mempool/peer paths or external-CAS recovery.
+5. The grant currently models amount limits, not the complete CP-0567 fee-cap policy; its counterparty/action scope is intent-specific rather than a general canonical recipient/service/asset policy registry. These differences require explicit mapping, not assumptions.
+
+### 11.7 Revised no-duplicate implementation sequence
+
+1. Treat PR #93 / CP-0475 QVAAC as the existing application-level capability and escrow prototype. Review its complete code/tests and dependency chain; do not rebuild its existing grant, fulfilment, refund, event or receipt mechanisms.
+2. Produce a concise gap matrix mapping QVAAC grant fields and transitions to CP-0567 requirements (including fee caps, capability lifecycle, canonical nonce/replay, atomic multi-payment counters, owner debit, block ordering, revocation, and branch semantics). Prefer extending/reusing the existing types where their semantics fit; introduce a new type only for a demonstrated incompatible consensus requirement.
+3. Separately design how the adapted capability state becomes part of `MonetaryLedgerState`, block execution, state root, versioned snapshot and branch replay. This is the genuinely missing protocol/consensus layer.
+4. Only after the PR90–93 dependency chain is reconciled and the gap matrix is reviewed should code integration be proposed. Keep all new work isolated from Genesis, supply, TXN4 wire bytes and live network until the explicit consensus/wire-format gates are approved.
+
+**Audit correction:** The earlier A1C recommendation for a new pure Rust capability module is superseded by this repository-wide finding. The correct next step is reuse-first gap analysis of QVAAC, followed by the missing canonical-ledger integration design—not a parallel implementation.
