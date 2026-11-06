@@ -4607,11 +4607,19 @@ mod tests {
         let callback_ip = callback_peer.ip();
         assert_qap1_netbird_overlay_ip(callback_ip);
         assert_qap1_test_bind_address(SocketAddr::new(callback_ip, 49_663));
+        // The callback listener is nonblocking for bounded accept polling. Explicitly
+        // restore blocking mode on the accepted stream: on Windows the accepted socket
+        // can retain nonblocking behavior, where a delayed DONE line returns WSAEWOULDBLOCK
+        // instead of honoring the configured read timeout.
+        callback_stream
+            .set_nonblocking(false)
+            .expect("set Node A callback stream to blocking mode");
         let mut callback_reader = std::io::BufReader::new(callback_stream);
         callback_reader
             .get_ref()
             .set_read_timeout(Some(Duration::from_secs(600)))
             .unwrap();
+        println!("QFP6_QAP1_NODE_A_CALLBACK_BLOCKING_MODE=PASS");
         let mut ready_line = String::new();
         std::io::BufRead::read_line(&mut callback_reader, &mut ready_line).unwrap();
         let ready = qap1_callback_fields(&ready_line);
