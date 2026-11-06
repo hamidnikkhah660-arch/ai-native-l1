@@ -265,10 +265,10 @@ try {
             throw "First QFP6 process omitted required evidence marker: $marker"
         }
     }
-    $anchor = [regex]::Match($firstOutput, '(?m)^QFP6_QAP1_MANIFEST_ANCHOR=([0-9a-fA-F]{64})$').Groups[1].Value
-    $stateRoot = [regex]::Match($firstOutput, '(?m)^QFP6_QAP1_STATE_ROOT=([0-9a-fA-F]{64})$').Groups[1].Value
-    $height = [regex]::Match($firstOutput, '(?m)^QFP6_QAP1_HEIGHT=([0-9]+)$').Groups[1].Value
-    $generation = [regex]::Match($firstOutput, '(?m)^QFP6_QAP1_GENERATION=([0-9]+)$').Groups[1].Value
+    $anchor = [regex]::Match($firstOutput, '(?m)^QFP6_QAP1_MANIFEST_ANCHOR=([0-9a-fA-F]{64})\r?$').Groups[1].Value
+    $stateRoot = [regex]::Match($firstOutput, '(?m)^QFP6_QAP1_STATE_ROOT=([0-9a-fA-F]{64})\r?$').Groups[1].Value
+    $height = [regex]::Match($firstOutput, '(?m)^QFP6_QAP1_HEIGHT=([0-9]+)\r?$').Groups[1].Value
+    $generation = [regex]::Match($firstOutput, '(?m)^QFP6_QAP1_GENERATION=([0-9]+)\r?$').Groups[1].Value
     Assert-Hex32 'Committed QFP6 manifest anchor' $anchor
     Assert-Hex32 'Committed QFP6 state root' $stateRoot
     if ($height -ne '1' -or $generation -ne '1') {
