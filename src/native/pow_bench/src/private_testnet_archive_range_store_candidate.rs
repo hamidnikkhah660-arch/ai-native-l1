@@ -28,6 +28,78 @@ pub const MAX_ARCHIVE_RANGE_WAL_BYTES: u64 = 300 * 1024 * 1024;
 const LENGTH_PREFIX_BYTES: usize = 4;
 const CHECKSUM_BYTES: usize = 32;
 
+fn invalid_archive_wal_file() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "archive range WAL must be a regular, non-reparse file",
+    )
+}
+
+/// Open a WAL without following a final symlink or blocking on a FIFO swapped in after
+/// the writer-lock path check. Validate the opened handle before recovery can read or truncate it.
+fn open_archive_wal_file(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)?
+    };
+
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?
+    };
+
+    #[cfg(not(any(unix, windows)))]
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(invalid_archive_wal_file());
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(invalid_archive_wal_file());
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // Ensure the opened regular file is still the object named by the WAL path.
+        // O_NOFOLLOW already rejects a final symlink; this catches a raced path replacement.
+        let current = std::fs::symlink_metadata(path)?;
+        if !current.is_file() || current.dev() != metadata.dev() || current.ino() != metadata.ino()
+        {
+            return Err(invalid_archive_wal_file());
+        }
+    }
+
+    Ok(file)
+}
+
 #[derive(Debug)]
 pub enum ArchiveRangeStoreError {
     Io(io::Error),
@@ -166,11 +238,7 @@ impl ArchiveRangeWalCandidate {
                 )),
             },
         )?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(path)?;
+        let file = open_archive_wal_file(path)?;
         // The path lock protects same-name first-open races. The file-object lock additionally
         // rejects hard-link aliases that have different names but refer to the same underlying WAL.
         let file_identity_lock = crate::snapshot_store::SnapshotWriterLock::acquire_file_identity(
@@ -856,6 +924,67 @@ mod tests {
         server: &ArchiveRangeServerCandidate,
     ) -> Result<ArchiveRangeWalCandidate, ArchiveRangeStoreError> {
         ArchiveRangeWalCandidate::open(path, limits(), server.snapshot_commitment(), 5, 15)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_open_rejects_fifo_without_blocking() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let dir = TestDir::new();
+        let path = dir.file().with_file_name("archive.fifo");
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed: {}",
+            io::Error::last_os_error()
+        );
+
+        let error = super::open_archive_wal_file(&path)
+            .expect_err("a FIFO must be rejected instead of entering WAL recovery");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn wal_open_rejects_symlink_without_touching_its_target() {
+        let dir = TestDir::new();
+        let path = dir.file().with_file_name("archive.wal");
+        let protected = dir.file().with_file_name("protected.data");
+        fs::write(&protected, b"do-not-modify").unwrap();
+
+        #[cfg(windows)]
+        let symlink_result = std::os::windows::fs::symlink_file(&protected, &path);
+        #[cfg(unix)]
+        let symlink_result = std::os::unix::fs::symlink(&protected, &path);
+        #[cfg(not(any(windows, unix)))]
+        let symlink_result: io::Result<()> = Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "symlink tests are unsupported on this platform",
+        ));
+
+        if let Err(error) = symlink_result {
+            eprintln!("SKIP archive WAL symlink test: {error}");
+            return;
+        }
+
+        assert!(super::open_archive_wal_file(&path).is_err());
+        assert_eq!(fs::read(&protected).unwrap(), b"do-not-modify");
+    }
+
+    #[test]
+    fn wal_open_preserves_existing_regular_file_contents() {
+        let dir = TestDir::new();
+        let path = dir.file().with_file_name("archive.wal");
+        fs::write(&path, b"existing-wal-bytes").unwrap();
+
+        let file = super::open_archive_wal_file(&path).unwrap();
+        assert_eq!(
+            file.metadata().unwrap().len(),
+            b"existing-wal-bytes".len() as u64
+        );
+        drop(file);
+        assert_eq!(fs::read(&path).unwrap(), b"existing-wal-bytes");
     }
 
     #[test]

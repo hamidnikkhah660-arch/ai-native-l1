@@ -23,6 +23,10 @@ snow = "=0.9.6"
 # FIPS 204 ML-DSA-65 implementation; its arithmetic/NTT/serialization components are formally verified, but deployment still requires an external review.
 libcrux-ml-dsa = "=0.0.4"
 
+[target.'cfg(unix)'.dependencies]
+# Unix-only no-follow/nonblocking filesystem opens and FIFO test fixtures.
+libc = "=0.2.190"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
