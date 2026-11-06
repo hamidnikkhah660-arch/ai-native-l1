@@ -198,3 +198,33 @@ Important gaps remain, so PR #93 is not equivalent to CP-0567 ledger enforcement
 4. Only after the PR90–93 dependency chain is reconciled and the gap matrix is reviewed should code integration be proposed. Keep all new work isolated from Genesis, supply, TXN4 wire bytes and live network until the explicit consensus/wire-format gates are approved.
 
 **Audit correction:** The earlier A1C recommendation for a new pure Rust capability module is superseded by this repository-wide finding. The correct next step is reuse-first gap analysis of QVAAC, followed by the missing canonical-ledger integration design—not a parallel implementation.
+
+### 11.8 QVAAC-to-CP-0567 gap matrix (reuse boundary)
+
+The following is the practical reuse map from the QVAAC source at PR #93 commit `801471c90b307a5c12f6785173d2d8986ffb74d3` to the narrower CP-0567 A0 native-transfer MVP. “Present” means present in the offline candidate model, not production consensus support.
+
+| CP-0567 requirement | Existing QVAAC candidate | Required treatment |
+|---|---|---|
+| Network binding | Present in intent, grant and evidence bundle | Reuse canonical domain rules; verify against PMT4 network/manifest at ledger boundary |
+| Capability/grant identifier | `grant_id` present | Reuse only after defining canonical ID, uniqueness and permanent no-reuse rules |
+| Owner/principal identity | `principal_id` present; test intent uses buyer as principal | Map to the actual QRun owner account and its authorization primitive |
+| Agent identity/key | `agent_id` and `agent_key_id` present | Reuse identity binding; add per-payment agent authorization/signature if retained by A0 |
+| Asset binding | Intent binds `asset_id` and `payment_asset_id`; grant binds `asset_class` and intent digest | Make native QZXB asset ID explicit in canonical capability state; reject every unsupported asset |
+| Per-payment amount ceiling | `max_per_transaction` present | Reuse checked amount rule |
+| Aggregate amount ceiling | `max_cumulative_spend` plus `spent_before`/`spent_after` in one escrow candidate | Replace local escrow-only accounting with one canonical capability counter shared by all payments |
+| Fee ceiling | No separate per-payment or aggregate fee counters | Add `max_fee_per_tx`, `max_total_fee`, and canonical `spent_fee` accounting |
+| Recipient restriction | One `counterparty_id` bound to the intent | Adapt to A0's bounded exact-recipient allowlist; define recipient account ID semantics |
+| Service/action restriction | `allowed_actions` bitmask exists for QVAAC escrow actions | A0 v1 defers service/action semantics; do not carry the QVAAC bitmask into consensus without a frozen action grammar |
+| Validity window | `not_before` and exclusive-style `expires_at` checks use supplied timestamp | Define block-height validity for consensus; do not silently reuse wall-clock checks |
+| Registration sequence / revocation epoch | `sequence` and `revocation_epoch` fields present | Keep as signed grant metadata only until backed by owner-authorized canonical register/revoke transitions and durable registry |
+| Per-payment replay nonce | No distinct capability-use `next_nonce` in the grant/escrow payment call | Add exact per-capability next nonce and consume only after successful atomic payment |
+| Owner signature / grant verification | `QvaacGrantVerifier` adapter interface exists | Production owner-signature/key-status verifier is missing; test verifier is non-cryptographic |
+| Agent signature on each payment | No distinct signed delegated-payment envelope in the current funding call | Add only if required by final A0 wire/security design; bind every payment field and capability ID |
+| Revocation registry | Adapter rechecks grant and test verifier models epoch 1 vs 2 | No persistent global registry/tombstones or on-chain revocation transition; implement in canonical ledger state |
+| Conditional fulfilment / escrow | Present: evaluator proof, acceptance/rejection, deadline refund and receipt | Keep as an application/escrow extension; A0 native-transfer v1 must not claim service delivery or require escrow semantics |
+| Atomic multi-payment/concurrency safety | Local candidate mutates one escrow object after checks | Not shared across simultaneous escrows, transactions or validators; move counters and balances into one cloned block candidate |
+| State root / durable snapshot | Hash-linked local events/receipt only | Add registry/counters/tombstones to monetary state root and versioned snapshot |
+| Fork/reorg/restart | Not wired to canonical PMT4 branch replay or monetary snapshot | Derive state from branch parent and ordered actions; prove reorg, switch-back and restart invariants |
+| Node/mempool/peer integration | Offline candidate only | No production runtime wiring; separate integration gate after deterministic ledger model |
+
+**Decision from this matrix:** QVAAC already supplies a useful application-level grant schema, evidence checks, escrow/fulfilment lifecycle and receipt pattern. CP-0567's genuinely new work is not another grant object: it is the missing canonical QZXB ledger registry, explicit fee budget and capability nonce, owner-authorized register/revoke actions, atomic shared spend accounting, state-root/snapshot commitment, and branch/reorg integration. The v1 native-transfer policy intentionally excludes QVAAC's service-fulfilment and escrow requirements; preserve those as a later composable layer rather than duplicating or forcing them into consensus.
