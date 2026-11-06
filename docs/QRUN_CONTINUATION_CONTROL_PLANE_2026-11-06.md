@@ -113,3 +113,27 @@ This table is intentionally selective, not a complete PR inventory. Always query
 ---
 
 **Operating principle:** the repository is the durable project memory; chat is an interface, not the source of truth. When evidence conflicts, source code + reproducible tests + exact GitHub commit/run take precedence over old chat summaries or this dated handoff. Update the handoff after verifying the new truth.
+
+## 3.4 PFM5 stack source review (2026-11-06)
+
+Exact fetched PR heads establish this dependency chain: `main` -> #60 / CP-0390 -> #123 / CP-0391 -> #124 / CP-0392 -> #125 / CP-0393 -> #126 / CP-0394 -> #127 / CP-0395 -> #128 / CP-0396.
+
+- #60 `9206f545926d6c752060d50bb78e85421a492490`: open, non-Draft; two GitHub CI jobs pass (run `40048033364`). Provides the PFM5 checkpoint replay primitive; test profile is deliberately easy.
+- #123 `39d64b7743582a0c0cd5bd9c3330fbefcc358f80`: open Draft; no GitHub checks reported. Adds `next_pfm5_manifest_after_replay`; no provider I/O, signed receipt, durable write or CAS.
+- #124 `c4ece0e46375d1cdc59337c453095b2be6f33b9d`: open Draft; no GitHub checks reported. Local PFM5/PCP4 durable store; `open_with_manifest_anchor` compares a caller-supplied commitment but performs no remote provider read or receipt verification.
+- #125 `cc563c7fb98974de546a568f77c2f1304cc9f51b`: open Draft; no GitHub checks reported. Immutable-object transport with in-memory test provider; no concrete provider adapter or independent two-host test.
+- #126 `16d1c3063c565cc0bdb1b88f593b9b2571b94345`: open Draft; no GitHub checks reported. `execute_intent` composes fresh signed ECR1 read, immutable object publication, exact CAS and ambiguous-result reread, but depends on external durable intent/floors.
+- #127 `786a531897e262e9f1c073bef1f582ffa33ca56f`: open Draft; no GitHub checks reported. PFJ1 crash-safe local intent journal; explicitly not an independent anti-rollback root.
+- #128 `91560bfcaf8d73cc1b703efb00e02316c7e7c455`: open Draft; no GitHub checks reported. High-water provider interface and gate functions; only in-memory test implementation, no production authority adapter.
+
+PR #123-#128 descriptions report Windows/offline local validation (778, 786, 791, 799, 807 and 816 library tests respectively, with additional target checks stated in each body). `gh pr checks` reported no GitHub checks for those heads at audit time; do not call these GitHub CI or independent security verification.
+
+**Critical composition finding:** in the PR #128 tree there is no production caller composing PFJ1 stage -> independent high-water advance -> CP-0394 execute -> PFJ1 finalize -> high-water finalize. High-water functions are only referenced outside their module by documentation; journal store has no production caller outside its own module. Exported candidate modules do not prove runtime integration.
+
+**Current node boundary:** on `origin/main`, `run_monetary_v4_hybrid_peer_smoke` in `src/native/pow_bench/src/bin/private_testnet_node.rs` opens the PFM4 store with local `open(...)` (audited source line 5687). It does not call `open_with_external_cas(...)` or the PFM5 store. PFM5 remains unintegrated with the actual PMT4 startup path.
+
+Next: write one mainline-compatible end-to-end integration design, not another isolated module. It must combine checkpoint authenticity (separate from CAS anti-rollback), fresh pinned ECR1 read, PFJ1 durable intent, independent high-water ordering, immutable object publication, exact CAS and ambiguous recovery, PFM5 bounded replay, and crash/restart/partition/reorg tests through the real PMT4 node using independently administered production adapters.
+
+## 9.1 Documentation validation checkpoint
+
+Commit `b4758e0cf1a6eb19cde63ed880109c96e4c7922a` on PR #138 completed GitHub Actions run [42234319470](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/42234319470) successfully across all three jobs: Rust format/check/test; Windows PMT4/TXN4 two-node loopback (including signed TXN4 rejection/propagation/replay and PFM4 paged archive reorg/stale-cursor checks); and EVM/wallet/dependency audit. This is CI evidence for that exact commit only, not PFM5 integration or public Mainnet readiness.

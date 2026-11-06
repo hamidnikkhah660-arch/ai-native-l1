@@ -308,3 +308,50 @@ Before any node treats a pruned checkpoint as canonical, require a separately sp
 5. The independent monotonic trust/floor mechanism must survive rollback of the node disk and must not be administered solely by the same operator or provider whose state it is meant to constrain.
 
 This checkpoint-authenticity gate is additional to (not a replacement for) external-CAS anti-rollback. Both are mandatory for safe pruned-history recovery.
+
+### 11.15 PFM5 implementation stack review: PR #60 and CP-0391 through CP-0396
+
+A source/metadata review on 2026-11-06 fetched the exact GitHub PR heads and inspected the candidate source, base relationships, exported APIs, node call sites, PR bodies and check rollups. The dependency chain is strictly stacked:
+
+`main` -> PR #60 / CP-0390 -> PR #123 / CP-0391 -> PR #124 / CP-0392 -> PR #125 / CP-0393 -> PR #126 / CP-0394 -> PR #127 / CP-0395 -> PR #128 / CP-0396.
+
+| PR | Head (short) | Base | Candidate contribution | Current review state at audit |
+|---|---|---|---|---|
+| #60 | `9206f54` | `main` (`0c489c1`) | Checkpoint-rooted bounded replay/fork-choice primitive | Open, non-Draft; two recorded CI jobs pass (run `40048033364`) |
+| #123 | `39d64b7` | #60 (`9206f54`) | Deterministic stale-writer/sibling-branch rebase helper | Open, Draft; no GitHub checks reported |
+| #124 | `c4ece0e` | #123 (`39d64b7`) | Local durable PCP4/PFM5 checkpoint-rooted fork store | Open, Draft; no GitHub checks reported |
+| #125 | `cc563c7` | #124 (`c4ece0e`) | Provider-neutral immutable object transport | Open, Draft; no GitHub checks reported |
+| #126 | `16d1c30` | #125 (`cc563c7`) | Signed ECR1 read, object publication, exact CAS and ambiguous-reply orchestration | Open, Draft; no GitHub checks reported |
+| #127 | `786a531` | #126 (`16d1c30`) | Crash-safe PFJ1 local intent journal | Open, Draft; no GitHub checks reported |
+| #128 | `91560bf` | #127 (`786a531`) | Independent high-water authority interface and caller-side gate functions | Open, Draft; no GitHub checks reported |
+
+The #123-#128 PR descriptions report Windows/offline local validation (respectively 778, 786, 791, 799, 807 and 816 library tests, with additional target checks as described in each PR). These are author-reported local results, not GitHub CI: `gh pr checks` returned no checks for #123-#128 at this audit. Do not label them as CI or independent security verification. PR #60 is different: its recorded GitHub CI run has two passing jobs.
+
+**Component-by-component source findings:**
+
+1. **CP-0390 / PR #60:** the existing fork-choice candidate now has `restore_pfm5_checkpoint_baseline_for_replay` and `rebuild_from_pfm5_checkpoint`. Reuse this as the replay primitive; do not create a second fork-choice engine. Its test profile is intentionally easy and not production PoW evidence. The independent checkpoint-authenticity gate in 11.14 remains mandatory.
+2. **CP-0391 / PR #123:** `next_pfm5_manifest_after_replay` derives a deterministic successor manifest after a fresh caller-supplied authenticated read and replayed fork-choice. It deliberately performs no provider I/O, signed receipt verification, durable write or CAS. Its tests model two fork-choice instances in one process, not two independent hosts.
+3. **CP-0392 / PR #124:** `PrivateTestnetPfm5ForkStoreCandidate` supports local checkpoint/manifest/branch persistence and reopen/replay. `open_with_manifest_anchor` compares the local manifest to a commitment supplied by a caller; it performs no provider I/O or receipt verification. PR body explicitly says this candidate is not wired into `private_testnet_node`, Devnet or a public runtime.
+4. **CP-0393 / PR #125:** immutable typed-object transport provides create-if-absent semantics, checkpoint -> branches -> manifest publication, read-back and bundle replay. Its provider tests use an in-memory double; no concrete object-store adapter, authenticated provider deployment, cross-host consistency or two-host stale-writer test is included.
+5. **CP-0394 / PR #126:** `execute_intent` performs a fresh verified ECR1 read, validates the exact intent/bundle relationship, publishes immutable objects, issues exact signed CAS, and classifies ambiguous outcomes by a fresh signed reread. It requires expected ECR1 and object-generation floors to come from independently protected durable state. It does not itself persist the caller's PFJ1 intent or advance an independent high-water authority.
+6. **CP-0395 / PR #127:** `Pfm5ExternalCasJournalStore` provides create-once PFJ1 state, durable intent staging, finalization, bounded atomic writes/read-back and child-process crash tests. It is a local crash-recovery journal, explicitly not an independent anti-rollback root. Its own API documentation requires the caller to advance an independent high-water authority after staging and before CP-0394 side effects.
+7. **CP-0396 / PR #128:** `Pfm5ExternalCasHighWaterProvider` defines authenticated read and linearizable compare-and-advance contracts; functions include `verify_ready_snapshot`, `advance_prepared_snapshot`, `advance_finalized_snapshot` and prepared-intent recovery classification. The only provider implementation in the candidate module is the in-memory test double. No real authority service, out-of-band trust provisioning or independently administered production adapter exists.
+
+**End-to-end composition gap confirmed by cross-reference search:** in the PR #128 tree, the high-water trait/functions are referenced outside their own module only by the CP-0396 documentation; the journal store has no production caller outside its own module; and no node/runtime caller composes PFJ1 staging + independent high-water advancement + CP-0394 `execute_intent` + PFJ1 finalization + final high-water advancement. The components are useful candidate building blocks, but their existence in `lib.rs` as exported modules does not constitute an integrated transaction pipeline.
+
+**Current PMT4 node path reconfirmed against `origin/main`:** `run_monetary_v4_hybrid_peer_smoke` in `src/native/pow_bench/src/bin/private_testnet_node.rs` opens `PrivateTestnetV4HybridForkStore` using local `open(...)` (source line 5687 in the audited baseline). It does not call `open_with_external_cas(...)`, and it does not use the PFM5 store candidate. The local PMT4 peer-smoke startup remains distinct from the PFM5/CAS candidate stack. The runtime uses an easy loopback-only PoW profile, so it is not public production evidence.
+
+**Integration decision:** do not merge the stacked PRs blindly or build another isolated PFM5 subsystem. First prepare one mainline-compatible integration design with an explicit call graph and durable ordering:
+
+1. Bootstrap from a trusted Genesis/profile and an independently approved checkpoint-authenticity result; do not infer historical validity from the provider signature.
+2. Obtain a fresh, pinned ECR1 read and independently authenticated high-water state; reconcile provider identity, network/Genesis pin, ECR1 record/generation, PFM5 generation/parent commitment, object generation, checkpoint-height floor, PFJ1 sequence and pending intent.
+3. Reopen/replay the local PFM5 store with the exact manifest commitment and complete bounded post-checkpoint branch set; reject missing/extra/ambiguous data and any floor rollback.
+4. For writes, verify Ready state; durably stage the exact PFJ1 intent; advance independent high-water sequence; call CP-0394 `execute_intent`; classify ambiguous results only by fresh authenticated read; durably finalize PFJ1; then advance the exact finalized high-water state.
+5. Exercise every crash boundary and lost/ambiguous reply, disk rollback, provider rollback, concurrent stale writers, partition/reconnect, reorg and restart through the actual PMT4 node entrypoint using a concrete independently administered provider and authority.
+6. Keep checkpoint authenticity, independent anti-rollback, provider durability, and node/runtime integration as separate acceptance gates. A passing test double cannot close a production adapter gate.
+
+No source, consensus, Genesis, monetary policy, network, runtime or release setting was changed in this review. PRs #123-#128 remain candidate branches; no merge is recommended until the dependency chain, production adapters, end-to-end composition, checkpoint authenticity and actual-node qualification are resolved.
+
+### 11.16 Documentation CI evidence update
+
+The documentation commit `b4758e0cf1a6eb19cde63ed880109c96e4c7922a` on PR #138 completed GitHub Actions run `42234319470` with conclusion `success` across all three jobs: `Format, check, and test`; `Windows PMT4 TXN4 two-node loopback`; and `EVM contract, wallet console and dependency audit`. The Windows job included signed TXN4 submit, invalid-signature rejection, peer propagation/replay, and PFM4 paged archive sync with inter-page reorg and stale-cursor rejection. This validates the checks run for that documentation commit; it does not certify the unmerged PR stack, PFM5 integration, public network convergence, production PoW, or Mainnet readiness.
