@@ -49,6 +49,26 @@
 - Existing candidate escrow includes useful deterministic checks and injected verifier boundaries, but injected test verifiers are not proof of production cryptographic verification. Candidate spend counters are not yet a canonical global ledger registry.
 - CP-0567 still needs a canonical QZXB capability registry, owner-authorized register/revoke transitions, per-capability nonce/replay protection, fee and aggregate spend accounting, atomic execution, state-root/snapshot commitment, and fork/reorg/recovery semantics. Do not alter fixed-width TXN4 casually; evaluate a separate TXN5 or versioned block-action envelope. No consensus change without explicit approval and decision record.
 
+## 3.4 PFM5 stack source review (2026-11-06)
+
+Exact fetched PR heads establish this dependency chain: `main` -> #60 / CP-0390 -> #123 / CP-0391 -> #124 / CP-0392 -> #125 / CP-0393 -> #126 / CP-0394 -> #127 / CP-0395 -> #128 / CP-0396.
+
+- #60 `9206f545926d6c752060d50bb78e85421a492490`: open, non-Draft; two GitHub CI jobs pass (run `40048033364`). Provides the PFM5 checkpoint replay primitive; test profile is deliberately easy.
+- #123 `39d64b7743582a0c0cd5bd9c3330fbefcc358f80`: open Draft; no GitHub checks reported. Adds `next_pfm5_manifest_after_replay`; no provider I/O, signed receipt, durable write or CAS.
+- #124 `c4ece0e46375d1cdc59337c453095b2be6f33b9d`: open Draft; no GitHub checks reported. Local PFM5/PCP4 durable store; `open_with_manifest_anchor` compares a caller-supplied commitment but performs no remote provider read or receipt verification.
+- #125 `cc563c7fb98974de546a568f77c2f1304cc9f51b`: open Draft; no GitHub checks reported. Immutable-object transport with in-memory test provider; no concrete provider adapter or independent two-host test.
+- #126 `16d1c3063c565cc0bdb1b88f593b9b2571b94345`: open Draft; no GitHub checks reported. `execute_intent` composes fresh signed ECR1 read, immutable object publication, exact CAS and ambiguous-result reread, but depends on external durable intent/floors.
+- #127 `786a531897e262e9f1c073bef1f582ffa33ca56f`: open Draft; no GitHub checks reported. PFJ1 crash-safe local intent journal; explicitly not an independent anti-rollback root.
+- #128 `91560bfcaf8d73cc1b703efb00e02316c7e7c455`: open Draft; no GitHub checks reported. High-water provider interface and gate functions; only in-memory test implementation, no production authority adapter.
+
+PR #123-#128 descriptions report Windows/offline local validation (778, 786, 791, 799, 807 and 816 library tests respectively, with additional target checks stated in each body). `gh pr checks` reported no GitHub checks for those heads at audit time; do not call these GitHub CI or independent security verification.
+
+**Critical composition finding:** in the PR #128 tree there is no production caller composing PFJ1 stage -> independent high-water advance -> CP-0394 execute -> PFJ1 finalize -> high-water finalize. High-water functions are only referenced outside their module by documentation; journal store has no production caller outside its own module. Exported candidate modules do not prove runtime integration.
+
+**Current node boundary:** on `origin/main`, `run_monetary_v4_hybrid_peer_smoke` in `src/native/pow_bench/src/bin/private_testnet_node.rs` opens the PFM4 store with local `open(...)` (audited source line 5687). It does not call `open_with_external_cas(...)` or the PFM5 store. PFM5 remains unintegrated with the actual PMT4 startup path.
+
+Next: write one mainline-compatible end-to-end integration design, not another isolated module. It must combine checkpoint authenticity (separate from CAS anti-rollback), fresh pinned ECR1 read, PFJ1 durable intent, independent high-water ordering, immutable object publication, exact CAS and ambiguous recovery, PFM5 bounded replay, and crash/restart/partition/reorg tests through the real PMT4 node using independently administered production adapters.
+
 ## 4. Other important evidence and project constraints
 
 - **QFP6/QAP1:** workflow run [42205440686](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/42205440686) passed a private NetBird cross-host admission/restart qualification. State root, height, and generation matched across restart. It used a private overlay; it is not public-Internet convergence or Mainnet proof. Do not claim replay rejection passed unless a specific passing marker/test is verified.
@@ -88,7 +108,7 @@ This table is intentionally selective, not a complete PR inventory. Always query
 
 ## 7. Next engineering sequence (not authorization to bypass gates)
 
-1. Recheck PR #138 CI for exact HEAD `8d3b8c46...`; record final result.
+1. Recheck PR #138 CI for the exact live PR head SHA (never reuse a prior commit's CI result); record the final result.
 2. Inspect existing PFM5 PR stack #124â€“#128 and External-CAS client/store APIs against PR #60 replay; map what is implemented, tested, integrated, and missing. Do not create a second fork-choice engine.
 3. Produce a precise PFM5 integration sequence covering remote anchor read, local/remote generation reconciliation, independent anti-rollback floor, checkpoint authenticity, bounded suffix replay, atomic publication, crash recovery, and actual PMT4 node startup.
 4. Define the checkpoint-authenticity policy separately from provider CAS anti-rollback.
@@ -112,28 +132,18 @@ This table is intentionally selective, not a complete PR inventory. Always query
 
 ---
 
-**Operating principle:** the repository is the durable project memory; chat is an interface, not the source of truth. When evidence conflicts, source code + reproducible tests + exact GitHub commit/run take precedence over old chat summaries or this dated handoff. Update the handoff after verifying the new truth.
-
-## 3.4 PFM5 stack source review (2026-11-06)
-
-Exact fetched PR heads establish this dependency chain: `main` -> #60 / CP-0390 -> #123 / CP-0391 -> #124 / CP-0392 -> #125 / CP-0393 -> #126 / CP-0394 -> #127 / CP-0395 -> #128 / CP-0396.
-
-- #60 `9206f545926d6c752060d50bb78e85421a492490`: open, non-Draft; two GitHub CI jobs pass (run `40048033364`). Provides the PFM5 checkpoint replay primitive; test profile is deliberately easy.
-- #123 `39d64b7743582a0c0cd5bd9c3330fbefcc358f80`: open Draft; no GitHub checks reported. Adds `next_pfm5_manifest_after_replay`; no provider I/O, signed receipt, durable write or CAS.
-- #124 `c4ece0e46375d1cdc59337c453095b2be6f33b9d`: open Draft; no GitHub checks reported. Local PFM5/PCP4 durable store; `open_with_manifest_anchor` compares a caller-supplied commitment but performs no remote provider read or receipt verification.
-- #125 `cc563c7fb98974de546a568f77c2f1304cc9f51b`: open Draft; no GitHub checks reported. Immutable-object transport with in-memory test provider; no concrete provider adapter or independent two-host test.
-- #126 `16d1c3063c565cc0bdb1b88f593b9b2571b94345`: open Draft; no GitHub checks reported. `execute_intent` composes fresh signed ECR1 read, immutable object publication, exact CAS and ambiguous-result reread, but depends on external durable intent/floors.
-- #127 `786a531897e262e9f1c073bef1f582ffa33ca56f`: open Draft; no GitHub checks reported. PFJ1 crash-safe local intent journal; explicitly not an independent anti-rollback root.
-- #128 `91560bfcaf8d73cc1b703efb00e02316c7e7c455`: open Draft; no GitHub checks reported. High-water provider interface and gate functions; only in-memory test implementation, no production authority adapter.
-
-PR #123-#128 descriptions report Windows/offline local validation (778, 786, 791, 799, 807 and 816 library tests respectively, with additional target checks stated in each body). `gh pr checks` reported no GitHub checks for those heads at audit time; do not call these GitHub CI or independent security verification.
-
-**Critical composition finding:** in the PR #128 tree there is no production caller composing PFJ1 stage -> independent high-water advance -> CP-0394 execute -> PFJ1 finalize -> high-water finalize. High-water functions are only referenced outside their module by documentation; journal store has no production caller outside its own module. Exported candidate modules do not prove runtime integration.
-
-**Current node boundary:** on `origin/main`, `run_monetary_v4_hybrid_peer_smoke` in `src/native/pow_bench/src/bin/private_testnet_node.rs` opens the PFM4 store with local `open(...)` (audited source line 5687). It does not call `open_with_external_cas(...)` or the PFM5 store. PFM5 remains unintegrated with the actual PMT4 startup path.
-
-Next: write one mainline-compatible end-to-end integration design, not another isolated module. It must combine checkpoint authenticity (separate from CAS anti-rollback), fresh pinned ECR1 read, PFJ1 durable intent, independent high-water ordering, immutable object publication, exact CAS and ambiguous recovery, PFM5 bounded replay, and crash/restart/partition/reorg tests through the real PMT4 node using independently administered production adapters.
-
 ## 9.1 Documentation validation checkpoint
 
 Commit `b4758e0cf1a6eb19cde63ed880109c96e4c7922a` on PR #138 completed GitHub Actions run [42234319470](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/42234319470) successfully across all three jobs: Rust format/check/test; Windows PMT4/TXN4 two-node loopback (including signed TXN4 rejection/propagation/replay and PFM4 paged archive reorg/stale-cursor checks); and EVM/wallet/dependency audit. This is CI evidence for that exact commit only, not PFM5 integration or public Mainnet readiness.
+
+## 9.2 Live continuation verification (2026-11-06, 18:12 Europe/Warsaw)
+
+- Local checkout: `D:\Temp\ASUS\QRUN_CP0566C_FINAL_MAINLINE_PREP_20261105`; branch `docs/qrun-master-roadmap-20261106`; worktree clean; local HEAD equals `origin/docs/qrun-master-roadmap-20261106`.
+- PR #138 is OPEN, non-Draft, base `main`; live head is `faef79fc9328478133e203c9be8c0aa875792cee` (`docs(qrun): refresh continuation checkpoint`). `mergeStateStatus=UNSTABLE`; do not infer mergeability from CI alone.
+- Latest exact-head workflow: run [42235955343](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/42235955343), head `faef79fc9328478133e203c9be8c0aa875792cee`, was IN_PROGRESS at the verification time. EVM contract/wallet/dependency audit job had passed; Rust `Test every target` was running; Windows PMT4/TXN4 two-node loopback job was running signed TXN4 submit/rejection/propagation/replay, with PFM4 paged archive reorg/stale-cursor step still pending. This run must be polled before reporting a final result.
+- Run [42234319470](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/42234319470) is SUCCESS for exact commit `b4758e0cf1a6eb19cde63ed880109c96e4c7922a` only. It is not evidence that the later `9265479...` or `faef79...` commits passed CI.
+- The later run [42235844835](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/42235844835) for `9265479...` was CANCELLED when superseded; do not call it passed.
+- PR #138 gained a PFM5 source-stack audit in commit `9265479bb5666cc195132db98cd6aa69cf8abe85`: PRs #123-#128 are a dependency stack, but their candidate pieces were not yet composed into a production caller. The precise composition gap and next integration design are recorded in section 3.4 above.
+- Documentation-only maintenance was performed; no source, consensus, protocol, Genesis, cryptographic trust, monetary policy, release gate, or network configuration was changed. No PR was merged and no deployment/publication was performed.
+
+**Operating principle:** the repository is the durable project memory; chat is an interface, not the source of truth. When evidence conflicts, source code + reproducible tests + exact GitHub commit/run take precedence over old chat summaries or this dated handoff. Update the handoff after verifying the new truth.
