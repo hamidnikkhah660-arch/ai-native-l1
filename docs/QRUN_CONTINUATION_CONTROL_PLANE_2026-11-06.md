@@ -193,3 +193,29 @@ Commit `b4758e0cf1a6eb19cde63ed880109c96e4c7922a` on PR #138 completed GitHub Ac
 - Documentation-only maintenance was performed; no source, consensus, protocol, Genesis, cryptographic trust, monetary policy, release gate, or network configuration was changed. No PR was merged and no deployment/publication was performed.
 
 **Operating principle:** the repository is the durable project memory; chat is an interface, not the source of truth. When evidence conflicts, source code + reproducible tests + exact GitHub commit/run take precedence over old chat summaries or this dated handoff. Update the handoff after verifying the new truth.
+
+## 3.8 Source-level API seam audit (2026-11-06)
+
+Inspected the actual CP-0393 through CP-0396 source snapshots on `origin/pr-125-inspect` through `origin/pr-128-inspect`, and compared the live node entrypoint on `origin/main`. This is a source review, not a production integration or provider qualification.
+
+### Confirmed API boundaries
+
+- CP-0394 exposes `execute_intent(object_client, cas_client, pin, context, intent, bundle)`. It reconstructs and byte-compares the deterministic intent, checks the pinned ECR1 client, publishes the immutable bundle with read-back verification, then performs signed ECR1 CAS and classifies ambiguous outcomes. Its outcomes include `Committed`, `AlreadyCommitted`, `CommittedAfterAmbiguousReply`, and `RetrySameIntent`.
+- The immutable-object seam is `Pfm5ImmutableObjectProviderTransport::{put_immutable,get}`. `Pfm5ImmutableObjectClient::publish_bundle` performs checkpoint/branch/manifest publication in bundle order and byte-exact read-back. The trait itself does not provide provider authentication, durability, cross-region consistency, or independent-host guarantees; these remain adapter qualification requirements.
+- The ECR1 CAS seam is separately `ExternalCasProviderTransport`, wrapped by `VerifiedExternalCasClient` for pinned receipt verification. Object storage and ECR1 CAS are two distinct trust/availability domains; success in one must not be assumed to imply success in the other.
+- CP-0395 exposes file-backed `Pfm5ExternalCasJournalStore::{initialize,load_checked,stage_intent,mark_committed}`. It is explicitly a local crash-recovery aid, not an anti-rollback root. Bootstrap is create-once from an already verified remote ECR1 record and object generation; missing/corrupt journal state must not be silently initialized again.
+- CP-0396 exposes `Pfm5ExternalCasHighWaterProvider::{read_authenticated,compare_and_advance}` plus caller-side transition helpers (`verify_ready_snapshot`, `advance_prepared_snapshot`, `advance_finalized_snapshot`, `observe_finalized_floor_for_prepared_intent`). The trait's security requirements are authenticated out-of-band identity, state outside the node/journal rollback domain, linearizable atomic compare-and-advance, strict successor/sequence checks and durable-before-return. No production adapter is supplied; in-memory test doubles do not qualify.
+
+### Important naming/integration distinction
+
+`PrivateTestnetV4HybridForkStore::open_with_external_cas` exists in the inspected fork-store candidate, but it is the PFM4/External-CAS anchored-open path. It is not a PFM5 publication caller and does not compose CP-0394, PFJ1 and the CP-0396 high-water lifecycle. Do not cite the presence of this method as proof that the PFM5 pipeline is wired into node startup.
+
+The live `run_monetary_v4_hybrid_peer_smoke` path on `origin/main` still opens `PrivateTestnetV4HybridForkStore` with local `open(...)` against `devnet_forkstore_pfm4`. The other `open_anchored` call sites inspected are recovery/test code, not this live peer-smoke startup. Thus the node-startup integration gap remains independently confirmed.
+
+### Required next implementation boundary (not yet authorized or implemented)
+
+A future caller must explicitly own and test the whole lifecycle: authenticate the remote ECR1 read and object-generation floor; explicitly bootstrap PFJ1 once; reconcile PFJ1 snapshot with independent high-water state; stage the exact deterministic intent; advance Prepared high-water before any remote side effect; invoke CP-0394 with independently authenticated object and ECR1 adapters; preserve the exact Prepared intent on `RetrySameIntent`; after a verified exact successor, finalize PFJ1 and advance Finalized high-water; on every ambiguous reply perform authenticated rereads; and quarantine any identity, generation, sequence, object, or checkpoint-authenticity mismatch. This caller must then be wired into an explicitly selected node startup mode and qualified through process crashes, disk rollback, two independently administered hosts and real provider semantics.
+
+### Recovery consequence
+
+The high-water record stores monotonic sequence plus ECR1 record and object generation, not the full serialized PFI1 intent. If local PFJ1 is rolled back to a Ready snapshot after the independent high-water has advanced to Prepared, the state cannot safely be reconstructed from the floor alone. Fail closed and quarantine for operator-assisted recovery; never synthesize a replacement intent or reset the high-water authority. If PFJ1 remains Prepared and the floor proves the exact finalized successor, recovery may proceed only after validating the pending intent and fresh authenticated ECR1/object state, then completing the idempotent local/floor transitions.
