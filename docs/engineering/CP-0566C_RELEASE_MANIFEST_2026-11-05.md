@@ -189,7 +189,7 @@ CP-0566C candidate cross-host qualification PASSED on exact feature commit `30bd
 
 This is a private-overlay, two-host candidate qualification using Node A on the user's Windows host and an ephemeral GitHub-hosted Windows Runner as Node B. It is not a public Devnet/Mainnet, independent-operator qualification, production security approval or real-value transaction. PR #135 remains OPEN and Draft.
 
-A separate policy-reconciliation gate is tracked in [issue #136](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/136): the QFP6 CP-0528 candidate uses a 1B Founder Genesis and 3B mining/security budget, while the current CP-0437 Mainnet direction specifies 10B to one owner at Genesis with zero subsequent issuance/subsidy. CP-0528 must not be treated as the production monetary policy until that version/economics boundary is explicitly resolved.
+The owner reconfirmed the eight-bucket CP-0566D target on 2026-11-06: 1B owner Genesis, up to 3B PoW mining/security, and six conditional 1B reserves. CP-0566D supersedes CP-0437 for future production design. The QFP6 CP-0528 code is a candidate implementation of that selected model, not frozen production consensus. Issue [#136](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/136) tracks profile/source/docs integration, exact mining-schedule remainder handling and lifecycle invariants.
 ## Integrity / counts
 
 Historical Crate diff paths (origin/main to local candidate HEAD): 83.
