@@ -1,7 +1,7 @@
 ﻿# CP-0567 — AI-Agent Payment Authorization: Protocol Design Candidate
 
 **Document ID:** CP-0567  
-**Version:** 0.1 (design candidate; not consensus-frozen)  
+**Version:** 0.2 (design candidate; not consensus-frozen)  
 **Date:** 2026-11-06  
 **Roadmap layer:** 9 — AI Agent Economy and bounded payment authorization  
 **Parent roadmap:** `QRUN_MASTER_ROADMAP_VERIFIABLE_AI_NATIVE_INFRASTRUCTURE_2026-11-06.md`  
@@ -209,7 +209,7 @@ Do not skip A0/A1 and jump directly to a consensus change. The first deliverable
 9. Capability state growth, pruning, and historical proof strategy.
 10. Cryptographic algorithm agility and future PQ migration compatibility.
 
-These decisions require a separate decision record before protocol implementation.
+These decisions are narrowed by the provisional A0 record: `CP-0567_A0_DECISION_RECORD_AI_AGENT_PAYMENT_AUTHORIZATION_2026-11-06.md`. The record makes explicit MVP recommendations and preserves unresolved code-dependent questions. Both documents remain design-only and require review before A1 implementation.
 
 ## 14. Acceptance and public-claim policy
 
@@ -220,3 +220,4 @@ The strongest future public claim should be narrow and testable, for example: �
 ---
 
 **Decision requested:** review this candidate architecture and resolve the open decisions before any consensus or production-runtime implementation begins.
+
