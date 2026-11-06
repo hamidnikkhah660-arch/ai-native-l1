@@ -1844,15 +1844,15 @@ mod tests {
 
     #[test]
     fn qap1_callback_parser_accepts_bomless_and_bom_prefixed_ready_done() {
-        let ready_bomless = "READY|nonce|100.64.0.2:49664|listener-key\n";
-        let ready_bom = "\u{feff}READY|nonce|100.64.0.2:49664|listener-key\r\n";
+        let ready_bomless = "READY|nonce|100.64.0.2:48664|listener-key\n";
+        let ready_bom = "\u{feff}READY|nonce|100.64.0.2:48664|listener-key\r\n";
         assert_eq!(
             qap1_callback_fields(ready_bomless),
-            vec!["READY", "nonce", "100.64.0.2:49664", "listener-key"]
+            vec!["READY", "nonce", "100.64.0.2:48664", "listener-key"]
         );
         assert_eq!(
             qap1_callback_fields(ready_bom),
-            vec!["READY", "nonce", "100.64.0.2:49664", "listener-key"]
+            vec!["READY", "nonce", "100.64.0.2:48664", "listener-key"]
         );
 
         let done_bomless = "DONE|nonce|anchor|state-root|1|1|PASS\n";
@@ -4532,7 +4532,7 @@ mod tests {
             TcpListener::bind(callback_bind).expect("bind private Node A callback listener");
         callback_listener.set_nonblocking(true).unwrap();
         let callback_address = callback_listener.local_addr().unwrap();
-        let remote_listener_port = 49_664u16;
+        let remote_listener_port = 48_664u16;
 
         let runner_config = format!(
             concat!(
