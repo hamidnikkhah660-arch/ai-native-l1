@@ -3895,6 +3895,8 @@ mod tests {
             return;
         };
         assert!(matches!(role.as_str(), "server" | "restart"));
+        let remote_connect_timeout = Duration::from_secs(30);
+        println!("QFP6_QAP1_REMOTE_CONNECT_TIMEOUT_SECONDS=30");
 
         use crate::external_cas_anchor_candidate::ExternalCasPin;
         use crate::external_cas_floor_store_candidate::ExternalCasFloorStore;
@@ -3975,19 +3977,21 @@ mod tests {
             drop(floor);
         }
 
-        let provider_transport = NoiseTcpExternalCasProviderTransport::new(
+        let provider_transport = NoiseTcpExternalCasProviderTransport::with_timeout(
             provider_address,
             provider_client_private,
             provider_server_public,
             provider_pin.clone(),
+            remote_connect_timeout,
         )
         .unwrap();
-        let anchor_transport = NoiseTcpOffhostAnchorTransport::new(
+        let anchor_transport = NoiseTcpOffhostAnchorTransport::with_timeout(
             anchor_address,
             anchor_client_private,
             anchor_server_public,
             anchor_pin.clone(),
             provider_pin.clone(),
+            remote_connect_timeout,
         )
         .unwrap();
         let floor = ExternalCasFloorStore::open(&floor_directory, provider_pin.clone()).unwrap();
@@ -4075,8 +4079,6 @@ mod tests {
         // NetBird can lazily re-activate an idle peer between the admission and
         // restart processes. Use the supported 30-second connection ceiling for
         // this cross-host qualification worker instead of the 5-second default.
-        let remote_connect_timeout = Duration::from_secs(30);
-        println!("QFP6_QAP1_REMOTE_CONNECT_TIMEOUT_SECONDS=30");
         let mut coordinator = {
             let provider_transport = NoiseTcpExternalCasProviderTransport::with_timeout(
                 provider_address,
