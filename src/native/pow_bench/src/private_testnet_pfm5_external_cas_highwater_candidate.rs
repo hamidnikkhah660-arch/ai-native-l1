@@ -428,6 +428,7 @@ mod tests {
     use super::*;
     use crate::{
         external_cas_anchor_candidate::ExternalCasWriteRequest,
+        private_testnet_pfm5_external_cas_journal_candidate::Pfm5ExternalCasJournalStore,
         v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES,
     };
 
@@ -740,6 +741,78 @@ mod tests {
         );
         assert_eq!(f.provider.reads, reads_before);
         assert_eq!(f.provider.writes, writes_before);
+    }
+
+    #[test]
+    fn authenticated_highwater_authorizes_reopened_disk_rollback_without_weakening_normal_load() {
+        use std::{
+            fs,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+        static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
+
+        let mut f = fixture();
+        let dir = std::env::temp_dir().join(format!(
+            "ain1-pfm5-recovery-integration-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("intent.pfj1");
+        let journal = Pfm5ExternalCasJournalStore::new(&path);
+
+        let initialized = journal
+            .initialize(
+                &f.cas_pin,
+                f.ready.last_record.clone(),
+                f.ready.object_generation,
+            )
+            .unwrap();
+        assert_eq!(initialized.sequence, 1);
+        let prepared = journal
+            .stage_intent(&f.cas_pin, &f.intent, 1, 0, f.ready.object_generation)
+            .unwrap();
+        assert_eq!(prepared.sequence, 2);
+
+        // Simulate the crash window: the independent authority durably reached the exact
+        // finalized successor, while the reopened local PFJ1 file still contains Prepared N.
+        let finalized = Pfm5ExternalCasJournalSnapshot {
+            sequence: 3,
+            last_record: f.intent.write_request.next_record.clone(),
+            object_generation: 41,
+            pending_intent: None,
+        };
+        f.provider.state =
+            Pfm5ExternalCasHighWaterState::from_snapshot(&f.authority_pin, &f.cas_pin, &finalized)
+                .unwrap();
+
+        let reopened = Pfm5ExternalCasJournalStore::new(&path);
+        assert!(matches!(
+            reopened.load_checked(&f.cas_pin, 3, 0, 40),
+            Err(crate::private_testnet_pfm5_external_cas_journal_candidate::Pfm5ExternalCasJournalError::SequenceRollback {
+                observed: 2,
+                minimum: 3,
+            })
+        ));
+
+        // The authorization is derived from the provider's authenticated read, not from a
+        // caller-constructed journal proof. Reopen accepts only the exact one-step rollback.
+        let authorization = authorize_prepared_journal_recovery(
+            &mut f.provider,
+            &f.authority_pin,
+            &f.cas_pin,
+            &prepared,
+        )
+        .unwrap();
+        let recovered = reopened
+            .load_prepared_for_recovery(&f.cas_pin, f.authority_pin.authority_id, &authorization)
+            .unwrap();
+        assert_eq!(recovered.sequence, 2);
+        assert_eq!(recovered.pending_intent, Some(f.intent.clone()));
+        assert_eq!(f.provider.reads, 1);
+        assert_eq!(f.provider.writes, 0);
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
