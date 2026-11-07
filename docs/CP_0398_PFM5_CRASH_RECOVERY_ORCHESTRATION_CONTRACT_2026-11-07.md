@@ -2,7 +2,33 @@
 
 Date: 2026-11-07
 
-Status: **Design and acceptance contract only. No recovery orchestrator, production provider, node integration, or operational readiness is claimed.**
+Status: **Recovery-load primitive implemented and locally validated on the working branch; full crash-recovery orchestration, production provider, node integration, and operational readiness are not implemented or claimed.**
+
+### Implementation update ? 2026-11-07
+
+The bounded recovery-load primitive is now implemented in `private_testnet_pfm5_external_cas_journal_candidate.rs` and `private_testnet_pfm5_external_cas_highwater_candidate.rs` on the CP-0398 source branch:
+
+- `authorize_prepared_journal_recovery` performs a fresh authenticated High-Water read and issues a crate-internal, opaque authorization only for the exact one-step Finalized successor.
+- `load_prepared_for_recovery` reopens PFJ1 under the existing file/lock/checksum/canonical-decoding protections; it accepts only a Prepared journal exactly one sequence behind that authorization, bound to the expected authority ID, provider/network/Genesis, exact finalized successor, advanced object generation, and a domain-separated digest of the complete encoded pending intent.
+- Ordinary `load_checked` is unchanged and continues to reject the stale sequence. The recovery API does not relax general floor checks.
+- Local validation after the recovery API and integrated test: `cargo fmt --check`, `cargo check --all-targets`, and `cargo test --lib` passed (827 passed). `cargo test --all-targets` also completed successfully (827 library tests plus every binary/integration target). After a test-only import-scope cleanup, all-target checking and the full library suite were rerun successfully.
+
+This closes only the specific journal-read dead end. The returned snapshot is not by itself commit evidence: CP-0394 must still perform its fresh signed ECR1 read and object verification, and a caller/orchestrator must still compose the complete crash matrix. No real provider or node/runtime wiring exists.
+
+### Integrated crash-recovery test ? 2026-11-07
+
+Added `crash_recovery_reopens_prepared_journal_and_reconciles_real_signed_ecr1_successor` in the CP-0394 executor test module. It composes the real CP-0394 executor, signed ML-DSA-65 ECR1 test provider, immutable-object client, disk-backed CP-0395 journal, and CP-0396 High-Water contract double:
+
+1. Initialize Ready PFJ1 and verify it against the independent-floor contract double.
+2. Persist the exact Prepared intent and advance the independent floor to Prepared before CP-0394 executes.
+3. Execute CP-0394 and commit the signed ECR1 successor (one CAS).
+4. Simulate the crash boundary by leaving the disk journal Prepared while advancing the independent floor to the exact Finalized successor.
+5. Reopen the disk journal; ordinary `load_checked` rejects its stale sequence.
+6. Obtain a fresh authenticated-floor authorization and load only the exact Prepared journal via the bounded recovery path.
+7. Re-execute the same intent through CP-0394; its fresh signed ECR1 read returns `AlreadyCommitted`, and the CAS count remains one.
+8. Finalize PFJ1 locally and verify it against the already-finalized independent floor.
+
+The first integrated end-to-end test passed locally (1 passed, 0 failed). A second integrated test, `crash_after_local_finalization_reconciles_prepared_highwater_on_restart`, covers the complementary crash window: CP-0394 confirms and commits the exact signed ECR1 successor once; PFJ1 persists Finalized locally; the process stops before the independent High-Water Prepared state is advanced. On restart, the test verifies that the stale Prepared floor is reconciled only through the exact Prepared-to-Finalized transition, the Ready snapshot verifies, and the external CAS count remains one. Both integrated tests use in-memory High-Water and signed ECR1 provider doubles plus a real temporary disk journal; they are not a production remote authority, multi-host test, node integration, or deployment qualification. The current full validation passed `cargo fmt -- --check`, `cargo check --all-targets`, and `cargo test --all-targets`; the library suite passed 828/828, all binary/integration targets passed, and the process exited with code 0.
 
 ## Purpose and boundary
 
@@ -81,7 +107,7 @@ The orchestrator implementation must expose deterministic fault points and use a
 
 ## Required automated tests before implementation is considered qualified
 
-- Add a narrowly scoped recovery-load API (or equivalent reviewed mechanism) that permits exactly the authenticated Finalized-floor / one-step-older Prepared-journal case without weakening normal `load_checked` semantics. It must still validate checksum, canonical encoding, domain, file safety, and the exact pending intent.
+- Extend the bounded recovery-load primitive with the remaining integration harness: verify the opaque authorization and exact-intent digest against real PFJ1 reopen and authenticated High-Water provider doubles; normal `load_checked` must continue to reject the same stale journal.
 - A single integration harness composes the real PFJ1 journal module, CP-0396 contract functions, CP-0394 executor, and deterministic provider doubles; separate unit tests are insufficient.
 - Child-process termination and restart at every matrix boundary, including after provider commit but before response delivery.
 - Exact assertions for same operation ID, same nonce/request digest, exact predecessor/successor, sequence increments of exactly one, and strictly advanced object generation.
@@ -94,7 +120,7 @@ The orchestrator implementation must expose deterministic fault points and use a
 
 1. Define a narrow recovery coordinator API over existing components; avoid duplicating their validation or weakening their types.
 2. Implement the deterministic integration harness and fault injection first. Tests must fail against an intentionally broken ordering (for example, CP-0394 called before Prepared floor confirmation).
-3. Implement the recovery-load path and coordinator only when each matrix transition has a precise result type and no ambiguous boolean success. Keep normal `load_checked` strict; do not weaken its minimum-floor behavior globally.
+3. The integrated CP-0394/CP-0395/CP-0396 crash-recovery test now covers the exact commit-before-local-finalize restart window. Next extend the harness across every crash point and fault response in the matrix, then design a production adapter only if a no-cost, independently authenticated authority can be supplied. Keep normal `load_checked` strict; do not weaken its minimum-floor behavior globally.
 4. Review provider authentication, canonical encoding, authority bootstrap/rotation/revocation, and linearizable compare-and-advance independently. The existing AWS adapter plan is design material only; **no AWS account, paid cloud resource, KMS, DynamoDB, or spend is authorized or required by this CP**.
 5. Run all-target Rust validation and exact-head CI; retain Draft status pending review.
 6. Do not wire into node startup, Devnet, or Mainnet until the independent provider adapter and multi-host rollback qualification pass and the project owner separately approves integration.

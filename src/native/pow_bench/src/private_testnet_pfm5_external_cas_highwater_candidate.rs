@@ -12,7 +12,9 @@
 use crate::{
     external_cas_anchor_candidate::{ExternalCasPin, ExternalCasRecord},
     private_testnet_pfm5_external_cas_candidate::Pfm5ExternalCasIntent,
-    private_testnet_pfm5_external_cas_journal_candidate::Pfm5ExternalCasJournalSnapshot,
+    private_testnet_pfm5_external_cas_journal_candidate::{
+        Pfm5ExternalCasJournalRecoveryAuthorization, Pfm5ExternalCasJournalSnapshot,
+    },
 };
 use std::fmt;
 
@@ -275,6 +277,55 @@ where
     Ok(observed)
 }
 
+/// Authorize the journal's narrowly scoped one-step recovery read. This performs a fresh
+/// authenticated High-Water read and binds the resulting authorization to the exact Prepared
+/// intent's finalized successor, domain, sequence, and advanced object generation.
+pub fn authorize_prepared_journal_recovery<P>(
+    provider: &mut P,
+    authority: &Pfm5ExternalCasHighWaterAuthorityPin,
+    pin: &ExternalCasPin,
+    prepared: &Pfm5ExternalCasJournalSnapshot,
+) -> Result<Pfm5ExternalCasJournalRecoveryAuthorization, Pfm5ExternalCasHighWaterError>
+where
+    P: Pfm5ExternalCasHighWaterProvider,
+{
+    let intent = prepared
+        .pending_intent
+        .as_ref()
+        .ok_or(Pfm5ExternalCasHighWaterError::PreparedSnapshotRequired)?;
+    if prepared.sequence <= 1
+        || prepared.last_record != intent.expected_current
+        || prepared.object_generation != intent.expected_object_generation
+    {
+        return Err(Pfm5ExternalCasHighWaterError::IntentMismatch);
+    }
+    intent
+        .validate(pin)
+        .map_err(|_| Pfm5ExternalCasHighWaterError::IntentMismatch)?;
+    let expected_sequence = prepared
+        .sequence
+        .checked_add(1)
+        .ok_or(Pfm5ExternalCasHighWaterError::InvalidTransition)?;
+    let observed = read_checked(provider, authority, pin)?;
+    if observed.journal_sequence != expected_sequence
+        || observed.record != intent.write_request.next_record
+        || observed.object_generation <= intent.expected_object_generation
+    {
+        return Err(Pfm5ExternalCasHighWaterError::HighWaterConflict);
+    }
+    Ok(
+        Pfm5ExternalCasJournalRecoveryAuthorization::from_authenticated_finalized_floor(
+            observed.authority_id,
+            pin,
+            observed.journal_sequence,
+            observed.record,
+            observed.object_generation,
+            intent,
+        )
+        .map_err(|_| Pfm5ExternalCasHighWaterError::HighWaterConflict)?,
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Transition {
     Prepared,
@@ -377,6 +428,7 @@ mod tests {
     use super::*;
     use crate::{
         external_cas_anchor_candidate::ExternalCasWriteRequest,
+        private_testnet_pfm5_external_cas_journal_candidate::Pfm5ExternalCasJournalStore,
         v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES,
     };
 
@@ -648,6 +700,119 @@ mod tests {
             .unwrap(),
             Pfm5ExternalCasHighWaterAdvance::AlreadyAdvanced
         );
+    }
+
+    #[test]
+    fn recovery_authorization_is_issued_only_from_exact_authenticated_finalized_floor() {
+        let mut f = fixture();
+        f.provider.state = Pfm5ExternalCasHighWaterState::from_snapshot(
+            &f.authority_pin,
+            &f.cas_pin,
+            &f.finalized,
+        )
+        .unwrap();
+        let _authorization = authorize_prepared_journal_recovery(
+            &mut f.provider,
+            &f.authority_pin,
+            &f.cas_pin,
+            &f.prepared,
+        )
+        .unwrap();
+        assert_eq!(f.provider.reads, 1);
+        assert_eq!(f.provider.writes, 0);
+
+        let reads_before = f.provider.reads;
+        let writes_before = f.provider.writes;
+        let mut wrong_intent = f.prepared.clone();
+        wrong_intent
+            .pending_intent
+            .as_mut()
+            .unwrap()
+            .write_request
+            .request_nonce = [0xFE; 32];
+        assert_eq!(
+            authorize_prepared_journal_recovery(
+                &mut f.provider,
+                &f.authority_pin,
+                &f.cas_pin,
+                &wrong_intent,
+            ),
+            Err(Pfm5ExternalCasHighWaterError::IntentMismatch)
+        );
+        assert_eq!(f.provider.reads, reads_before);
+        assert_eq!(f.provider.writes, writes_before);
+    }
+
+    #[test]
+    fn authenticated_highwater_authorizes_reopened_disk_rollback_without_weakening_normal_load() {
+        use std::{
+            fs,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+        static NEXT_DIR: AtomicU64 = AtomicU64::new(1);
+
+        let mut f = fixture();
+        let dir = std::env::temp_dir().join(format!(
+            "ain1-pfm5-recovery-integration-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("intent.pfj1");
+        let journal = Pfm5ExternalCasJournalStore::new(&path);
+
+        let initialized = journal
+            .initialize(
+                &f.cas_pin,
+                f.ready.last_record.clone(),
+                f.ready.object_generation,
+            )
+            .unwrap();
+        assert_eq!(initialized.sequence, 1);
+        let prepared = journal
+            .stage_intent(&f.cas_pin, &f.intent, 1, 0, f.ready.object_generation)
+            .unwrap();
+        assert_eq!(prepared.sequence, 2);
+
+        // Simulate the crash window: the independent authority durably reached the exact
+        // finalized successor, while the reopened local PFJ1 file still contains Prepared N.
+        let finalized = Pfm5ExternalCasJournalSnapshot {
+            sequence: 3,
+            last_record: f.intent.write_request.next_record.clone(),
+            object_generation: 41,
+            pending_intent: None,
+        };
+        f.provider.state =
+            Pfm5ExternalCasHighWaterState::from_snapshot(&f.authority_pin, &f.cas_pin, &finalized)
+                .unwrap();
+
+        let reopened = Pfm5ExternalCasJournalStore::new(&path);
+        assert!(matches!(
+            reopened.load_checked(&f.cas_pin, 3, 0, 40),
+            Err(crate::private_testnet_pfm5_external_cas_journal_candidate::Pfm5ExternalCasJournalError::SequenceRollback {
+                observed: 2,
+                minimum: 3,
+            })
+        ));
+
+        // The authorization is derived from the provider's authenticated read, not from a
+        // caller-constructed journal proof. Reopen accepts only the exact one-step rollback.
+        let authorization = authorize_prepared_journal_recovery(
+            &mut f.provider,
+            &f.authority_pin,
+            &f.cas_pin,
+            &prepared,
+        )
+        .unwrap();
+        let recovered = reopened
+            .load_prepared_for_recovery(&f.cas_pin, f.authority_pin.authority_id, &authorization)
+            .unwrap();
+        assert_eq!(recovered.sequence, 2);
+        assert_eq!(recovered.pending_intent, Some(f.intent.clone()));
+        assert_eq!(f.provider.reads, 1);
+        assert_eq!(f.provider.writes, 0);
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

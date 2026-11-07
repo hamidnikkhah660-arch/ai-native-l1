@@ -59,6 +59,7 @@ pub enum Pfm5ExternalCasJournalError {
     RecordRollback { observed: u64, minimum: u64 },
     ObjectGenerationRollback { observed: u64, minimum: u64 },
     ReadbackMismatch,
+    RecoveryAuthorizationMismatch,
 }
 
 impl std::fmt::Display for Pfm5ExternalCasJournalError {
@@ -92,6 +93,51 @@ pub struct Pfm5ExternalCasJournalSnapshot {
 impl Pfm5ExternalCasJournalSnapshot {
     pub fn is_prepared(&self) -> bool {
         self.pending_intent.is_some()
+    }
+}
+
+/// Narrow authorization produced only after an authenticated finalized High-Water read.
+/// Its fields are private so external callers cannot manufacture rollback exceptions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pfm5ExternalCasJournalRecoveryAuthorization {
+    authority_id: [u8; 32],
+    provider_id: [u8; 32],
+    network_id: [u8; 32],
+    genesis_digest: [u8; 32],
+    finalized_sequence: u64,
+    finalized_record: ExternalCasRecord,
+    finalized_object_generation: u64,
+    intent_digest: [u8; 32],
+}
+impl Pfm5ExternalCasJournalRecoveryAuthorization {
+    /// Crate-internal constructor; callers must invoke this only after read_authenticated
+    /// and exact Prepared-intent/finalized-successor checks in the High-Water module.
+    pub(crate) fn from_authenticated_finalized_floor(
+        authority_id: [u8; 32],
+        pin: &ExternalCasPin,
+        finalized_sequence: u64,
+        finalized_record: ExternalCasRecord,
+        finalized_object_generation: u64,
+        intent: &Pfm5ExternalCasIntent,
+    ) -> Result<Self, Pfm5ExternalCasJournalError> {
+        if authority_id == [0; 32] || finalized_sequence == 0 || finalized_object_generation == 0 {
+            return Err(Pfm5ExternalCasJournalError::RecoveryAuthorizationMismatch);
+        }
+        intent
+            .validate(pin)
+            .map_err(|_| Pfm5ExternalCasJournalError::RecoveryAuthorizationMismatch)?;
+        validate_record_domain(pin, &finalized_record)?;
+        let intent_digest = recovery_intent_digest(pin, intent)?;
+        Ok(Self {
+            authority_id,
+            provider_id: pin.provider_id,
+            network_id: pin.network_id,
+            genesis_digest: pin.genesis_digest,
+            finalized_sequence,
+            finalized_record,
+            finalized_object_generation,
+            intent_digest,
+        })
     }
 }
 
@@ -155,6 +201,50 @@ impl Pfm5ExternalCasJournalStore {
         )?;
         Ok(snapshot)
     }
+    /// Load a one-step stale Prepared journal only with authorization returned by an
+    /// authenticated independent finalized High-Water observation. Normal load_checked
+    /// remains strict and never accepts a stale sequence.
+    pub fn load_prepared_for_recovery(
+        &self,
+        pin: &ExternalCasPin,
+        expected_authority_id: [u8; 32],
+        authorization: &Pfm5ExternalCasJournalRecoveryAuthorization,
+    ) -> Result<Pfm5ExternalCasJournalSnapshot, Pfm5ExternalCasJournalError> {
+        let _locks = self.acquire_locks()?;
+        let snapshot = self.load_unlocked(pin)?;
+        let intent = snapshot
+            .pending_intent
+            .as_ref()
+            .ok_or(Pfm5ExternalCasJournalError::RecoveryAuthorizationMismatch)?;
+        let expected_finalized_sequence = snapshot
+            .sequence
+            .checked_add(1)
+            .ok_or(Pfm5ExternalCasJournalError::RecoveryAuthorizationMismatch)?;
+        if expected_authority_id == [0; 32]
+            || authorization.authority_id != expected_authority_id
+            || authorization.provider_id != pin.provider_id
+            || authorization.network_id != pin.network_id
+            || authorization.genesis_digest != pin.genesis_digest
+            || authorization.finalized_sequence != expected_finalized_sequence
+            || authorization.finalized_record != intent.write_request.next_record
+            || authorization.finalized_object_generation <= intent.expected_object_generation
+            || authorization.intent_digest != recovery_intent_digest(pin, intent)?
+            || snapshot.last_record != intent.expected_current
+            || snapshot.object_generation != intent.expected_object_generation
+        {
+            return Err(Pfm5ExternalCasJournalError::RecoveryAuthorizationMismatch);
+        }
+        intent
+            .validate(pin)
+            .map_err(|_| Pfm5ExternalCasJournalError::RecoveryAuthorizationMismatch)?;
+        validate_record_domain(pin, &authorization.finalized_record)?;
+        snapshot
+            .last_record
+            .validate_successor(&authorization.finalized_record)
+            .map_err(|_| Pfm5ExternalCasJournalError::RecoveryAuthorizationMismatch)?;
+        Ok(snapshot)
+    }
+
     /// Durably stage the exact intent before remote object publication or ECR1 CAS.
     ///
     /// If the same intent is already Prepared this is idempotent. A different intent cannot
@@ -348,6 +438,19 @@ fn validate_record_domain(
         return Err(Pfm5ExternalCasJournalError::PinMismatch);
     }
     Ok(())
+}
+
+fn recovery_intent_digest(
+    pin: &ExternalCasPin,
+    intent: &Pfm5ExternalCasIntent,
+) -> Result<[u8; 32], Pfm5ExternalCasJournalError> {
+    let encoded = intent
+        .encode(pin)
+        .map_err(|_| Pfm5ExternalCasJournalError::RecoveryAuthorizationMismatch)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"AIN1-PFM5-RECOVERY-INTENT-AUTH-V1\0");
+    hasher.update(encoded);
+    Ok(hasher.finalize().into())
 }
 
 fn validate_floors(
@@ -892,6 +995,76 @@ mod tests {
             })
         ));
         assert_eq!(staged.sequence, 2);
+    }
+
+    #[test]
+    fn bounded_recovery_load_accepts_only_exact_one_step_prepared_rollback() {
+        let (pin, current, intent) = fixture();
+        let dir = TestDir::new();
+        let journal = store(&dir);
+        journal.initialize(&pin, current, 40).unwrap();
+        let prepared = journal.stage_intent(&pin, &intent, 1, 0, 40).unwrap();
+        let reopened = store(&dir);
+
+        // Ordinary loading remains fail-closed at the authenticated finalized floor.
+        assert!(matches!(
+            reopened.load_checked(&pin, 3, 0, 40),
+            Err(Pfm5ExternalCasJournalError::SequenceRollback {
+                observed: 2,
+                minimum: 3
+            })
+        ));
+
+        let authorization =
+            Pfm5ExternalCasJournalRecoveryAuthorization::from_authenticated_finalized_floor(
+                [7; 32],
+                &pin,
+                3,
+                intent.write_request.next_record.clone(),
+                41,
+                &intent,
+            )
+            .unwrap();
+        assert_eq!(
+            reopened
+                .load_prepared_for_recovery(&pin, [7; 32], &authorization)
+                .unwrap(),
+            prepared
+        );
+        assert_eq!(
+            reopened.load_prepared_for_recovery(&pin, [8; 32], &authorization),
+            Err(Pfm5ExternalCasJournalError::RecoveryAuthorizationMismatch)
+        );
+
+        let skipped_sequence =
+            Pfm5ExternalCasJournalRecoveryAuthorization::from_authenticated_finalized_floor(
+                [7; 32],
+                &pin,
+                4,
+                intent.write_request.next_record.clone(),
+                41,
+                &intent,
+            )
+            .unwrap();
+        assert_eq!(
+            reopened.load_prepared_for_recovery(&pin, [7; 32], &skipped_sequence),
+            Err(Pfm5ExternalCasJournalError::RecoveryAuthorizationMismatch)
+        );
+
+        let unadvanced_generation =
+            Pfm5ExternalCasJournalRecoveryAuthorization::from_authenticated_finalized_floor(
+                [7; 32],
+                &pin,
+                3,
+                intent.write_request.next_record.clone(),
+                40,
+                &intent,
+            )
+            .unwrap();
+        assert_eq!(
+            reopened.load_prepared_for_recovery(&pin, [7; 32], &unadvanced_generation),
+            Err(Pfm5ExternalCasJournalError::RecoveryAuthorizationMismatch)
+        );
     }
 
     #[test]
