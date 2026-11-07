@@ -28,7 +28,7 @@ Added `crash_recovery_reopens_prepared_journal_and_reconciles_real_signed_ecr1_s
 7. Re-execute the same intent through CP-0394; its fresh signed ECR1 read returns `AlreadyCommitted`, and the CAS count remains one.
 8. Finalize PFJ1 locally and verify it against the already-finalized independent floor.
 
-The new end-to-end test passed locally (1 passed, 0 failed); the full library suite then passed 827/827, and `cargo test --all-targets` completed successfully (exit code 0). It uses in-memory High-Water and signed ECR1 provider doubles plus a real temporary disk journal; it is not a production remote authority, multi-host test, node integration, or deployment qualification.
+The first integrated end-to-end test passed locally (1 passed, 0 failed). A second integrated test, `crash_after_local_finalization_reconciles_prepared_highwater_on_restart`, covers the complementary crash window: CP-0394 confirms and commits the exact signed ECR1 successor once; PFJ1 persists Finalized locally; the process stops before the independent High-Water Prepared state is advanced. On restart, the test verifies that the stale Prepared floor is reconciled only through the exact Prepared-to-Finalized transition, the Ready snapshot verifies, and the external CAS count remains one. Both integrated tests use in-memory High-Water and signed ECR1 provider doubles plus a real temporary disk journal; they are not a production remote authority, multi-host test, node integration, or deployment qualification. The current full validation passed `cargo fmt -- --check`, `cargo check --all-targets`, and `cargo test --all-targets`; the library suite passed 828/828, all binary/integration targets passed, and the process exited with code 0.
 
 ## Purpose and boundary
 

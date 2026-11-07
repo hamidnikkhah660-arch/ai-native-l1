@@ -1049,6 +1049,77 @@ mod tests {
     }
 
     #[test]
+    fn crash_after_local_finalization_reconciles_prepared_highwater_on_restart() {
+        let fixture = Fixture::new();
+        let verifier = LibcruxMlDsa65VerifierCandidate;
+        let (bundle, current, pin) = fixture.bundle_and_anchor(&verifier, 0x31);
+        let intent = prepare_intent(&fixture, &bundle, current.clone(), &pin);
+        let authority = Pfm5ExternalCasHighWaterAuthorityPin {
+            authority_id: [0xA2; 32],
+        };
+        let directory = TestDirectory::new();
+        let journal_path = directory.path().join("intent.pfj1");
+        let journal = Pfm5ExternalCasJournalStore::new(&journal_path);
+        let ready = journal.initialize(&pin, current, 40).unwrap();
+        let mut highwater = MemoryHighWater(
+            Pfm5ExternalCasHighWaterState::from_snapshot(&authority, &pin, &ready).unwrap(),
+        );
+        let prepared = journal.stage_intent(&pin, &intent, 1, 0, 40).unwrap();
+        assert_eq!(
+            advance_prepared_snapshot(&mut highwater, &authority, &pin, &prepared).unwrap(),
+            Pfm5ExternalCasHighWaterAdvance::Advanced
+        );
+
+        let (provider, remote_state, cas_calls) =
+            signed_cas_provider(pin.clone(), intent.expected_current.clone(), 0x31, false);
+        let mut cas =
+            VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
+                .unwrap();
+        let mut objects = Pfm5ImmutableObjectClient::new(MemoryObjectProvider::default());
+        let outcome = execute_intent(
+            &mut objects,
+            &mut cas,
+            &pin,
+            &fixture.context(),
+            &intent,
+            &bundle,
+        )
+        .unwrap();
+        assert!(matches!(outcome, Pfm5ExternalCasOutcome::Committed { .. }));
+        assert_eq!(cas_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            remote_state.lock().unwrap().current,
+            intent.write_request.next_record
+        );
+
+        // Persist local Finalized first, then simulate a crash before advancing independent High-Water.
+        let finalized = Pfm5ExternalCasJournalSnapshot {
+            sequence: 3,
+            last_record: intent.write_request.next_record.clone(),
+            object_generation: 41,
+            pending_intent: None,
+        };
+        let local_finalized = journal
+            .mark_committed(&pin, &intent, finalized.last_record.clone(), 41, 2, 0, 40)
+            .unwrap();
+        assert_eq!(local_finalized, finalized);
+
+        // Restart sees a valid local journal, but it must not be treated as ready against seq-2 floor.
+        let reopened = Pfm5ExternalCasJournalStore::new(&journal_path);
+        let loaded = reopened.load_checked(&pin, 2, 0, 40).unwrap();
+        assert_eq!(loaded, finalized);
+        assert!(verify_ready_snapshot(&mut highwater, &authority, &pin, &loaded).is_err());
+
+        // Reconcile only the exact Prepared -> Finalized transition; no second ECR1 CAS is issued.
+        assert_eq!(
+            advance_finalized_snapshot(&mut highwater, &authority, &pin, &intent, &finalized)
+                .unwrap(),
+            Pfm5ExternalCasHighWaterAdvance::Advanced
+        );
+        verify_ready_snapshot(&mut highwater, &authority, &pin, &loaded).unwrap();
+        assert_eq!(cas_calls.load(Ordering::SeqCst), 1);
+    }
+    #[test]
     fn object_readback_precedes_signed_ecr1_commit() {
         let fixture = Fixture::new();
         let verifier = LibcruxMlDsa65VerifierCandidate;
