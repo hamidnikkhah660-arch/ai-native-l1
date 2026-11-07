@@ -417,3 +417,6 @@ pub mod private_testnet_qhwr_operation_recovery_model;
 pub mod private_testnet_qhwr_signer_idempotency_model;
 
 pub mod private_testnet_qhwr_durable_replay_ledger_candidate;
+
+/// CP-0412 single-host durable QHWR operation journal; candidate only, not production-wired.
+pub mod private_testnet_qhwr_durable_operation_journal_candidate;
