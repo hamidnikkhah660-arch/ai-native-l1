@@ -395,3 +395,288 @@ mod tests {
         assert_eq!(QhwrResponse::decode(&bytes).unwrap(), value);
     }
 }
+
+// Authenticated Noise client adapter. The caller supplies an already-connected TCP stream;
+// this module never opens a listener or changes network/firewall configuration.
+use crate::devnet_noise_transport_candidate::{DevnetNoiseError, DevnetNoiseSession};
+use crate::private_testnet_pfm5_external_cas_highwater_adapter_candidate::Pfm5AuthenticatedHighWaterTransport;
+use std::{fmt, net::TcpStream};
+
+#[derive(Debug)]
+pub enum QhwrNoiseClientError {
+    Noise(DevnetNoiseError),
+    Codec(QhwrCodecError),
+    Remote(QhwrErrorStatus),
+    UnexpectedResponse,
+    ChallengeMismatch,
+    InvalidStateWidth,
+}
+impl fmt::Display for QhwrNoiseClientError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Noise(error) => write!(f, "Noise session failed: {error}"),
+            Self::Codec(error) => write!(f, "QHWR codec failed: {error:?}"),
+            Self::Remote(status) => write!(f, "QHWR peer returned status {status:?}"),
+            Self::UnexpectedResponse => f.write_str("QHWR peer returned an unexpected response"),
+            Self::ChallengeMismatch => f.write_str("QHWR response challenge did not match request"),
+            Self::InvalidStateWidth => f.write_str("QHWR next state has an invalid wire width"),
+        }
+    }
+}
+impl std::error::Error for QhwrNoiseClientError {}
+
+pub struct Pfm5QhwrNoiseClient {
+    stream: TcpStream,
+    session: DevnetNoiseSession,
+}
+impl Pfm5QhwrNoiseClient {
+    /// Establish a pinned Noise XX session on a caller-provided TCP connection.
+    /// The remote static key is checked before any QHWR application request is sent.
+    pub fn connect(
+        mut stream: TcpStream,
+        local_static_private_key: &[u8; 32],
+        trusted_remote_static_public_key: &[u8; 32],
+        network_id: &[u8; 32],
+    ) -> Result<Self, QhwrNoiseClientError> {
+        let session = DevnetNoiseSession::connect(
+            &mut stream,
+            local_static_private_key,
+            trusted_remote_static_public_key,
+            network_id,
+        )
+        .map_err(QhwrNoiseClientError::Noise)?;
+        Ok(Self { stream, session })
+    }
+
+    pub fn remote_static_public_key(&self) -> &[u8; 32] {
+        self.session.remote_static_public_key()
+    }
+
+    fn exchange(
+        &mut self,
+        request: QhwrRequest,
+        expected_operation: QhwrOperation,
+        expected_challenge: [u8; 32],
+    ) -> Result<Pfm5ExternalCasHighWaterSignedResponseV1, QhwrNoiseClientError> {
+        let encoded = request.encode().map_err(QhwrNoiseClientError::Codec)?;
+        self.session
+            .write_record(&mut self.stream, &encoded)
+            .map_err(QhwrNoiseClientError::Noise)?;
+        let plaintext = self
+            .session
+            .read_record(&mut self.stream)
+            .map_err(QhwrNoiseClientError::Noise)?;
+        match QhwrResponse::decode(&plaintext).map_err(QhwrNoiseClientError::Codec)? {
+            QhwrResponse::Error(status) => Err(QhwrNoiseClientError::Remote(status)),
+            QhwrResponse::SignedState {
+                operation,
+                response,
+            } => {
+                if operation != expected_operation {
+                    return Err(QhwrNoiseClientError::UnexpectedResponse);
+                }
+                if response.challenge != expected_challenge {
+                    return Err(QhwrNoiseClientError::ChallengeMismatch);
+                }
+                Ok(response)
+            }
+        }
+    }
+}
+
+impl Pfm5AuthenticatedHighWaterTransport for Pfm5QhwrNoiseClient {
+    type Error = QhwrNoiseClientError;
+
+    fn read(
+        &mut self,
+        challenge: [u8; 32],
+    ) -> Result<Pfm5ExternalCasHighWaterSignedResponseV1, Self::Error> {
+        self.exchange(
+            QhwrRequest::Read { challenge },
+            QhwrOperation::Read,
+            challenge,
+        )
+    }
+
+    fn compare_and_advance(
+        &mut self,
+        challenge: [u8; 32],
+        expected_state_digest: [u8; 32],
+        next_wire_state: Vec<u8>,
+    ) -> Result<Pfm5ExternalCasHighWaterSignedResponseV1, Self::Error> {
+        if next_wire_state.len() != QHWA_V1_WIRE_BYTES {
+            return Err(QhwrNoiseClientError::InvalidStateWidth);
+        }
+        let mut fixed_state = [0u8; QHWA_V1_WIRE_BYTES];
+        fixed_state.copy_from_slice(&next_wire_state);
+        self.exchange(
+            QhwrRequest::CompareAndAdvance {
+                challenge,
+                expected_state_digest,
+                next_state_wire: fixed_state,
+            },
+            QhwrOperation::CompareAndAdvance,
+            challenge,
+        )
+    }
+}
+
+#[cfg(test)]
+mod noise_client_tests {
+    use super::*;
+    use snow::{params::NoiseParams, Builder};
+    use std::{
+        net::{TcpListener, TcpStream},
+        thread,
+    };
+
+    fn keypair() -> ([u8; 32], [u8; 32]) {
+        let params: NoiseParams = "Noise_XX_25519_ChaChaPoly_SHA256".parse().unwrap();
+        let mut pair = Builder::new(params).generate_keypair().unwrap();
+        let mut private = [0u8; 32];
+        let mut public = [0u8; 32];
+        private.copy_from_slice(&pair.private);
+        public.copy_from_slice(&pair.public);
+        pair.private.fill(0);
+        pair.public.fill(0);
+        (private, public)
+    }
+
+    #[test]
+    fn pinned_noise_client_roundtrips_read_and_cas_records() {
+        let network = [0x31; 32];
+        let (server_private, server_public) = keypair();
+        let (client_private, client_public) = keypair();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut session = DevnetNoiseSession::accept(
+                &mut stream,
+                &server_private,
+                &[client_public],
+                &network,
+            )
+            .unwrap();
+
+            let read = session.read_record(&mut stream).unwrap();
+            let read_request = QhwrRequest::decode(&read).unwrap();
+            let read_challenge = match read_request {
+                QhwrRequest::Read { challenge } => challenge,
+                _ => panic!("expected READ request"),
+            };
+            let read_response = QhwrResponse::SignedState {
+                operation: QhwrOperation::Read,
+                response: Pfm5ExternalCasHighWaterSignedResponseV1 {
+                    challenge: read_challenge,
+                    key_id: [0x44; 32],
+                    key_generation: 7,
+                    wire_state: vec![0x55; QHWA_V1_WIRE_BYTES],
+                    signature: [0x66; ML_DSA_65_SIGNATURE_BYTES],
+                },
+            };
+            session
+                .write_record(&mut stream, &read_response.encode().unwrap())
+                .unwrap();
+
+            let cas = session.read_record(&mut stream).unwrap();
+            match QhwrRequest::decode(&cas).unwrap() {
+                QhwrRequest::CompareAndAdvance {
+                    challenge,
+                    expected_state_digest,
+                    next_state_wire,
+                } => {
+                    assert_eq!(challenge, [0x22; 32]);
+                    assert_eq!(expected_state_digest, [0x33; 32]);
+                    assert_eq!(next_state_wire, [0x77; QHWA_V1_WIRE_BYTES]);
+                }
+                _ => panic!("expected COMPARE_AND_ADVANCE request"),
+            }
+            let cas_response = QhwrResponse::SignedState {
+                operation: QhwrOperation::CompareAndAdvance,
+                response: Pfm5ExternalCasHighWaterSignedResponseV1 {
+                    challenge: [0x22; 32],
+                    key_id: [0x44; 32],
+                    key_generation: 7,
+                    wire_state: vec![0x88; QHWA_V1_WIRE_BYTES],
+                    signature: [0x99; ML_DSA_65_SIGNATURE_BYTES],
+                },
+            };
+            session
+                .write_record(&mut stream, &cas_response.encode().unwrap())
+                .unwrap();
+        });
+
+        let stream = TcpStream::connect(address).unwrap();
+        let mut client =
+            Pfm5QhwrNoiseClient::connect(stream, &client_private, &server_public, &network)
+                .unwrap();
+        assert_eq!(client.remote_static_public_key(), &server_public);
+
+        let read = Pfm5AuthenticatedHighWaterTransport::read(&mut client, [0x11; 32]).unwrap();
+        assert_eq!(read.challenge, [0x11; 32]);
+        assert_eq!(read.wire_state, vec![0x55; QHWA_V1_WIRE_BYTES]);
+
+        let cas = Pfm5AuthenticatedHighWaterTransport::compare_and_advance(
+            &mut client,
+            [0x22; 32],
+            [0x33; 32],
+            vec![0x77; QHWA_V1_WIRE_BYTES],
+        )
+        .unwrap();
+        assert_eq!(cas.challenge, [0x22; 32]);
+        assert_eq!(cas.wire_state, vec![0x88; QHWA_V1_WIRE_BYTES]);
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn noise_client_rejects_response_challenge_mismatch() {
+        let network = [0x41; 32];
+        let (server_private, server_public) = keypair();
+        let (client_private, client_public) = keypair();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut session = DevnetNoiseSession::accept(
+                &mut stream,
+                &server_private,
+                &[client_public],
+                &network,
+            )
+            .unwrap();
+            let request = session.read_record(&mut stream).unwrap();
+            assert!(matches!(
+                QhwrRequest::decode(&request),
+                Ok(QhwrRequest::Read { .. })
+            ));
+            let response = QhwrResponse::SignedState {
+                operation: QhwrOperation::Read,
+                response: Pfm5ExternalCasHighWaterSignedResponseV1 {
+                    challenge: [0xFE; 32],
+                    key_id: [0x44; 32],
+                    key_generation: 7,
+                    wire_state: vec![0x55; QHWA_V1_WIRE_BYTES],
+                    signature: [0x66; ML_DSA_65_SIGNATURE_BYTES],
+                },
+            };
+            session
+                .write_record(&mut stream, &response.encode().unwrap())
+                .unwrap();
+        });
+
+        let stream = TcpStream::connect(address).unwrap();
+        let mut client =
+            Pfm5QhwrNoiseClient::connect(stream, &client_private, &server_public, &network)
+                .unwrap();
+        let result = Pfm5AuthenticatedHighWaterTransport::read(&mut client, [0x11; 32]);
+        assert!(matches!(
+            result,
+            Err(QhwrNoiseClientError::ChallengeMismatch)
+        ));
+        server.join().unwrap();
+    }
+}
