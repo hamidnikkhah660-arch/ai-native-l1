@@ -85,6 +85,7 @@ pub mod private_testnet_pfm5_archive_binding_candidate;
 pub mod private_testnet_pfm5_external_cas_candidate;
 /// Candidate-only adapter contract and fail-closed caller gates for an independent PFM5 anti-rollback high-water authority.
 pub mod private_testnet_pfm5_external_cas_highwater_candidate;
+pub mod private_testnet_pfm5_external_cas_highwater_wire_candidate;
 /// Candidate-only durable journal for exact PFM5 External-CAS intents and crash recovery.
 pub mod private_testnet_pfm5_external_cas_journal_candidate;
 /// Candidate-only durable PFM5/PCP4 checkpoint-rooted PMT4 branch store; no live provider or node wiring.
