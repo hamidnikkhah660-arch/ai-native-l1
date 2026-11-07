@@ -23,6 +23,10 @@ The authority key MUST be domain-separated and bind the complete CP-0403 scope:
 
 The authority MUST derive the canonical replay key itself from these typed fields, or verify a canonical digest supplied by a trusted adapter. It MUST reject zero/invalid required identity fields and unknown protocol versions. A caller-supplied opaque key without verifiable scope binding is insufficient.
 
+## 2.1 Protocol-version reconciliation
+
+Earlier CP-0402 wording called for bounded challenge expiry and an expiry argument. That requirement is superseded for QHWR v1 by the wire-format review recorded in CP-0403: v1 carries a client-generated challenge but no server-issued lease, authenticated issuance time, or expiry claim. The current v1 implementation MUST NOT accept a caller-supplied expiry or silently delete consumed challenge entries. It retains replay identities indefinitely and fails closed at capacity. Bounded retention is a future protocol-version change, not a deployment-time configuration switch. This section resolves the historical wording conflict; it does not alter the v1 wire format.
+
 ## 3. Required atomic operation
 
 The minimum semantic operation is:
