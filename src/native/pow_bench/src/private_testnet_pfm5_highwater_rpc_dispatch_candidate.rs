@@ -727,6 +727,147 @@ mod dispatch_path_tests {
         assert_eq!(signer.calls, 1);
     }
 
+    fn test_noise_keypair() -> ([u8; 32], [u8; 32]) {
+        use snow::{params::NoiseParams, Builder};
+        let params: NoiseParams = "Noise_XX_25519_ChaChaPoly_SHA256".parse().unwrap();
+        let mut pair = Builder::new(params).generate_keypair().unwrap();
+        let mut private = [0u8; 32];
+        let mut public = [0u8; 32];
+        private.copy_from_slice(&pair.private);
+        public.copy_from_slice(&pair.public);
+        pair.private.fill(0);
+        pair.public.fill(0);
+        (private, public)
+    }
+
+    #[test]
+    fn loopback_noise_server_rejects_unknown_peer_before_dependencies() {
+        use std::{
+            net::{TcpListener, TcpStream},
+            thread,
+        };
+
+        let network = [0x51; 32];
+        let (server_private, server_public) = test_noise_keypair();
+        let (client_private, _client_public) = test_noise_keypair();
+        let (_, unknown_public) = test_noise_keypair();
+        let (authority, pin) = pins();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut provider = FixedProvider {
+                state: valid_state(&authority, &pin),
+                fail: false,
+                reads: 0,
+            };
+            let mut ledger = FixedLedger {
+                result: Ok(true),
+                calls: 0,
+            };
+            let mut signer = FixedSigner {
+                fail: false,
+                calls: 0,
+                digest: None,
+            };
+            let result = serve_one_loopback_noise_connection(
+                stream,
+                &server_private,
+                &[unknown_public],
+                &network,
+                &authority,
+                &pin,
+                &mut provider,
+                &mut ledger,
+                &mut signer,
+            );
+            (result, provider.reads, ledger.calls, signer.calls)
+        });
+
+        let mut stream = TcpStream::connect(address).unwrap();
+        let client_result =
+            DevnetNoiseSession::connect(&mut stream, &client_private, &server_public, &network);
+        // The initiator cannot know that the responder rejected its static key until it attempts
+        // application traffic; the server-side authentication result is authoritative here.
+        assert!(client_result.is_ok());
+        drop(stream);
+        let (server_result, provider_reads, ledger_calls, signer_calls) = server.join().unwrap();
+        assert!(matches!(
+            server_result,
+            Err(QhwrLoopbackServerError::Noise(
+                DevnetNoiseError::UntrustedPeer
+            ))
+        ));
+        assert_eq!(provider_reads, 0);
+        assert_eq!(ledger_calls, 0);
+        assert_eq!(signer_calls, 0);
+    }
+
+    #[test]
+    fn loopback_noise_server_rejects_wrong_network_id_before_dependencies() {
+        use std::{
+            net::{TcpListener, TcpStream},
+            thread,
+        };
+
+        let server_network = [0x61; 32];
+        let client_network = [0x62; 32];
+        let (server_private, server_public) = test_noise_keypair();
+        let (client_private, client_public) = test_noise_keypair();
+        let (authority, pin) = pins();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut provider = FixedProvider {
+                state: valid_state(&authority, &pin),
+                fail: false,
+                reads: 0,
+            };
+            let mut ledger = FixedLedger {
+                result: Ok(true),
+                calls: 0,
+            };
+            let mut signer = FixedSigner {
+                fail: false,
+                calls: 0,
+                digest: None,
+            };
+            let result = serve_one_loopback_noise_connection(
+                stream,
+                &server_private,
+                &[client_public],
+                &server_network,
+                &authority,
+                &pin,
+                &mut provider,
+                &mut ledger,
+                &mut signer,
+            );
+            (result, provider.reads, ledger.calls, signer.calls)
+        });
+
+        let mut stream = TcpStream::connect(address).unwrap();
+        let client_result = DevnetNoiseSession::connect(
+            &mut stream,
+            &client_private,
+            &server_public,
+            &client_network,
+        );
+        drop(stream);
+        let (server_result, provider_reads, ledger_calls, signer_calls) = server.join().unwrap();
+        assert!(client_result.is_err());
+        assert!(matches!(
+            server_result,
+            Err(QhwrLoopbackServerError::Noise(_))
+        ));
+        assert_eq!(provider_reads, 0);
+        assert_eq!(ledger_calls, 0);
+        assert_eq!(signer_calls, 0);
+    }
+
     #[test]
     fn loopback_noise_server_authenticates_peer_and_dispatches_one_read() {
         use snow::{params::NoiseParams, Builder};

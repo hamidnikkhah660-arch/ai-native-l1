@@ -162,7 +162,7 @@ introduced by this candidate.
 
 ## Dispatcher fault-path qualification update
 
-The READ-only dispatcher now has ten focused tests. In addition to malformed request, unauthorized
+The READ-only dispatcher now has twelve focused tests. In addition to malformed request, unauthorized
 peer, and CAS rejection, tests exercise replay rejection, replay-ledger failure, Provider failure,
 Signer failure, and a successful READ envelope. The tests assert the order and absence of downstream
 calls: replay/ledger failures do not call the Provider or Signer; Provider failure occurs only after
