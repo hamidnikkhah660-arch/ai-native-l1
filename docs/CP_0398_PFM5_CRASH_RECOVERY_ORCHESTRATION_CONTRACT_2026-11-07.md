@@ -1,4 +1,4 @@
-﻿# CP-0398 - PFM5 crash-recovery orchestration contract and qualification matrix
+# CP-0398 - PFM5 crash-recovery orchestration contract and qualification matrix
 
 Date: 2026-11-07
 
@@ -109,4 +109,3 @@ No changes to Genesis, Network ID, consensus, PoW, issuance, wallet allocation, 
 - CP-0396: independent high-water state contract and transition checks.
 - CP-0397: provider-adapter design; no production adapter is deployed.
 - CP-0398: missing caller recovery composition and crash qualification requirements.
-
