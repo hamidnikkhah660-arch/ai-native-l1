@@ -26,7 +26,7 @@ The signed response contains:
 - exact QHWA v1 bytes; and
 - an ML-DSA-65 signature.
 
-The signature digest is SHA-256 over the response signing domain, challenge, key ID, key generation, encoded state length, and exact encoded state bytes. This binds the response to the outstanding request and to the full canonical state. The caller must generate a cryptographically secure, unpredictable challenge for each request and compare it with the outstanding request context. This module does not generate randomness, track outstanding requests, or maintain a network replay cache.
+The signature digest is SHA-256 over the response signing domain, challenge, key ID, key generation, encoded state length, and exact encoded state bytes. This binds the response to the outstanding request and to the full canonical state. The authenticated adapter candidate generates a fresh 32-byte challenge using the operating-system CSPRNG for each read and compare-and-advance operation, rejects an all-zero result, and verifies that the response carries the exact challenge supplied for that operation. The adapter does not persist challenges, maintain a distributed replay cache, or provide cross-process uniqueness guarantees; a production transport must enforce request expiry and one-time outstanding-request handling.
 
 Verification rejects zero/mismatched challenges, authority mismatch, invalid pins, key ID mismatch, key generation mismatch, malformed or cross-domain state, and invalid ML-DSA-65 signatures. The public key is supplied by the verifier pin, not read from the response.
 
@@ -38,7 +38,7 @@ The verifier pin currently represents one active key generation. Key rotation, r
 
 ## 5. Not implemented / non-goals
 
-- no network transport, TLS/mTLS, RPC client, or request-challenge generator;
+- no concrete network transport, TLS/mTLS, RPC client, or distributed replay cache;
 - no replay cache or distributed request coordination;
 - no remote linearizable compare-and-advance provider;
 - no independently operated authority or production key custody;
@@ -51,10 +51,12 @@ The verifier pin currently represents one active key generation. Key rotation, r
 Before any production consideration:
 1. Define and review authority bootstrap and out-of-band pin distribution.
 2. Specify key rotation/revocation with monotonic trust-store generations and recovery.
-3. Qualify unpredictable challenge generation, expiration, outstanding-request binding, and replay handling in the actual client transport.
+3. Qualify OS-CSPRNG challenge generation, expiration, outstanding-request binding, and replay handling in the actual client transport.
 4. Implement remote compare-and-advance that conditionally compares the complete predecessor state and provides linearizable semantics.
 5. Verify authenticated readback after every state transition and classify ambiguous write outcomes by fresh signed read.
 6. Run adversarial tests and independent multi-host fault/rollback qualification under separate operators.
 7. Obtain independent cryptographic and operational review.
+
+The candidate adapter implements the existing High-Water provider trait over an abstract transport. It verifies signed reads and CAS responses, validates exact authority/provider pins and successor shape, and resolves an ambiguous CAS transport error only by a fresh authenticated read (exact successor = success, unchanged predecessor = retryable transport error, any other state = conflict). It does not itself make the remote CAS atomic or durable; those properties remain obligations of the concrete provider. Five adapter tests cover real ML-DSA-65 signed reads, tampered signatures, rejection before transport I/O for a wrong authority, distinct fresh challenges on successive reads, and the PFM5 Prepared transition that advances the journal sequence without advancing the ECR1 record or immutable-object generation. The adapter accepts both legal transition shapes: Prepared (record and object generation unchanged) and Finalized (valid ECR1 successor and strictly increased object generation).
 
 This document and code are candidate engineering artifacts only.
