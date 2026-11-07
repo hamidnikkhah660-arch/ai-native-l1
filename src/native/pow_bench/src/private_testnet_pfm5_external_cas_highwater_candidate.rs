@@ -252,6 +252,15 @@ where
         .pending_intent
         .as_ref()
         .ok_or(Pfm5ExternalCasHighWaterError::PreparedSnapshotRequired)?;
+    if prepared.sequence <= 1
+        || prepared.last_record != intent.expected_current
+        || prepared.object_generation != intent.expected_object_generation
+    {
+        return Err(Pfm5ExternalCasHighWaterError::IntentMismatch);
+    }
+    intent
+        .validate(pin)
+        .map_err(|_| Pfm5ExternalCasHighWaterError::IntentMismatch)?;
     let expected_sequence = prepared
         .sequence
         .checked_add(1)
@@ -638,6 +647,84 @@ mod tests {
             .unwrap(),
             f.provider.state
         );
+    }
+
+    #[test]
+    fn prepared_recovery_rejects_mismatched_predecessor_generation_and_sequence() {
+        let mut f = fixture();
+        f.provider.state = Pfm5ExternalCasHighWaterState::from_snapshot(
+            &f.authority_pin,
+            &f.cas_pin,
+            &f.finalized,
+        )
+        .unwrap();
+
+        let mut wrong_predecessor = f.prepared.clone();
+        wrong_predecessor.last_record.operation_id = [0x99; 32];
+        assert_eq!(
+            observe_finalized_floor_for_prepared_intent(
+                &mut f.provider,
+                &f.authority_pin,
+                &f.cas_pin,
+                &wrong_predecessor
+            ),
+            Err(Pfm5ExternalCasHighWaterError::IntentMismatch)
+        );
+
+        let mut wrong_generation = f.prepared.clone();
+        wrong_generation.object_generation += 1;
+        assert_eq!(
+            observe_finalized_floor_for_prepared_intent(
+                &mut f.provider,
+                &f.authority_pin,
+                &f.cas_pin,
+                &wrong_generation
+            ),
+            Err(Pfm5ExternalCasHighWaterError::IntentMismatch)
+        );
+
+        let mut invalid_sequence = f.prepared.clone();
+        invalid_sequence.sequence = 1;
+        assert_eq!(
+            observe_finalized_floor_for_prepared_intent(
+                &mut f.provider,
+                &f.authority_pin,
+                &f.cas_pin,
+                &invalid_sequence
+            ),
+            Err(Pfm5ExternalCasHighWaterError::IntentMismatch)
+        );
+        assert_eq!(f.provider.writes, 0);
+    }
+
+    #[test]
+    fn prepared_recovery_validates_the_exact_intent_before_observing_floor() {
+        let mut f = fixture();
+        f.provider.state = Pfm5ExternalCasHighWaterState::from_snapshot(
+            &f.authority_pin,
+            &f.cas_pin,
+            &f.finalized,
+        )
+        .unwrap();
+
+        let mut malformed = f.prepared.clone();
+        malformed
+            .pending_intent
+            .as_mut()
+            .unwrap()
+            .write_request
+            .next_record
+            .next_state_digest = [0xA9; 32];
+        assert_eq!(
+            observe_finalized_floor_for_prepared_intent(
+                &mut f.provider,
+                &f.authority_pin,
+                &f.cas_pin,
+                &malformed
+            ),
+            Err(Pfm5ExternalCasHighWaterError::IntentMismatch)
+        );
+        assert_eq!(f.provider.writes, 0);
     }
 
     #[test]
