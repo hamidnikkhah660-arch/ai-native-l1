@@ -284,3 +284,297 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod dispatch_path_tests {
+    use super::*;
+    use crate::private_testnet_pfm5_highwater_rpc_wire_candidate::QHWA_V1_WIRE_BYTES;
+    use crate::v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES;
+
+    fn pins() -> (Pfm5ExternalCasHighWaterAuthorityPin, ExternalCasPin) {
+        (
+            Pfm5ExternalCasHighWaterAuthorityPin {
+                authority_id: [1; 32],
+            },
+            ExternalCasPin {
+                provider_id: [2; 32],
+                network_id: [3; 32],
+                genesis_digest: [4; 32],
+                receipt_key_id: [5; 32],
+                receipt_public_key: [6; ML_DSA_65_PUBLIC_KEY_BYTES],
+            },
+        )
+    }
+    struct FixedProvider {
+    state:
+        crate::private_testnet_pfm5_external_cas_highwater_candidate::Pfm5ExternalCasHighWaterState,
+    fail: bool,
+}
+    impl Pfm5ExternalCasHighWaterProvider for FixedProvider {
+        type Error = String;
+    fn read_authenticated(
+        &mut self,
+        _: &Pfm5ExternalCasHighWaterAuthorityPin,
+        _: &ExternalCasPin,
+    ) -> Result<
+        crate::private_testnet_pfm5_external_cas_highwater_candidate::Pfm5ExternalCasHighWaterState,
+        Self::Error,
+        >{
+            if self.fail {
+                Err("provider offline".to_owned())
+            } else {
+                Ok(self.state.clone())
+            }
+        }
+        fn compare_and_advance(
+            &mut self,
+            _: &Pfm5ExternalCasHighWaterAuthorityPin,
+            _: &ExternalCasPin,
+            _: &crate::private_testnet_pfm5_external_cas_highwater_candidate::Pfm5ExternalCasHighWaterState,
+            _: &crate::private_testnet_pfm5_external_cas_highwater_candidate::Pfm5ExternalCasHighWaterState,
+        ) -> Result<(), Self::Error> {
+            panic!("READ-only dispatcher must never perform CAS")
+        }
+    }
+    struct FixedLedger {
+        result: Result<bool, String>,
+        calls: usize,
+    }
+    impl QhwrDurableReplayLedger for FixedLedger {
+        type Error = String;
+        fn reserve_once(&mut self, _: &[u8; 32], _: &[u8; 32]) -> Result<bool, Self::Error> {
+            self.calls += 1;
+            self.result.clone()
+        }
+    }
+    struct FixedSigner {
+        fail: bool,
+        calls: usize,
+        digest: Option<[u8; 32]>,
+    }
+    impl QhwrResponseSigner for FixedSigner {
+        type Error = String;
+        fn key_id(&self) -> [u8; 32] {
+            [0x72; 32]
+        }
+        fn key_generation(&self) -> u64 {
+            1
+        }
+        fn sign_digest(
+            &mut self,
+            digest: &[u8; 32],
+        ) -> Result<[u8; ML_DSA_65_SIGNATURE_BYTES], Self::Error> {
+            self.calls += 1;
+            self.digest = Some(*digest);
+            if self.fail {
+                Err("signer offline".to_owned())
+            } else {
+                Ok([0xA5; ML_DSA_65_SIGNATURE_BYTES])
+            }
+        }
+    }
+    fn valid_state(
+        authority: &Pfm5ExternalCasHighWaterAuthorityPin,
+        pin: &ExternalCasPin,
+    ) -> crate::private_testnet_pfm5_external_cas_highwater_candidate::Pfm5ExternalCasHighWaterState
+    {
+        use crate::external_cas_anchor_candidate::ExternalCasRecord;
+        crate::private_testnet_pfm5_external_cas_highwater_candidate::Pfm5ExternalCasHighWaterState {
+        authority_id: authority.authority_id,
+        provider_id: pin.provider_id,
+        network_id: pin.network_id,
+        genesis_digest: pin.genesis_digest,
+        journal_sequence: 9,
+        record: ExternalCasRecord {
+            generation: 7,
+            provider_id: pin.provider_id,
+            network_id: pin.network_id,
+            genesis_digest: pin.genesis_digest,
+            previous_record_digest: [0x61; 32],
+            previous_state_digest: [0x62; 32],
+            next_state_digest: [0x63; 32],
+            operation_id: [0x64; 32],
+            request_digest: [0x65; 32],
+        },
+        object_generation: 40,
+    }
+    }
+    fn read_request(challenge: [u8; 32]) -> Vec<u8> {
+        QhwrRequest::Read { challenge }.encode().unwrap()
+    }
+
+    #[test]
+    fn replayed_challenge_is_rejected_before_provider_or_signer() {
+        let (authority, pin) = pins();
+        let mut provider = FixedProvider {
+            state: valid_state(&authority, &pin),
+            fail: false,
+        };
+        let mut ledger = FixedLedger {
+            result: Ok(false),
+            calls: 0,
+        };
+        let mut signer = FixedSigner {
+            fail: false,
+            calls: 0,
+            digest: None,
+        };
+        let response = dispatch_read_only(
+            &read_request([0x31; 32]),
+            &[10; 32],
+            &[[10; 32]],
+            &authority,
+            &pin,
+            &mut provider,
+            &mut ledger,
+            &mut signer,
+        )
+        .unwrap();
+        assert_eq!(
+            QhwrResponse::decode(&response).unwrap(),
+            QhwrResponse::Error(QhwrErrorStatus::ChallengeReplayOrExpired)
+        );
+        assert_eq!(ledger.calls, 1);
+        assert_eq!(signer.calls, 0);
+    }
+
+    #[test]
+    fn replay_ledger_failure_fails_closed_before_provider_or_signer() {
+        let (authority, pin) = pins();
+        let mut provider = FixedProvider {
+            state: valid_state(&authority, &pin),
+            fail: false,
+        };
+        let mut ledger = FixedLedger {
+            result: Err("ledger unavailable".to_owned()),
+            calls: 0,
+        };
+        let mut signer = FixedSigner {
+            fail: false,
+            calls: 0,
+            digest: None,
+        };
+        let result = dispatch_read_only(
+            &read_request([0x32; 32]),
+            &[10; 32],
+            &[[10; 32]],
+            &authority,
+            &pin,
+            &mut provider,
+            &mut ledger,
+            &mut signer,
+        );
+        assert!(matches!(result, Err(QhwrDispatchError::ReplayLedger(_))));
+        assert_eq!(ledger.calls, 1);
+        assert_eq!(signer.calls, 0);
+    }
+
+    #[test]
+    fn provider_failure_happens_after_replay_reservation_and_before_signing() {
+        let (authority, pin) = pins();
+        let mut provider = FixedProvider {
+            state: valid_state(&authority, &pin),
+            fail: true,
+        };
+        let mut ledger = FixedLedger {
+            result: Ok(true),
+            calls: 0,
+        };
+        let mut signer = FixedSigner {
+            fail: false,
+            calls: 0,
+            digest: None,
+        };
+        let result = dispatch_read_only(
+            &read_request([0x33; 32]),
+            &[10; 32],
+            &[[10; 32]],
+            &authority,
+            &pin,
+            &mut provider,
+            &mut ledger,
+            &mut signer,
+        );
+        assert!(matches!(result, Err(QhwrDispatchError::Provider(_))));
+        assert_eq!(ledger.calls, 1);
+        assert_eq!(signer.calls, 0);
+    }
+
+    #[test]
+    fn signer_failure_does_not_return_an_unsigned_state() {
+        let (authority, pin) = pins();
+        let mut provider = FixedProvider {
+            state: valid_state(&authority, &pin),
+            fail: false,
+        };
+        let mut ledger = FixedLedger {
+            result: Ok(true),
+            calls: 0,
+        };
+        let mut signer = FixedSigner {
+            fail: true,
+            calls: 0,
+            digest: None,
+        };
+        let result = dispatch_read_only(
+            &read_request([0x34; 32]),
+            &[10; 32],
+            &[[10; 32]],
+            &authority,
+            &pin,
+            &mut provider,
+            &mut ledger,
+            &mut signer,
+        );
+        assert!(matches!(result, Err(QhwrDispatchError::Signer(_))));
+        assert_eq!(ledger.calls, 1);
+        assert_eq!(signer.calls, 1);
+        assert!(signer.digest.is_some());
+    }
+
+    #[test]
+    fn read_path_returns_challenge_bound_signed_envelope() {
+        let (authority, pin) = pins();
+        let mut provider = FixedProvider {
+            state: valid_state(&authority, &pin),
+            fail: false,
+        };
+        let mut ledger = FixedLedger {
+            result: Ok(true),
+            calls: 0,
+        };
+        let mut signer = FixedSigner {
+            fail: false,
+            calls: 0,
+            digest: None,
+        };
+        let challenge = [0x35; 32];
+        let response = dispatch_read_only(
+            &read_request(challenge),
+            &[10; 32],
+            &[[10; 32]],
+            &authority,
+            &pin,
+            &mut provider,
+            &mut ledger,
+            &mut signer,
+        )
+        .unwrap();
+        match QhwrResponse::decode(&response).unwrap() {
+            QhwrResponse::SignedState {
+                operation: QhwrOperation::Read,
+                response,
+            } => {
+                assert_eq!(response.challenge, challenge);
+                assert_eq!(response.key_id, [0x72; 32]);
+                assert_eq!(response.key_generation, 1);
+                assert_eq!(response.signature, [0xA5; ML_DSA_65_SIGNATURE_BYTES]);
+                assert_eq!(response.wire_state.len(), QHWA_V1_WIRE_BYTES);
+                assert_eq!(signer.digest, Some(response.signing_digest()));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        assert_eq!(ledger.calls, 1);
+        assert_eq!(signer.calls, 1);
+    }
+}

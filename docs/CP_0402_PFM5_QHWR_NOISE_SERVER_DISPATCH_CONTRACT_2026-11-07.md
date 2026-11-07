@@ -159,3 +159,17 @@ must still provide and independently qualify both, along with an independent hig
 Noise accept/connection lifecycle, bounded listener admission, operational limits, and multi-host
 fault/replay testing. No runtime wiring, listener, public bind, CAS service, or launch approval is
 introduced by this candidate.
+
+## Dispatcher fault-path qualification update
+
+The READ-only dispatcher now has eight focused tests. In addition to malformed request, unauthorized
+peer, and CAS rejection, tests exercise replay rejection, replay-ledger failure, Provider failure,
+Signer failure, and a successful READ envelope. The tests assert the order and absence of downstream
+calls: replay/ledger failures do not call the Provider or Signer; Provider failure occurs only after
+challenge reservation and never calls the Signer; Signer failure returns no unsigned state. The
+successful-path test checks the exact challenge, key identity/generation, fixed wire length, and
+that the signer receives the response's canonical signing digest.
+
+All replay and provider/signer test implementations are in test code only; they are not production
+storage, signer custody, or a deployed Provider. The production qualifications and non-goals above
+remain unchanged.
