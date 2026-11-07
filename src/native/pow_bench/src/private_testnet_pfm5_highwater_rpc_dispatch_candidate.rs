@@ -23,13 +23,23 @@ use crate::{
 use sha2::{Digest, Sha256};
 use std::{fmt, net::TcpStream};
 
+/// Full authenticated replay namespace. Network ID and peer identity must come from
+/// the same completed Noise session; operation must come from the decoded request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QhwrReplayScope {
+    pub network_id: [u8; 32],
+    pub authenticated_peer: [u8; 32],
+    pub operation: QhwrOperation,
+}
+
 /// Production implementations must use durable, atomic, cross-process storage.
-/// Ok(true) reserves a new peer/challenge pair; Ok(false) means replay.
+/// QHWR v1 has no server-issued expiry lease; do not infer expiry from client time.
+/// Ok(true) reserves a new full-scope challenge; Ok(false) means replay.
 pub trait QhwrDurableReplayLedger {
     type Error: fmt::Display;
     fn reserve_once(
         &mut self,
-        authenticated_peer: &[u8; 32],
+        scope: &QhwrReplayScope,
         challenge: &[u8; 32],
     ) -> Result<bool, Self::Error>;
 }
@@ -75,9 +85,10 @@ fn error_response(status: QhwrErrorStatus) -> Result<Vec<u8>, QhwrDispatchError>
 /// authenticated_peer must be the remote static key returned by DevnetNoiseSession::accept.
 /// The connection owner must close the connection after this one request/response. READ only;
 /// COMPARE_AND_ADVANCE is rejected without provider, ledger, or signer side effects.
-pub fn dispatch_read_only<P, L, S>(
+fn dispatch_read_only<P, L, S>(
     request_bytes: &[u8],
     authenticated_peer: &[u8; 32],
+    network_id: &[u8; 32],
     trusted_peers: &[[u8; 32]],
     authority: &Pfm5ExternalCasHighWaterAuthorityPin,
     provider_pin: &ExternalCasPin,
@@ -94,18 +105,26 @@ where
         Ok(request) => request,
         Err(_) => return error_response(QhwrErrorStatus::MalformedRequest),
     };
-    let challenge = match &request {
-        QhwrRequest::Read { challenge } => challenge,
+    let (challenge, operation) = match &request {
+        QhwrRequest::Read { challenge } => (challenge, QhwrOperation::Read),
         QhwrRequest::CompareAndAdvance { .. } => {
             return error_response(QhwrErrorStatus::UnsupportedVersionOrOperation);
         }
     };
+    if network_id != &provider_pin.network_id {
+        return error_response(QhwrErrorStatus::UnauthorizedPeer);
+    }
     if authenticated_peer.iter().all(|byte| *byte == 0)
         || !trusted_peers.iter().any(|peer| peer == authenticated_peer)
     {
         return error_response(QhwrErrorStatus::UnauthorizedPeer);
     }
-    match replay_ledger.reserve_once(authenticated_peer, challenge) {
+    let replay_scope = QhwrReplayScope {
+        network_id: *network_id,
+        authenticated_peer: *authenticated_peer,
+        operation,
+    };
+    match replay_ledger.reserve_once(&replay_scope, challenge) {
         Ok(true) => {}
         Ok(false) => return error_response(QhwrErrorStatus::ChallengeReplayOrExpired),
         Err(error) => return Err(QhwrDispatchError::ReplayLedger(error.to_string())),
@@ -211,6 +230,7 @@ where
     let response = dispatch_read_only(
         &request,
         &authenticated_peer,
+        network_id,
         trusted_peers,
         authority,
         provider_pin,
@@ -253,7 +273,7 @@ mod tests {
     struct NeverLedger;
     impl QhwrDurableReplayLedger for NeverLedger {
         type Error = String;
-        fn reserve_once(&mut self, _: &[u8; 32], _: &[u8; 32]) -> Result<bool, Self::Error> {
+        fn reserve_once(&mut self, _: &QhwrReplayScope, _: &[u8; 32]) -> Result<bool, Self::Error> {
             panic!("ledger must not be called for rejected requests")
         }
     }
@@ -303,6 +323,7 @@ mod tests {
         let response = dispatch_read_only(
             &request,
             &[10; 32],
+            &pin.network_id,
             &[[10; 32]],
             &authority,
             &pin,
@@ -323,6 +344,7 @@ mod tests {
         let response = dispatch_read_only(
             b"not-qhwr",
             &[10; 32],
+            &pin.network_id,
             &[[10; 32]],
             &authority,
             &pin,
@@ -338,6 +360,32 @@ mod tests {
     }
 
     #[test]
+    fn noise_network_mismatch_with_provider_pin_is_rejected_before_dependencies() {
+        let (authority, pin) = pins();
+        let request = QhwrRequest::Read {
+            challenge: [0xA1; 32],
+        }
+        .encode()
+        .unwrap();
+        let response = dispatch_read_only(
+            &request,
+            &[10; 32],
+            &[0x99; 32],
+            &[[10; 32]],
+            &authority,
+            &pin,
+            &mut NeverProvider,
+            &mut NeverLedger,
+            &mut NeverSigner,
+        )
+        .unwrap();
+        assert_eq!(
+            QhwrResponse::decode(&response).unwrap(),
+            QhwrResponse::Error(QhwrErrorStatus::UnauthorizedPeer)
+        );
+    }
+
+    #[test]
     fn unauthorized_read_is_rejected_before_ledger_provider_or_signer() {
         let (authority, pin) = pins();
         let request = QhwrRequest::Read {
@@ -348,6 +396,7 @@ mod tests {
         let response = dispatch_read_only(
             &request,
             &[10; 32],
+            &pin.network_id,
             &[[12; 32]],
             &authority,
             &pin,
@@ -419,11 +468,17 @@ mod dispatch_path_tests {
     struct FixedLedger {
         result: Result<bool, String>,
         calls: usize,
+        last_scope: Option<QhwrReplayScope>,
     }
     impl QhwrDurableReplayLedger for FixedLedger {
         type Error = String;
-        fn reserve_once(&mut self, _: &[u8; 32], _: &[u8; 32]) -> Result<bool, Self::Error> {
+        fn reserve_once(
+            &mut self,
+            scope: &QhwrReplayScope,
+            _: &[u8; 32],
+        ) -> Result<bool, Self::Error> {
             self.calls += 1;
+            self.last_scope = Some(*scope);
             self.result.clone()
         }
     }
@@ -494,6 +549,7 @@ mod dispatch_path_tests {
         let mut ledger = FixedLedger {
             result: Ok(false),
             calls: 0,
+            last_scope: None,
         };
         let mut signer = FixedSigner {
             fail: false,
@@ -503,6 +559,7 @@ mod dispatch_path_tests {
         let response = dispatch_read_only(
             &read_request([0x31; 32]),
             &[10; 32],
+            &pin.network_id,
             &[[10; 32]],
             &authority,
             &pin,
@@ -531,6 +588,7 @@ mod dispatch_path_tests {
         let mut ledger = FixedLedger {
             result: Err("ledger unavailable".to_owned()),
             calls: 0,
+            last_scope: None,
         };
         let mut signer = FixedSigner {
             fail: false,
@@ -540,6 +598,7 @@ mod dispatch_path_tests {
         let result = dispatch_read_only(
             &read_request([0x32; 32]),
             &[10; 32],
+            &pin.network_id,
             &[[10; 32]],
             &authority,
             &pin,
@@ -564,6 +623,7 @@ mod dispatch_path_tests {
         let mut ledger = FixedLedger {
             result: Ok(true),
             calls: 0,
+            last_scope: None,
         };
         let mut signer = FixedSigner {
             fail: false,
@@ -573,6 +633,7 @@ mod dispatch_path_tests {
         let result = dispatch_read_only(
             &read_request([0x33; 32]),
             &[10; 32],
+            &pin.network_id,
             &[[10; 32]],
             &authority,
             &pin,
@@ -596,6 +657,7 @@ mod dispatch_path_tests {
         let mut ledger = FixedLedger {
             result: Ok(true),
             calls: 0,
+            last_scope: None,
         };
         let mut signer = FixedSigner {
             fail: true,
@@ -605,6 +667,7 @@ mod dispatch_path_tests {
         let result = dispatch_read_only(
             &read_request([0x34; 32]),
             &[10; 32],
+            &pin.network_id,
             &[[10; 32]],
             &authority,
             &pin,
@@ -629,6 +692,7 @@ mod dispatch_path_tests {
         let mut ledger = FixedLedger {
             result: Ok(true),
             calls: 0,
+            last_scope: None,
         };
         let mut signer = FixedSigner {
             fail: false,
@@ -639,6 +703,7 @@ mod dispatch_path_tests {
         let unauthorized = dispatch_read_only(
             &read_request([0x39; 32]),
             &[11; 32],
+            &pin.network_id,
             &[[10; 32]],
             &authority,
             &pin,
@@ -662,6 +727,7 @@ mod dispatch_path_tests {
         let cas = dispatch_read_only(
             &cas_request,
             &[10; 32],
+            &pin.network_id,
             &[[10; 32]],
             &authority,
             &pin,
@@ -690,6 +756,7 @@ mod dispatch_path_tests {
         let mut ledger = FixedLedger {
             result: Ok(true),
             calls: 0,
+            last_scope: None,
         };
         let mut signer = FixedSigner {
             fail: false,
@@ -700,6 +767,7 @@ mod dispatch_path_tests {
         let response = dispatch_read_only(
             &read_request(challenge),
             &[10; 32],
+            &pin.network_id,
             &[[10; 32]],
             &authority,
             &pin,
@@ -723,6 +791,14 @@ mod dispatch_path_tests {
             other => panic!("unexpected response: {other:?}"),
         }
         assert_eq!(ledger.calls, 1);
+        assert_eq!(
+            ledger.last_scope,
+            Some(QhwrReplayScope {
+                network_id: pin.network_id,
+                authenticated_peer: [10; 32],
+                operation: QhwrOperation::Read,
+            })
+        );
         assert_eq!(provider.reads, 1);
         assert_eq!(signer.calls, 1);
     }
@@ -765,6 +841,7 @@ mod dispatch_path_tests {
             let mut ledger = FixedLedger {
                 result: Ok(true),
                 calls: 0,
+                last_scope: None,
             };
             let mut signer = FixedSigner {
                 fail: false,
@@ -829,6 +906,7 @@ mod dispatch_path_tests {
             let mut ledger = FixedLedger {
                 result: Ok(true),
                 calls: 0,
+                last_scope: None,
             };
             let mut signer = FixedSigner {
                 fail: false,
@@ -893,6 +971,7 @@ mod dispatch_path_tests {
             let mut ledger = FixedLedger {
                 result: Ok(true),
                 calls: 0,
+                last_scope: None,
             };
             let mut signer = FixedSigner {
                 fail: false,
@@ -956,7 +1035,8 @@ mod dispatch_path_tests {
         let network = [0x41; 32];
         let (server_private, server_public) = keypair();
         let (client_private, client_public) = keypair();
-        let (authority, pin) = pins();
+        let (authority, mut pin) = pins();
+        pin.network_id = network;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
 
@@ -970,6 +1050,7 @@ mod dispatch_path_tests {
             let mut ledger = FixedLedger {
                 result: Ok(true),
                 calls: 0,
+                last_scope: None,
             };
             let mut signer = FixedSigner {
                 fail: false,
