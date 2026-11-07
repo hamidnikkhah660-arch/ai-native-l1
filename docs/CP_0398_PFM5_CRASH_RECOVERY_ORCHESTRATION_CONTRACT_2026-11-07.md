@@ -81,7 +81,8 @@ The orchestrator implementation must expose deterministic fault points and use a
 
 ## Required automated tests before implementation is considered qualified
 
-- Add a narrowly scoped recovery-load API (or equivalent reviewed mechanism) that permits exactly the authenticated Finalized-floor / one-step-older Prepared-journal case without weakening normal `load_checked` semantics. It must still validate checksum, canonical encoding, domain, file safety, and the exact pending intent.\n- A single integration harness composes the real PFJ1 journal module, CP-0396 contract functions, CP-0394 executor, and deterministic provider doubles; separate unit tests are insufficient.
+- Add a narrowly scoped recovery-load API (or equivalent reviewed mechanism) that permits exactly the authenticated Finalized-floor / one-step-older Prepared-journal case without weakening normal `load_checked` semantics. It must still validate checksum, canonical encoding, domain, file safety, and the exact pending intent.
+- A single integration harness composes the real PFJ1 journal module, CP-0396 contract functions, CP-0394 executor, and deterministic provider doubles; separate unit tests are insufficient.
 - Child-process termination and restart at every matrix boundary, including after provider commit but before response delivery.
 - Exact assertions for same operation ID, same nonce/request digest, exact predecessor/successor, sequence increments of exactly one, and strictly advanced object generation.
 - Competing writer, stale response, false-success CAS, lost authenticated readback, corrupted/malformed journal, wrong domain, authority rollback, sequence skip, and authority outage.
