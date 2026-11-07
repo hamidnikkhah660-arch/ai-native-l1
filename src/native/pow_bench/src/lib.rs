@@ -409,3 +409,5 @@ pub mod private_testnet_pfm5_external_cas_coordinator_candidate;
 pub mod private_testnet_pfm5_external_cas_highwater_adapter_candidate;
 pub mod private_testnet_pfm5_highwater_rpc_dispatch_candidate;
 pub mod private_testnet_pfm5_highwater_rpc_wire_candidate;
+
+pub mod private_testnet_qhwr_durable_replay_ledger_candidate;
