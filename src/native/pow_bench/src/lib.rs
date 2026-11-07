@@ -411,5 +411,7 @@ pub mod private_testnet_pfm5_highwater_rpc_dispatch_candidate;
 pub mod private_testnet_pfm5_highwater_rpc_wire_candidate;
 /// CP-0407 pure state-transition model; not a durable authority or production integration.
 pub mod private_testnet_qhwr_operation_recovery_model;
+/// CP-0409 in-memory signer idempotency model; not a durable signer or production integration.
+pub mod private_testnet_qhwr_signer_idempotency_model;
 
 pub mod private_testnet_qhwr_durable_replay_ledger_candidate;
