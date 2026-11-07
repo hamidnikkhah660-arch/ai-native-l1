@@ -472,6 +472,9 @@ mod tests {
         },
         private_testnet_driver::PrivateTestnetChain,
         private_testnet_monetary_wire::encode_candidate_v4_hybrid_monetary_network_block,
+        private_testnet_pfm5_external_cas_coordinator_candidate::{
+            execute_ready_intent, Pfm5ExternalCasCoordinatorError,
+        },
         private_testnet_pfm5_external_cas_highwater_candidate::{
             advance_finalized_snapshot, advance_prepared_snapshot,
             authorize_prepared_journal_recovery, verify_ready_snapshot,
@@ -937,6 +940,143 @@ mod tests {
         }
     }
 
+    struct RefusingAdvanceHighWater {
+        state: Pfm5ExternalCasHighWaterState,
+        writes: usize,
+    }
+    impl Pfm5ExternalCasHighWaterProvider for RefusingAdvanceHighWater {
+        type Error = &'static str;
+        fn read_authenticated(
+            &mut self,
+            _authority: &Pfm5ExternalCasHighWaterAuthorityPin,
+            _pin: &ExternalCasPin,
+        ) -> Result<Pfm5ExternalCasHighWaterState, Self::Error> {
+            Ok(self.state.clone())
+        }
+        fn compare_and_advance(
+            &mut self,
+            _authority: &Pfm5ExternalCasHighWaterAuthorityPin,
+            _pin: &ExternalCasPin,
+            _expected: &Pfm5ExternalCasHighWaterState,
+            _next: &Pfm5ExternalCasHighWaterState,
+        ) -> Result<(), Self::Error> {
+            self.writes += 1;
+            Err("injected High-Water write failure")
+        }
+    }
+
+    #[test]
+    fn coordinator_never_calls_cas_when_prepared_highwater_advance_fails() {
+        let fixture = Fixture::new();
+        let verifier = LibcruxMlDsa65VerifierCandidate;
+        let (bundle, current, pin) = fixture.bundle_and_anchor(&verifier, 0x31);
+        let intent = prepare_intent(&fixture, &bundle, current.clone(), &pin);
+        let authority = Pfm5ExternalCasHighWaterAuthorityPin {
+            authority_id: [0xA3; 32],
+        };
+        let directory = TestDirectory::new();
+        let journal = Pfm5ExternalCasJournalStore::new(directory.path().join("coordinator.pfj1"));
+        let ready = journal.initialize(&pin, current.clone(), 40).unwrap();
+        let mut highwater = RefusingAdvanceHighWater {
+            state: Pfm5ExternalCasHighWaterState::from_snapshot(&authority, &pin, &ready).unwrap(),
+            writes: 0,
+        };
+        let (provider, _remote_state, cas_calls) =
+            signed_cas_provider(pin.clone(), current, 0x31, false);
+        let mut cas =
+            VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
+                .unwrap();
+        let mut objects = Pfm5ImmutableObjectClient::new(MemoryObjectProvider::default());
+
+        let result = execute_ready_intent(
+            &journal,
+            &mut highwater,
+            &authority,
+            &pin,
+            &fixture.context(),
+            &intent,
+            &bundle,
+            &mut objects,
+            &mut cas,
+            1,
+            0,
+            40,
+        );
+
+        assert!(matches!(
+            result,
+            Err(Pfm5ExternalCasCoordinatorError::HighWater(_))
+        ));
+        assert_eq!(highwater.writes, 1);
+        assert_eq!(cas_calls.load(Ordering::SeqCst), 0);
+        let prepared = journal.load_checked(&pin, 2, 0, 40).unwrap();
+        assert_eq!(prepared.pending_intent, Some(intent));
+        assert_eq!(prepared.sequence, 2);
+    }
+    #[test]
+    fn coordinator_runs_ordered_ready_to_finalized_transition() {
+        let fixture = Fixture::new();
+        let verifier = LibcruxMlDsa65VerifierCandidate;
+        let (bundle, current, pin) = fixture.bundle_and_anchor(&verifier, 0x31);
+        let intent = prepare_intent(&fixture, &bundle, current.clone(), &pin);
+        let authority = Pfm5ExternalCasHighWaterAuthorityPin {
+            authority_id: [0xA4; 32],
+        };
+        let directory = TestDirectory::new();
+        let journal =
+            Pfm5ExternalCasJournalStore::new(directory.path().join("coordinator-success.pfj1"));
+        let ready = journal.initialize(&pin, current.clone(), 40).unwrap();
+        let mut highwater = MemoryHighWater(
+            Pfm5ExternalCasHighWaterState::from_snapshot(&authority, &pin, &ready).unwrap(),
+        );
+        let (provider, remote_state, cas_calls) =
+            signed_cas_provider(pin.clone(), current, 0x31, false);
+        let mut cas =
+            VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
+                .unwrap();
+        let mut objects = Pfm5ImmutableObjectClient::new(MemoryObjectProvider::default());
+
+        let result = execute_ready_intent(
+            &journal,
+            &mut highwater,
+            &authority,
+            &pin,
+            &fixture.context(),
+            &intent,
+            &bundle,
+            &mut objects,
+            &mut cas,
+            1,
+            0,
+            40,
+        )
+        .unwrap();
+
+        match result {
+            crate::private_testnet_pfm5_external_cas_coordinator_candidate::Pfm5ExternalCasCoordinatorOutcome::Finalized {
+                snapshot,
+                highwater: Pfm5ExternalCasHighWaterAdvance::Advanced,
+            } => {
+                assert_eq!(snapshot.sequence, 3);
+                assert_eq!(snapshot.last_record, intent.write_request.next_record);
+                assert_eq!(snapshot.object_generation, 41);
+                assert!(!snapshot.is_prepared());
+            }
+            other => panic!("unexpected coordinator result: {other:?}"),
+        }
+        assert_eq!(cas_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            remote_state.lock().unwrap().current,
+            intent.write_request.next_record
+        );
+        verify_ready_snapshot(
+            &mut highwater,
+            &authority,
+            &pin,
+            &journal.load_checked(&pin, 3, 0, 41).unwrap(),
+        )
+        .unwrap();
+    }
     #[test]
     fn crash_recovery_reopens_prepared_journal_and_reconciles_real_signed_ecr1_successor() {
         let fixture = Fixture::new();
