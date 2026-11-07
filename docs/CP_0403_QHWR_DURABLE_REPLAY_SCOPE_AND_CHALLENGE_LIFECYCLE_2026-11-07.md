@@ -1,4 +1,4 @@
-﻿# CP-0403 - QHWR Durable Replay Scope and Challenge Lifecycle
+# CP-0403 - QHWR Durable Replay Scope and Challenge Lifecycle
 
 Date: 2026-11-07
 Status: Engineering design contract; not an implementation, deployment approval, or security certification.
@@ -39,7 +39,7 @@ The durable uniqueness key MUST include all of:
 - `operation`: a stable, explicitly encoded operation discriminator (`Read` or `CompareAndAdvance`);
 - `challenge`: the exact 32-byte request challenge.
 
-The dispatcher MUST pass the authenticated Network ID from the same Noise session context used for handshake verification. It MUST NOT accept a caller-supplied, unverified network identifier. Operation MUST be derived from the strictly decoded request, not from an independent caller argument.
+The dispatcher MUST pass the authenticated Network ID from the same Noise session context used for handshake verification, and MUST verify that it exactly matches the configured provider/network pin before touching the ledger, provider, or signer. Keep the dispatcher entry point private to the authenticated session-serving boundary; it MUST NOT accept a caller-supplied, unverified network identifier. Operation MUST be derived from the strictly decoded request, not from an independent caller argument.
 
 Conceptual API shape (design only; not implemented):
 
