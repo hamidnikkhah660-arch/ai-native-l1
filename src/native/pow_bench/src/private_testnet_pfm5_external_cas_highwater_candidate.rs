@@ -384,6 +384,7 @@ mod tests {
         state: Pfm5ExternalCasHighWaterState,
         lose_reply_after_commit: bool,
         fail_without_commit: bool,
+        reads: usize,
         writes: usize,
     }
     impl Pfm5ExternalCasHighWaterProvider for MemoryAuthority {
@@ -393,6 +394,7 @@ mod tests {
             _authority: &Pfm5ExternalCasHighWaterAuthorityPin,
             _pin: &ExternalCasPin,
         ) -> Result<Pfm5ExternalCasHighWaterState, Self::Error> {
+            self.reads += 1;
             Ok(self.state.clone())
         }
         fn compare_and_advance(
@@ -508,6 +510,7 @@ mod tests {
                 state: initial,
                 lose_reply_after_commit: false,
                 fail_without_commit: false,
+                reads: 0,
                 writes: 0,
             },
         }
@@ -694,6 +697,7 @@ mod tests {
             ),
             Err(Pfm5ExternalCasHighWaterError::IntentMismatch)
         );
+        assert_eq!(f.provider.reads, 0);
         assert_eq!(f.provider.writes, 0);
     }
 
@@ -724,6 +728,7 @@ mod tests {
             ),
             Err(Pfm5ExternalCasHighWaterError::IntentMismatch)
         );
+        assert_eq!(f.provider.reads, 0);
         assert_eq!(f.provider.writes, 0);
     }
 
