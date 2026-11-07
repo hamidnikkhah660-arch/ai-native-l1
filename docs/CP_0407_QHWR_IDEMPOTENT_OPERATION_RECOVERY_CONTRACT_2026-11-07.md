@@ -131,3 +131,11 @@ Each result must identify whether it is a pure model test, local database test, 
 6. Only then design production dispatcher integration behind an explicit feature/configuration gate and independent review.
 
 This contract does not implement PostgreSQL, an external service, a signer/HSM idempotency API, a durable operation journal, multi-host linearizability, anti-rollback, or production recovery. It does not authorize deployment or production wiring. CP-0405 remains a single-host candidate; CP-0406 remains an external authority contract; Public Mint remains disabled.
+
+## 10. CP-0407 pure model implementation evidence
+
+The first implementation slice is `src/native/pow_bench/src/private_testnet_qhwr_operation_recovery_model.rs`, exported as `private_testnet_qhwr_operation_recovery_model`. It is deliberately an in-memory pure transition model, not an authority adapter.
+
+The model exercises the Absent -> Reserved -> Prepared -> Completed sequence; idempotent same-state retries; immutable operation/request/provider pins; immutable provider snapshot and signer key ID/generation/signing digest after Prepared; completion only from Prepared; SHA-256 verification metadata for exact response bytes; and rejection of changed completion bytes or forbidden regression.
+
+Five focused unit tests currently pass. Their evidence class is **local pure-model unit tests** only. The model has no disk/database persistence, no concurrent transaction semantics, no replica/failover behavior, no rollback protection, no real provider call, and no signer/HSM call. It therefore proves neither crash recovery nor exactly-once execution. The next implementation boundary remains an external transactional authority and a separately qualified durable-idempotency signer.
