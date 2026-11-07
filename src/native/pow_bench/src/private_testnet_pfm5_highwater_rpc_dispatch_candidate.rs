@@ -869,6 +869,71 @@ mod dispatch_path_tests {
     }
 
     #[test]
+    fn loopback_noise_server_rejects_malformed_record_before_dependencies() {
+        use std::{
+            io::Write,
+            net::{TcpListener, TcpStream},
+            thread,
+        };
+
+        let network = [0x71; 32];
+        let (server_private, server_public) = test_noise_keypair();
+        let (client_private, client_public) = test_noise_keypair();
+        let (authority, pin) = pins();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut provider = FixedProvider {
+                state: valid_state(&authority, &pin),
+                fail: false,
+                reads: 0,
+            };
+            let mut ledger = FixedLedger {
+                result: Ok(true),
+                calls: 0,
+            };
+            let mut signer = FixedSigner {
+                fail: false,
+                calls: 0,
+                digest: None,
+            };
+            let result = serve_one_loopback_noise_connection(
+                stream,
+                &server_private,
+                &[client_public],
+                &network,
+                &authority,
+                &pin,
+                &mut provider,
+                &mut ledger,
+                &mut signer,
+            );
+            (result, provider.reads, ledger.calls, signer.calls)
+        });
+
+        let mut stream = TcpStream::connect(address).unwrap();
+        let _client =
+            DevnetNoiseSession::connect(&mut stream, &client_private, &server_public, &network)
+                .unwrap();
+        // A zero-length Noise record is outside the protocol's authenticated ciphertext bounds.
+        stream.write_all(&0u32.to_be_bytes()).unwrap();
+        stream.flush().unwrap();
+
+        let (server_result, provider_reads, ledger_calls, signer_calls) = server.join().unwrap();
+        assert!(matches!(
+            server_result,
+            Err(QhwrLoopbackServerError::Noise(
+                DevnetNoiseError::MalformedRecord
+            ))
+        ));
+        assert_eq!(provider_reads, 0);
+        assert_eq!(ledger_calls, 0);
+        assert_eq!(signer_calls, 0);
+    }
+
+    #[test]
     fn loopback_noise_server_authenticates_peer_and_dispatches_one_read() {
         use snow::{params::NoiseParams, Builder};
         use std::{
