@@ -5,6 +5,8 @@
 //! serialize writers on one host; this is not a distributed or multi-host consensus ledger.
 //! Windows parent-directory durability is not independently established here and requires
 //! platform-specific power-loss qualification before production use.
+//! The unkeyed record checksum detects accidental corruption, not malicious local rewrite or
+//! rollback; resisting that threat requires an independent external monotonic authority.
 
 use crate::private_testnet_pfm5_highwater_rpc_dispatch_candidate::{
     QhwrDurableReplayLedger, QhwrReplayScope,

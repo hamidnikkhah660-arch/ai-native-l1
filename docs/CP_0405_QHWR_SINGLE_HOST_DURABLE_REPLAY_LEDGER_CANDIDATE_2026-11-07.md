@@ -1,4 +1,4 @@
-# CP-0405 — QHWR Single-Host Durable Replay Ledger Candidate
+# CP-0405 - QHWR Single-Host Durable Replay Ledger Candidate
 
 Date: 2026-11-07
 Status: engineering candidate; not production-qualified
@@ -7,6 +7,8 @@ Base: CP-0403 branch `work/cp0403-replay-scope-challenge-lifecycle-20261107`
 ## 1. Purpose and boundary
 
 CP-0405 adds a concrete append-only implementation of `QhwrDurableReplayLedger` for one host. It is intended to replace test-only ledger mocks in controlled integration tests and to establish a reviewable persistence contract.
+
+This candidate protects against accidental corruption/torn writes and cooperating concurrent writers. Its unkeyed SHA-256 checksums are not authentication: a privileged local actor who can rewrite the WAL can delete or replace records and recompute checksums. This candidate is **not** a defense against malicious local tampering or rollback.
 
 This candidate is **not** a distributed replay authority, multi-host linearizable store, production service deployment, or mainnet approval. The QHWR listener/dispatcher is not automatically wired to this store by this change; an integrator must explicitly construct the store and pass it to the dispatcher. Provider and signer qualification remain separate gates.
 
@@ -65,7 +67,7 @@ The OS locks serialize access to one WAL on one host. A second process cannot op
 
 This is not multi-host coordination. Separate machines can each hold independent local WALs and accept the same challenge. Production multi-host operation requires one independently qualified shared atomic authority (or a consensus-backed provider) and a defined failover/replication model.
 
-On Windows, the candidate requests `File::sync_all` for the WAL, but this implementation does not independently establish parent-directory entry durability under power loss. Windows power-loss qualification and any required platform-specific directory flush behavior remain release blockers. A successful local test is not proof against storage-controller lies, filesystem bugs, sudden power loss, or malicious rollback of the entire host volume.
+On Windows, the candidate requests `File::sync_all` for the WAL, but this implementation does not independently establish parent-directory entry durability under power loss. Windows power-loss qualification and any required platform-specific directory flush behavior remain release blockers. A successful local test is not proof against storage-controller lies, filesystem bugs, sudden power loss, malicious WAL rewrite/deletion, restoration of an older backup, or rollback of the entire host volume. The record checksum is unkeyed and cannot detect a maliciously recomputed journal. Anti-rollback against a privileged local attacker requires an independent external monotonic anchor or equivalent trusted append-only authority.
 
 ## 6. Test evidence
 
