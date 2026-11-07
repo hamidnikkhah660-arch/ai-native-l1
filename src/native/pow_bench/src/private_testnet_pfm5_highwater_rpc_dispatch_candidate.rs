@@ -387,6 +387,7 @@ mod dispatch_path_tests {
     state:
         crate::private_testnet_pfm5_external_cas_highwater_candidate::Pfm5ExternalCasHighWaterState,
     fail: bool,
+    reads: usize,
 }
     impl Pfm5ExternalCasHighWaterProvider for FixedProvider {
         type Error = String;
@@ -398,6 +399,7 @@ mod dispatch_path_tests {
         crate::private_testnet_pfm5_external_cas_highwater_candidate::Pfm5ExternalCasHighWaterState,
         Self::Error,
         >{
+            self.reads += 1;
             if self.fail {
                 Err("provider offline".to_owned())
             } else {
@@ -487,6 +489,7 @@ mod dispatch_path_tests {
         let mut provider = FixedProvider {
             state: valid_state(&authority, &pin),
             fail: false,
+            reads: 0,
         };
         let mut ledger = FixedLedger {
             result: Ok(false),
@@ -513,6 +516,7 @@ mod dispatch_path_tests {
             QhwrResponse::Error(QhwrErrorStatus::ChallengeReplayOrExpired)
         );
         assert_eq!(ledger.calls, 1);
+        assert_eq!(provider.reads, 0);
         assert_eq!(signer.calls, 0);
     }
 
@@ -522,6 +526,7 @@ mod dispatch_path_tests {
         let mut provider = FixedProvider {
             state: valid_state(&authority, &pin),
             fail: false,
+            reads: 0,
         };
         let mut ledger = FixedLedger {
             result: Err("ledger unavailable".to_owned()),
@@ -544,6 +549,7 @@ mod dispatch_path_tests {
         );
         assert!(matches!(result, Err(QhwrDispatchError::ReplayLedger(_))));
         assert_eq!(ledger.calls, 1);
+        assert_eq!(provider.reads, 0);
         assert_eq!(signer.calls, 0);
     }
 
@@ -553,6 +559,7 @@ mod dispatch_path_tests {
         let mut provider = FixedProvider {
             state: valid_state(&authority, &pin),
             fail: true,
+            reads: 0,
         };
         let mut ledger = FixedLedger {
             result: Ok(true),
@@ -584,6 +591,7 @@ mod dispatch_path_tests {
         let mut provider = FixedProvider {
             state: valid_state(&authority, &pin),
             fail: false,
+            reads: 0,
         };
         let mut ledger = FixedLedger {
             result: Ok(true),
@@ -611,11 +619,73 @@ mod dispatch_path_tests {
     }
 
     #[test]
+    fn unauthorized_peer_and_cas_are_rejected_without_side_effects() {
+        let (authority, pin) = pins();
+        let mut provider = FixedProvider {
+            state: valid_state(&authority, &pin),
+            fail: false,
+            reads: 0,
+        };
+        let mut ledger = FixedLedger {
+            result: Ok(true),
+            calls: 0,
+        };
+        let mut signer = FixedSigner {
+            fail: false,
+            calls: 0,
+            digest: None,
+        };
+
+        let unauthorized = dispatch_read_only(
+            &read_request([0x39; 32]),
+            &[11; 32],
+            &[[10; 32]],
+            &authority,
+            &pin,
+            &mut provider,
+            &mut ledger,
+            &mut signer,
+        )
+        .unwrap();
+        assert_eq!(
+            QhwrResponse::decode(&unauthorized).unwrap(),
+            QhwrResponse::Error(QhwrErrorStatus::UnauthorizedPeer)
+        );
+
+        let cas_request = QhwrRequest::CompareAndAdvance {
+            challenge: [0x3A; 32],
+            expected_state_digest: [0x3B; 32],
+            next_state_wire: [0xCC; QHWA_V1_WIRE_BYTES],
+        }
+        .encode()
+        .unwrap();
+        let cas = dispatch_read_only(
+            &cas_request,
+            &[10; 32],
+            &[[10; 32]],
+            &authority,
+            &pin,
+            &mut provider,
+            &mut ledger,
+            &mut signer,
+        )
+        .unwrap();
+        assert_eq!(
+            QhwrResponse::decode(&cas).unwrap(),
+            QhwrResponse::Error(QhwrErrorStatus::UnsupportedVersionOrOperation)
+        );
+        assert_eq!(provider.reads, 0);
+        assert_eq!(ledger.calls, 0);
+        assert_eq!(signer.calls, 0);
+    }
+
+    #[test]
     fn read_path_returns_challenge_bound_signed_envelope() {
         let (authority, pin) = pins();
         let mut provider = FixedProvider {
             state: valid_state(&authority, &pin),
             fail: false,
+            reads: 0,
         };
         let mut ledger = FixedLedger {
             result: Ok(true),
@@ -653,6 +723,7 @@ mod dispatch_path_tests {
             other => panic!("unexpected response: {other:?}"),
         }
         assert_eq!(ledger.calls, 1);
+        assert_eq!(provider.reads, 1);
         assert_eq!(signer.calls, 1);
     }
 
@@ -688,6 +759,7 @@ mod dispatch_path_tests {
             let mut provider = FixedProvider {
                 state: valid_state(&authority, &pin),
                 fail: false,
+                reads: 0,
             };
             let mut ledger = FixedLedger {
                 result: Ok(true),
