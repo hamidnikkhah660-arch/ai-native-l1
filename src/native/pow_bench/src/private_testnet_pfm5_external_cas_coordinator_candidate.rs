@@ -1,11 +1,12 @@
-//! CP-0399 candidate: one ordered coordinator for a fresh PFM5/ECR1 transition.
+//! CP-0399 candidate: ordered PFM5 external-CAS coordination and restart recovery.
 //!
-//! This layer is deliberately a candidate API. It enforces Ready -> durable Prepared ->
-//! independent High-Water Prepared -> CP-0394 execution -> local Finalized -> independent
-//! High-Water Finalized (the independent floor is committed before local finalization so that
-//! a crash can be recovered using the exact Prepared-intent authorization path). It does not
-//! provide a concrete independent High-Water or CAS adapter,
-//! node-runtime wiring, or production deployment approval.
+//! The normal path is Ready -> durable PFJ1 Prepared -> independent High-Water Prepared ->
+//! CP-0394 execution -> independent High-Water Finalized -> local PFJ1 Finalized.
+//! Restart recovery reuses only the exact pending intent. If the independent floor is already
+//! Finalized, recovery requires the bounded CP-0398 authorization and read-only signed ECR1
+//! verification; it never retries CAS. This remains a candidate API, not production runtime
+//! wiring. Concrete independently operated High-Water/CAS providers and deployment approval
+//! are still absent.
 
 use crate::{
     external_cas_anchor_candidate::{
@@ -13,7 +14,8 @@ use crate::{
     },
     private_testnet_checkpoint_candidate::Pcp4ValidationContext,
     private_testnet_pfm5_external_cas_candidate::{
-        execute_intent, Pfm5ExternalCasIntent, Pfm5ExternalCasOutcome,
+        execute_intent, verify_already_committed_intent, Pfm5ExternalCasIntent,
+        Pfm5ExternalCasOutcome,
     },
     private_testnet_pfm5_external_cas_highwater_candidate::{
         advance_finalized_snapshot, advance_prepared_snapshot, authorize_prepared_journal_recovery,
@@ -214,19 +216,22 @@ where
             ));
         }
 
-        // CP-0394 performs a new signed ECR1 read. A correctly finalized floor must resolve
-        // to this exact successor, not a RetrySameIntent or a different generation.
-        let execution = execute_intent(object_client, cas_client, pin, context, &intent, bundle)
-            .map_err(|error| Pfm5ExternalCasCoordinatorError::Execute(error.to_string()))?;
+        // The independent floor already claims Finalized. Use the read-only CP-0394
+        // verifier: if signed ECR1 is stale or contradictory, fail closed without a CAS write.
+        let execution = verify_already_committed_intent(
+            object_client,
+            cas_client,
+            pin,
+            context,
+            &intent,
+            bundle,
+        )
+        .map_err(|error| Pfm5ExternalCasCoordinatorError::Execute(error.to_string()))?;
         let committed_object_generation = match execution {
-            Pfm5ExternalCasOutcome::Committed { ref receipt, .. } => receipt.object_generation,
             Pfm5ExternalCasOutcome::AlreadyCommitted {
                 object_generation, ..
-            }
-            | Pfm5ExternalCasOutcome::CommittedAfterAmbiguousReply {
-                object_generation, ..
             } => object_generation,
-            Pfm5ExternalCasOutcome::RetrySameIntent { .. } => {
+            _ => {
                 return Err(Pfm5ExternalCasCoordinatorError::HighWater(
                     Pfm5ExternalCasHighWaterError::HighWaterConflict,
                 ));
