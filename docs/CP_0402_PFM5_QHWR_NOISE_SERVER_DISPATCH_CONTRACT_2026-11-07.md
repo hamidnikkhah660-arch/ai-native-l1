@@ -173,3 +173,16 @@ that the signer receives the response's canonical signing digest.
 All replay and provider/signer test implementations are in test code only; they are not production
 storage, signer custody, or a deployed Provider. The production qualifications and non-goals above
 remain unchanged.
+
+## Loopback Noise qualification harness
+
+Added serve_one_loopback_noise_connection as a one-request qualification harness. It accepts an
+already accepted TCP stream only when both local and remote socket addresses are loopback, completes
+the existing pinned Noise XX handshake with the configured Network-ID prologue, derives the
+authenticated peer identity from the Noise session itself, reads one bounded encrypted record,
+dispatches one READ-only request, writes one encrypted response, and then drops the stream.
+It does not open a listener, bind a port, alter runtime defaults, or enable CAS.
+
+A real TCP loopback test now exercises client/server Noise XX authentication and one complete
+QHWR READ request/response through the dispatcher. This validates the integration seam, not
+production networking, external-host operation, or a production deployment.

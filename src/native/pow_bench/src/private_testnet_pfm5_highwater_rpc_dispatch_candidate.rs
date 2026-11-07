@@ -5,6 +5,7 @@
 //! until its independent provider and durable replay path have been separately qualified.
 //! Noise peer authentication is performed by the caller.
 
+use crate::devnet_noise_transport_candidate::{DevnetNoiseError, DevnetNoiseSession};
 use crate::{
     external_cas_anchor_candidate::ExternalCasPin,
     private_testnet_pfm5_external_cas_highwater_candidate::{
@@ -20,7 +21,7 @@ use crate::{
     v4_fat1_trust_candidate::ML_DSA_65_SIGNATURE_BYTES,
 };
 use sha2::{Digest, Sha256};
-use std::fmt;
+use std::{fmt, net::TcpStream};
 
 /// Production implementations must use durable, atomic, cross-process storage.
 /// Ok(true) reserves a new peer/challenge pair; Ok(false) means replay.
@@ -145,6 +146,83 @@ where
     .map_err(|_| QhwrDispatchError::Codec)
 }
 
+#[derive(Debug)]
+pub enum QhwrLoopbackServerError {
+    LoopbackOnly,
+    Noise(DevnetNoiseError),
+    Dispatch(QhwrDispatchError),
+}
+impl fmt::Display for QhwrLoopbackServerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LoopbackOnly => {
+                f.write_str("QHWR qualification server accepts loopback TCP only")
+            }
+            Self::Noise(error) => write!(f, "QHWR Noise connection failed: {error}"),
+            Self::Dispatch(error) => write!(f, "QHWR dispatch failed: {error}"),
+        }
+    }
+}
+impl std::error::Error for QhwrLoopbackServerError {}
+
+/// Serve exactly one request on an already accepted loopback TCP stream.
+///
+/// Both local and remote socket addresses must be loopback. Noise XX authentication and the
+/// Network-ID prologue are completed before reading an application record. The authenticated
+/// remote static key is passed to the READ-only dispatcher. The stream is dropped on return;
+/// this is a qualification harness entry point, not a production listener.
+pub fn serve_one_loopback_noise_connection<P, L, S>(
+    mut stream: TcpStream,
+    server_static_private_key: &[u8; 32],
+    trusted_peers: &[[u8; 32]],
+    network_id: &[u8; 32],
+    authority: &Pfm5ExternalCasHighWaterAuthorityPin,
+    provider_pin: &ExternalCasPin,
+    provider: &mut P,
+    replay_ledger: &mut L,
+    signer: &mut S,
+) -> Result<(), QhwrLoopbackServerError>
+where
+    P: Pfm5ExternalCasHighWaterProvider,
+    L: QhwrDurableReplayLedger,
+    S: QhwrResponseSigner,
+{
+    let local = stream
+        .local_addr()
+        .map_err(|error| QhwrLoopbackServerError::Noise(DevnetNoiseError::Io(error.to_string())))?;
+    let remote = stream
+        .peer_addr()
+        .map_err(|error| QhwrLoopbackServerError::Noise(DevnetNoiseError::Io(error.to_string())))?;
+    if !local.ip().is_loopback() || !remote.ip().is_loopback() {
+        return Err(QhwrLoopbackServerError::LoopbackOnly);
+    }
+
+    let mut session = DevnetNoiseSession::accept(
+        &mut stream,
+        server_static_private_key,
+        trusted_peers,
+        network_id,
+    )
+    .map_err(QhwrLoopbackServerError::Noise)?;
+    let authenticated_peer = *session.remote_static_public_key();
+    let request = session
+        .read_record(&mut stream)
+        .map_err(QhwrLoopbackServerError::Noise)?;
+    let response = dispatch_read_only(
+        &request,
+        &authenticated_peer,
+        trusted_peers,
+        authority,
+        provider_pin,
+        provider,
+        replay_ledger,
+        signer,
+    )
+    .map_err(QhwrLoopbackServerError::Dispatch)?;
+    session
+        .write_record(&mut stream, &response)
+        .map_err(QhwrLoopbackServerError::Noise)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,5 +654,86 @@ mod dispatch_path_tests {
         }
         assert_eq!(ledger.calls, 1);
         assert_eq!(signer.calls, 1);
+    }
+
+    #[test]
+    fn loopback_noise_server_authenticates_peer_and_dispatches_one_read() {
+        use snow::{params::NoiseParams, Builder};
+        use std::{
+            net::{TcpListener, TcpStream},
+            thread,
+        };
+
+        fn keypair() -> ([u8; 32], [u8; 32]) {
+            let params: NoiseParams = "Noise_XX_25519_ChaChaPoly_SHA256".parse().unwrap();
+            let mut pair = Builder::new(params).generate_keypair().unwrap();
+            let mut private = [0u8; 32];
+            let mut public = [0u8; 32];
+            private.copy_from_slice(&pair.private);
+            public.copy_from_slice(&pair.public);
+            pair.private.fill(0);
+            pair.public.fill(0);
+            (private, public)
+        }
+
+        let network = [0x41; 32];
+        let (server_private, server_public) = keypair();
+        let (client_private, client_public) = keypair();
+        let (authority, pin) = pins();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut provider = FixedProvider {
+                state: valid_state(&authority, &pin),
+                fail: false,
+            };
+            let mut ledger = FixedLedger {
+                result: Ok(true),
+                calls: 0,
+            };
+            let mut signer = FixedSigner {
+                fail: false,
+                calls: 0,
+                digest: None,
+            };
+            serve_one_loopback_noise_connection(
+                stream,
+                &server_private,
+                &[client_public],
+                &network,
+                &authority,
+                &pin,
+                &mut provider,
+                &mut ledger,
+                &mut signer,
+            )
+            .unwrap();
+            assert_eq!(ledger.calls, 1);
+            assert_eq!(signer.calls, 1);
+        });
+
+        let mut stream = TcpStream::connect(address).unwrap();
+        let mut client =
+            DevnetNoiseSession::connect(&mut stream, &client_private, &server_public, &network)
+                .unwrap();
+        let challenge = [0x42; 32];
+        client
+            .write_record(&mut stream, &read_request(challenge))
+            .unwrap();
+        let response_bytes = client.read_record(&mut stream).unwrap();
+        match QhwrResponse::decode(&response_bytes).unwrap() {
+            QhwrResponse::SignedState {
+                operation: QhwrOperation::Read,
+                response,
+            } => {
+                assert_eq!(response.challenge, challenge);
+                assert_eq!(response.key_id, [0x72; 32]);
+                assert_eq!(response.wire_state.len(), QHWA_V1_WIRE_BYTES);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        server.join().unwrap();
     }
 }
