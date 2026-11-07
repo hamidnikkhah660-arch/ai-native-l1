@@ -386,6 +386,9 @@ mod tests {
         fail_without_commit: bool,
         reads: usize,
         writes: usize,
+        fail_read_on_call: Option<usize>,
+        compete_before_compare: bool,
+        succeed_without_commit: bool,
     }
     impl Pfm5ExternalCasHighWaterProvider for MemoryAuthority {
         type Error = &'static str;
@@ -395,6 +398,9 @@ mod tests {
             _pin: &ExternalCasPin,
         ) -> Result<Pfm5ExternalCasHighWaterState, Self::Error> {
             self.reads += 1;
+            if self.fail_read_on_call == Some(self.reads) {
+                return Err("read unavailable");
+            }
             Ok(self.state.clone())
         }
         fn compare_and_advance(
@@ -405,11 +411,21 @@ mod tests {
             next: &Pfm5ExternalCasHighWaterState,
         ) -> Result<(), Self::Error> {
             self.writes += 1;
+            if self.compete_before_compare {
+                self.compete_before_compare = false;
+                self.state.journal_sequence += 1;
+                self.state.record.operation_id = [0x9A; 32];
+                self.state.object_generation += 1;
+                return Err("concurrent writer advanced floor");
+            }
             if self.state != *expected {
                 return Err("compare conflict");
             }
             if self.fail_without_commit {
                 return Err("unavailable before commit");
+            }
+            if self.succeed_without_commit {
+                return Ok(());
             }
             self.state = next.clone();
             if self.lose_reply_after_commit {
@@ -512,6 +528,9 @@ mod tests {
                 fail_without_commit: false,
                 reads: 0,
                 writes: 0,
+                fail_read_on_call: None,
+                compete_before_compare: false,
+                succeed_without_commit: false,
             },
         }
     }
@@ -752,6 +771,63 @@ mod tests {
             ),
             Err(Pfm5ExternalCasHighWaterError::IdentityMismatch)
         );
+    }
+
+    #[test]
+    fn missing_prepared_intent_is_rejected_before_authority_read() {
+        let mut f = fixture();
+        assert_eq!(
+            observe_finalized_floor_for_prepared_intent(
+                &mut f.provider,
+                &f.authority_pin,
+                &f.cas_pin,
+                &f.ready
+            ),
+            Err(Pfm5ExternalCasHighWaterError::PreparedSnapshotRequired)
+        );
+        assert_eq!(f.provider.reads, 0);
+        assert_eq!(f.provider.writes, 0);
+    }
+
+    #[test]
+    fn concurrent_floor_advance_between_read_and_cas_fails_closed() {
+        let mut f = fixture();
+        f.provider.compete_before_compare = true;
+        assert_eq!(
+            advance_prepared_snapshot(&mut f.provider, &f.authority_pin, &f.cas_pin, &f.prepared),
+            Err(Pfm5ExternalCasHighWaterError::HighWaterConflict)
+        );
+        assert_eq!(f.provider.reads, 2);
+        assert_eq!(f.provider.writes, 1);
+        assert_ne!(f.provider.state.journal_sequence, f.ready.sequence);
+    }
+
+    #[test]
+    fn successful_cas_without_durable_readback_is_rejected() {
+        let mut f = fixture();
+        f.provider.succeed_without_commit = true;
+        assert_eq!(
+            advance_prepared_snapshot(&mut f.provider, &f.authority_pin, &f.cas_pin, &f.prepared),
+            Err(Pfm5ExternalCasHighWaterError::ReadbackMismatch)
+        );
+        assert_eq!(f.provider.state.journal_sequence, f.ready.sequence);
+        assert_eq!(f.provider.reads, 2);
+        assert_eq!(f.provider.writes, 1);
+    }
+
+    #[test]
+    fn unavailable_readback_after_commit_does_not_claim_success() {
+        let mut f = fixture();
+        f.provider.fail_read_on_call = Some(2);
+        assert_eq!(
+            advance_prepared_snapshot(&mut f.provider, &f.authority_pin, &f.cas_pin, &f.prepared),
+            Err(Pfm5ExternalCasHighWaterError::HighWaterUnavailable(
+                "read unavailable".to_owned()
+            ))
+        );
+        assert_eq!(f.provider.state.journal_sequence, f.prepared.sequence);
+        assert_eq!(f.provider.reads, 2);
+        assert_eq!(f.provider.writes, 1);
     }
 
     #[test]
