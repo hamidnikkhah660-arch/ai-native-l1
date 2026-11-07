@@ -409,6 +409,8 @@ pub mod private_testnet_pfm5_external_cas_coordinator_candidate;
 pub mod private_testnet_pfm5_external_cas_highwater_adapter_candidate;
 pub mod private_testnet_pfm5_highwater_rpc_dispatch_candidate;
 pub mod private_testnet_pfm5_highwater_rpc_wire_candidate;
+/// CP-0410 provider-neutral durable signer contract; no signer implementation or production wiring.
+pub mod private_testnet_qhwr_idempotent_signer_contract;
 /// CP-0407 pure state-transition model; not a durable authority or production integration.
 pub mod private_testnet_qhwr_operation_recovery_model;
 /// CP-0409 in-memory signer idempotency model; not a durable signer or production integration.
