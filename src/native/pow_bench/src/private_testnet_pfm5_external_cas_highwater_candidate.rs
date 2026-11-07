@@ -196,7 +196,9 @@ where
     )
 }
 
-/// Call after PFJ1 is durably finalized with the verified ECR1 successor.
+/// Call after CP-0394 has verified the exact ECR1 successor and before local PFJ1 finalization.
+/// The independent finalized floor is advanced first so a crash leaves only the narrowly
+/// recoverable case: a one-step-stale Prepared journal authorized by this authenticated floor.
 pub fn advance_finalized_snapshot<P>(
     provider: &mut P,
     authority: &Pfm5ExternalCasHighWaterAuthorityPin,
