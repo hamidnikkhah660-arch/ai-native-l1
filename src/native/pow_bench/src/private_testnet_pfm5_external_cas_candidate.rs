@@ -1175,6 +1175,84 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_resumes_after_ecr1_commit_before_highwater_finalization() {
+        let fixture = Fixture::new();
+        let verifier = LibcruxMlDsa65VerifierCandidate;
+        let (bundle, current, pin) = fixture.bundle_and_anchor(&verifier, 0x31);
+        let intent = prepare_intent(&fixture, &bundle, current.clone(), &pin);
+        let authority = Pfm5ExternalCasHighWaterAuthorityPin {
+            authority_id: [0xA8; 32],
+        };
+        let directory = TestDirectory::new();
+        let journal =
+            Pfm5ExternalCasJournalStore::new(directory.path().join("coordinator-ecr1-first.pfj1"));
+        let ready = journal.initialize(&pin, current.clone(), 40).unwrap();
+        let mut highwater = MemoryHighWater(
+            Pfm5ExternalCasHighWaterState::from_snapshot(&authority, &pin, &ready).unwrap(),
+        );
+        let prepared = journal.stage_intent(&pin, &intent, 1, 0, 40).unwrap();
+        assert_eq!(
+            advance_prepared_snapshot(&mut highwater, &authority, &pin, &prepared).unwrap(),
+            Pfm5ExternalCasHighWaterAdvance::Advanced
+        );
+
+        let (provider, remote_state, cas_calls) =
+            signed_cas_provider(pin.clone(), current, 0x31, false);
+        let mut cas =
+            VerifiedExternalCasClient::new(pin.clone(), provider, LibcruxMlDsa65VerifierCandidate)
+                .unwrap();
+        let mut objects = Pfm5ImmutableObjectClient::new(MemoryObjectProvider::default());
+
+        // Simulate the process stopping immediately after signed ECR1 CAS committed,
+        // before the coordinator advances High-Water or finalizes PFJ1.
+        let first = execute_intent(
+            &mut objects,
+            &mut cas,
+            &pin,
+            &fixture.context(),
+            &intent,
+            &bundle,
+        )
+        .unwrap();
+        assert!(matches!(first, Pfm5ExternalCasOutcome::Committed { .. }));
+        assert_eq!(cas_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            remote_state.lock().unwrap().current,
+            intent.write_request.next_record
+        );
+        assert_eq!(highwater.0.journal_sequence, prepared.sequence);
+        assert_eq!(journal.load_checked(&pin, 2, 0, 40).unwrap(), prepared);
+
+        // Restart: the exact signed successor is already present. Recovery must not issue
+        // a second CAS; it should only advance the independent floor and local journal.
+        let resumed = resume_prepared_intent(
+            &journal,
+            &mut highwater,
+            &authority,
+            &pin,
+            &fixture.context(),
+            &bundle,
+            &mut objects,
+            &mut cas,
+            1,
+            0,
+            40,
+        )
+        .unwrap();
+        assert!(matches!(
+            resumed,
+            crate::private_testnet_pfm5_external_cas_coordinator_candidate::Pfm5ExternalCasCoordinatorOutcome::Finalized {
+                highwater: Pfm5ExternalCasHighWaterAdvance::Advanced,
+                ..
+            }
+        ));
+        assert_eq!(cas_calls.load(Ordering::SeqCst), 1);
+        let finalized = journal.load_checked(&pin, 3, 0, 41).unwrap();
+        assert_eq!(finalized.last_record, intent.write_request.next_record);
+        assert!(finalized.pending_intent.is_none());
+        verify_ready_snapshot(&mut highwater, &authority, &pin, &finalized).unwrap();
+    }
+    #[test]
     fn coordinator_recovers_finalized_highwater_without_repeating_cas() {
         let fixture = Fixture::new();
         let verifier = LibcruxMlDsa65VerifierCandidate;
