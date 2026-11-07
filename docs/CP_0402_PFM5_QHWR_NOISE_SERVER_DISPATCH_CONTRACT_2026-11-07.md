@@ -1,7 +1,7 @@
 ﻿# CP-0402 — PFM5 QHWR Noise Server Dispatcher Contract
 
-Date: 2026-11-07  
-Status: Draft engineering contract; not an implementation, deployment approval, or security certification.  
+Date: 2026-11-07
+Status: Draft engineering contract; not an implementation, deployment approval, or security certification.
 Parent: CP-0401 QHWR v1 wire contract and pinned Noise client.
 
 ## 1. Purpose and scope
