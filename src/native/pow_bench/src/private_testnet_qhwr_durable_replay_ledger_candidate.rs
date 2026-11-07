@@ -14,11 +14,13 @@ use crate::private_testnet_pfm5_highwater_rpc_dispatch_candidate::{
 use crate::private_testnet_pfm5_highwater_rpc_wire_candidate::QhwrOperation;
 use crate::snapshot_store::{SnapshotStoreError, SnapshotWriterLock};
 use sha2::{Digest, Sha256};
+#[cfg(any(unix, test))]
+use std::path::PathBuf;
 use std::{
     collections::HashSet,
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 const RECORD_MAGIC: &[u8; 8] = b"QHWRRPL1";
@@ -83,6 +85,7 @@ impl From<SnapshotStoreError> for QhwrReplayLedgerError {
 /// Append-only, checksummed replay reservations with a single active writer per file.
 /// A successful `reserve_once` is returned only after the record's `sync_all` barrier.
 pub struct QhwrDurableReplayLedgerCandidate {
+    #[cfg(unix)]
     path: PathBuf,
     file: File,
     _path_lock: SnapshotWriterLock,
@@ -94,19 +97,40 @@ pub struct QhwrDurableReplayLedgerCandidate {
 
 impl QhwrDurableReplayLedgerCandidate {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, QhwrReplayLedgerError> {
-        let path = path.as_ref();
-        if path.file_name().is_none() || !parent_directory(path).is_dir() {
+        let input_path = path.as_ref();
+        let file_name = input_path
+            .file_name()
+            .ok_or(QhwrReplayLedgerError::InvalidPath)?;
+        let canonical_parent = fs::canonicalize(parent_directory(input_path))?;
+        let path = canonical_parent.join(file_name);
+        if !canonical_parent.is_dir() {
             return Err(QhwrReplayLedgerError::InvalidPath);
         }
-        let path_lock = SnapshotWriterLock::acquire(path)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(path)?;
-        let file_identity_lock = SnapshotWriterLock::acquire_file_identity(&file, path)?;
+        // Windows has no validated parent-directory flush in this candidate. Require
+        // the WAL name to be provisioned before open; never create a name and then
+        // report successful reservations without proving that directory entry durable.
+        #[cfg(windows)]
+        if !path.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Windows QHWR WAL must be pre-provisioned; directory-entry durability is not established",
+            )
+            .into());
+        }
+        // Pin the parent directory at open time. A later process-wide current-directory
+        // change must not redirect syncs or lock diagnostics to a different WAL path.
+        let path_lock = SnapshotWriterLock::acquire(&path)?;
+        let mut file_options = OpenOptions::new();
+        file_options.read(true).write(true);
+        #[cfg(windows)]
+        file_options.create(false);
+        #[cfg(not(windows))]
+        file_options.create(true);
+        let file = file_options.open(&path)?;
+        let file_identity_lock = SnapshotWriterLock::acquire_file_identity(&file, &path)?;
         let mut ledger = Self {
-            path: path.to_path_buf(),
+            #[cfg(unix)]
+            path,
             file,
             _path_lock: path_lock,
             _file_identity_lock: file_identity_lock,
@@ -202,6 +226,7 @@ impl QhwrDurableReplayLedger for QhwrDurableReplayLedgerCandidate {
             self.poisoned = true;
             return Err(error.into());
         }
+        #[cfg(unix)]
         if let Err(error) = sync_parent(&self.path) {
             self.poisoned = true;
             return Err(error);
@@ -248,10 +273,6 @@ fn parent_directory(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-#[cfg(windows)]
-fn sync_parent(_path: &Path) -> Result<(), QhwrReplayLedgerError> {
-    Ok(())
-}
 #[cfg(unix)]
 fn sync_parent(path: &Path) -> Result<(), QhwrReplayLedgerError> {
     File::open(parent_directory(path))?.sync_all()?;
@@ -291,7 +312,13 @@ mod tests {
             Self(path)
         }
         fn file(&self) -> PathBuf {
-            self.0.join("replay.wal")
+            let path = self.0.join("replay.wal");
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            path
         }
     }
     impl Drop for TestDir {
@@ -306,6 +333,19 @@ mod tests {
             authenticated_peer: [peer; 32],
             operation,
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_open_rejects_unprovisioned_wal_path() {
+        let dir = TestDir::new();
+        let path = dir.0.join("not-created.wal");
+        assert!(matches!(
+            QhwrDurableReplayLedgerCandidate::open(&path),
+            Err(QhwrReplayLedgerError::Io(ref error))
+                if error.kind() == io::ErrorKind::Unsupported
+        ));
+        assert!(!path.exists());
     }
 
     #[test]
@@ -473,6 +513,21 @@ mod tests {
         let status = child.wait().unwrap();
         assert!(status.success(), "child process failed: {status}");
         assert!(QhwrDurableReplayLedgerCandidate::open(&path).is_ok());
+    }
+
+    #[test]
+    fn hard_link_alias_cannot_open_the_same_wal_for_writing() {
+        let dir = TestDir::new();
+        let path = dir.file();
+        let alias = dir.0.join("replay-alias.wal");
+        fs::hard_link(&path, &alias).unwrap();
+        let first = QhwrDurableReplayLedgerCandidate::open(&path).unwrap();
+        assert!(matches!(
+            QhwrDurableReplayLedgerCandidate::open(&alias),
+            Err(QhwrReplayLedgerError::WriterLockUnavailable)
+        ));
+        drop(first);
+        assert!(QhwrDurableReplayLedgerCandidate::open(&alias).is_ok());
     }
 
     #[test]
