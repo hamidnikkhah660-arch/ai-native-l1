@@ -407,3 +407,4 @@ pub mod token_forge;
 pub mod private_testnet_pfm5_external_cas_coordinator_candidate;
 /// Candidate authenticated High-Water transport adapter; not wired to production runtime.
 pub mod private_testnet_pfm5_external_cas_highwater_adapter_candidate;
+pub mod private_testnet_pfm5_highwater_rpc_wire_candidate;
