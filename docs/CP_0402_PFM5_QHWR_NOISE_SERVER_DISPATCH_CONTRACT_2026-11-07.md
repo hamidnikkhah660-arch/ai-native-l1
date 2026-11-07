@@ -132,3 +132,30 @@ Before any public deployment: independent security review; independently operate
 ## 12. Explicit change restrictions
 
 No changes to Genesis, consensus, issuance/economics, public listener defaults, firewall, VPN, NetBird policy/routes, DNS, OpenVPN adapter/service, release gates, or website publication are authorized by this CP.
+
+## CP-0402 initial READ-only dispatcher implementation
+
+A first dispatcher core now exists in
+src/native/pow_bench/src/private_testnet_pfm5_highwater_rpc_dispatch_candidate.rs.
+It is a request handler, not a TCP listener or production service. It accepts only an already
+Noise-authenticated peer identity supplied by its caller and performs one QHWR request dispatch.
+
+The initial implementation is intentionally READ-only:
+- malformed QHWR requests are rejected before any dependency is called;
+- COMPARE_AND_ADVANCE is rejected before provider, replay-ledger, or signer side effects;
+- peer authorization is checked against an explicit static-key allow-list before replay reservation;
+- READ reserves the peer/challenge pair through a required replay-ledger interface before provider IO;
+- provider state is validated and canonically encoded before signing;
+- response signatures are produced only through an injected signer interface; no private key
+  implementation or key custody is included here.
+
+Three focused tests currently pass: malformed-request rejection, CAS rejection with no side
+effects, and unauthorized-peer rejection with no side effects. These tests use panic-on-call
+dependencies to prove the rejected paths do not invoke them.
+
+The replay-ledger interface contract requires durable atomic cross-process reservation, but no
+concrete implementation is supplied. The signer is also only an interface. A production service
+must still provide and independently qualify both, along with an independent high-water provider,
+Noise accept/connection lifecycle, bounded listener admission, operational limits, and multi-host
+fault/replay testing. No runtime wiring, listener, public bind, CAS service, or launch approval is
+introduced by this candidate.
