@@ -32,11 +32,7 @@ impl QhwrSignerRequest {
         signer_key_generation: u64,
         signing_digest: [u8; 32],
     ) -> Result<Self, QhwrSignerContractError> {
-        if qhwr_identity_digest.iter().all(|byte| *byte == 0)
-            || signer_key_id.iter().all(|byte| *byte == 0)
-            || signer_key_generation == 0
-            || signing_digest.iter().all(|byte| *byte == 0)
-        {
+        if signer_key_id.iter().all(|byte| *byte == 0) || signer_key_generation == 0 {
             return Err(QhwrSignerContractError::InvalidRequest);
         }
         Ok(Self {
@@ -50,10 +46,8 @@ impl QhwrSignerRequest {
 
     /// Revalidate public fields before an adapter sends the request to a signer.
     pub fn validate(&self) -> Result<(), QhwrSignerContractError> {
-        if self.qhwr_identity_digest.iter().all(|byte| *byte == 0)
-            || self.signer_key_id.iter().all(|byte| *byte == 0)
+        if self.signer_key_id.iter().all(|byte| *byte == 0)
             || self.signer_key_generation == 0
-            || self.signing_digest.iter().all(|byte| *byte == 0)
             || self.operation_key != derive_operation_key(&self.qhwr_identity_digest)
         {
             return Err(QhwrSignerContractError::InvalidRequest);
@@ -189,11 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn request_rejects_zero_identity_key_generation_and_digest() {
-        assert_eq!(
-            QhwrSignerRequest::from_identity_digest([0; 32], [1; 32], 1, [2; 32]),
-            Err(QhwrSignerContractError::InvalidRequest)
-        );
+    fn request_rejects_zero_key_id_and_generation_but_accepts_any_digest_value() {
         assert_eq!(
             QhwrSignerRequest::from_identity_digest([1; 32], [0; 32], 1, [2; 32]),
             Err(QhwrSignerContractError::InvalidRequest)
@@ -202,10 +192,7 @@ mod tests {
             QhwrSignerRequest::from_identity_digest([1; 32], [2; 32], 0, [3; 32]),
             Err(QhwrSignerContractError::InvalidRequest)
         );
-        assert_eq!(
-            QhwrSignerRequest::from_identity_digest([1; 32], [2; 32], 1, [0; 32]),
-            Err(QhwrSignerContractError::InvalidRequest)
-        );
+        assert!(QhwrSignerRequest::from_identity_digest([0; 32], [2; 32], 1, [0; 32]).is_ok());
     }
 
     #[test]
