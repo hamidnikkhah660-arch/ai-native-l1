@@ -24,7 +24,7 @@ This document is deliberately provider-neutral. The repository currently has no 
 
 Before any provider side effect, the caller must:
 
-- load PFJ1 with `load_checked` using the independently observed minimum sequence, ECR1 record-generation floor, and object-generation floor;
+- authenticate and validate the independent high-water state first, then load PFJ1 through a recovery-specific checked-read path. For ordinary Prepared/Prepared and Prepared/Ready reconciliation, `load_checked` may be used with floors that do not exceed the local snapshot. For the disk-rollback case where the authenticated floor is Finalized and PFJ1 is exactly one sequence behind, **do not call `load_checked` with the finalized sequence as its minimum**: that correctly rejects the stale local sequence before recovery can inspect its pending intent. A narrowly scoped recovery-load API must validate PFJ1 encoding, checksum, domain, intent, and file safety while allowing only this exact one-transition lag for subsequent independent-floor and fresh-ECR1 proof.
 - require `snapshot.pending_intent` and validate that exact intent against the configured `ExternalCasPin`;
 - require `snapshot.last_record == intent.expected_current` and `snapshot.object_generation == intent.expected_object_generation`;
 - validate the pinned authority/provider/network/Genesis tuple and authenticated high-water response;
@@ -49,7 +49,7 @@ The recovery implementation must not infer trust from a local sequence, a checks
 
 This can occur when the local journal disk was restored to an earlier Prepared image after the independent authority had advanced.
 
-1. Require `observe_finalized_floor_for_prepared_intent` to return the exact next journal sequence, exact intended successor record, and advanced object generation under the pinned authority/domain.
+1. Load PFJ1 using the narrowly scoped recovery-load API described above; require its pending intent and predecessor fields to match exactly. Require `observe_finalized_floor_for_prepared_intent` to return the exact next journal sequence, exact intended successor record, and advanced object generation under the pinned authority/domain. This is a single permitted lag (`prepared.sequence + 1`), not a general relaxation of floors.
 2. **Do not finalize PFJ1 from the high-water record alone.** Fetch and validate the intent's immutable bundle and call CP-0394 with the same intent. Its fresh signed ECR1 read must independently confirm that the ECR1 record is the exact intended successor and the object generation is advanced. If the external ECR1 state is unavailable or disagrees, fail closed and raise an operator-visible integrity incident; never lower the authority floor.
 3. Only after this fresh exact evidence may `mark_committed` reconcile PFJ1 to the successor. Re-read the authenticated high-water floor and require exact equality with the finalized journal state. Do not advance or rewrite an already-finalized authority state.
 
@@ -81,7 +81,7 @@ The orchestrator implementation must expose deterministic fault points and use a
 
 ## Required automated tests before implementation is considered qualified
 
-- A single integration harness composes the real PFJ1 journal module, CP-0396 contract functions, CP-0394 executor, and deterministic provider doubles; separate unit tests are insufficient.
+- Add a narrowly scoped recovery-load API (or equivalent reviewed mechanism) that permits exactly the authenticated Finalized-floor / one-step-older Prepared-journal case without weakening normal `load_checked` semantics. It must still validate checksum, canonical encoding, domain, file safety, and the exact pending intent.\n- A single integration harness composes the real PFJ1 journal module, CP-0396 contract functions, CP-0394 executor, and deterministic provider doubles; separate unit tests are insufficient.
 - Child-process termination and restart at every matrix boundary, including after provider commit but before response delivery.
 - Exact assertions for same operation ID, same nonce/request digest, exact predecessor/successor, sequence increments of exactly one, and strictly advanced object generation.
 - Competing writer, stale response, false-success CAS, lost authenticated readback, corrupted/malformed journal, wrong domain, authority rollback, sequence skip, and authority outage.
@@ -93,7 +93,7 @@ The orchestrator implementation must expose deterministic fault points and use a
 
 1. Define a narrow recovery coordinator API over existing components; avoid duplicating their validation or weakening their types.
 2. Implement the deterministic integration harness and fault injection first. Tests must fail against an intentionally broken ordering (for example, CP-0394 called before Prepared floor confirmation).
-3. Implement the coordinator only when each matrix transition has a precise result type and no ambiguous boolean success.
+3. Implement the recovery-load path and coordinator only when each matrix transition has a precise result type and no ambiguous boolean success. Keep normal `load_checked` strict; do not weaken its minimum-floor behavior globally.
 4. Review provider authentication, canonical encoding, authority bootstrap/rotation/revocation, and linearizable compare-and-advance independently. The existing AWS adapter plan is design material only; **no AWS account, paid cloud resource, KMS, DynamoDB, or spend is authorized or required by this CP**.
 5. Run all-target Rust validation and exact-head CI; retain Draft status pending review.
 6. Do not wire into node startup, Devnet, or Mainnet until the independent provider adapter and multi-host rollback qualification pass and the project owner separately approves integration.
@@ -109,3 +109,4 @@ No changes to Genesis, Network ID, consensus, PoW, issuance, wallet allocation, 
 - CP-0396: independent high-water state contract and transition checks.
 - CP-0397: provider-adapter design; no production adapter is deployed.
 - CP-0398: missing caller recovery composition and crash qualification requirements.
+
