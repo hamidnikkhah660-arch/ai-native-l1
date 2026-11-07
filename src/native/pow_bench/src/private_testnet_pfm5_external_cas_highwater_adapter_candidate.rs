@@ -220,6 +220,7 @@ mod tests {
         key_generation: u64,
         signing_key: libcrux_ml_dsa::ml_dsa_65::MLDSA65SigningKey,
         tamper_signature: bool,
+        lose_cas_reply: bool,
         seen_challenges: Vec<[u8; 32]>,
     }
 
@@ -283,6 +284,10 @@ mod tests {
             )
             .unwrap();
             self.state = next.state;
+            if self.lose_cas_reply {
+                self.lose_cas_reply = false;
+                return Err("CAS reply lost after commit");
+            }
             Ok(self.response(challenge))
         }
     }
@@ -341,6 +346,7 @@ mod tests {
             key_generation,
             signing_key: pair.signing_key,
             tamper_signature,
+            lose_cas_reply: false,
             seen_challenges: Vec::new(),
         };
         (
@@ -394,6 +400,58 @@ mod tests {
         let transport = adapter.into_transport();
         assert_eq!(transport.seen_challenges.len(), 2);
         assert_ne!(transport.seen_challenges[0], transport.seen_challenges[1]);
+    }
+
+    #[test]
+    fn adapter_accepts_finalized_transition_with_exact_record_successor() {
+        let (mut adapter, authority, provider) = adapter_fixture(false);
+        let expected = adapter.read_authenticated(&authority, &provider).unwrap();
+        let mut finalized = expected.clone();
+        finalized.journal_sequence += 1;
+        finalized.object_generation += 1;
+        finalized.record.generation += 1;
+        finalized.record.previous_record_digest = expected.record.digest().unwrap();
+        finalized.record.previous_state_digest = expected.record.next_state_digest;
+        finalized.record.next_state_digest = [0x73; 32];
+        finalized.record.operation_id = [0x74; 32];
+        finalized.record.request_digest = [0x75; 32];
+
+        Pfm5ExternalCasHighWaterProvider::compare_and_advance(
+            &mut adapter,
+            &authority,
+            &provider,
+            &expected,
+            &finalized,
+        )
+        .unwrap();
+
+        assert_eq!(
+            adapter.read_authenticated(&authority, &provider).unwrap(),
+            finalized
+        );
+    }
+
+    #[test]
+    fn adapter_resolves_lost_cas_reply_by_fresh_authenticated_read() {
+        let (mut adapter, authority, provider) = adapter_fixture(false);
+        let expected = adapter.read_authenticated(&authority, &provider).unwrap();
+        let mut prepared = expected.clone();
+        prepared.journal_sequence += 1;
+        adapter.transport.lose_cas_reply = true;
+
+        Pfm5ExternalCasHighWaterProvider::compare_and_advance(
+            &mut adapter,
+            &authority,
+            &provider,
+            &expected,
+            &prepared,
+        )
+        .unwrap();
+
+        assert_eq!(
+            adapter.read_authenticated(&authority, &provider).unwrap(),
+            prepared
+        );
     }
 
     #[test]
