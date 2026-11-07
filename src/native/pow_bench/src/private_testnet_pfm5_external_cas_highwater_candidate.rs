@@ -721,6 +721,70 @@ mod tests {
     }
 
     #[test]
+    fn prepared_recovery_rejects_mismatched_finalized_floor_components() {
+        let mut wrong_sequence = fixture();
+        wrong_sequence.provider.state = Pfm5ExternalCasHighWaterState::from_snapshot(
+            &wrong_sequence.authority_pin,
+            &wrong_sequence.cas_pin,
+            &wrong_sequence.finalized,
+        )
+        .unwrap();
+        wrong_sequence.provider.state.journal_sequence += 1;
+        assert_eq!(
+            observe_finalized_floor_for_prepared_intent(
+                &mut wrong_sequence.provider,
+                &wrong_sequence.authority_pin,
+                &wrong_sequence.cas_pin,
+                &wrong_sequence.prepared,
+            ),
+            Err(Pfm5ExternalCasHighWaterError::HighWaterConflict)
+        );
+        assert_eq!(wrong_sequence.provider.reads, 1);
+        assert_eq!(wrong_sequence.provider.writes, 0);
+
+        let mut wrong_record = fixture();
+        wrong_record.provider.state = Pfm5ExternalCasHighWaterState::from_snapshot(
+            &wrong_record.authority_pin,
+            &wrong_record.cas_pin,
+            &wrong_record.finalized,
+        )
+        .unwrap();
+        wrong_record.provider.state.record.operation_id = [0xAB; 32];
+        assert_eq!(
+            observe_finalized_floor_for_prepared_intent(
+                &mut wrong_record.provider,
+                &wrong_record.authority_pin,
+                &wrong_record.cas_pin,
+                &wrong_record.prepared,
+            ),
+            Err(Pfm5ExternalCasHighWaterError::HighWaterConflict)
+        );
+        assert_eq!(wrong_record.provider.reads, 1);
+        assert_eq!(wrong_record.provider.writes, 0);
+
+        let mut stale_generation = fixture();
+        stale_generation.provider.state = Pfm5ExternalCasHighWaterState::from_snapshot(
+            &stale_generation.authority_pin,
+            &stale_generation.cas_pin,
+            &stale_generation.finalized,
+        )
+        .unwrap();
+        stale_generation.provider.state.object_generation =
+            stale_generation.intent.expected_object_generation;
+        assert_eq!(
+            observe_finalized_floor_for_prepared_intent(
+                &mut stale_generation.provider,
+                &stale_generation.authority_pin,
+                &stale_generation.cas_pin,
+                &stale_generation.prepared,
+            ),
+            Err(Pfm5ExternalCasHighWaterError::HighWaterConflict)
+        );
+        assert_eq!(stale_generation.provider.reads, 1);
+        assert_eq!(stale_generation.provider.writes, 0);
+    }
+
+    #[test]
     fn prepared_recovery_validates_the_exact_intent_before_observing_floor() {
         let mut f = fixture();
         f.provider.state = Pfm5ExternalCasHighWaterState::from_snapshot(
