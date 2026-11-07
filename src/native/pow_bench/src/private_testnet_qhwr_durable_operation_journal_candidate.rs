@@ -174,6 +174,15 @@ impl QhwrJournalState {
 
 /// Append-only, checksummed, single-writer journal for one local host.
 /// The external replay authority and durable idempotent signer remain separate.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QhwrJournalFaultPoint {
+    BeforeWrite,
+    AfterHeader,
+    AfterPayload,
+    AfterChecksum,
+    AfterSync,
+}
 pub struct QhwrDurableOperationJournalCandidate {
     #[cfg(unix)]
     path: PathBuf,
@@ -183,6 +192,8 @@ pub struct QhwrDurableOperationJournalCandidate {
     states: HashMap<[u8; 32], QhwrJournalState>,
     valid_len: u64,
     poisoned: bool,
+    #[cfg(test)]
+    fault_at: Option<QhwrJournalFaultPoint>,
 }
 
 impl QhwrDurableOperationJournalCandidate {
@@ -235,6 +246,8 @@ impl QhwrDurableOperationJournalCandidate {
             states: HashMap::new(),
             valid_len: 0,
             poisoned: false,
+            #[cfg(test)]
+            fault_at: None,
         };
         journal.recover()?;
         Ok(journal)
@@ -432,22 +445,53 @@ impl QhwrDurableOperationJournalCandidate {
             self.poisoned = true;
             return Err(error.into());
         }
-        if let Err(error) = self
-            .file
-            .write_all(&header)
-            .and_then(|_| self.file.write_all(&payload))
-            .and_then(|_| self.file.write_all(&checksum))
-            .and_then(|_| self.file.sync_all())
-        {
+        #[cfg(test)]
+        self.inject_fault(QhwrJournalFaultPoint::BeforeWrite)?;
+        if let Err(error) = self.file.write_all(&header) {
             self.poisoned = true;
             return Err(error.into());
         }
-
+        #[cfg(test)]
+        self.inject_fault(QhwrJournalFaultPoint::AfterHeader)?;
+        if let Err(error) = self.file.write_all(&payload) {
+            self.poisoned = true;
+            return Err(error.into());
+        }
+        #[cfg(test)]
+        self.inject_fault(QhwrJournalFaultPoint::AfterPayload)?;
+        if let Err(error) = self.file.write_all(&checksum) {
+            self.poisoned = true;
+            return Err(error.into());
+        }
+        #[cfg(test)]
+        self.inject_fault(QhwrJournalFaultPoint::AfterChecksum)?;
+        if let Err(error) = self.file.sync_all() {
+            self.poisoned = true;
+            return Err(error.into());
+        }
+        #[cfg(test)]
+        self.inject_fault(QhwrJournalFaultPoint::AfterSync)?;
         self.valid_len = new_len;
         self.states.insert(operation_key, next_state);
         Ok(true)
     }
 
+    #[cfg(test)]
+    fn inject_fault(
+        &mut self,
+        point: QhwrJournalFaultPoint,
+    ) -> Result<(), QhwrOperationJournalError> {
+        if self.fault_at == Some(point) {
+            self.fault_at = None;
+            self.poisoned = true;
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("injected QHWR journal fault at {point:?}"),
+            )
+            .into());
+        }
+        Ok(())
+    }
     fn recover(&mut self) -> Result<(), QhwrOperationJournalError> {
         let file_len = self.file.metadata()?.len();
         if file_len > MAX_JOURNAL_BYTES {
@@ -1008,6 +1052,126 @@ mod tests {
             Some(QhwrJournalState::Reserved { .. })
         ));
         assert_eq!(fs::metadata(&path).unwrap().len(), durable_len);
+    }
+
+    #[test]
+    fn injected_before_write_poisons_handle_and_reopen_keeps_old_state() {
+        let path = test_path();
+        let identity = pins();
+        {
+            let mut journal = QhwrDurableOperationJournalCandidate::open(&path).unwrap();
+            journal.fault_at = Some(QhwrJournalFaultPoint::BeforeWrite);
+            assert!(matches!(
+                journal.reserve(identity.clone()),
+                Err(QhwrOperationJournalError::Io(_))
+            ));
+            assert!(matches!(
+                journal.reserve(identity.clone()),
+                Err(QhwrOperationJournalError::StoreNeedsRecovery)
+            ));
+        }
+        let mut reopened = QhwrDurableOperationJournalCandidate::open(&path).unwrap();
+        assert_eq!(reopened.operation_count(), 0);
+        assert_eq!(reopened.durable_len(), 0);
+        assert!(matches!(reopened.reserve(identity), Ok(true)));
+    }
+
+    #[test]
+    fn injected_after_header_poisons_and_restart_discards_unacknowledged_tail() {
+        let path = test_path();
+        let identity = pins();
+        {
+            let mut journal = QhwrDurableOperationJournalCandidate::open(&path).unwrap();
+            journal.fault_at = Some(QhwrJournalFaultPoint::AfterHeader);
+            assert!(matches!(
+                journal.reserve(identity.clone()),
+                Err(QhwrOperationJournalError::Io(_))
+            ));
+            assert!(matches!(
+                journal.reserve(identity.clone()),
+                Err(QhwrOperationJournalError::StoreNeedsRecovery)
+            ));
+        }
+        let mut reopened = QhwrDurableOperationJournalCandidate::open(&path).unwrap();
+        assert_eq!(reopened.operation_count(), 0);
+        assert_eq!(reopened.durable_len(), 0);
+        assert!(matches!(reopened.reserve(identity), Ok(true)));
+    }
+
+    #[test]
+    fn injected_after_payload_poisons_and_restart_discards_unacknowledged_tail() {
+        let path = test_path();
+        let identity = pins();
+        {
+            let mut journal = QhwrDurableOperationJournalCandidate::open(&path).unwrap();
+            journal.fault_at = Some(QhwrJournalFaultPoint::AfterPayload);
+            assert!(matches!(
+                journal.reserve(identity.clone()),
+                Err(QhwrOperationJournalError::Io(_))
+            ));
+            assert!(matches!(
+                journal.reserve(identity.clone()),
+                Err(QhwrOperationJournalError::StoreNeedsRecovery)
+            ));
+        }
+        let mut reopened = QhwrDurableOperationJournalCandidate::open(&path).unwrap();
+        assert_eq!(reopened.operation_count(), 0);
+        assert_eq!(reopened.durable_len(), 0);
+        assert!(matches!(reopened.reserve(identity), Ok(true)));
+    }
+
+    #[test]
+    fn injected_before_sync_reopen_adopts_only_complete_valid_record() {
+        let path = test_path();
+        let identity = pins();
+        {
+            let mut journal = QhwrDurableOperationJournalCandidate::open(&path).unwrap();
+            journal.fault_at = Some(QhwrJournalFaultPoint::AfterChecksum);
+            assert!(matches!(
+                journal.reserve(identity.clone()),
+                Err(QhwrOperationJournalError::Io(_))
+            ));
+            assert!(matches!(
+                journal.reserve(identity.clone()),
+                Err(QhwrOperationJournalError::StoreNeedsRecovery)
+            ));
+        }
+        let mut reopened = QhwrDurableOperationJournalCandidate::open(&path).unwrap();
+        assert!(reopened.operation_count() <= 1);
+        if reopened.operation_count() == 1 {
+            assert!(matches!(
+                reopened.state(&identity.operation_key),
+                Some(QhwrJournalState::Reserved { pins: current }) if current == &identity
+            ));
+            assert!(matches!(reopened.reserve(identity), Ok(false)));
+        } else {
+            assert_eq!(reopened.durable_len(), 0);
+            assert!(matches!(reopened.reserve(identity), Ok(true)));
+        }
+    }
+    #[test]
+    fn injected_lost_ack_after_sync_recovers_the_exact_committed_reservation() {
+        let path = test_path();
+        let identity = pins();
+        {
+            let mut journal = QhwrDurableOperationJournalCandidate::open(&path).unwrap();
+            journal.fault_at = Some(QhwrJournalFaultPoint::AfterSync);
+            assert!(matches!(
+                journal.reserve(identity.clone()),
+                Err(QhwrOperationJournalError::Io(_))
+            ));
+            assert!(matches!(
+                journal.reserve(identity.clone()),
+                Err(QhwrOperationJournalError::StoreNeedsRecovery)
+            ));
+        }
+        let mut reopened = QhwrDurableOperationJournalCandidate::open(&path).unwrap();
+        assert_eq!(reopened.operation_count(), 1);
+        assert!(matches!(
+            reopened.state(&identity.operation_key),
+            Some(QhwrJournalState::Reserved { pins: current }) if current == &identity
+        ));
+        assert!(matches!(reopened.reserve(identity), Ok(false)));
     }
 
     #[test]
