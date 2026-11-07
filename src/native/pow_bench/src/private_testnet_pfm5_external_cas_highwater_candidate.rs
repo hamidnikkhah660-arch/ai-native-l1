@@ -252,6 +252,15 @@ where
         .pending_intent
         .as_ref()
         .ok_or(Pfm5ExternalCasHighWaterError::PreparedSnapshotRequired)?;
+    if prepared.sequence <= 1
+        || prepared.last_record != intent.expected_current
+        || prepared.object_generation != intent.expected_object_generation
+    {
+        return Err(Pfm5ExternalCasHighWaterError::IntentMismatch);
+    }
+    intent
+        .validate(pin)
+        .map_err(|_| Pfm5ExternalCasHighWaterError::IntentMismatch)?;
     let expected_sequence = prepared
         .sequence
         .checked_add(1)
@@ -375,7 +384,11 @@ mod tests {
         state: Pfm5ExternalCasHighWaterState,
         lose_reply_after_commit: bool,
         fail_without_commit: bool,
+        reads: usize,
         writes: usize,
+        fail_read_on_call: Option<usize>,
+        compete_before_compare: bool,
+        succeed_without_commit: bool,
     }
     impl Pfm5ExternalCasHighWaterProvider for MemoryAuthority {
         type Error = &'static str;
@@ -384,6 +397,10 @@ mod tests {
             _authority: &Pfm5ExternalCasHighWaterAuthorityPin,
             _pin: &ExternalCasPin,
         ) -> Result<Pfm5ExternalCasHighWaterState, Self::Error> {
+            self.reads += 1;
+            if self.fail_read_on_call == Some(self.reads) {
+                return Err("read unavailable");
+            }
             Ok(self.state.clone())
         }
         fn compare_and_advance(
@@ -394,11 +411,21 @@ mod tests {
             next: &Pfm5ExternalCasHighWaterState,
         ) -> Result<(), Self::Error> {
             self.writes += 1;
+            if self.compete_before_compare {
+                self.compete_before_compare = false;
+                self.state.journal_sequence += 1;
+                self.state.record.operation_id = [0x9A; 32];
+                self.state.object_generation += 1;
+                return Err("concurrent writer advanced floor");
+            }
             if self.state != *expected {
                 return Err("compare conflict");
             }
             if self.fail_without_commit {
                 return Err("unavailable before commit");
+            }
+            if self.succeed_without_commit {
+                return Ok(());
             }
             self.state = next.clone();
             if self.lose_reply_after_commit {
@@ -499,7 +526,11 @@ mod tests {
                 state: initial,
                 lose_reply_after_commit: false,
                 fail_without_commit: false,
+                reads: 0,
                 writes: 0,
+                fail_read_on_call: None,
+                compete_before_compare: false,
+                succeed_without_commit: false,
             },
         }
     }
@@ -641,6 +672,150 @@ mod tests {
     }
 
     #[test]
+    fn prepared_recovery_rejects_mismatched_predecessor_generation_and_sequence() {
+        let mut f = fixture();
+        f.provider.state = Pfm5ExternalCasHighWaterState::from_snapshot(
+            &f.authority_pin,
+            &f.cas_pin,
+            &f.finalized,
+        )
+        .unwrap();
+
+        let mut wrong_predecessor = f.prepared.clone();
+        wrong_predecessor.last_record.operation_id = [0x99; 32];
+        assert_eq!(
+            observe_finalized_floor_for_prepared_intent(
+                &mut f.provider,
+                &f.authority_pin,
+                &f.cas_pin,
+                &wrong_predecessor
+            ),
+            Err(Pfm5ExternalCasHighWaterError::IntentMismatch)
+        );
+
+        let mut wrong_generation = f.prepared.clone();
+        wrong_generation.object_generation += 1;
+        assert_eq!(
+            observe_finalized_floor_for_prepared_intent(
+                &mut f.provider,
+                &f.authority_pin,
+                &f.cas_pin,
+                &wrong_generation
+            ),
+            Err(Pfm5ExternalCasHighWaterError::IntentMismatch)
+        );
+
+        let mut invalid_sequence = f.prepared.clone();
+        invalid_sequence.sequence = 1;
+        assert_eq!(
+            observe_finalized_floor_for_prepared_intent(
+                &mut f.provider,
+                &f.authority_pin,
+                &f.cas_pin,
+                &invalid_sequence
+            ),
+            Err(Pfm5ExternalCasHighWaterError::IntentMismatch)
+        );
+        assert_eq!(f.provider.reads, 0);
+        assert_eq!(f.provider.writes, 0);
+    }
+
+    #[test]
+    fn prepared_recovery_rejects_mismatched_finalized_floor_components() {
+        let mut wrong_sequence = fixture();
+        wrong_sequence.provider.state = Pfm5ExternalCasHighWaterState::from_snapshot(
+            &wrong_sequence.authority_pin,
+            &wrong_sequence.cas_pin,
+            &wrong_sequence.finalized,
+        )
+        .unwrap();
+        wrong_sequence.provider.state.journal_sequence += 1;
+        assert_eq!(
+            observe_finalized_floor_for_prepared_intent(
+                &mut wrong_sequence.provider,
+                &wrong_sequence.authority_pin,
+                &wrong_sequence.cas_pin,
+                &wrong_sequence.prepared,
+            ),
+            Err(Pfm5ExternalCasHighWaterError::HighWaterConflict)
+        );
+        assert_eq!(wrong_sequence.provider.reads, 1);
+        assert_eq!(wrong_sequence.provider.writes, 0);
+
+        let mut wrong_record = fixture();
+        wrong_record.provider.state = Pfm5ExternalCasHighWaterState::from_snapshot(
+            &wrong_record.authority_pin,
+            &wrong_record.cas_pin,
+            &wrong_record.finalized,
+        )
+        .unwrap();
+        wrong_record.provider.state.record.operation_id = [0xAB; 32];
+        assert_eq!(
+            observe_finalized_floor_for_prepared_intent(
+                &mut wrong_record.provider,
+                &wrong_record.authority_pin,
+                &wrong_record.cas_pin,
+                &wrong_record.prepared,
+            ),
+            Err(Pfm5ExternalCasHighWaterError::HighWaterConflict)
+        );
+        assert_eq!(wrong_record.provider.reads, 1);
+        assert_eq!(wrong_record.provider.writes, 0);
+
+        let mut stale_generation = fixture();
+        stale_generation.provider.state = Pfm5ExternalCasHighWaterState::from_snapshot(
+            &stale_generation.authority_pin,
+            &stale_generation.cas_pin,
+            &stale_generation.finalized,
+        )
+        .unwrap();
+        stale_generation.provider.state.object_generation =
+            stale_generation.intent.expected_object_generation;
+        assert_eq!(
+            observe_finalized_floor_for_prepared_intent(
+                &mut stale_generation.provider,
+                &stale_generation.authority_pin,
+                &stale_generation.cas_pin,
+                &stale_generation.prepared,
+            ),
+            Err(Pfm5ExternalCasHighWaterError::HighWaterConflict)
+        );
+        assert_eq!(stale_generation.provider.reads, 1);
+        assert_eq!(stale_generation.provider.writes, 0);
+    }
+
+    #[test]
+    fn prepared_recovery_validates_the_exact_intent_before_observing_floor() {
+        let mut f = fixture();
+        f.provider.state = Pfm5ExternalCasHighWaterState::from_snapshot(
+            &f.authority_pin,
+            &f.cas_pin,
+            &f.finalized,
+        )
+        .unwrap();
+
+        let mut malformed = f.prepared.clone();
+        malformed
+            .pending_intent
+            .as_mut()
+            .unwrap()
+            .write_request
+            .next_record
+            .next_state_digest = [0xA9; 32];
+        assert_eq!(
+            observe_finalized_floor_for_prepared_intent(
+                &mut f.provider,
+                &f.authority_pin,
+                &f.cas_pin,
+                &malformed
+            ),
+            Err(Pfm5ExternalCasHighWaterError::IntentMismatch)
+        );
+        assert_eq!(f.provider.reads, 0);
+        assert_eq!(f.provider.writes, 0);
+    }
+
+    #[test]
     fn wrong_authority_or_cas_domain_is_rejected() {
         let mut f = fixture();
         let wrong_authority = Pfm5ExternalCasHighWaterAuthorityPin {
@@ -660,6 +835,63 @@ mod tests {
             ),
             Err(Pfm5ExternalCasHighWaterError::IdentityMismatch)
         );
+    }
+
+    #[test]
+    fn missing_prepared_intent_is_rejected_before_authority_read() {
+        let mut f = fixture();
+        assert_eq!(
+            observe_finalized_floor_for_prepared_intent(
+                &mut f.provider,
+                &f.authority_pin,
+                &f.cas_pin,
+                &f.ready
+            ),
+            Err(Pfm5ExternalCasHighWaterError::PreparedSnapshotRequired)
+        );
+        assert_eq!(f.provider.reads, 0);
+        assert_eq!(f.provider.writes, 0);
+    }
+
+    #[test]
+    fn concurrent_floor_advance_between_read_and_cas_fails_closed() {
+        let mut f = fixture();
+        f.provider.compete_before_compare = true;
+        assert_eq!(
+            advance_prepared_snapshot(&mut f.provider, &f.authority_pin, &f.cas_pin, &f.prepared),
+            Err(Pfm5ExternalCasHighWaterError::HighWaterConflict)
+        );
+        assert_eq!(f.provider.reads, 2);
+        assert_eq!(f.provider.writes, 1);
+        assert_ne!(f.provider.state.journal_sequence, f.ready.sequence);
+    }
+
+    #[test]
+    fn successful_cas_without_durable_readback_is_rejected() {
+        let mut f = fixture();
+        f.provider.succeed_without_commit = true;
+        assert_eq!(
+            advance_prepared_snapshot(&mut f.provider, &f.authority_pin, &f.cas_pin, &f.prepared),
+            Err(Pfm5ExternalCasHighWaterError::ReadbackMismatch)
+        );
+        assert_eq!(f.provider.state.journal_sequence, f.ready.sequence);
+        assert_eq!(f.provider.reads, 2);
+        assert_eq!(f.provider.writes, 1);
+    }
+
+    #[test]
+    fn unavailable_readback_after_commit_does_not_claim_success() {
+        let mut f = fixture();
+        f.provider.fail_read_on_call = Some(2);
+        assert_eq!(
+            advance_prepared_snapshot(&mut f.provider, &f.authority_pin, &f.cas_pin, &f.prepared),
+            Err(Pfm5ExternalCasHighWaterError::HighWaterUnavailable(
+                "read unavailable".to_owned()
+            ))
+        );
+        assert_eq!(f.provider.state.journal_sequence, f.prepared.sequence);
+        assert_eq!(f.provider.reads, 2);
+        assert_eq!(f.provider.writes, 1);
     }
 
     #[test]
