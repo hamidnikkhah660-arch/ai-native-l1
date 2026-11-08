@@ -497,6 +497,34 @@ impl PrivateTestnetChain {
         minimum_generation: u64,
         minimum_checkpoint_height: u64,
     ) -> Result<Self, Pfm5CheckpointRestoreError> {
+        let baseline = Self::restore_pfm5_checkpoint_baseline_for_replay(
+            manifest,
+            checkpoint,
+            context,
+            expected_manifest_commitment,
+            minimum_generation,
+            minimum_checkpoint_height,
+        )?;
+        if !manifest.branch_digests.is_empty()
+            || manifest.canonical_tip_height != checkpoint.logical_height
+            || manifest.canonical_tip_digest != checkpoint.consensus_tip_digest
+        {
+            return Err(Pfm5CheckpointRestoreError::ManifestRequiresArchiveReplay);
+        }
+        Ok(baseline)
+    }
+
+    /// Restore only the authenticated PCP4 base so a separate fork-choice procedure can replay
+    /// every branch named by PFM5. This does not select `manifest.canonical_tip`; callers must
+    /// verify the complete branch digest set and replay result before publishing canonical state.
+    pub fn restore_pfm5_checkpoint_baseline_for_replay(
+        manifest: &Pfm5CheckpointManifest,
+        checkpoint: &Pcp4CheckpointRecord,
+        context: &Pcp4ValidationContext<'_>,
+        expected_manifest_commitment: [u8; 32],
+        minimum_generation: u64,
+        minimum_checkpoint_height: u64,
+    ) -> Result<Self, Pfm5CheckpointRestoreError> {
         if expected_manifest_commitment == [0; 32] || minimum_generation == 0 {
             return Err(Pfm5CheckpointRestoreError::MissingTrustedManifestAnchor);
         }
@@ -512,15 +540,14 @@ impl PrivateTestnetChain {
         if manifest.checkpoint_height < minimum_checkpoint_height {
             return Err(Pfm5CheckpointRestoreError::CheckpointHeightRollback);
         }
+        if manifest.canonical_tip_height < checkpoint.logical_height {
+            return Err(Pfm5CheckpointRestoreError::InvalidManifest(
+                "canonical tip is below the checkpoint base".into(),
+            ));
+        }
         manifest
             .validate_checkpoint(checkpoint, context)
             .map_err(|error| Pfm5CheckpointRestoreError::InvalidCheckpoint(error.to_string()))?;
-        if !manifest.branch_digests.is_empty()
-            || manifest.canonical_tip_height != checkpoint.logical_height
-            || manifest.canonical_tip_digest != checkpoint.consensus_tip_digest
-        {
-            return Err(Pfm5CheckpointRestoreError::ManifestRequiresArchiveReplay);
-        }
         let state =
             MonetaryLedgerState::decode_snapshot(&checkpoint.monetary_snapshot, context.network_id)
                 .map_err(|error| {
