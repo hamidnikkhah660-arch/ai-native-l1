@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="QRun native QZXB wallet research: Windows DPAPI custody, 12-word BIP39 recovery with QZXB-specific Ed25519 derivation, signed TXN2 transfers and current compatibility limits.">
+<meta name="robots" content="index,follow,max-image-preview:large">
+<link rel="canonical" href="https://hamidnikkhah660-arch.github.io/ai-native-l1/wallet.html">
+<meta name="theme-color" content="#0b1220">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="QRun Blockchain">
+<meta property="og:title" content="QZXB Native Wallet | QRun Wallet Research and Safety">
+<meta property="og:description" content="What the candidate QZXB Windows wallet supports, how its recovery path works, and why it is not yet a public Mainnet or Trust Wallet release.">
+<meta property="og:url" content="https://hamidnikkhah660-arch.github.io/ai-native-l1/wallet.html">
+<meta property="og:image" content="https://hamidnikkhah660-arch.github.io/ai-native-l1/assets/qrun-social-card.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="QZXB Native Wallet | QRun Wallet Research and Safety">
+<meta name="twitter:description" content="Windows wallet candidate, DPAPI custody, QZXB-specific recovery and current Mainnet/compatibility limits.">
+<meta name="twitter:image" content="https://hamidnikkhah660-arch.github.io/ai-native-l1/assets/qrun-social-card.png">
+<title>QZXB Native Wallet | QRun Wallet Research and Safety</title>
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"WebPage","name":"QZXB Native Wallet | QRun Wallet Research and Safety","url":"https://hamidnikkhah660-arch.github.io/ai-native-l1/wallet.html","description":"Candidate Windows native-wallet research for QZXB, with CurrentUser DPAPI custody and a chain-specific BIP39-to-Ed25519 recovery path.","isPartOf":{"@type":"WebSite","name":"QRun Blockchain","url":"https://hamidnikkhah660-arch.github.io/ai-native-l1/"},"about":{"@type":"SoftwareSourceCode","name":"QRun Blockchain","codeRepository":"https://github.com/hamidnikkhah660-arch/ai-native-l1","programmingLanguage":"Rust","license":"https://www.apache.org/licenses/LICENSE-2.0"}}</script>
+<style>
+:root{color-scheme:dark;--bg:#09111f;--panel:#101d30;--text:#edf4ff;--muted:#b4c2d6;--line:#2a3b54;--accent:#8be0ff;--accent2:#b4a2ff;--good:#a7f3d0}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.7;background:radial-gradient(ellipse at 50% -10%,#1e3656 0,transparent 52%),var(--bg);color:var(--text)}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}.wrap{width:min(1000px,calc(100% - 36px));margin:auto}header{border-bottom:1px solid var(--line);background:#09111fcc}.nav{display:flex;justify-content:space-between;gap:16px;align-items:center;flex-wrap:wrap;padding:18px 0}.brand{font-weight:850;color:var(--text)}nav{display:flex;flex-wrap:wrap;gap:14px}nav a{font-size:.92rem;color:var(--muted)}main{padding:48px 0 64px}.eyebrow{font-size:.78rem;text-transform:uppercase;letter-spacing:.13em;color:var(--accent);font-weight:800}h1{font-size:clamp(2.2rem,5.4vw,4rem);line-height:1.08;letter-spacing:-.04em;margin:14px 0}h2{margin:34px 0 10px;font-size:1.55rem}h3{font-size:1.1rem;margin:0 0 8px}p,li{color:var(--muted)}.lead{font-size:1.16rem;max-width:850px}.panel,.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:21px;margin:14px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}.note{padding:14px 17px;border-left:3px solid var(--accent2);background:#171932;border-radius:0 10px 10px 0}code{overflow-wrap:anywhere;color:#dbeafe}footer{border-top:1px solid var(--line);padding:24px 0 36px;color:var(--muted);font-size:.9rem}table{border-collapse:collapse;width:100%;margin:15px 0;background:#0c1929}td,th{border:1px solid var(--line);padding:10px;text-align:left}th{color:var(--accent)}@media(max-width:680px){main{padding-top:30px}}
+</style>
+</head>
+<body>
+<header><div class="wrap nav"><a class="brand" href="index.html">QRun Blockchain &middot; QZXB</a><nav aria-label="Guide navigation"><a href="index.html">Home</a><a href="technology.html">Technology</a><a href="cryptography.html">Cryptography</a><a href="economics.html">Supply</a><a href="wallet.html">Wallet</a><a href="status.html">Status</a><a href="contribute.html">Contribute</a><a href="https://github.com/hamidnikkhah660-arch/ai-native-l1">Source</a></nav></div></header>
+<main class="wrap">
+<div class="eyebrow">Wallet engineering guide &middot; Experimental candidate</div>
+<h1>QZXB Native Wallet: Current Capabilities and Safety</h1>
+<p class="lead">The repository contains a Windows-native QZXB wallet CLI candidate for local account creation, recovery, address inspection and signed TXN2 transfer construction. It is not yet a released public Mainnet wallet, mobile app, hardware-wallet integration or a Trust Wallet listing.</p>
+<div class="note"><strong>Do not deposit funds or share a recovery phrase.</strong> QRun has no value-bearing public Mainnet or independently verified spendable public QZXB balance. A successful local wallet command does not create a public coin balance. Never paste a mnemonic, seed, private key or wallet file into chat, a website form or an untrusted application.</div>
+<h2>What the candidate CLI supports</h2>
+<div class="grid">
+<div class="card"><h3>Create and recover</h3><p>Create a standard 12-word English BIP39 recovery phrase or restore from a valid 12-word phrase. Console entry for restoration is masked. The wallet derives a QZXB-specific Ed25519 signing seed from the BIP39 seed.</p></div>
+<div class="card"><h3>Local custody</h3><p>The <code>QZKW1_Windows_CurrentUser_DPAPI</code> format protects the 32-byte signing seed using Windows CurrentUser DPAPI. This is desktop-user protection, not an HSM, hardware wallet or portable encrypted backup.</p></div>
+<div class="card"><h3>Address and signing</h3><p>Inspect the public account identifier and construct signed native TXN2 transfers. The default self-contained signature mode carries the public key with an Ed25519 signature so validating nodes can derive and check the sender account.</p></div>
+<div class="card"><h3>Read-only queries</h3><p>RPC status, balance and transaction-status queries are restricted by the candidate client to numeric loopback addresses and require a read-only RPC response.</p></div>
+</div>
+<h2>Recovery and compatibility</h2>
+<p>The candidate recovery path uses a 12-word English BIP39 phrase, then applies the QZXB-specific domain <code>QUANTUMZXB-ED25519-SEED-FROM-BIP39-V1</code> before deriving the Ed25519 key. This is not a standard Bitcoin/EVM BIP32 derivation path. A generic wallet that accepts the same BIP39 words will not necessarily derive the same QZXB account.</p>
+<p>The DPAPI-protected wallet file is tied to the Windows CurrentUser protection context. For a new Windows user or machine, the documented restore path creates a new protected file from the recovery phrase; the DPAPI file alone is not a portable cross-device backup.</p>
+<div class="note">Trust Wallet, MetaMask, Ledger, Trezor, WalletConnect, mobile apps and browser extensions are not currently qualified as native QZXB wallet integrations. Adding a custom EVM network does not add support for the QRun native protocol or its chain-specific Ed25519 derivation. Do not import the QZXB phrase into an unsupported wallet to experiment.</div>
+<h2>Native transfer flow and confirmation limits</h2>
+<ol><li>The sender constructs and signs a TXN2 transfer with the intended network ID, recipient account ID, nonce, amount, fee and expiry.</li><li>An optional <code>--submit-to</code> path sends the signed transaction using the versioned QZTS/1 transaction-ingress protocol.</li><li>The node admission acknowledgement means only that the candidate ingress accepted the transaction to its mempool. It does not prove block inclusion, canonical confirmation, finality, a public balance or settlement with a buyer.</li></ol>
+<p>The current candidate RPC query surface is loopback-only. The wallet CLI source is part of <a href="https://github.com/hamidnikkhah660-arch/ai-native-l1/pull/135">PR #135</a> on a separate feature branch; that PR remains Draft and is not a production binary release.</p>
+<h2>Native QZXB and EVM test assets are separate</h2>
+<p>The separate QX ERC-20 test asset and browser deployment console use EVM test/local environments. They are not the native QZXB coin, not a QRun-to-EVM bridge, and not a source of native QZXB/USDT liquidity. No cross-chain transfer route is currently claimed.</p>
+<h2>Review and next wallet milestones</h2>
+<ul><li>Freeze the production QRun network/Genesis identity and align the QFP6 candidate with owner policy <a href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/feat/qzxb-usdt-trading-gate-20261104/docs/CP-0566D_QZXB_EIGHT_BUCKET_TOKENOMICS_DIRECTION_2026-11-06.md">CP-0566D</a>.</li><li>Qualify wallet create/restore and signed transfers against independent nodes on the same production identity, including inclusion, confirmation, reorg and recovery tests.</li><li>Define and review the chain-specific wallet integration package before claiming third-party, mobile or hardware-wallet compatibility.</li><li>Publish reproducible wallet binaries and checksums only with a reviewed network release and clear custody/recovery instructions.</li></ul>
+<p>Source reference: <a href="https://github.com/hamidnikkhah660-arch/ai-native-l1/blob/feat/qzxb-usdt-trading-gate-20261104/src/native/pow_bench/src/bin/qzxb_wallet.rs">candidate wallet source on the feature branch</a>. Current project gates: <a href="status.html">technical status</a>, <a href="economics.html">QZXB supply direction</a>, and <a href="cryptography.html">cryptography profile</a>.</p>
+<div class="panel"><strong>Current status:</strong> Candidate Windows wallet tooling exists in the feature branch. No public Mainnet QZXB balance, public transaction service or real-money wallet settlement is claimed.</div>
+</main>
+<footer><div class="wrap">QRun Blockchain &middot; <a href="index.html">Project homepage</a> &middot; <a href="https://github.com/hamidnikkhah660-arch/ai-native-l1">Source repository</a> &middot; <a href="mailto:hamidnikkhah660@gmail.com?subject=QRun%20wallet%20collaboration">Contact the project</a></div></footer>
+</body>
+</html>
