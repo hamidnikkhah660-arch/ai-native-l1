@@ -499,6 +499,41 @@ impl QRunV06UnifiedAssetState {
         Ok(())
     }
 
+    /// Atomically credit then debit the network/policy-derived sink for a reserve retirement.
+    /// No spendable balance remains after this staged transition.
+    pub(crate) fn apply_v06_protocol_burn_reserve_retirement(
+        &mut self,
+        burn_sink: AccountId,
+        amount_atoms: u128,
+    ) -> Result<(), UnifiedAssetError> {
+        if burn_sink == [0; 32]
+            || amount_atoms == 0
+            || self.ledger.account(&burn_sink).is_some()
+            || self.amm.is_pool_account_id(&burn_sink)
+            || self
+                .registry
+                .registered_asset_ids()
+                .iter()
+                .any(|asset| orderbook_vault_account(self.network_id(), *asset) == burn_sink)
+            || orderbook_vault_account(self.network_id(), self.native_asset_id) == burn_sink
+        {
+            return Err(UnifiedAssetError::InvalidOrderBookTransfer);
+        }
+        let mut next = self.clone();
+        let before = next.ledger.total_value()?;
+        next.ledger
+            .credit_v06_protocol_issuance(&burn_sink, amount_atoms)?;
+        next.ledger
+            .burn_v06_protocol_issuance(&burn_sink, amount_atoms)?;
+        next.refresh_native_balance_mirror()?;
+        next.verify_invariants()?;
+        if next.ledger.total_value()? != before {
+            return Err(UnifiedAssetError::Ledger(StateError::InvariantViolation));
+        }
+        *self = next;
+        Ok(())
+    }
+
     /// Deterministically pay this block's native transfer fees to its committed producer.
     pub(crate) fn settle_v06_block_fees(
         &mut self,

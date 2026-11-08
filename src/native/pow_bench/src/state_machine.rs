@@ -643,6 +643,43 @@ impl LedgerState {
         Ok(())
     }
 
+    /// Remove a newly issued protocol burn-reserve amount from its deterministic sink.
+    /// This crate-private debit is only valid inside the enclosing atomic QFB6 transition.
+    pub(crate) fn burn_v06_protocol_issuance(
+        &mut self,
+        sink: &AccountId,
+        amount_atoms: u128,
+    ) -> Result<(), StateError> {
+        if is_zero_account(sink) || amount_atoms == 0 {
+            return Err(StateError::InvalidAmount);
+        }
+        let amount = u64::try_from(amount_atoms).map_err(|_| StateError::AmountOverflow)?;
+        let before = self.total_value()?;
+        let mut next = self.clone();
+        let mut account = next
+            .accounts
+            .get(sink)
+            .copied()
+            .ok_or(StateError::MissingSender)?;
+        if account.balance < amount {
+            return Err(StateError::InsufficientBalance);
+        }
+        account.balance -= amount;
+        if account.balance == 0 && account.nonce == 0 {
+            next.accounts.remove(sink);
+        } else {
+            next.accounts.insert(*sink, account);
+        }
+        let expected_after = before
+            .checked_sub(amount as u128)
+            .ok_or(StateError::InvariantViolation)?;
+        if next.total_value()? != expected_after {
+            return Err(StateError::InvariantViolation);
+        }
+        *self = next;
+        Ok(())
+    }
+
     /// Stage the account/height/timestamp portion of a CP-0398 v0.4 mining-only candidate.
     /// This intentionally is not a public mint API and does not set the block tip hash: the
     /// caller must first derive and verify the complete profile-bound post-state root and block ID.

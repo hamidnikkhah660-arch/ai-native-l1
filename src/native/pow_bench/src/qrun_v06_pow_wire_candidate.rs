@@ -1,6 +1,6 @@
-//! Isolated QFP6 PoW envelope for the CP-0528-aware canonical QFB6 v3 execution block.
+//! Isolated QFP6 PoW envelope for the CP-0528-aware canonical QFB6 v5 execution block.
 //!
-//! QFP5/QFB5 remains unchanged. QFP6 binds the complete canonical QFB6 v4 bytes,
+//! QFP5/QFB5 remains unchanged. QFP6 binds the complete canonical QFB6 v5 bytes,
 //! including Ledger, AMM, Asset Registry, OrderBook and CP-0528 tokenomics/release state,
 //! into the PoW header hash. This is a wire/PoW candidate only: it is not yet
 //! connected to node admission, persistence, or peer transport.
@@ -14,11 +14,11 @@ use crate::{
 };
 use sha2::{Digest, Sha256};
 
-pub const QRUN_V06_POW_WIRE_VERSION: u16 = 3;
+pub const QRUN_V06_POW_WIRE_VERSION: u16 = 4;
 pub const QRUN_V06_PROTOCOL_VERSION: u16 = 6;
 const MAGIC: [u8; 4] = *b"QFP6";
 const HEADER_LEN: usize = 4 + 2 + 2 + 32 + 8 + 8 + 32 + 32 + 32 + 32 + 8 + 4;
-const COMMITMENT_DOMAIN: &[u8] = b"QRUN-V06-POW-QFB6-COMMITMENT-V3\0";
+const COMMITMENT_DOMAIN: &[u8] = b"QRUN-V06-POW-QFB6-COMMITMENT-V4\0";
 
 pub const MAX_QRUN_V06_POW_ENVELOPE_BYTES: usize = HEADER_LEN + MAX_QRUN_V06_BLOCK_BYTES;
 
@@ -136,7 +136,7 @@ fn check_header_body_binding(
     Ok(())
 }
 
-/// Encode QFP6 wire v2 as a fixed-width PoW header followed by one canonical QFB6 v3 payload.
+/// Encode QFP6 wire v4 as a fixed-width PoW header followed by one canonical QFB6 v5 payload.
 ///
 /// Layout: magic, wire version, protocol version, network, height, timestamp,
 /// parent, previous consensus tip, PoW commitment, target, nonce, body length,
@@ -282,9 +282,10 @@ mod tests {
         qrun_v06_canonical_execution_candidate::{
             QRunV06BlockOperation, QRunV06CanonicalExecutionState,
         },
-        qrun_v06_unified_asset_candidate::QRunV06UnifiedAssetState,
-        qzxb_amm_candidate::QzxbAmmStateCandidate,
-        state_machine::{AccountId, LedgerState, TransactionAuthenticator},
+        qrun_v06_tokenomics_candidate::{
+            QRunV06MiningScheduleCandidate, QRunV06SignedBurnReserveRetirement,
+        },
+        state_machine::{AccountId, TransactionAuthenticator},
     };
 
     const NETWORK: [u8; 32] = [0xD6; 32];
@@ -309,10 +310,25 @@ mod tests {
     }
 
     fn fixture() -> QRunV06PowBlock {
-        let ledger = LedgerState::genesis(NETWORK, vec![(OWNER, 50_000)]).unwrap();
-        let amm = QzxbAmmStateCandidate::new(NETWORK, 32, 64, 512).unwrap();
-        let unified = QRunV06UnifiedAssetState::new(ledger, amm).unwrap();
-        let state = QRunV06CanonicalExecutionState::new(unified, PROFILE).unwrap();
+        let state = QRunV06CanonicalExecutionState::cp0528_genesis_candidate(
+            NETWORK,
+            PROFILE,
+            OWNER,
+            QRunV06MiningScheduleCandidate::cp0422_research_candidate(),
+        )
+        .unwrap();
+        let policy_fingerprint = state.tokenomics().unwrap().policy_fingerprint();
+        let mut retirement = QRunV06SignedBurnReserveRetirement {
+            network_id: NETWORK,
+            policy_fingerprint,
+            expected_burned_atoms: 0,
+            amount_atoms: 50_000,
+            valid_until_timestamp: 10_000,
+            purpose_digest: [0xDA; 32],
+            evidence_digest: [0xDB; 32],
+            founder_signature: Vec::new(),
+        };
+        retirement.founder_signature = retirement.signing_digest().unwrap().to_vec();
 
         let mut block = QRunV06Block {
             network_id: NETWORK,
@@ -322,7 +338,9 @@ mod tests {
             parent_hash: state.tip_hash(),
             state_root: [0; 32],
             producer: PRODUCER,
-            operations: Vec::<QRunV06BlockOperation>::new(),
+            operations: vec![QRunV06BlockOperation::ProtocolBurnReserveRetirement(
+                retirement,
+            )],
         };
         block.state_root = state
             .preview_state_root_after(&block, &DigestAuthenticator)
@@ -354,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn qfp6_v3_round_trip_binds_qfb6_v4_tokenomics_release_root_and_producer_to_pow_digest() {
+    fn qfp6_v4_round_trip_binds_qfb6_v5_burn_reserve_retirement_root_and_producer_to_pow_digest() {
         let envelope = fixture();
         let bytes = encode_qrun_v06_pow_block(&envelope.header, &envelope.block).unwrap();
         assert_eq!(&bytes[..4], b"QFP6");
@@ -398,11 +416,11 @@ mod tests {
             Err(QRunV06PowWireError::UnsupportedVersion(99))
         );
 
-        let mut legacy_v2 = canonical.clone();
-        legacy_v2[4..6].copy_from_slice(&2u16.to_be_bytes());
+        let mut legacy_v3 = canonical.clone();
+        legacy_v3[4..6].copy_from_slice(&3u16.to_be_bytes());
         assert_eq!(
-            decode_qrun_v06_pow_block(&legacy_v2),
-            Err(QRunV06PowWireError::UnsupportedVersion(2))
+            decode_qrun_v06_pow_block(&legacy_v3),
+            Err(QRunV06PowWireError::UnsupportedVersion(3))
         );
 
         let mut trailing = canonical.clone();
