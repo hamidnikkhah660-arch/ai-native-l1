@@ -357,7 +357,7 @@ impl TargetHistory {
     /// Validate the next history record before a state transition is applied. Keeping this
     /// check separate prevents a rejected timestamp/height/target from leaving chain state
     /// advanced while target history and the consensus tip remain at the parent.
-    fn validate_next(
+    pub(crate) fn validate_next(
         &self,
         height: u64,
         target: Uint256,
@@ -396,7 +396,7 @@ impl TargetHistory {
         Ok(())
     }
 
-    fn record_next(
+    pub(crate) fn record_next(
         &mut self,
         height: u64,
         target: Uint256,

@@ -431,7 +431,13 @@ mod tests {
                 .env(CHILD_READY, &ready)
                 .env(CHILD_GO, &go)
                 .spawn()
-                .expect("spawn independent writer process");
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "spawn independent writer process failed (exe={executable:?}, io_kind={:?}, raw_os_error={:?}): {error}",
+                        error.kind(),
+                        error.raw_os_error()
+                    )
+                });
             children.push(child);
             ready_files.push(ready);
         }
