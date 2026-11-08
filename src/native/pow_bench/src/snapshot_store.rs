@@ -234,9 +234,10 @@ impl SnapshotWriterLock {
             .file_name()
             .ok_or(SnapshotStoreError::InvalidPath)?;
         match fs::symlink_metadata(snapshot_path) {
-            Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_dir() => {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
                 // Symlink destinations have ambiguous semantics for atomic replacement:
-                // reject them instead of locking one target and replacing another path entry.
+                // reject them, as well as special files, instead of treating another object
+                // as a snapshot/WAL and potentially blocking during recovery.
                 return Err(SnapshotStoreError::InvalidPath);
             }
             Ok(_) => {}
@@ -262,12 +263,7 @@ impl SnapshotWriterLock {
         let mut lock_name = final_name.to_os_string();
         lock_name.push(".writer.lock");
         let lock_path = parent.join(lock_name);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)?;
+        let file = open_snapshot_lock_file(&lock_path)?;
         if let Err(error) = try_lock_exclusive(&file) {
             if error.kind() == io::ErrorKind::WouldBlock || error.raw_os_error() == Some(33) {
                 return Err(SnapshotStoreError::WriterLockBusy(lock_path));
@@ -299,6 +295,66 @@ impl SnapshotWriterLock {
         }
         Ok(Self { _file: lock_file })
     }
+}
+
+fn invalid_snapshot_lock_file() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "snapshot writer lock must be a regular, non-reparse file",
+    )
+}
+
+#[cfg(unix)]
+fn open_snapshot_lock_file(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        // A raced FIFO must not block open; a symlink must not redirect the lock to another file.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(invalid_snapshot_lock_file());
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_snapshot_lock_file(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(invalid_snapshot_lock_file());
+    }
+    Ok(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_snapshot_lock_file(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(invalid_snapshot_lock_file());
+    }
+    Ok(file)
 }
 
 fn try_lock_exclusive(file: &File) -> io::Result<()> {
@@ -490,6 +546,73 @@ mod tests {
         drop(owner);
         let next_owner = SnapshotWriterLock::acquire(&path).unwrap();
         drop(next_owner);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_lock_rejects_fifo_snapshot_path_before_creating_lock() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let dir = TestDir::new("writer_lock_fifo_target");
+        let path = dir.file("ledger.stv2");
+        let lock_path = dir.file("ledger.stv2.writer.lock");
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        assert!(matches!(
+            SnapshotWriterLock::acquire(&path),
+            Err(SnapshotStoreError::InvalidPath)
+        ));
+        assert!(!lock_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_lock_rejects_fifo_lock_path_without_blocking() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let dir = TestDir::new("writer_lock_fifo_lock");
+        let path = dir.file("ledger.stv2");
+        let lock_path = dir.file("ledger.stv2.writer.lock");
+        let c_path = CString::new(lock_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let result = SnapshotWriterLock::acquire(&path);
+        assert!(matches!(
+            result,
+            Err(SnapshotStoreError::Io(error))
+                if error.kind() == io::ErrorKind::InvalidInput
+        ));
+    }
+
+    #[test]
+    fn writer_lock_rejects_symlinked_lock_path_without_touching_target() {
+        let dir = TestDir::new("writer_lock_symlink_lock");
+        let path = dir.file("ledger.stv2");
+        let lock_path = dir.file("ledger.stv2.writer.lock");
+        let protected = dir.file("protected.data");
+        fs::write(&protected, b"do-not-truncate").unwrap();
+
+        #[cfg(windows)]
+        let symlink_result = std::os::windows::fs::symlink_file(&protected, &lock_path);
+        #[cfg(unix)]
+        let symlink_result = std::os::unix::fs::symlink(&protected, &lock_path);
+        #[cfg(not(any(windows, unix)))]
+        let symlink_result: io::Result<()> = Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "symlink tests are unsupported on this platform",
+        ));
+
+        if let Err(error) = symlink_result {
+            eprintln!("SKIP writer-lock symlink lock-path test: {error}");
+            return;
+        }
+
+        assert!(matches!(
+            SnapshotWriterLock::acquire(&path),
+            Err(SnapshotStoreError::Io(_))
+        ));
+        assert_eq!(fs::read(&protected).unwrap(), b"do-not-truncate");
     }
 
     #[cfg(windows)]

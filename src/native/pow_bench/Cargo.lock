@@ -45,6 +45,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.16",
  "hmac",
+ "libc",
  "libcrux-ml-dsa",
  "sha2",
  "snow",
