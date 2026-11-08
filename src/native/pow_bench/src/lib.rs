@@ -164,7 +164,7 @@ pub mod qrun_v06_profile_trust_dynamodb_floor_candidate;
 pub mod qrun_v06_qap1_coordinator_candidate;
 /// CP-0558 append-only QAP1 intent journal for exact QFP6/Provider/Q6EA crash recovery.
 pub mod qrun_v06_qap1_journal_candidate;
-/// CP-0542 signed Q6QA external quote-asset qualification bundle; independent commitment required; not yet wired into QFB6 CreatePair.
+/// CP-0542 signed Q6QA external quote-asset qualification; required by QFB6 candidate market execution, not reserve proof.
 pub mod qrun_v06_quote_asset_qualification_candidate;
 /// CP-0528 QFP6 eight-bucket monetary state, 1B-Founder Genesis and candidate mining schedule.
 pub mod qrun_v06_tokenomics_candidate;

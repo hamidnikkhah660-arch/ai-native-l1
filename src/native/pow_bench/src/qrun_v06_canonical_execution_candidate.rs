@@ -60,7 +60,10 @@ pub enum QRunV06ExecutionError {
     Malformed,
     BadMagic,
     UnsupportedVersion(u16),
-    Oversize { actual: usize, limit: usize },
+    Oversize {
+        actual: usize,
+        limit: usize,
+    },
     TooManyOperations(usize),
     InvalidNetwork,
     InvalidProfile,
@@ -68,9 +71,15 @@ pub enum QRunV06ExecutionError {
     WrongProfile,
     InvalidHeight,
     InvalidTimestamp,
-    HeightMismatch { expected: u64, actual: u64 },
+    HeightMismatch {
+        expected: u64,
+        actual: u64,
+    },
     ParentHashMismatch,
-    TimestampNotIncreasing { previous: u64, actual: u64 },
+    TimestampNotIncreasing {
+        previous: u64,
+        actual: u64,
+    },
     FeePoolNotEmptyAtBlockStart,
     DuplicateTransaction,
     StateRootMismatch,
@@ -89,6 +98,11 @@ pub enum QRunV06ExecutionError {
     GenesisDescriptor(QRunV06GenesisDescriptorError),
     MissingQuoteAssetAuthorization,
     QuoteAssetAuthorizationMismatch,
+    QuoteAssetDecimalsMismatch {
+        asset_id: [u8; 32],
+        q6qa_decimals: u8,
+        registry_decimals: u8,
+    },
     QuoteAssetAuthorizationRollback,
     InvalidQuoteAssetAuthorizationPin,
     SnapshotMalformed,
@@ -1039,6 +1053,58 @@ impl QRunV06CanonicalExecutionState {
         Ok(())
     }
 
+    fn validate_quote_asset_decimals_for_block(
+        &self,
+        block: &QRunV06Block,
+        authorization: Option<&QRunV06TrustAuthorizedQuoteAsset>,
+    ) -> Result<(), QRunV06ExecutionError> {
+        let Some(asset_id) = self.required_quote_asset_for_block(block)? else {
+            return Ok(());
+        };
+        if asset_id == self.unified.native_asset_id() {
+            return Ok(());
+        }
+
+        // A Q6QA trust pin may be prepublished before a market pair is created.
+        // Decimal equality is required only once this asset is actually used by a pair.
+        let asset_is_in_market_pair = self
+            .orderbook
+            .pair_rules_iter()
+            .any(|rules| rules.quote == asset_id)
+            || self
+                .unified
+                .amm()
+                .pair_asset_pairs_iter()
+                .any(|(asset_a, asset_b)| asset_a == asset_id || asset_b == asset_id);
+        if !asset_is_in_market_pair {
+            return Ok(());
+        }
+
+        let authorization =
+            authorization.ok_or(QRunV06ExecutionError::MissingQuoteAssetAuthorization)?;
+        authorization
+            .require_for_pair(
+                &self.network_id(),
+                &self.profile_id,
+                &asset_id,
+                block.height,
+            )
+            .map_err(|_| QRunV06ExecutionError::QuoteAssetAuthorizationMismatch)?;
+
+        let metadata = self.unified.registry().asset(&asset_id).ok_or(
+            QRunV06ExecutionError::AssetRegistry(AssetRegistryError::AssetNotFound),
+        )?;
+        let q6qa_decimals = authorization.qualification().decimals();
+        if metadata.decimals != q6qa_decimals {
+            return Err(QRunV06ExecutionError::QuoteAssetDecimalsMismatch {
+                asset_id,
+                q6qa_decimals,
+                registry_decimals: metadata.decimals,
+            });
+        }
+        Ok(())
+    }
+
     fn apply_orderbook_operation<A: TransactionAuthenticator>(
         &mut self,
         signed: &QRunV06SignedOrderBookOperation,
@@ -1286,6 +1352,9 @@ impl QRunV06CanonicalExecutionState {
             }
         }
 
+        // Recheck Q6QA decimals after ordered operations stage any same-block registrations.
+        // A mismatch aborts this cloned transition before its state root can be committed.
+        self.validate_quote_asset_decimals_for_block(block, quote_authorization)?;
         self.verify_invariants()?;
         let fees_paid_to_producer = self.unified.settle_v06_block_fees(block.producer)?;
         let mining_reward_atoms = if let Some(tokenomics) = &self.tokenomics {
@@ -2425,6 +2494,87 @@ mod tests {
     }
 
     #[test]
+    fn qfb6_amm_quote_decimal_mismatch_rejects_same_block_registration_atomically() {
+        let mut state = fixture();
+        let original_root = state.state_root().unwrap();
+
+        let mut registration = AssetRegistration {
+            network_id: NETWORK,
+            issuer: ALICE,
+            issuer_nonce: 1,
+            salt: [0x6A; 32],
+            name: "Decimal Mismatch Quote".to_string(),
+            symbol: "DMQ".to_string(),
+            decimals: 6,
+            supply_policy: AssetSupplyPolicy::Fixed {
+                total_supply: 50_000,
+            },
+            initial_supply: 50_000,
+            initial_recipient: ALICE,
+            trust_policy: AssetTrustPolicy::Unverified,
+            expires_at: 50_000,
+            signature: Vec::new(),
+        };
+        registration.signature = registration.signing_digest().unwrap().to_vec();
+        let asset_id = registration.asset_id();
+        let native = qzxb_native_asset_id(NETWORK).unwrap();
+        let pair_id = QzxbAmmStateCandidate::pair_id_for_assets(native, asset_id).unwrap();
+
+        let create_pair = {
+            let mut operation = AmmSignedOperation {
+                network_id: NETWORK,
+                sender: ALICE,
+                nonce: 1,
+                expires_at: 50_000,
+                operation: AmmOperation::CreatePair {
+                    token_a: native,
+                    token_b: asset_id,
+                },
+                signature: Vec::new(),
+            };
+            operation.signature = operation.signing_digest().unwrap().to_vec();
+            operation
+        };
+        let block = block_for(
+            &state,
+            vec![
+                QRunV06BlockOperation::AssetRegistration(registration),
+                QRunV06BlockOperation::Amm(create_pair),
+            ],
+        );
+        let authorization =
+            crate::qrun_v06_profile_trust_candidate::test_trust_authorized_quote_asset_candidate_with_decimals(
+                NETWORK, PROFILE, asset_id, [0xDA; 32], [0xDB; 32], 3, 1, 10, 1, 1, 18,
+            );
+        let expected_error = QRunV06ExecutionError::QuoteAssetDecimalsMismatch {
+            asset_id,
+            q6qa_decimals: 18,
+            registry_decimals: 6,
+        };
+
+        assert_eq!(
+            state.preview_state_root_after_with_quote_asset_authorization(
+                &block,
+                &DigestAuthenticator,
+                Some(&authorization),
+            ),
+            Err(expected_error.clone())
+        );
+        assert_eq!(
+            state.apply_block_with_quote_asset_authorization(
+                &block,
+                &DigestAuthenticator,
+                Some(&authorization),
+            ),
+            Err(expected_error)
+        );
+        assert_eq!(state.state_root().unwrap(), original_root);
+        assert!(state.unified().registry().asset(&asset_id).is_none());
+        assert_eq!(state.unified().registry().issuer_nonce(&ALICE), 0);
+        assert!(state.unified().amm().pair_assets(&pair_id).is_err());
+    }
+
+    #[test]
     fn block_can_register_asset_then_create_amm_pair_in_canonical_order() {
         let mut state = fixture();
         // The test authenticator is deliberately digest-shaped; production uses the
@@ -2492,8 +2642,8 @@ mod tests {
             ],
         );
         let quote_authorization =
-            crate::qrun_v06_profile_trust_candidate::test_trust_authorized_quote_asset_candidate(
-                NETWORK, PROFILE, asset_id, [0xD7; 32], [0xD8; 32], 3, 1, 10, 1, 1,
+            crate::qrun_v06_profile_trust_candidate::test_trust_authorized_quote_asset_candidate_with_decimals(
+                NETWORK, PROFILE, asset_id, [0xD7; 32], [0xD8; 32], 3, 1, 10, 1, 1, 8,
             );
         let wrong_quote_authorization =
             crate::qrun_v06_profile_trust_candidate::test_trust_authorized_quote_asset_candidate(
@@ -2553,8 +2703,8 @@ mod tests {
             Err(QRunV06ExecutionError::MissingQuoteAssetAuthorization)
         );
         let swap_authorization =
-            crate::qrun_v06_profile_trust_candidate::test_trust_authorized_quote_asset_candidate(
-                NETWORK, PROFILE, asset_id, [0xD7; 32], [0xD8; 32], 3, 1, 10, 1, 2,
+            crate::qrun_v06_profile_trust_candidate::test_trust_authorized_quote_asset_candidate_with_decimals(
+                NETWORK, PROFILE, asset_id, [0xD7; 32], [0xD8; 32], 3, 1, 10, 1, 2, 8,
             );
         assert_eq!(
             state.preview_state_root_after_with_quote_asset_authorization(
@@ -2648,8 +2798,8 @@ mod tests {
         );
         block.producer = BOB;
         let quote_authorization =
-            crate::qrun_v06_profile_trust_candidate::test_trust_authorized_quote_asset_candidate(
-                NETWORK, PROFILE, asset_id, [0xDA; 32], [0xDB; 32], 3, 1, 10, 1, 1,
+            crate::qrun_v06_profile_trust_candidate::test_trust_authorized_quote_asset_candidate_with_decimals(
+                NETWORK, PROFILE, asset_id, [0xDA; 32], [0xDB; 32], 3, 1, 10, 1, 1, 8,
             );
         block.state_root = state
             .preview_state_root_after_with_quote_asset_authorization(
@@ -2863,6 +3013,31 @@ mod tests {
             Some([0xD7; 32])
         );
         assert_eq!(restored.quote_asset_authorization_epoch(), Some(3));
+
+        let restored_root = restored.state_root().unwrap();
+        let mismatched_after_restart =
+            crate::qrun_v06_profile_trust_candidate::test_trust_authorized_quote_asset_candidate_with_decimals(
+                NETWORK, PROFILE, quote_asset, [0xDA; 32], [0xD8; 32], 4, 1, 10, 2, 2, 18,
+            );
+        let followup_block = block_for(
+            &restored,
+            vec![QRunV06BlockOperation::NativeTransfer(transfer(
+                ALICE, BOB, 2, 10, 1,
+            ))],
+        );
+        assert_eq!(
+            restored.preview_state_root_after_with_quote_asset_authorization(
+                &followup_block,
+                &DigestAuthenticator,
+                Some(&mismatched_after_restart),
+            ),
+            Err(QRunV06ExecutionError::QuoteAssetDecimalsMismatch {
+                asset_id: quote_asset,
+                q6qa_decimals: 18,
+                registry_decimals: 6,
+            })
+        );
+        assert_eq!(restored.state_root().unwrap(), restored_root);
 
         // The quote authorization is included in the canonical execution root, not
         // merely in an unchecked sidecar. Recomputing the outer snapshot checksum

@@ -371,6 +371,7 @@ impl QRunV06SignedQuoteAssetQualificationCandidate {
             network_id: r.network_id,
             profile_id: r.profile_id,
             asset_id: r.asset_id,
+            decimals: r.decimals,
             external_chain_id: r.external_chain_id,
             authority_key_id: r.authority_key_id,
             qualification_epoch: r.qualification_epoch,
@@ -386,6 +387,7 @@ pub struct QRunV06VerifiedQuoteAssetQualificationCandidate {
     network_id: NetworkId,
     profile_id: [u8; 32],
     asset_id: AssetId,
+    decimals: u8,
     external_chain_id: [u8; 32],
     authority_key_id: [u8; 32],
     qualification_epoch: u64,
@@ -403,10 +405,34 @@ pub(crate) fn test_verified_quote_asset_candidate(
     valid_from_height: u64,
     valid_until_height: u64,
 ) -> QRunV06VerifiedQuoteAssetQualificationCandidate {
+    test_verified_quote_asset_candidate_with_decimals(
+        network_id,
+        profile_id,
+        asset_id,
+        commitment,
+        qualification_epoch,
+        valid_from_height,
+        valid_until_height,
+        6,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn test_verified_quote_asset_candidate_with_decimals(
+    network_id: NetworkId,
+    profile_id: [u8; 32],
+    asset_id: AssetId,
+    commitment: [u8; 32],
+    qualification_epoch: u64,
+    valid_from_height: u64,
+    valid_until_height: u64,
+    decimals: u8,
+) -> QRunV06VerifiedQuoteAssetQualificationCandidate {
     QRunV06VerifiedQuoteAssetQualificationCandidate {
         network_id,
         profile_id,
         asset_id,
+        decimals,
         external_chain_id: [0x44; 32],
         authority_key_id: [0x45; 32],
         qualification_epoch,
@@ -425,6 +451,9 @@ impl QRunV06VerifiedQuoteAssetQualificationCandidate {
     }
     pub fn asset_id(&self) -> AssetId {
         self.asset_id
+    }
+    pub fn decimals(&self) -> u8 {
+        self.decimals
     }
     pub fn external_chain_id(&self) -> [u8; 32] {
         self.external_chain_id
@@ -677,7 +706,14 @@ mod tests {
         assert_eq!(bytes.len(), Q6QA_FIXED_BYTES + 32);
         let d = QRunV06SignedQuoteAssetQualificationCandidate::decode(&bytes).unwrap();
         assert_eq!(d, b);
-        assert_eq!(verify(&d, 100).unwrap().asset_id(), [0x33; 32]);
+        let verified = verify(&d, 100).unwrap();
+        assert_eq!(verified.asset_id(), [0x33; 32]);
+        assert_eq!(verified.decimals(), 6);
+
+        let mut eight_decimal = signed(QualificationStatus::Approved);
+        eight_decimal.record.decimals = 8;
+        eight_decimal.signature = eight_decimal.record.signing_digest().unwrap().to_vec();
+        assert_eq!(verify(&eight_decimal, 100).unwrap().decimals(), 8);
     }
     #[test]
     fn q6qa_refuses_missing_wrong_or_mutated_independent_commitment() {

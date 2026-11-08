@@ -692,7 +692,36 @@ pub(crate) fn test_trust_authorized_quote_asset_candidate(
     profile_trust_epoch: u64,
     authorized_height: u64,
 ) -> QRunV06TrustAuthorizedQuoteAsset {
-    let qualification =
+    test_trust_authorized_quote_asset_candidate_with_decimals(
+        network_id,
+        profile_id,
+        asset_id,
+        q6qa_commitment,
+        profile_pin_commitment,
+        qualification_epoch,
+        valid_from_height,
+        valid_until_height,
+        profile_trust_epoch,
+        authorized_height,
+        6,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn test_trust_authorized_quote_asset_candidate_with_decimals(
+    network_id: [u8; 32],
+    profile_id: [u8; 32],
+    asset_id: [u8; 32],
+    q6qa_commitment: [u8; 32],
+    profile_pin_commitment: [u8; 32],
+    qualification_epoch: u64,
+    valid_from_height: u64,
+    valid_until_height: u64,
+    profile_trust_epoch: u64,
+    authorized_height: u64,
+    decimals: u8,
+) -> QRunV06TrustAuthorizedQuoteAsset {
+    let qualification = if decimals == 6 {
         crate::qrun_v06_quote_asset_qualification_candidate::test_verified_quote_asset_candidate(
             network_id,
             profile_id,
@@ -701,7 +730,19 @@ pub(crate) fn test_trust_authorized_quote_asset_candidate(
             qualification_epoch,
             valid_from_height,
             valid_until_height,
-        );
+        )
+    } else {
+        crate::qrun_v06_quote_asset_qualification_candidate::test_verified_quote_asset_candidate_with_decimals(
+            network_id,
+            profile_id,
+            asset_id,
+            q6qa_commitment,
+            qualification_epoch,
+            valid_from_height,
+            valid_until_height,
+            decimals,
+        )
+    };
     QRunV06TrustAuthorizedQuoteAsset {
         qualification,
         profile_pin_commitment,
