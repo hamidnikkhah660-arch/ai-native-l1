@@ -13,7 +13,9 @@ use crate::{
     qrun_v06_canonical_execution_candidate::{
         QRunV06Block, QRunV06BlockOperation, QRunV06CanonicalExecutionState, QRunV06ExecutionError,
     },
-    qrun_v06_pow_fork_choice_candidate::{QRunV06ForkChoiceError, QRunV06PowForkChoice},
+    qrun_v06_pow_fork_choice_candidate::{
+        QRunV06ForkChoiceError, QRunV06PowForkChoice, QRunV06QuoteAssetAuthorizationProvider,
+    },
     qrun_v06_pow_wire_candidate::{
         decode_qrun_v06_pow_block, encode_qrun_v06_pow_block, qrun_v06_pow_state_commitment,
         verify_qrun_v06_pow_block, QRunV06PowWireError,
@@ -35,6 +37,8 @@ pub enum QRunV06MiningError {
     HeightOverflow,
     Cancelled,
     NonceBudgetExhausted,
+    MissingQuoteAssetAuthorization,
+    QuoteAssetAuthorizationProvider(String),
     Execution(QRunV06ExecutionError),
     Consensus(ConsensusError),
     ForkChoice(QRunV06ForkChoiceError),
@@ -97,6 +101,58 @@ pub fn mine_qfp6_block_on_tip<A: TransactionAuthenticator>(
     max_nonce_attempts: u64,
     cancellation: &AtomicBool,
 ) -> Result<QRunV06MinedBlock, QRunV06MiningError> {
+    mine_qfp6_block_on_tip_inner(
+        fork_choice,
+        parent_consensus_tip,
+        timestamp,
+        producer,
+        operations,
+        authenticator,
+        max_nonce_attempts,
+        cancellation,
+        None,
+    )
+}
+
+/// Quote-aware variant for a block that uses an externally authorized non-native market asset.
+/// The provider must obtain a fresh height-bound Q6TS/Q6QA authorization for the exact parent,
+/// block and asset. The caller must obtain a fresh authorization again during fork-choice import
+/// and subsequent QAP1 durable admission; the preview token is not embedded in the wire block.
+pub fn mine_qfp6_block_on_tip_with_quote_asset_authorization<A: TransactionAuthenticator>(
+    fork_choice: &QRunV06PowForkChoice,
+    parent_consensus_tip: &[u8; 32],
+    timestamp: u64,
+    producer: [u8; 32],
+    operations: Vec<QRunV06BlockOperation>,
+    authenticator: &A,
+    quote_authorizer: &mut QRunV06QuoteAssetAuthorizationProvider<'_>,
+    max_nonce_attempts: u64,
+    cancellation: &AtomicBool,
+) -> Result<QRunV06MinedBlock, QRunV06MiningError> {
+    mine_qfp6_block_on_tip_inner(
+        fork_choice,
+        parent_consensus_tip,
+        timestamp,
+        producer,
+        operations,
+        authenticator,
+        max_nonce_attempts,
+        cancellation,
+        Some(quote_authorizer),
+    )
+}
+
+fn mine_qfp6_block_on_tip_inner<A: TransactionAuthenticator>(
+    fork_choice: &QRunV06PowForkChoice,
+    parent_consensus_tip: &[u8; 32],
+    timestamp: u64,
+    producer: [u8; 32],
+    operations: Vec<QRunV06BlockOperation>,
+    authenticator: &A,
+    max_nonce_attempts: u64,
+    cancellation: &AtomicBool,
+    mut quote_authorizer: Option<&mut QRunV06QuoteAssetAuthorizationProvider<'_>>,
+) -> Result<QRunV06MinedBlock, QRunV06MiningError> {
     if max_nonce_attempts == 0 || max_nonce_attempts > QRUN_V06_MAX_NONCE_ATTEMPTS_PER_JOB {
         return Err(QRunV06MiningError::InvalidNonceBudget);
     }
@@ -140,7 +196,23 @@ pub fn mine_qfp6_block_on_tip<A: TransactionAuthenticator>(
         producer,
         operations,
     };
-    block.state_root = parent_state.preview_state_root_after(&block, authenticator)?;
+    let quote_authorization = match parent_state.required_quote_asset_for_block(&block)? {
+        Some(asset_id) => {
+            let authorize = quote_authorizer
+                .as_deref_mut()
+                .ok_or(QRunV06MiningError::MissingQuoteAssetAuthorization)?;
+            Some(
+                authorize(parent_state, &block, asset_id)
+                    .map_err(QRunV06MiningError::QuoteAssetAuthorizationProvider)?,
+            )
+        }
+        None => None,
+    };
+    block.state_root = parent_state.preview_state_root_after_with_quote_asset_authorization(
+        &block,
+        authenticator,
+        quote_authorization.as_ref(),
+    )?;
     let execution_state_root = block.state_root;
     let mut header = PowHeader {
         protocol_version: QRUN_V06_PROTOCOL_VERSION,
@@ -188,10 +260,15 @@ mod tests {
     use super::*;
     use crate::{
         consensus::{ConsensusParameters, PowAlgorithm, PowParameters},
+        qrun_v06_asset_registry_candidate::{
+            AssetRegistration, AssetSupplyPolicy, AssetTrustPolicy,
+        },
         qrun_v06_canonical_execution_candidate::QRunV06BlockOperation,
         qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
         qrun_v06_pow_fork_choice_candidate::QRunV06PowForkChoice,
+        qrun_v06_profile_trust_candidate::test_trust_authorized_quote_asset_candidate,
         qrun_v06_tokenomics_candidate::{QRunV06MiningScheduleCandidate, QRunV06TokenomicsState},
+        qzxb_amm_candidate::{qzxb_native_asset_id, AmmOperation, AmmSignedOperation},
         state_machine::AccountId,
     };
     use std::sync::atomic::AtomicBool;
@@ -205,6 +282,22 @@ mod tests {
     impl TransactionAuthenticator for EmptyAuthenticator {
         fn verify(&self, _: &AccountId, _: &[u8; 32], _: &[u8]) -> Result<(), ()> {
             Err(())
+        }
+    }
+
+    struct DigestAuthenticator;
+    impl TransactionAuthenticator for DigestAuthenticator {
+        fn verify(
+            &self,
+            sender: &AccountId,
+            digest: &[u8; 32],
+            signature: &[u8],
+        ) -> Result<(), ()> {
+            if *sender != [0; 32] && signature == digest {
+                Ok(())
+            } else {
+                Err(())
+            }
         }
     }
 
@@ -358,6 +451,138 @@ mod tests {
             Err(QRunV06MiningError::NonceBudgetExhausted)
         );
         assert_eq!(graph.canonical_state().height(), 0);
+    }
+
+    #[test]
+    fn quote_aware_miner_requires_fresh_authorization_and_builds_importable_amm_block() {
+        const Q6QA_COMMITMENT: [u8; 32] = [0xB1; 32];
+        const Q6PN_COMMITMENT: [u8; 32] = [0xB2; 32];
+
+        let (_params, _genesis, mut graph) = setup(Uint256::MAX);
+        let cancellation = AtomicBool::new(false);
+        let genesis_tip = graph.canonical_tip().tip_hash;
+        let mut registration = AssetRegistration {
+            network_id: NETWORK,
+            issuer: OWNER,
+            issuer_nonce: 1,
+            salt: [0xB3; 32],
+            name: "QRun quote asset fixture".to_string(),
+            symbol: "QRTST".to_string(),
+            decimals: 6,
+            supply_policy: AssetSupplyPolicy::Fixed {
+                total_supply: 1_000,
+            },
+            initial_supply: 1_000,
+            initial_recipient: OWNER,
+            trust_policy: AssetTrustPolicy::Unverified,
+            expires_at: 10_000,
+            signature: Vec::new(),
+        };
+        registration.signature = registration.signing_digest().unwrap().to_vec();
+        let quote_asset = registration.asset_id();
+
+        let registration_block = mine_qfp6_block_on_tip(
+            &graph,
+            &genesis_tip,
+            31,
+            PRODUCER,
+            vec![QRunV06BlockOperation::AssetRegistration(registration)],
+            &DigestAuthenticator,
+            1,
+            &cancellation,
+        )
+        .unwrap();
+        graph
+            .insert_encoded(&registration_block.envelope, &DigestAuthenticator)
+            .unwrap();
+
+        let parent_tip = graph.canonical_tip().tip_hash;
+        let native_asset = qzxb_native_asset_id(NETWORK).unwrap();
+        let mut create_pair = AmmSignedOperation {
+            network_id: NETWORK,
+            sender: OWNER,
+            nonce: 1,
+            expires_at: 10_000,
+            operation: AmmOperation::CreatePair {
+                token_a: native_asset,
+                token_b: quote_asset,
+            },
+            signature: Vec::new(),
+        };
+        create_pair.signature = create_pair.signing_digest().unwrap().to_vec();
+        let operations = vec![QRunV06BlockOperation::Amm(create_pair)];
+
+        assert_eq!(
+            mine_qfp6_block_on_tip(
+                &graph,
+                &parent_tip,
+                62,
+                PRODUCER,
+                operations.clone(),
+                &DigestAuthenticator,
+                1,
+                &cancellation,
+            ),
+            Err(QRunV06MiningError::MissingQuoteAssetAuthorization)
+        );
+
+        let mut mine_authorizer =
+            |_: &QRunV06CanonicalExecutionState, block: &QRunV06Block, asset_id: [u8; 32]| {
+                Ok(test_trust_authorized_quote_asset_candidate(
+                    NETWORK,
+                    PROFILE,
+                    asset_id,
+                    Q6QA_COMMITMENT,
+                    Q6PN_COMMITMENT,
+                    3,
+                    1,
+                    100,
+                    1,
+                    block.height,
+                ))
+            };
+        let mined = mine_qfp6_block_on_tip_with_quote_asset_authorization(
+            &graph,
+            &parent_tip,
+            62,
+            PRODUCER,
+            operations,
+            &DigestAuthenticator,
+            &mut mine_authorizer,
+            1,
+            &cancellation,
+        )
+        .unwrap();
+        let mut import_authorizer =
+            |_: &QRunV06CanonicalExecutionState, block: &QRunV06Block, asset_id: [u8; 32]| {
+                Ok(test_trust_authorized_quote_asset_candidate(
+                    NETWORK,
+                    PROFILE,
+                    asset_id,
+                    Q6QA_COMMITMENT,
+                    Q6PN_COMMITMENT,
+                    3,
+                    1,
+                    100,
+                    1,
+                    block.height,
+                ))
+            };
+        graph
+            .insert_encoded_with_quote_asset_authorization(
+                &mined.envelope,
+                &DigestAuthenticator,
+                &mut import_authorizer,
+            )
+            .unwrap();
+        assert_eq!(graph.canonical_state().height(), 2);
+        assert_eq!(
+            graph
+                .canonical_state()
+                .quote_asset_authorization_commitment(),
+            Some(Q6QA_COMMITMENT)
+        );
+        assert_eq!(graph.canonical_state().unified().amm().pair_count(), 1);
     }
 
     #[test]
