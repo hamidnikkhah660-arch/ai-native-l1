@@ -12,8 +12,9 @@
 //! peer-discovery service, full-history sync daemon or public Mainnet binary.
 
 use crate::{
-    external_cas_anchor_candidate::ExternalCasProviderTransport,
+    external_cas_anchor_candidate::{ExternalCasPin, ExternalCasProviderTransport},
     qrun_node_shutdown_signal_candidate::QRunNodeShutdownSignalCandidate,
+    qrun_v06_external_anchor_candidate::{QRunV06ExternalAnchorPin, QRunV06ExternalAnchorState},
     qrun_v06_node_runtime_candidate::{
         QRunV06NodeAnchorGate, QRunV06NodeRuntime, QRunV06PeerReplayGuard,
     },
@@ -89,6 +90,7 @@ pub enum QRunV06NodeSupervisorError {
     PendingAnchorTransition,
     NetworkMismatch,
     ProfileMismatch,
+    CoordinatorPinMismatch,
     Listener(String),
     HandshakeBudgetExceeded,
     StatisticsOverflow,
@@ -153,6 +155,21 @@ fn validate_qap1_lifecycle(
     Ok(())
 }
 
+fn validate_qap1_pin_bindings(
+    state: &QRunV06ExternalAnchorState,
+    provider_pin: &ExternalCasPin,
+    qfp6_pin: &QRunV06ExternalAnchorPin,
+) -> Result<(), QRunV06NodeSupervisorError> {
+    if qfp6_pin.external_cas_pin() != provider_pin
+        || provider_pin.network_id != state.network_id
+        || provider_pin.genesis_digest != state.genesis_digest
+        || qfp6_pin.genesis_descriptor_commitment() != state.genesis_descriptor_commitment
+    {
+        return Err(QRunV06NodeSupervisorError::CoordinatorPinMismatch);
+    }
+    Ok(())
+}
+
 fn validate_startup<A: QRunV06NodeAnchorGate>(
     runtime: &QRunV06NodeRuntime<A>,
     local_static_private_key: &[u8; 32],
@@ -206,6 +223,11 @@ where
 {
     config.validate()?;
     validate_startup(runtime, local_static_private_key, network_id, profile_id)?;
+    validate_qap1_pin_bindings(
+        runtime.committed_anchor_state(),
+        coordinator.provider_pin(),
+        coordinator.qfp6_pin(),
+    )?;
     if trusted_remote_static_public_keys.is_empty()
         || trusted_remote_static_public_keys.len() > 64
         || trusted_remote_static_public_keys
@@ -340,6 +362,55 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES;
+
+    #[test]
+    fn supervisor_requires_the_recovery_coordinator_provider_and_genesis_pins_to_match() {
+        let state = QRunV06ExternalAnchorState {
+            network_id: [3; 32],
+            genesis_digest: [4; 32],
+            genesis_descriptor_commitment: [5; 32],
+            profile_id: [6; 32],
+            consensus_fingerprint: [7; 32],
+            segment_base_height: 0,
+            segment_base_tip: [8; 32],
+            checkpoint_anchor: [0; 32],
+            manifest_generation: 0,
+            manifest_anchor: [9; 32],
+            canonical_height: 0,
+            canonical_tip: [8; 32],
+            canonical_state_root: [10; 32],
+            cumulative_chainwork: [0; 32],
+        };
+        let provider_pin = ExternalCasPin {
+            provider_id: [11; 32],
+            network_id: state.network_id,
+            genesis_digest: state.genesis_digest,
+            receipt_key_id: [12; 32],
+            receipt_public_key: [13; ML_DSA_65_PUBLIC_KEY_BYTES],
+        };
+        let qfp6_pin = QRunV06ExternalAnchorPin::new(
+            provider_pin.clone(),
+            state.genesis_descriptor_commitment,
+        )
+        .unwrap();
+
+        assert!(validate_qap1_pin_bindings(&state, &provider_pin, &qfp6_pin).is_ok());
+
+        let mut wrong_provider = provider_pin.clone();
+        wrong_provider.network_id = [14; 32];
+        assert_eq!(
+            validate_qap1_pin_bindings(&state, &wrong_provider, &qfp6_pin),
+            Err(QRunV06NodeSupervisorError::CoordinatorPinMismatch)
+        );
+
+        let wrong_descriptor_pin =
+            QRunV06ExternalAnchorPin::new(provider_pin.clone(), [15; 32]).unwrap();
+        assert_eq!(
+            validate_qap1_pin_bindings(&state, &provider_pin, &wrong_descriptor_pin),
+            Err(QRunV06NodeSupervisorError::CoordinatorPinMismatch)
+        );
+    }
 
     #[test]
     fn supervisor_default_config_is_bounded_and_valid() {
