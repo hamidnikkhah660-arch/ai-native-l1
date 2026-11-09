@@ -3920,6 +3920,9 @@ mod tests {
         use crate::external_cas_offhost_anchor_noise_transport_candidate::NoiseTcpOffhostAnchorTransport;
         use crate::external_cas_offhost_anchor_protocol_candidate::ExternalCasOffhostAnchorPin;
         use crate::qrun_v06_external_anchor_candidate::QRunV06ExternalAnchorPin;
+        use crate::qrun_v06_node_supervisor_candidate::{
+            run_qfp6_node_supervisor, QRunV06NodeSupervisorConfig, QRunV06NodeSupervisorStopReason,
+        };
         use crate::qrun_v06_qap1_coordinator_candidate::QRunV06Qap1ExternalCoordinator;
 
         let required = |name: &str| env::var(name).unwrap_or_else(|_| panic!("missing {name}"));
@@ -4146,35 +4149,38 @@ mod tests {
             .unwrap()
         };
 
-        let mut handler = |guard: &mut QRunV06PeerReplayGuard, frame: &[u8]| {
-            crate::qrun_v06_peer_listener_candidate::process_qfp6_peer_frame_with_qap1(
-                &mut runtime,
-                guard,
-                frame,
-                &EmptyAuthenticator,
-                &mut quote_authorizer,
-                &mut coordinator,
-            )
-        };
-        let report = crate::qrun_v06_peer_listener_candidate::serve_qfp6_noise_listener(
+        let report = run_qfp6_node_supervisor(
             &listener,
-            QRunV06PeerListenerConfig {
-                max_sessions: 1,
-                max_requests_per_session: 2,
-                max_failed_handshakes: 2,
-                accept_poll_interval: Duration::from_millis(10),
+            QRunV06NodeSupervisorConfig {
+                listener: QRunV06PeerListenerConfig {
+                    max_sessions: 1,
+                    max_requests_per_session: 2,
+                    max_failed_handshakes: 2,
+                    accept_poll_interval: Duration::from_millis(10),
+                },
+                max_total_sessions: 1,
+                // The process-worker watchdog owns the external shutdown flag.
+                // It is intentionally the only shutdown authority in this child process.
+                install_os_signal_handler: false,
             },
             &listener_private,
             &[trusted_peer_public],
             &NETWORK,
             &PROFILE,
             &shutdown,
-            &mut handler,
+            &mut runtime,
+            &EmptyAuthenticator,
+            &mut quote_authorizer,
+            &mut coordinator,
         )
         .unwrap();
         shutdown.store(true, std::sync::atomic::Ordering::Release);
         watchdog.join().unwrap();
 
+        assert_eq!(
+            report.stop_reason,
+            QRunV06NodeSupervisorStopReason::SessionBudgetReached
+        );
         assert_eq!(report.stats.accepted_connections, 1);
         assert_eq!(report.stats.authenticated_sessions, 1);
         assert_eq!(report.stats.requests_received, 2);

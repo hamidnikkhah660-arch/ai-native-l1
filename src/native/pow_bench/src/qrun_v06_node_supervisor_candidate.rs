@@ -45,6 +45,9 @@ pub struct QRunV06NodeSupervisorConfig {
     pub listener: QRunV06PeerListenerConfig,
     /// Hard process-lifetime cap on accepted TCP connections, including failed handshakes.
     pub max_total_sessions: usize,
+    /// Install OS Ctrl-C/Ctrl-Break or SIGINT/SIGTERM handlers.
+    /// Disable only when an embedding service manager owns the external shutdown flag.
+    pub install_os_signal_handler: bool,
 }
 
 impl Default for QRunV06NodeSupervisorConfig {
@@ -52,6 +55,7 @@ impl Default for QRunV06NodeSupervisorConfig {
         Self {
             listener: QRunV06PeerListenerConfig::default(),
             max_total_sessions: QRUN_V06_SUPERVISOR_MAX_TOTAL_SESSIONS,
+            install_os_signal_handler: true,
         }
     }
 }
@@ -208,6 +212,7 @@ pub fn run_qfp6_node_supervisor<A, T, P, PV, AV, Q>(
     trusted_remote_static_public_keys: &[[u8; 32]],
     network_id: &[u8; 32],
     profile_id: &[u8; 32],
+    shutdown_requested: &AtomicBool,
     runtime: &mut QRunV06NodeRuntime<A>,
     authenticator: &T,
     quote_authorizer: &mut QRunV06QuoteAssetAuthorizationProvider<'_>,
@@ -237,16 +242,22 @@ where
         return Err(QRunV06NodeSupervisorError::InvalidIdentity);
     }
 
-    let signal = QRunNodeShutdownSignalCandidate::install()
-        .map_err(|error| QRunV06NodeSupervisorError::ShutdownSignal(error.to_string()))?;
-    let shutdown = AtomicBool::new(false);
+    let signal = if config.install_os_signal_handler {
+        Some(
+            QRunNodeShutdownSignalCandidate::install()
+                .map_err(|error| QRunV06NodeSupervisorError::ShutdownSignal(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let signal_ref = signal.as_ref();
     let watcher_stop = AtomicBool::new(false);
 
     let run_result = thread::scope(|scope| {
         let watcher = scope.spawn(|| {
             while !watcher_stop.load(Ordering::Acquire) {
-                if signal.is_shutdown_requested() {
-                    shutdown.store(true, Ordering::Release);
+                if signal_ref.is_some_and(|signal| signal.is_shutdown_requested()) {
+                    shutdown_requested.store(true, Ordering::Release);
                     break;
                 }
                 thread::sleep(SHUTDOWN_WATCH_INTERVAL);
@@ -258,7 +269,7 @@ where
             let mut rounds = 0u64;
 
             let stop_reason = loop {
-                if shutdown.load(Ordering::Acquire) {
+                if shutdown_requested.load(Ordering::Acquire) {
                     break QRunV06NodeSupervisorStopReason::ShutdownRequested;
                 }
                 if aggregate.accepted_connections >= config.max_total_sessions {
@@ -277,7 +288,7 @@ where
 
                 let mut on_q6pb = |guard: &mut QRunV06PeerReplayGuard, frame: &[u8]| {
                     if runtime.requires_reopen() || runtime.has_pending_external_anchor() {
-                        shutdown.store(true, Ordering::Release);
+                        shutdown_requested.store(true, Ordering::Release);
                         return Err(
                             "QFP6 runtime is poisoned; reconcile QAP1 before service".to_string()
                         );
@@ -291,7 +302,7 @@ where
                         coordinator,
                     );
                     if runtime.requires_reopen() || runtime.has_pending_external_anchor() {
-                        shutdown.store(true, Ordering::Release);
+                        shutdown_requested.store(true, Ordering::Release);
                     }
                     response
                 };
@@ -303,7 +314,7 @@ where
                     trusted_remote_static_public_keys,
                     network_id,
                     profile_id,
-                    &shutdown,
+                    shutdown_requested,
                     &mut on_q6pb,
                 )
                 .map_err(|error: QRunV06PeerListenerError| {
@@ -348,9 +359,12 @@ where
         service_result
     });
 
-    let uninstall_result = signal
-        .uninstall()
-        .map_err(|error| QRunV06NodeSupervisorError::ShutdownSignal(error.to_string()));
+    let uninstall_result = match signal {
+        Some(signal) => signal
+            .uninstall()
+            .map_err(|error| QRunV06NodeSupervisorError::ShutdownSignal(error.to_string())),
+        None => Ok(()),
+    };
 
     match (run_result, uninstall_result) {
         (Err(error), _) => Err(error),
@@ -420,6 +434,7 @@ mod tests {
             config.max_total_sessions,
             QRUN_V06_SUPERVISOR_MAX_TOTAL_SESSIONS
         );
+        assert!(config.install_os_signal_handler);
     }
 
     #[test]
