@@ -11,7 +11,7 @@ The QRun V06 executable now has two distinct commands:
 - `--preflight`: verifies the externally pinned Genesis/Q6PN/Q6TS/Q6EA identity package and the independently administered Q6TS DynamoDB floor.
 - `--probe-qap1`: performs the same preflight, then makes read-only signed Provider and Q6EA Anchor observations over their independently pinned Noise XX endpoints.
 
-The service probe is not node startup. It does not run Provider CAS, Q6EA Anchor CAS, write either floor, publish a block, admit a transaction, acknowledge a peer, bind the node's P2P listener or mine.
+The service probe is not node startup. It does not run Provider CAS or Q6EA Anchor CAS, or advance either trusted floor record. It may create/update the local Provider floor's diagnostic OS lock file to obtain mutual exclusion. It does not publish a block, admit a transaction, acknowledge a peer, bind the node's P2P listener or mine.
 
 ## Additional config fields
 
@@ -29,7 +29,7 @@ The following fields are **optional for `--preflight`** and become mandatory onl
 
 The two `.npk1` files must be NPK1 envelopes produced with the existing Windows CurrentUser DPAPI Noise-key provisioner. Each envelope is bound to the exact configured network ID; the protected files must be readable under the same Windows user identity that runs the probe. The Provider and Q6EA client private keys must be different; equality causes refusal and both in-memory copies are zeroized. The JSON config never accepts plaintext private keys. Do not put a private key on a command line or in the JSON config.
 
-The Provider floor directory must already contain the separately provisioned local Provider high-water state for the exact ECR1 Provider pin. The probe calls `ExternalCasFloorStore::open`; it does not call `initialize`, does not accept a missing floor, and does not adopt the current remote Provider response as a new trust floor.
+The Provider floor directory must already contain the separately provisioned local Provider high-water state for the exact ECR1 Provider pin. The probe calls `ExternalCasFloorStore::open`; it does not call `initialize`, does not accept a missing floor, and does not adopt the current remote Provider response as a new trust floor. The floor record itself is read-only during the probe, but the store's OS-backed mutual-exclusion lock may create/update its diagnostic PID lock file; the output reports this local lock-metadata side effect explicitly.
 
 The Q6EA expected-state file is a canonical Q6EA v2 state encoding. Its SHA-256 is included in the externally pinned config. The probe decodes the state and checks its network, profile, Provider Genesis digest, Q6GD descriptor commitment and consensus fingerprint against the Q6PN/Q6GD identity already accepted by preflight.
 

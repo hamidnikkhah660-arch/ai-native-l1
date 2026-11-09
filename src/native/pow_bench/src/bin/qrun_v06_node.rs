@@ -618,8 +618,10 @@ fn validate_q6ea_expected_state_identity(
     Ok(())
 }
 
-/// Read-only QAP1 service qualification. This sends signed Provider Read and Q6EA Read
+/// Read-only QAP1 state qualification. This sends signed Provider Read and Q6EA Read
 /// requests only; it never issues Provider CAS, Anchor CAS, floor advance, block admission or ACK.
+/// The local Provider floor's OS writer-lock file may be created/updated for mutual exclusion;
+/// the trusted floor record itself remains unchanged.
 fn probe_qap1_services(
     config_path: &Path,
     independently_pinned_config_digest: &[u8; 32],
@@ -846,7 +848,8 @@ fn run(args: &[String]) -> Result<(), String> {
         println!("q6ea_sequence={}", state.canonical_height);
         println!("q6ea_manifest_generation={}", state.manifest_generation);
         println!("q6ea_canonical_tip={}", hex(&state.canonical_tip));
-        println!("provider_floor=OPENED_READ_ONLY");
+        println!("provider_floor_state=READ_ONLY_NO_ADVANCE");
+        println!("provider_floor_lock=OS_LOCK_METADATA_MAY_BE_CREATED_OR_UPDATED");
         println!("provider_cas=NOT_CALLED");
         println!("q6ea_anchor_cas=NOT_CALLED");
     } else {
