@@ -140,6 +140,8 @@ pub mod qrun_v06_external_anchor_candidate;
 pub mod qrun_v06_genesis_descriptor_candidate;
 /// CP-0546 append-only historical Q6TS/Q6PN/Q6QA trust-history and pinned checkpoint verifier candidate.
 pub mod qrun_v06_historical_trust_candidate;
+/// CP-0569 branch-local QFP6 block-template construction and bounded Argon2id nonce search; caller performs durable QAP1 admission.
+pub mod qrun_v06_miner_candidate;
 /// CP-0547/0550/0551 QFP6 admission, bounded peer ingress/ACK and per-session replay guard; no production listener wiring yet.
 pub mod qrun_v06_node_runtime_candidate;
 /// CP-0568 supervised QFP6 QAP1 peer-service lifecycle; injected resources only, no public Mainnet activation.
