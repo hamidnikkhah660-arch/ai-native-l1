@@ -1503,6 +1503,43 @@ mod tests {
     }
 
     #[test]
+    fn qfp6_difficulty_retarget_remains_branch_local_across_siblings() {
+        let mut params = params(2);
+        params.initial_target = Uint256::from_be_bytes([0x1F; 32]);
+        params.validate().unwrap();
+
+        let genesis = TargetHistoryNode::genesis_at(&params, 1_000);
+        let fast_first =
+            TargetHistoryNode::append(&genesis, 1, params.initial_target, 1_005, &params).unwrap();
+        let fast_parent =
+            TargetHistoryNode::append(&fast_first, 2, params.initial_target, 1_010, &params)
+                .unwrap();
+
+        let slow_first =
+            TargetHistoryNode::append(&genesis, 1, params.initial_target, 1_030, &params).unwrap();
+        let slow_parent =
+            TargetHistoryNode::append(&slow_first, 2, params.initial_target, 1_090, &params)
+                .unwrap();
+
+        let fast_target =
+            TargetHistoryNode::expected_next_target(&fast_parent, 3, &params).unwrap();
+        let slow_target =
+            TargetHistoryNode::expected_next_target(&slow_parent, 3, &params).unwrap();
+
+        assert!(fast_target < params.initial_target);
+        assert!(slow_target > params.initial_target);
+        assert_ne!(fast_target, slow_target);
+
+        assert!(matches!(
+            TargetHistoryNode::append(&fast_parent, 3, slow_target, 1_020, &params),
+            Err(QRunV06ForkChoiceError::ExpectedTargetMismatch { .. })
+        ));
+        assert!(matches!(
+            TargetHistoryNode::append(&slow_parent, 3, fast_target, 1_100, &params),
+            Err(QRunV06ForkChoiceError::ExpectedTargetMismatch { .. })
+        ));
+    }
+    #[test]
     fn qfp6_first_retarget_accepts_unanchored_stale_epoch_and_eases_to_max_clamp() {
         let mut params = params(8);
         // Keep 4x within the 256-bit range so the exact configured clamp is observable.
