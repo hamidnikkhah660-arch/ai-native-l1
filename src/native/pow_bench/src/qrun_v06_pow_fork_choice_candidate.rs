@@ -1530,6 +1530,25 @@ mod tests {
         assert!(slow_target > params.initial_target);
         assert_ne!(fast_target, slow_target);
 
+        let fast_checkpoint_tail =
+            export_target_history_tail(&fast_parent, params.difficulty_window_blocks as usize);
+        let slow_checkpoint_tail =
+            export_target_history_tail(&slow_parent, params.difficulty_window_blocks as usize);
+        let fast_restored =
+            TargetHistoryNode::from_checkpoint_entries(&fast_checkpoint_tail, 2, &params, 1_000)
+                .unwrap();
+        let slow_restored =
+            TargetHistoryNode::from_checkpoint_entries(&slow_checkpoint_tail, 2, &params, 1_000)
+                .unwrap();
+        assert_eq!(
+            TargetHistoryNode::expected_next_target(&fast_restored, 3, &params).unwrap(),
+            fast_target
+        );
+        assert_eq!(
+            TargetHistoryNode::expected_next_target(&slow_restored, 3, &params).unwrap(),
+            slow_target
+        );
+
         assert!(matches!(
             TargetHistoryNode::append(&fast_parent, 3, slow_target, 1_020, &params),
             Err(QRunV06ForkChoiceError::ExpectedTargetMismatch { .. })
