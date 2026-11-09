@@ -1074,6 +1074,54 @@ impl QRunV06Qap1Journal {
         write_phase_snapshot(directory, self.phase, &self.encode()?)
     }
 
+    /// Audit the latest QAP1 snapshot without deleting stale temporaries or cleaning phase files.
+    /// The dedicated OS lock file may be created/updated to serialize the audit, but all phase
+    /// snapshots are read-only. Any interrupted temp file or unexpected entry is a hard error.
+    pub fn audit_latest<PV: MlDsa65Verifier, AV: MlDsa65Verifier>(
+        directory: &Path,
+        provider_pin: &ExternalCasPin,
+        anchor_pin: &ExternalCasOffhostAnchorPin,
+        provider_verifier: &PV,
+        anchor_verifier: &AV,
+    ) -> Result<Option<Self>, QRunV06Qap1Error> {
+        match fs::symlink_metadata(directory) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() => {
+                return Err(QRunV06Qap1Error::NonCanonical);
+            }
+            Ok(_) => {}
+        }
+        let _lock = StoreWriterLock::acquire(directory, LOCK_NAME)?;
+        validate_qap1_directory_for_audit_locked(directory)?;
+
+        let latest = if phase_path(directory, QRunV06Qap1Phase::Finalized as u16).exists() {
+            let finalized = Self::decode(
+                &read_snapshot(&phase_path(directory, QRunV06Qap1Phase::Finalized as u16))?,
+                provider_pin,
+            )?;
+            if finalized.phase != QRunV06Qap1Phase::Finalized {
+                return Err(QRunV06Qap1Error::InvalidPhase);
+            }
+            if let Some(previous) = load_latest_no_cleanup(directory, provider_pin)? {
+                finalized.validate_successive_snapshot(&previous)?;
+            }
+            Some(finalized)
+        } else {
+            load_latest_no_cleanup(directory, provider_pin)?
+        };
+
+        if let Some(journal) = &latest {
+            journal.verify_saved_evidence(
+                provider_pin,
+                anchor_pin,
+                provider_verifier,
+                anchor_verifier,
+            )?;
+        }
+        Ok(latest)
+    }
+
     /// Read and cryptographically verify all evidence saved in the latest QAP1 phase.
     /// A local checksum is never treated as proof that Provider or Anchor receipts are trusted.
     pub fn load_latest<PV: MlDsa65Verifier, AV: MlDsa65Verifier>(
@@ -1173,6 +1221,35 @@ const MAX_QAP1_BYTES: usize = HEADER_BYTES
     + 4
     + MAX_QRUN_V06_MANIFEST_BYTES
     + CHECKSUM_BYTES;
+
+/// Audit-only directory validation. Unlike the recovery loader, this never removes stale temp
+/// snapshots: an interrupted write remains visible for operator-directed recovery.
+fn validate_qap1_directory_for_audit_locked(directory: &Path) -> Result<(), QRunV06Qap1Error> {
+    let metadata = fs::symlink_metadata(directory)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(QRunV06Qap1Error::NonCanonical);
+    }
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_symlink() || !kind.is_file() {
+            return Err(QRunV06Qap1Error::NonCanonical);
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == LOCK_NAME {
+            continue;
+        }
+        let phase_file =
+            (1..=7).any(|phase| name == format!("{QAP1_PREFIX}{phase:02}{QAP1_SUFFIX}"));
+        if phase_file {
+            continue;
+        }
+        // In particular, do not delete `.qap1-*.tmp` here. A temp file signals an interrupted
+        // phase publication and requires an explicit recovery decision outside the audit path.
+        return Err(QRunV06Qap1Error::NonCanonical);
+    }
+    Ok(())
+}
 
 fn validate_qap1_directory_locked(directory: &Path) -> Result<(), QRunV06Qap1Error> {
     let metadata = fs::symlink_metadata(directory)?;
@@ -1674,6 +1751,39 @@ mod tests {
                 .expect("Prepared journal must survive reopen");
         assert_eq!(loaded, journal);
         assert_eq!(loaded.phase(), QRunV06Qap1Phase::Prepared);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn qap1_audit_verifies_prepared_snapshot_and_never_deletes_interrupted_temp() {
+        let (pin, anchor_pin, journal, _provider_signing_key, _anchor_signing_key) = fixture();
+        let directory = temp_directory();
+        journal.persist_prepared(&directory, &pin).unwrap();
+        let verifier = LibcruxMlDsa65VerifierCandidate;
+
+        let audited =
+            QRunV06Qap1Journal::audit_latest(&directory, &pin, &anchor_pin, &verifier, &verifier)
+                .unwrap()
+                .expect("Prepared intent must be visible to audit");
+        assert_eq!(audited, journal);
+        assert_eq!(audited.phase(), QRunV06Qap1Phase::Prepared);
+
+        let temp = directory.join(".qap1-interrupted-audit.tmp");
+        std::fs::write(&temp, b"operator recovery evidence").unwrap();
+        let phase_path_before = phase_path(&directory, QRunV06Qap1Phase::Prepared as u16);
+        let phase_bytes_before = std::fs::read(&phase_path_before).unwrap();
+        assert_eq!(
+            QRunV06Qap1Journal::audit_latest(&directory, &pin, &anchor_pin, &verifier, &verifier,),
+            Err(QRunV06Qap1Error::NonCanonical)
+        );
+        assert!(
+            temp.exists(),
+            "audit must not delete interrupted temp evidence"
+        );
+        assert_eq!(
+            std::fs::read(&phase_path_before).unwrap(),
+            phase_bytes_before
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
