@@ -544,6 +544,11 @@ impl QRunV06PowForkChoice {
         self.profile_id
     }
 
+    /// The exact consensus parameters pinned when this branch graph was constructed.
+    pub fn consensus_parameters(&self) -> &ConsensusParameters {
+        &self.params
+    }
+
     pub fn base_tip(&self) -> [u8; 32] {
         self.base_tip
     }
