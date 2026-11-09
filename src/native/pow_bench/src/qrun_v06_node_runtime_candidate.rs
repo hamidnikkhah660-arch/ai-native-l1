@@ -2192,9 +2192,27 @@ mod tests {
             fail_next_advance: false,
             advance_calls: 0,
         };
-        let mut runtime =
-            QRunV06NodeRuntime::new(store, gate, GENESIS_DIGEST, initial.clone()).unwrap();
-        let envelope = first_block(&runtime.store);
+        let mut recovery_quote = quote_provider();
+        let recovery_coordinator = durable_noise_qap1_coordinator(
+            &provider_server,
+            &anchor_server,
+            provider_pin.clone(),
+            anchor_pin.clone(),
+            &initial,
+            &floor_dir,
+        );
+        let mut runtime = QRunV06NodeRuntime::recover_qap1_after_process_restart(
+            store,
+            gate,
+            recovery_coordinator,
+            GENESIS_DIGEST,
+            &EmptyAuthenticator,
+            &mut recovery_quote,
+        )
+        .unwrap();
+        assert!(runtime.qap1_recovery_verified());
+
+        let mut fork_choice = runtime.store.graph().unwrap().clone();
         let mut quote = quote_provider();
         let mut coordinator = durable_noise_qap1_coordinator(
             &provider_server,
@@ -2204,15 +2222,33 @@ mod tests {
             &initial,
             &floor_dir,
         );
+        let shutdown = AtomicBool::new(false);
+        let mining_report = crate::qrun_v06_qap1_mining_loop_candidate::run_qfp6_qap1_mining_loop(
+            &mut runtime,
+            &mut fork_choice,
+            PRODUCER,
+            &EmptyAuthenticator,
+            &mut quote,
+            &mut coordinator,
+            crate::qrun_v06_qap1_mining_loop_candidate::QRunV06Qap1MiningLoopConfig {
+                max_blocks_per_run: 2,
+                max_nonce_attempts_per_block: 100_000,
+            },
+            &shutdown,
+            |parent| Ok((parent.last_timestamp() + 60, Vec::new())),
+        )
+        .unwrap();
 
-        let admission = runtime
-            .submit_envelope_with_qap1(&envelope, &EmptyAuthenticator, &mut quote, &mut coordinator)
-            .unwrap();
-        assert!(matches!(admission, QRunV06NodeAdmission::Acknowledged(_)));
-        assert!(admission.is_acknowledged());
-        assert_eq!(runtime.canonical_height().unwrap(), 1);
-        assert_eq!(runtime.manifest_generation().unwrap(), 1);
-        assert!(runtime.qap1_required);
+        assert_eq!(mining_report.blocks_acknowledged, 2);
+        assert_eq!(mining_report.starting_height, 0);
+        assert_eq!(mining_report.ending_height, 2);
+        assert_eq!(runtime.canonical_height().unwrap(), 2);
+        assert_eq!(runtime.manifest_generation().unwrap(), 2);
+        assert_eq!(fork_choice.canonical_tip().height, 2);
+        assert_eq!(
+            fork_choice.canonical_tip().tip_hash,
+            mining_report.ending_tip
+        );
         assert!(!runtime.store.has_qap1_intent().unwrap());
         coordinator
             .verify_current(runtime.committed_anchor_state())
@@ -2261,12 +2297,12 @@ mod tests {
         let recovered_coordinator = durable_noise_qap1_coordinator(
             &provider_server,
             &anchor_server,
-            provider_pin,
-            anchor_pin,
+            provider_pin.clone(),
+            anchor_pin.clone(),
             &expected_anchor,
             &floor_dir,
         );
-        let recovered = QRunV06NodeRuntime::recover_qap1_after_process_restart(
+        let mut recovered = QRunV06NodeRuntime::recover_qap1_after_process_restart(
             reopened_store,
             recovery_gate,
             recovered_coordinator,
@@ -2276,7 +2312,8 @@ mod tests {
         )
         .unwrap();
         assert!(recovered.qap1_required);
-        assert_eq!(recovered.canonical_height().unwrap(), 1);
+        assert!(recovered.qap1_recovery_verified());
+        assert_eq!(recovered.canonical_height().unwrap(), 2);
         assert_eq!(
             recovered.manifest_generation().unwrap(),
             expected_generation
@@ -2285,6 +2322,46 @@ mod tests {
             recovered.store.canonical_state_root().unwrap(),
             expected_root
         );
+
+        let mut recovered_fork_choice = recovered.store.graph().unwrap().clone();
+        let mut resumed_quote = quote_provider();
+        let mut resumed_coordinator = durable_noise_qap1_coordinator(
+            &provider_server,
+            &anchor_server,
+            provider_pin.clone(),
+            anchor_pin.clone(),
+            &expected_anchor,
+            &floor_dir,
+        );
+        let resumed_report = crate::qrun_v06_qap1_mining_loop_candidate::run_qfp6_qap1_mining_loop(
+            &mut recovered,
+            &mut recovered_fork_choice,
+            PRODUCER,
+            &EmptyAuthenticator,
+            &mut resumed_quote,
+            &mut resumed_coordinator,
+            crate::qrun_v06_qap1_mining_loop_candidate::QRunV06Qap1MiningLoopConfig {
+                max_blocks_per_run: 1,
+                max_nonce_attempts_per_block: 100_000,
+            },
+            &shutdown,
+            |parent| Ok((parent.last_timestamp() + 60, Vec::new())),
+        )
+        .unwrap();
+        assert_eq!(resumed_report.blocks_acknowledged, 1);
+        assert_eq!(resumed_report.starting_height, 2);
+        assert_eq!(resumed_report.ending_height, 3);
+        assert_eq!(recovered.canonical_height().unwrap(), 3);
+        assert_eq!(
+            recovered.manifest_generation().unwrap(),
+            expected_generation + 1
+        );
+        assert_eq!(recovered_fork_choice.canonical_tip().height, 3);
+        resumed_coordinator
+            .verify_current(recovered.committed_anchor_state())
+            .unwrap();
+
+        drop(resumed_coordinator);
         drop(recovered);
         anchor_server.shutdown_and_join();
         provider_server.shutdown_and_join();
