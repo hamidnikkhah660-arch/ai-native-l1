@@ -31,6 +31,7 @@ const READ_REQUEST_BYTES: usize = 96;
 const WRITE_REQUEST_BYTES: usize = 448;
 const PROFILE_DOMAIN: &[u8] = b"QRUN-V05-EXTERNAL-CAS-NOISE-PROFILE-V1\0";
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
@@ -124,22 +125,26 @@ impl Drop for NoiseTcpExternalCasProviderTransport {
 impl NoiseTcpExternalCasProviderTransport {
     pub fn new(
         address: SocketAddr,
-        local_static_private_key: [u8; 32],
+        mut local_static_private_key: [u8; 32],
         trusted_server_static_public_key: [u8; 32],
         pin: ExternalCasPin,
     ) -> Result<Self, ExternalCasNoiseError> {
-        Self::with_timeout(
+        let result = Self::with_timeout(
             address,
             local_static_private_key,
             trusted_server_static_public_key,
             pin,
             DEFAULT_CONNECT_TIMEOUT,
-        )
+        );
+        // The array is Copy, so clear this constructor's original stack copy as well as the
+        // copy consumed by with_timeout (which is retained only inside the transport on success).
+        local_static_private_key.fill(0);
+        result
     }
 
     pub fn with_timeout(
         address: SocketAddr,
-        local_static_private_key: [u8; 32],
+        mut local_static_private_key: [u8; 32],
         trusted_server_static_public_key: [u8; 32],
         pin: ExternalCasPin,
         connect_timeout: Duration,
@@ -149,11 +154,20 @@ impl NoiseTcpExternalCasProviderTransport {
             || connect_timeout.is_zero()
             || connect_timeout > MAX_CONNECT_TIMEOUT
         {
+            local_static_private_key.fill(0);
             return Err(ExternalCasNoiseError::InvalidConfiguration);
         }
-        pin.validate()
-            .map_err(|error| ExternalCasNoiseError::Contract(error.to_string()))?;
-        let profile_id = external_cas_noise_profile_id(&pin)?;
+        if let Err(error) = pin.validate() {
+            local_static_private_key.fill(0);
+            return Err(ExternalCasNoiseError::Contract(error.to_string()));
+        }
+        let profile_id = match external_cas_noise_profile_id(&pin) {
+            Ok(profile_id) => profile_id,
+            Err(error) => {
+                local_static_private_key.fill(0);
+                return Err(error);
+            }
+        };
         Ok(Self {
             address,
             local_static_private_key,
@@ -170,6 +184,8 @@ impl NoiseTcpExternalCasProviderTransport {
         }
         let mut stream = TcpStream::connect_timeout(&self.address, self.connect_timeout)?;
         stream.set_nodelay(true)?;
+        stream.set_read_timeout(Some(DEFAULT_IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(DEFAULT_IO_TIMEOUT))?;
         let mut session = QRunV05NoiseSession::connect(
             &mut stream,
             &self.local_static_private_key,
