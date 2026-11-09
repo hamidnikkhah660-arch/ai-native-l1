@@ -6,8 +6,14 @@
 //! It is intentionally preflight-only until the production QAP1/Provider/Anchor/runtime wiring
 //! and independent deployment qualifications are complete.
 use ai_native_l1_pow_bench::{
+    external_cas_anchor_candidate::ExternalCasPin,
+    external_cas_floor_store_candidate::ExternalCasFloorStore,
+    external_cas_noise_transport_candidate::NoiseTcpExternalCasProviderTransport,
+    external_cas_offhost_anchor_noise_transport_candidate::NoiseTcpOffhostAnchorTransport,
     external_cas_offhost_anchor_protocol_candidate::ExternalCasOffhostAnchorPin,
+    noise_key_provisioning::load_protected_noise_private_key,
     qrun_v06_canonical_execution_candidate::QRunV06CanonicalExecutionState,
+    qrun_v06_external_anchor_candidate::{QRunV06ExternalAnchorPin, QRunV06ExternalAnchorState},
     qrun_v06_profile_pin_candidate::QRunV06VerifiedProfilePin,
     qrun_v06_profile_trust_candidate::{
         verify_qrun_v06_profile_trust_envelope, MonotonicQRunV06ProfileTrustFloorStore,
@@ -15,6 +21,7 @@ use ai_native_l1_pow_bench::{
         QRunV06ProfileTrustStatus, QRunV06SignedProfileTrustEnvelope,
     },
     qrun_v06_profile_trust_dynamodb_floor_candidate::AwsDynamoDbQ6tsProfileTrustFloorStore,
+    qrun_v06_qap1_coordinator_candidate::QRunV06Qap1ExternalCoordinator,
     qrun_v06_tokenomics_candidate::QRUN_V06_FOUNDER_GENESIS_ATOMS,
     v4_fat1_mldsa65_candidate::LibcruxMlDsa65VerifierCandidate,
     v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES,
@@ -59,6 +66,11 @@ struct Config {
     q6ea_anchor_noise_server_key_sha256: [u8; 32],
     provider_endpoint: SocketAddr,
     q6ea_anchor_endpoint: SocketAddr,
+    provider_noise_client_key_path: Option<PathBuf>,
+    q6ea_anchor_noise_client_key_path: Option<PathBuf>,
+    provider_floor_store_path: Option<PathBuf>,
+    q6ea_expected_state_path: Option<PathBuf>,
+    q6ea_expected_state_sha256: Option<[u8; 32]>,
 }
 
 #[derive(Debug)]
@@ -77,6 +89,10 @@ struct PreflightSummary {
     trust_epoch: u64,
     has_quote_asset_pin: bool,
     provider_id: [u8; 32],
+    provider_pin: ExternalCasPin,
+    q6ea_anchor_pin: ExternalCasOffhostAnchorPin,
+    provider_noise_server_public_key: [u8; 32],
+    q6ea_anchor_noise_server_public_key: [u8; 32],
 }
 
 fn parse_hex32(name: &str, value: &str) -> Result<[u8; 32], String> {
@@ -235,6 +251,18 @@ fn parse_config(
     let path_field = |name: &str| -> Result<PathBuf, String> {
         Ok(resolve_path(base, required_string(&value, name)?))
     };
+    let optional_path_field = |name: &str| -> Result<Option<PathBuf>, String> {
+        match value.get(name) {
+            None => Ok(None),
+            Some(_) => Ok(Some(resolve_path(base, required_string(&value, name)?))),
+        }
+    };
+    let optional_digest_field = |name: &str| -> Result<Option<[u8; 32]>, String> {
+        match value.get(name) {
+            None => Ok(None),
+            Some(_) => Ok(Some(parse_hex32(name, required_string(&value, name)?)?)),
+        }
+    };
 
     Ok(Config {
         network_id: parse_hex32("network_id", required_string(&value, "network_id")?)?,
@@ -295,6 +323,13 @@ fn parse_config(
             "q6ea_anchor_endpoint",
             required_string(&value, "q6ea_anchor_endpoint")?,
         )?,
+        provider_noise_client_key_path: optional_path_field("provider_noise_client_key_path")?,
+        q6ea_anchor_noise_client_key_path: optional_path_field(
+            "q6ea_anchor_noise_client_key_path",
+        )?,
+        provider_floor_store_path: optional_path_field("provider_floor_store_path")?,
+        q6ea_expected_state_path: optional_path_field("q6ea_expected_state_path")?,
+        q6ea_expected_state_sha256: optional_digest_field("q6ea_expected_state_sha256")?,
     })
 }
 
@@ -542,7 +577,172 @@ fn preflight(
         trust_epoch: envelope.record.trust_epoch,
         has_quote_asset_pin: profile_pin.quote_asset_trust_pin().is_some(),
         provider_id: profile_pin.bundle().external_cas_pin().provider_id,
+        provider_pin: profile_pin.bundle().external_cas_pin().clone(),
+        q6ea_anchor_pin,
+        provider_noise_server_public_key: provider_noise_server_key,
+        q6ea_anchor_noise_server_public_key: q6ea_anchor_noise_server_key,
     })
+}
+
+fn require_distinct_qap1_client_keys(
+    provider_key: &mut [u8; 32],
+    anchor_key: &mut [u8; 32],
+) -> Result<(), String> {
+    if provider_key == anchor_key {
+        provider_key.fill(0);
+        anchor_key.fill(0);
+        return Err("Provider and Q6EA Anchor Noise client private keys must be distinct".into());
+    }
+    Ok(())
+}
+
+fn validate_q6ea_expected_state_identity(
+    state: &QRunV06ExternalAnchorState,
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    genesis_digest: &[u8; 32],
+    genesis_descriptor_commitment: &[u8; 32],
+    consensus_fingerprint: &[u8; 32],
+) -> Result<(), String> {
+    state
+        .validate()
+        .map_err(|error| format!("Q6EA expected state is invalid: {error:?}"))?;
+    if &state.network_id != network_id
+        || &state.profile_id != profile_id
+        || &state.genesis_digest != genesis_digest
+        || &state.genesis_descriptor_commitment != genesis_descriptor_commitment
+        || &state.consensus_fingerprint != consensus_fingerprint
+    {
+        return Err("Q6EA expected state does not bind the exact Q6PN Provider/network/Genesis/Q6GD/consensus identity".into());
+    }
+    Ok(())
+}
+
+/// Read-only QAP1 service qualification. This sends signed Provider Read and Q6EA Read
+/// requests only; it never issues Provider CAS, Anchor CAS, floor advance, block admission or ACK.
+fn probe_qap1_services(
+    config_path: &Path,
+    independently_pinned_config_digest: &[u8; 32],
+) -> Result<(PreflightSummary, QRunV06ExternalAnchorState), String> {
+    let config = parse_config(config_path, independently_pinned_config_digest)?;
+    let expected_state_path = config
+        .q6ea_expected_state_path
+        .as_deref()
+        .ok_or_else(|| "--probe-qap1 requires q6ea_expected_state_path".to_string())?;
+    let expected_state_digest = config
+        .q6ea_expected_state_sha256
+        .as_ref()
+        .ok_or_else(|| "--probe-qap1 requires q6ea_expected_state_sha256".to_string())?;
+    let provider_client_key_path = config
+        .provider_noise_client_key_path
+        .as_deref()
+        .ok_or_else(|| "--probe-qap1 requires provider_noise_client_key_path".to_string())?;
+    let anchor_client_key_path = config
+        .q6ea_anchor_noise_client_key_path
+        .as_deref()
+        .ok_or_else(|| "--probe-qap1 requires q6ea_anchor_noise_client_key_path".to_string())?;
+    let provider_floor_path = config
+        .provider_floor_store_path
+        .as_deref()
+        .ok_or_else(|| "--probe-qap1 requires provider_floor_store_path".to_string())?;
+    let summary = preflight(config_path, independently_pinned_config_digest)?;
+
+    let expected_state_bytes = read_bounded(
+        expected_state_path,
+        512,
+        "independently pinned Q6EA expected state",
+    )?;
+    let actual_state_sha256: [u8; 32] = Sha256::digest(&expected_state_bytes).into();
+    if &actual_state_sha256 != expected_state_digest {
+        return Err(
+            "Q6EA expected-state SHA-256 differs from the independently pinned config digest"
+                .into(),
+        );
+    }
+    let expected_state = QRunV06ExternalAnchorState::decode(&expected_state_bytes)
+        .map_err(|error| format!("Q6EA expected state decode failed: {error:?}"))?;
+    validate_q6ea_expected_state_identity(
+        &expected_state,
+        &config.network_id,
+        &config.profile_id,
+        &summary.provider_pin.genesis_digest,
+        &summary.genesis_commitment,
+        &config.consensus_fingerprint,
+    )?;
+
+    // Open only an existing Provider high-water floor. No initialize/create/advance fallback.
+    let provider_floor =
+        ExternalCasFloorStore::open(provider_floor_path, summary.provider_pin.clone()).map_err(
+            |error| format!("existing Provider monotonic floor could not be opened: {error:?}"),
+        )?;
+
+    // Client static identities are protected by Windows CurrentUser DPAPI and bound to this
+    // exact network ID. Plaintext keys never appear in the JSON config or on a command line.
+    let mut provider_client_key =
+        load_protected_noise_private_key(provider_client_key_path, &config.network_id).map_err(
+            |error| format!("protected Provider Noise client key unavailable: {error:?}"),
+        )?;
+    let mut anchor_client_key =
+        match load_protected_noise_private_key(anchor_client_key_path, &config.network_id) {
+            Ok(key) => key,
+            Err(error) => {
+                provider_client_key.fill(0);
+                return Err(format!(
+                    "protected Q6EA Anchor Noise client key unavailable: {error:?}"
+                ));
+            }
+        };
+    require_distinct_qap1_client_keys(&mut provider_client_key, &mut anchor_client_key)?;
+
+    let provider_transport_result = NoiseTcpExternalCasProviderTransport::new(
+        config.provider_endpoint,
+        provider_client_key,
+        summary.provider_noise_server_public_key,
+        summary.provider_pin.clone(),
+    );
+    provider_client_key.fill(0);
+    let provider_transport = match provider_transport_result {
+        Ok(transport) => transport,
+        Err(error) => {
+            anchor_client_key.fill(0);
+            return Err(format!(
+                "Provider Noise transport configuration failed: {error:?}"
+            ));
+        }
+    };
+
+    let anchor_transport_result = NoiseTcpOffhostAnchorTransport::new(
+        config.q6ea_anchor_endpoint,
+        anchor_client_key,
+        summary.q6ea_anchor_noise_server_public_key,
+        summary.q6ea_anchor_pin.clone(),
+        summary.provider_pin.clone(),
+    );
+    anchor_client_key.fill(0);
+    let anchor_transport = anchor_transport_result
+        .map_err(|error| format!("Q6EA Anchor Noise transport configuration failed: {error:?}"))?;
+
+    let qfp6_anchor_pin =
+        QRunV06ExternalAnchorPin::new(summary.provider_pin.clone(), summary.genesis_commitment)
+            .map_err(|error| format!("QFP6 external-anchor pin construction failed: {error:?}"))?;
+    let mut coordinator = QRunV06Qap1ExternalCoordinator::new(
+        provider_transport,
+        provider_floor,
+        anchor_transport,
+        qfp6_anchor_pin,
+        summary.q6ea_anchor_pin.clone(),
+        LibcruxMlDsa65VerifierCandidate,
+        LibcruxMlDsa65VerifierCandidate,
+    )
+    .map_err(|error| format!("QAP1 Provider/Anchor pin binding failed: {error:?}"))?;
+
+    coordinator
+        .verify_current(&expected_state)
+        .map_err(|error| {
+            format!("read-only QAP1 Provider/Anchor verification failed: {error:?}")
+        })?;
+
+    Ok((summary, expected_state))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -561,10 +761,12 @@ fn print_help() {
          \n\
          Usage:\n\
            qrun_v06_node --preflight --config <path> --config-sha256 <64-hex>\n\
+           qrun_v06_node --probe-qap1 --config <path> --config-sha256 <64-hex>\n\
            qrun_v06_node --help\n\
          \n\
-         This build verifies the full QFB6 Genesis snapshot, Q6GD/Q6PN/Q6TS and the independent AWS DynamoDB Q6TS floor.\n\
-         It is preflight-only: it does not open a QFP6 data directory, bind P2P, or start a node."
+         --preflight verifies the pinned Genesis/Q6PN/Q6TS/Q6EA bootstrap package.\n\
+         --probe-qap1 additionally performs read-only signed Provider and Q6EA Anchor reads over pinned Noise endpoints.\n\
+         Neither command starts a node, mutates a store/floor, admits transactions, or mines."
     );
 }
 
@@ -577,16 +779,22 @@ fn run(args: &[String]) -> Result<(), String> {
         return Err("node runtime is not enabled in this build: QAP1/Provider/Anchor, node-key custody, durable-store recovery and independent production qualification must be wired and verified first".into());
     }
     if args.len() != 5
-        || args[0] != "--preflight"
+        || !matches!(args[0].as_str(), "--preflight" | "--probe-qap1")
         || args[1] != "--config"
         || args[3] != "--config-sha256"
     {
-        return Err(
-            "expected '--preflight --config <path> --config-sha256 <64-hex>' (or '--help')".into(),
-        );
+        return Err("expected '--preflight|--probe-qap1 --config <path> --config-sha256 <64-hex>' (or '--help')".into());
     }
     let expected_config_digest = parse_hex32("config_sha256", &args[4])?;
-    let summary = preflight(Path::new(&args[2]), &expected_config_digest)?;
+    let (summary, q6ea_state) = if args[0] == "--probe-qap1" {
+        let (summary, state) = probe_qap1_services(Path::new(&args[2]), &expected_config_digest)?;
+        (summary, Some(state))
+    } else {
+        (
+            preflight(Path::new(&args[2]), &expected_config_digest)?,
+            None,
+        )
+    };
     println!("QFP6 BOOTSTRAP PREFLIGHT: PASS");
     println!("config_sha256={}", hex(&expected_config_digest));
     println!("network_id={}", hex(&summary.network_id));
@@ -624,11 +832,26 @@ fn run(args: &[String]) -> Result<(), String> {
             "absent (native chain only; quote-asset operations remain gated)"
         }
     );
+    println!("crypto_verifier=LibcruxMlDsa65VerifierCandidate");
+    println!("crypto_qualification=CANDIDATE_ONLY_NOT_PRODUCTION_APPROVED");
     println!("runtime=NOT_STARTED");
     println!("node_p2p_listener=NOT_OPENED");
     println!("qfp6_data_directory=NOT_TOUCHED");
     println!("qfp6_store=NOT_MUTATED");
     println!("anti_rollback_floor=independent DynamoDB strongly-consistent read; no writes");
+    if let Some(state) = q6ea_state {
+        println!("qap1_service_probe=PASS");
+        println!("provider_signed_read=PASS");
+        println!("q6ea_anchor_signed_read=PASS");
+        println!("q6ea_sequence={}", state.canonical_height);
+        println!("q6ea_manifest_generation={}", state.manifest_generation);
+        println!("q6ea_canonical_tip={}", hex(&state.canonical_tip));
+        println!("provider_floor=OPENED_READ_ONLY");
+        println!("provider_cas=NOT_CALLED");
+        println!("q6ea_anchor_cas=NOT_CALLED");
+    } else {
+        println!("qap1_service_probe=NOT_REQUESTED");
+    }
     Ok(())
 }
 
@@ -662,6 +885,89 @@ mod tests {
     const TEST_NETWORK: [u8; 32] = [0xA1; 32];
     const TEST_PROFILE: [u8; 32] = [0xA2; 32];
     const TEST_Q6PN_COMMITMENT: [u8; 32] = [0xA3; 32];
+
+    #[test]
+    fn preflight_config_does_not_require_qap1_client_secrets_or_provider_floor() {
+        let path = env::temp_dir().join(format!(
+            "qrun-qfp6-cp0574-config-{}.json",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let mut value = serde_json::json!({
+            "network_id": "01".repeat(32),
+            "profile_id": "02".repeat(32),
+            "profile_pin_commitment": "03".repeat(32),
+            "founder_account": "04".repeat(32),
+            "consensus_fingerprint": "05".repeat(32),
+            "tokenomics_policy_fingerprint": "06".repeat(32),
+            "genesis_snapshot_sha256": "07".repeat(32),
+            "genesis_snapshot_path": "genesis.q6gs",
+            "q6pn_path": "q6pn.bin",
+            "q6ts_path": "q6ts.bin",
+            "q6ts_ed25519_authority_public_key_path": "authority-ed.pub",
+            "q6ts_mldsa65_authority_public_key_path": "authority-pq.pub",
+            "q6ts_authority_keyset_id": "08".repeat(32),
+            "aws_cli_path": "aws",
+            "aws_region": "us-east-1",
+            "q6ts_floor_table": "q6ts-floor",
+            "q6ea_anchor_id": "09".repeat(32),
+            "q6ea_receipt_key_id": "0a".repeat(32),
+            "q6ea_receipt_public_key_path": "q6ea-receipt.pub",
+            "provider_noise_server_key_path": "provider-noise.pub",
+            "provider_noise_server_key_sha256": "0b".repeat(32),
+            "q6ea_anchor_noise_server_key_path": "anchor-noise.pub",
+            "q6ea_anchor_noise_server_key_sha256": "0c".repeat(32),
+            "provider_endpoint": "192.0.2.10:9100",
+            "q6ea_anchor_endpoint": "192.0.2.11:9200"
+        });
+
+        let bytes = serde_json::to_vec(&value).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        let basic = parse_config(&path, &digest).unwrap();
+        assert!(basic.provider_noise_client_key_path.is_none());
+        assert!(basic.q6ea_anchor_noise_client_key_path.is_none());
+        assert!(basic.provider_floor_store_path.is_none());
+        assert!(basic.q6ea_expected_state_path.is_none());
+        assert!(basic.q6ea_expected_state_sha256.is_none());
+
+        value["provider_noise_client_key_path"] = serde_json::json!("provider-client.npk1");
+        value["q6ea_anchor_noise_client_key_path"] = serde_json::json!("anchor-client.npk1");
+        value["provider_floor_store_path"] = serde_json::json!("provider-floor");
+        value["q6ea_expected_state_path"] = serde_json::json!("anchor-state.q6ea");
+        value["q6ea_expected_state_sha256"] = serde_json::json!("0d".repeat(32));
+        let bytes = serde_json::to_vec(&value).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        let probe = parse_config(&path, &digest).unwrap();
+        assert!(probe.provider_noise_client_key_path.is_some());
+        assert!(probe.q6ea_anchor_noise_client_key_path.is_some());
+        assert!(probe.provider_floor_store_path.is_some());
+        assert!(probe.q6ea_expected_state_path.is_some());
+        assert_eq!(probe.q6ea_expected_state_sha256, Some([0x0d; 32]));
+
+        value["q6ea_expected_state_sha256"] = serde_json::json!("not-a-digest");
+        let bytes = serde_json::to_vec(&value).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        assert!(parse_config(&path, &digest).is_err());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn equal_qap1_client_keys_are_rejected_and_zeroized() {
+        let mut provider = [0x41; 32];
+        let mut anchor = [0x41; 32];
+        assert!(require_distinct_qap1_client_keys(&mut provider, &mut anchor).is_err());
+        assert_eq!(provider, [0; 32]);
+        assert_eq!(anchor, [0; 32]);
+
+        let mut provider = [0x42; 32];
+        let mut anchor = [0x43; 32];
+        assert!(require_distinct_qap1_client_keys(&mut provider, &mut anchor).is_ok());
+        assert_eq!(provider, [0x42; 32]);
+        assert_eq!(anchor, [0x43; 32]);
+    }
 
     #[test]
     fn q6ts_real_dual_signatures_verify_against_exact_current_floor() {
@@ -850,6 +1156,62 @@ mod tests {
     }
 
     #[test]
+    fn q6ea_expected_state_must_bind_exact_q6pn_and_genesis_identity() {
+        let state = QRunV06ExternalAnchorState {
+            network_id: TEST_NETWORK,
+            genesis_digest: [0x31; 32],
+            genesis_descriptor_commitment: [0x32; 32],
+            profile_id: TEST_PROFILE,
+            consensus_fingerprint: [0x33; 32],
+            segment_base_height: 0,
+            segment_base_tip: [0x34; 32],
+            checkpoint_anchor: [0; 32],
+            manifest_generation: 0,
+            manifest_anchor: [0x35; 32],
+            canonical_height: 0,
+            canonical_tip: [0x34; 32],
+            canonical_state_root: [0x36; 32],
+            cumulative_chainwork: [0; 32],
+        };
+        assert!(validate_q6ea_expected_state_identity(
+            &state,
+            &TEST_NETWORK,
+            &TEST_PROFILE,
+            &[0x31; 32],
+            &[0x32; 32],
+            &[0x33; 32],
+        )
+        .is_ok());
+        assert!(validate_q6ea_expected_state_identity(
+            &state,
+            &[0xA9; 32],
+            &TEST_PROFILE,
+            &[0x31; 32],
+            &[0x32; 32],
+            &[0x33; 32],
+        )
+        .is_err());
+        assert!(validate_q6ea_expected_state_identity(
+            &state,
+            &TEST_NETWORK,
+            &TEST_PROFILE,
+            &[0xA9; 32],
+            &[0x32; 32],
+            &[0x33; 32],
+        )
+        .is_err());
+        assert!(validate_q6ea_expected_state_identity(
+            &state,
+            &TEST_NETWORK,
+            &TEST_PROFILE,
+            &[0x31; 32],
+            &[0x32; 32],
+            &[0xA9; 32],
+        )
+        .is_err());
+    }
+
+    #[test]
     fn help_is_available_without_loading_any_artifact() {
         assert!(run(&["--help".into()]).is_ok());
     }
@@ -899,6 +1261,19 @@ mod tests {
             parse_hex32("network_id", &"ab".repeat(32)).unwrap(),
             [0xab; 32]
         );
+    }
+
+    #[test]
+    fn read_only_qap1_probe_refuses_missing_config_before_any_network_call() {
+        let error = run(&[
+            "--probe-qap1".into(),
+            "--config".into(),
+            "missing-qrun-v06-node.json".into(),
+            "--config-sha256".into(),
+            "11".repeat(32),
+        ])
+        .unwrap_err();
+        assert!(error.contains("cannot inspect config"));
     }
 
     #[test]

@@ -139,24 +139,27 @@ impl Drop for NoiseTcpOffhostAnchorTransport {
 impl NoiseTcpOffhostAnchorTransport {
     pub fn new(
         address: SocketAddr,
-        local_static_private_key: [u8; 32],
+        mut local_static_private_key: [u8; 32],
         trusted_server_static_public_key: [u8; 32],
         anchor_pin: crate::external_cas_offhost_anchor_protocol_candidate::ExternalCasOffhostAnchorPin,
         provider_pin: ExternalCasPin,
     ) -> Result<Self, OffhostAnchorNoiseError> {
-        Self::with_timeout(
+        let result = Self::with_timeout(
             address,
             local_static_private_key,
             trusted_server_static_public_key,
             anchor_pin,
             provider_pin,
             DEFAULT_CONNECT_TIMEOUT,
-        )
+        );
+        // Clear the original stack copy; with_timeout owns a separate Copy value.
+        local_static_private_key.fill(0);
+        result
     }
 
     pub fn with_timeout(
         address: SocketAddr,
-        local_static_private_key: [u8; 32],
+        mut local_static_private_key: [u8; 32],
         trusted_server_static_public_key: [u8; 32],
         anchor_pin: crate::external_cas_offhost_anchor_protocol_candidate::ExternalCasOffhostAnchorPin,
         provider_pin: ExternalCasPin,
@@ -167,9 +170,16 @@ impl NoiseTcpOffhostAnchorTransport {
             || connect_timeout.is_zero()
             || connect_timeout > MAX_CONNECT_TIMEOUT
         {
+            local_static_private_key.fill(0);
             return Err(OffhostAnchorNoiseError::InvalidConfiguration);
         }
-        let profile_id = offhost_anchor_noise_profile_id(&anchor_pin, &provider_pin)?;
+        let profile_id = match offhost_anchor_noise_profile_id(&anchor_pin, &provider_pin) {
+            Ok(profile_id) => profile_id,
+            Err(error) => {
+                local_static_private_key.fill(0);
+                return Err(error);
+            }
+        };
         Ok(Self {
             address,
             local_static_private_key,
