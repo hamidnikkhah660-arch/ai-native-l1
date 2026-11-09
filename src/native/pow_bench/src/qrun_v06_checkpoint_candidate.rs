@@ -574,13 +574,20 @@ mod tests {
     use super::*;
     use crate::{
         consensus::Uint256,
+        qrun_v06_canonical_execution_candidate::{QRunV06Block, QRunV06BlockOperation},
         qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
         qrun_v06_tokenomics_candidate::{
-            QRunV06MiningScheduleCandidate, QRunV06TokenomicsState, QRUN_V06_FOUNDER_GENESIS_ATOMS,
+            QRunV06AllocationBucket, QRunV06MiningScheduleCandidate,
+            QRunV06SignedBurnReserveRetirement, QRunV06TokenomicsState,
+            QRUN_V06_FOUNDER_GENESIS_ATOMS,
         },
         qrun_v06_unified_asset_candidate::QRunV06UnifiedAssetState,
         qzxb_amm_candidate::QzxbAmmStateCandidate,
         state_machine::LedgerState,
+        transaction_auth::{
+            AccountPublicKey, Ed25519TransactionAuthenticator, Ed25519TransactionSigner,
+            TransactionAuthenticatorKind,
+        },
     };
 
     const NETWORK: [u8; 32] = [0xE1; 32];
@@ -621,6 +628,237 @@ mod tests {
             unified, PROFILE, tokenomics, descriptor,
         )
         .unwrap()
+    }
+
+    fn genesis_for(owner: [u8; 32]) -> QRunV06CanonicalExecutionState {
+        let schedule = QRunV06MiningScheduleCandidate::cp0422_research_candidate();
+        let tokenomics = QRunV06TokenomicsState::genesis(NETWORK, owner, schedule).unwrap();
+        let consensus = params();
+        let descriptor = QRunV06GenesisDescriptor::new(
+            NETWORK,
+            PROFILE,
+            owner,
+            1,
+            qrun_v06_consensus_fingerprint(&consensus).unwrap(),
+            tokenomics.policy_fingerprint(),
+        )
+        .unwrap();
+        let ledger = LedgerState::genesis_at(
+            NETWORK,
+            vec![(owner, QRUN_V06_FOUNDER_GENESIS_ATOMS as u64)],
+            descriptor.genesis_timestamp(),
+        )
+        .unwrap();
+        let amm = QzxbAmmStateCandidate::new(NETWORK, 32, 64, 512).unwrap();
+        let unified = QRunV06UnifiedAssetState::new(ledger, amm).unwrap();
+        QRunV06CanonicalExecutionState::new_with_genesis_descriptor(
+            unified, PROFILE, tokenomics, descriptor,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn consensus_fingerprint_binds_every_current_consensus_parameter() {
+        let baseline = params();
+        let baseline_fingerprint = qrun_v06_consensus_fingerprint(&baseline).unwrap();
+        let mut variants = Vec::new();
+
+        let mut changed = baseline.clone();
+        changed.protocol_version += 1;
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        changed.target_block_time_secs += 1;
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        changed.difficulty_window_blocks += 1;
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        changed.difficulty_min_ratio_divisor += 1;
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        changed.difficulty_max_ratio += 1;
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        let mut pow_limit = changed.pow_limit.to_be_bytes();
+        pow_limit[31] -= 1;
+        changed.pow_limit = Uint256::from_be_bytes(pow_limit);
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        changed.initial_target = Uint256::from_be_bytes([0x01; 32]);
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        changed.pow.memory_kib += 1;
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        changed.pow.iterations += 1;
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        changed.pow.lanes += 1;
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        changed.issuance = crate::issuance_schedule::IssuanceParameters::new(
+            baseline.issuance.maximum_supply() + 1,
+            baseline.issuance.initial_subsidy(),
+            baseline.issuance.blocks_per_halving(),
+        )
+        .unwrap();
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        changed.issuance = crate::issuance_schedule::IssuanceParameters::new(
+            baseline.issuance.maximum_supply(),
+            baseline.issuance.initial_subsidy() + 1,
+            baseline.issuance.blocks_per_halving(),
+        )
+        .unwrap();
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        changed.issuance = crate::issuance_schedule::IssuanceParameters::new(
+            baseline.issuance.maximum_supply(),
+            baseline.issuance.initial_subsidy(),
+            baseline.issuance.blocks_per_halving() + 1,
+        )
+        .unwrap();
+        variants.push(changed);
+
+        assert_eq!(variants.len(), 13);
+        for (index, variant) in variants.iter().enumerate() {
+            variant.validate().unwrap();
+            let fingerprint = qrun_v06_consensus_fingerprint(variant).unwrap();
+            assert_ne!(
+                fingerprint, baseline_fingerprint,
+                "consensus parameter mutation at index {index} was not fingerprinted"
+            );
+        }
+
+        let mut invalid_output = baseline;
+        invalid_output.pow.output_bytes -= 1;
+        assert!(matches!(
+            qrun_v06_consensus_fingerprint(&invalid_output),
+            Err(QRunV06CheckpointError::Consensus(
+                crate::consensus::ConsensusError::InvalidPowParameters
+            ))
+        ));
+    }
+
+    #[test]
+    fn checkpoint_restore_preserves_protocol_burn_reserve_retirement_accounting() {
+        let params = params();
+        let founder = Ed25519TransactionSigner::from_seed([0xF1; 32]);
+        let mut state = genesis_for(founder.account_id());
+        let policy_fingerprint = state.tokenomics().unwrap().policy_fingerprint();
+        let retirement_amount = 77_000u128;
+        let mut retirement = QRunV06SignedBurnReserveRetirement {
+            network_id: NETWORK,
+            policy_fingerprint,
+            expected_burned_atoms: 0,
+            amount_atoms: retirement_amount,
+            valid_until_timestamp: 10_000,
+            purpose_digest: [0xF2; 32],
+            evidence_digest: [0xF3; 32],
+            founder_signature: Vec::new(),
+        };
+        retirement.founder_signature = founder.sign_digest(&retirement.signing_digest().unwrap());
+        let authenticator = Ed25519TransactionAuthenticator::select(
+            TransactionAuthenticatorKind::Ed25519V1,
+            [AccountPublicKey {
+                account_id: founder.account_id(),
+                public_key: founder.public_key(),
+            }],
+        )
+        .unwrap();
+
+        let mut block = QRunV06Block {
+            network_id: NETWORK,
+            profile_id: PROFILE,
+            height: 1,
+            timestamp: 2,
+            parent_hash: state.tip_hash(),
+            state_root: [0; 32],
+            producer: [0xF4; 32],
+            operations: vec![QRunV06BlockOperation::ProtocolBurnReserveRetirement(
+                retirement,
+            )],
+        };
+        block.state_root = state
+            .preview_state_root_after(&block, &authenticator)
+            .unwrap();
+        state.apply_block(&block, &authenticator).unwrap();
+
+        let live_supply_before_checkpoint =
+            state.tokenomics().unwrap().live_supply_atoms().unwrap();
+        assert_eq!(
+            state.tokenomics().unwrap().burned_atoms(),
+            retirement_amount
+        );
+        assert_eq!(
+            state
+                .tokenomics()
+                .unwrap()
+                .issued_by_bucket_atoms(QRunV06AllocationBucket::ProtocolBurnReserve),
+            retirement_amount
+        );
+
+        let checkpoint = QRunV06CheckpointCandidate::from_validated_branch(
+            state,
+            [0xF5; 32],
+            Uint256::ONE,
+            vec![QRunV06TargetHistoryEntry {
+                height: 1,
+                target: params.initial_target,
+                timestamp: 2,
+            }],
+            &params,
+        )
+        .unwrap();
+        let bytes = checkpoint.encode_snapshot().unwrap();
+        let anchor = checkpoint.commitment().unwrap();
+        let restored = QRunV06CheckpointCandidate::decode_snapshot(
+            &bytes, &params, &NETWORK, &PROFILE, anchor,
+        )
+        .unwrap();
+
+        let restored_tokenomics = restored.execution_state().tokenomics().unwrap();
+        assert_eq!(restored_tokenomics.burned_atoms(), retirement_amount);
+        assert_eq!(
+            restored_tokenomics
+                .issued_by_bucket_atoms(QRunV06AllocationBucket::ProtocolBurnReserve),
+            retirement_amount
+        );
+        assert_eq!(
+            restored_tokenomics
+                .unissued_by_bucket_atoms(QRunV06AllocationBucket::ProtocolBurnReserve)
+                .unwrap(),
+            QRunV06AllocationBucket::ProtocolBurnReserve.budget_atoms() - retirement_amount
+        );
+        assert_eq!(
+            restored_tokenomics.live_supply_atoms().unwrap(),
+            live_supply_before_checkpoint
+        );
+        assert_eq!(
+            restored_tokenomics.live_supply_atoms().unwrap(),
+            restored
+                .execution_state()
+                .unified()
+                .ledger()
+                .total_value()
+                .unwrap()
+        );
+        assert_eq!(
+            restored.execution_state().state_root().unwrap(),
+            checkpoint.execution_state().state_root().unwrap()
+        );
     }
 
     #[test]

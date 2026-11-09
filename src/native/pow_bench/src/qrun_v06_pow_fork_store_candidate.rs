@@ -4919,6 +4919,181 @@ mod tests {
     }
 
     #[test]
+    fn default_2016_block_retarget_is_reached_across_1024_block_checkpoint_segments() {
+        let mut consensus = params();
+        consensus.difficulty_window_blocks = 2_016;
+        // A deliberately easy test target keeps this boundary regression affordable while
+        // retaining the actual Argon2id verifier and the full production window arithmetic.
+        consensus.initial_target = Uint256::from_be_bytes([0xF0; 32]);
+        consensus.validate().unwrap();
+
+        let schedule = QRunV06MiningScheduleCandidate::cp0422_research_candidate();
+        let tokenomics = crate::qrun_v06_tokenomics_candidate::QRunV06TokenomicsState::genesis(
+            NETWORK, OWNER, schedule,
+        )
+        .unwrap();
+        let descriptor =
+            crate::qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor::new(
+                NETWORK,
+                PROFILE,
+                OWNER,
+                1,
+                crate::qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint(&consensus)
+                    .unwrap(),
+                tokenomics.policy_fingerprint(),
+            )
+            .unwrap();
+        let genesis = QRunV06CanonicalExecutionState::cp0528_genesis_candidate_with_descriptor(
+            descriptor, schedule,
+        )
+        .unwrap();
+        let genesis_descriptor_commitment = genesis.genesis_descriptor_commitment().unwrap();
+
+        // In-memory segment one reaches the existing 1,024-block bound from Genesis.
+        let mut segment_one =
+            crate::qrun_v06_pow_fork_choice_candidate::QRunV06PowForkChoice::
+                new_with_expected_genesis_descriptor_commitment(
+                    genesis.clone(),
+                    consensus.clone(),
+                    genesis_descriptor_commitment,
+                )
+                .unwrap();
+        let mut tip = segment_one.canonical_tip().tip_hash;
+        let mut state = genesis;
+        for height in 1..=1_024u64 {
+            let target = segment_one.expected_next_target(&tip).unwrap();
+            assert_eq!(target, consensus.initial_target);
+            let timestamp = 1 + height * 31;
+            let (envelope, digest) = candidate(&state, tip, timestamp, target, &consensus);
+            segment_one
+                .insert_encoded(&envelope, &EmptyAuthenticator)
+                .unwrap();
+            tip = digest;
+            state = segment_one.canonical_state().clone();
+        }
+        assert_eq!(segment_one.canonical_tip().height, 1_024);
+        assert_eq!(segment_one.archive_len(), 1_024);
+
+        let checkpoint_one = segment_one.canonical_checkpoint().unwrap();
+        let checkpoint_one_bytes = checkpoint_one.encode_snapshot().unwrap();
+        let checkpoint_one_anchor = checkpoint_one.commitment().unwrap();
+        let checkpoint_one_decoded = QRunV06CheckpointCandidate::decode_snapshot(
+            &checkpoint_one_bytes,
+            &consensus,
+            &NETWORK,
+            &PROFILE,
+            checkpoint_one_anchor,
+        )
+        .unwrap();
+        drop(segment_one);
+
+        // Segment two starts from the independently supplied checkpoint commitment and
+        // continues to the actual first retarget at height 2,017 (window = 2,016).
+        let mut segment_two =
+            crate::qrun_v06_pow_fork_choice_candidate::QRunV06PowForkChoice::
+                from_checkpoint_with_expected_genesis_descriptor_commitment(
+                    checkpoint_one_decoded,
+                    consensus.clone(),
+                    genesis_descriptor_commitment,
+                )
+                .unwrap();
+        let mut retargeted_target = None;
+        for height in 1_025..=2_017u64 {
+            let target = segment_two.expected_next_target(&tip).unwrap();
+            if height == 2_017 {
+                assert_ne!(target, consensus.initial_target);
+                retargeted_target = Some(target);
+            }
+            let timestamp = 1 + height * 31;
+            let (envelope, digest) = candidate(&state, tip, timestamp, target, &consensus);
+            segment_two
+                .insert_encoded(&envelope, &EmptyAuthenticator)
+                .unwrap();
+            tip = digest;
+            state = segment_two.canonical_state().clone();
+        }
+        let retargeted_target =
+            retargeted_target.expect("height 2,017 must execute the first retarget");
+        assert_eq!(segment_two.canonical_tip().height, 2_017);
+        assert_eq!(segment_two.archive_len(), 993);
+
+        // The second checkpoint must retain the complete 2,016-entry tail after retarget.
+        let checkpoint_two = segment_two.canonical_checkpoint().unwrap();
+        let checkpoint_two_bytes = checkpoint_two.encode_snapshot().unwrap();
+        let checkpoint_two_anchor = checkpoint_two.commitment().unwrap();
+        let checkpoint_two_decoded = QRunV06CheckpointCandidate::decode_snapshot(
+            &checkpoint_two_bytes,
+            &consensus,
+            &NETWORK,
+            &PROFILE,
+            checkpoint_two_anchor,
+        )
+        .unwrap();
+        assert_eq!(checkpoint_two_decoded.target_history().len(), 2_016);
+        drop(segment_two);
+
+        let segment_three =
+            crate::qrun_v06_pow_fork_choice_candidate::QRunV06PowForkChoice::
+                from_checkpoint_with_expected_genesis_descriptor_commitment(
+                    checkpoint_two_decoded,
+                    consensus.clone(),
+                    genesis_descriptor_commitment,
+                )
+                .unwrap();
+        assert_eq!(segment_three.canonical_tip().height, 2_017);
+        assert_eq!(
+            segment_three.expected_next_target(&tip).unwrap(),
+            retargeted_target
+        );
+
+        // Finally persist the retargeted checkpoint once, reopen it against the exact
+        // manifest anchor, and verify that target history still authorizes height 2,018.
+        let durable_dir = TestDir::new();
+        let durable = QRunV06DurableForkStore::open_from_checkpoint(
+            &durable_dir.0,
+            &checkpoint_two_bytes,
+            consensus.clone(),
+            NETWORK,
+            PROFILE,
+            checkpoint_two_anchor,
+            &EmptyAuthenticator,
+            None,
+        )
+        .unwrap();
+        assert_eq!(durable.canonical_height().unwrap(), 2_017);
+        assert_eq!(durable.canonical_tip().unwrap(), tip);
+        let expected_state_root = durable.canonical_state_root().unwrap();
+        let manifest_anchor = durable.manifest_anchor().unwrap();
+        drop(durable);
+
+        let reopened = QRunV06DurableForkStore::open_from_checkpoint(
+            &durable_dir.0,
+            &checkpoint_two_bytes,
+            consensus,
+            NETWORK,
+            PROFILE,
+            checkpoint_two_anchor,
+            &EmptyAuthenticator,
+            Some(manifest_anchor),
+        )
+        .unwrap();
+        assert_eq!(reopened.canonical_height().unwrap(), 2_017);
+        assert_eq!(reopened.canonical_tip().unwrap(), tip);
+        assert_eq!(
+            reopened.canonical_state_root().unwrap(),
+            expected_state_root
+        );
+        assert_eq!(
+            reopened
+                .graph()
+                .unwrap()
+                .expected_next_target(&tip)
+                .unwrap(),
+            retargeted_target
+        );
+    }
+
+    #[test]
     fn checkpoint_segment_ambiguous_commit_recovers_from_checkpoint_base() {
         let genesis_dir = TestDir::new();
         let segment_dir = TestDir::new();
