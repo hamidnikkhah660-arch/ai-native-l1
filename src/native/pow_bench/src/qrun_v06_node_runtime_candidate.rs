@@ -168,6 +168,7 @@ pub struct QRunV06NodeRuntime<A: QRunV06NodeAnchorGate> {
     pending_anchor_commit: Option<PendingAnchorCommit>,
     recovery_required: bool,
     qap1_required: bool,
+    qap1_recovered: bool,
 }
 
 impl<A: QRunV06NodeAnchorGate> QRunV06NodeRuntime<A> {
@@ -200,6 +201,7 @@ impl<A: QRunV06NodeAnchorGate> QRunV06NodeRuntime<A> {
             pending_anchor_commit: None,
             recovery_required: false,
             qap1_required: false,
+            qap1_recovered: false,
         })
     }
 
@@ -238,6 +240,7 @@ impl<A: QRunV06NodeAnchorGate> QRunV06NodeRuntime<A> {
             pending_anchor_commit: None,
             recovery_required: false,
             qap1_required: false,
+            qap1_recovered: false,
         })
     }
 
@@ -275,6 +278,7 @@ impl<A: QRunV06NodeAnchorGate> QRunV06NodeRuntime<A> {
                 pending_anchor_commit: None,
                 recovery_required: false,
                 qap1_required: true,
+                qap1_recovered: true,
             });
         }
 
@@ -435,6 +439,7 @@ impl<A: QRunV06NodeAnchorGate> QRunV06NodeRuntime<A> {
             pending_anchor_commit: None,
             recovery_required: false,
             qap1_required: true,
+            qap1_recovered: true,
         })
     }
 
@@ -680,6 +685,11 @@ impl<A: QRunV06NodeAnchorGate> QRunV06NodeRuntime<A> {
     /// A network-facing supervisor must require this to be true before binding its listener.
     pub fn requires_qap1(&self) -> bool {
         self.qap1_required
+    }
+
+    /// True only after the QAP1 restart constructor verified the Provider and Q6EA state.
+    pub fn qap1_recovery_verified(&self) -> bool {
+        self.qap1_recovered
     }
 }
 

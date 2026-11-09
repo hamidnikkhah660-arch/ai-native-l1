@@ -143,6 +143,16 @@ fn validate_identity_material(
     Ok(())
 }
 
+fn validate_qap1_lifecycle(
+    qap1_required: bool,
+    qap1_recovered: bool,
+) -> Result<(), QRunV06NodeSupervisorError> {
+    if !qap1_required || !qap1_recovered {
+        return Err(QRunV06NodeSupervisorError::RuntimeNotQap1Recovered);
+    }
+    Ok(())
+}
+
 fn validate_startup<A: QRunV06NodeAnchorGate>(
     runtime: &QRunV06NodeRuntime<A>,
     local_static_private_key: &[u8; 32],
@@ -150,9 +160,7 @@ fn validate_startup<A: QRunV06NodeAnchorGate>(
     profile_id: &[u8; 32],
 ) -> Result<(), QRunV06NodeSupervisorError> {
     validate_identity_material(local_static_private_key, network_id, profile_id)?;
-    if !runtime.requires_qap1() {
-        return Err(QRunV06NodeSupervisorError::RuntimeNotQap1Recovered);
-    }
+    validate_qap1_lifecycle(runtime.requires_qap1(), runtime.qap1_recovery_verified())?;
     if runtime.requires_reopen() {
         return Err(QRunV06NodeSupervisorError::RuntimeRequiresRecovery);
     }
@@ -374,6 +382,19 @@ mod tests {
             ),
             Err(QRunV06NodeSupervisorError::StatisticsOverflow)
         );
+    }
+
+    #[test]
+    fn supervisor_requires_both_qap1_admission_and_verified_restart_recovery() {
+        assert_eq!(
+            validate_qap1_lifecycle(false, false),
+            Err(QRunV06NodeSupervisorError::RuntimeNotQap1Recovered)
+        );
+        assert_eq!(
+            validate_qap1_lifecycle(true, false),
+            Err(QRunV06NodeSupervisorError::RuntimeNotQap1Recovered)
+        );
+        assert!(validate_qap1_lifecycle(true, true).is_ok());
     }
 
     #[test]
