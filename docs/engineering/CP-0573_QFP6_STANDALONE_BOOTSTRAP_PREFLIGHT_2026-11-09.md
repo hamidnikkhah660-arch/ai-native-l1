@@ -22,6 +22,7 @@ The preflight requires an out-of-band SHA-256 for the complete configuration and
 10. Loads the Q6TS monotonic floor through the strongly consistent, read-only AWS DynamoDB adapter, verifies both signatures and requires the signed envelope to be the exact current floor head. It never provisions or advances the floor.
 11. Requires a Q6EA Anchor pin bound to the Provider ID, network ID and Genesis digest embedded in Q6PN. The Anchor receipt key ID and ML-DSA-65 public key must both differ from the Provider receipt key ID/public key.
 12. Requires Provider and Q6EA Anchor endpoints to be distinct numeric SocketAddr values with nonzero ports and specified unicast IP addresses. DNS names, wildcard and multicast addresses are refused. This catches malformed/identical endpoint configuration but does not establish independent operators.
+13. Requires separate 32-byte Provider and Q6EA Anchor Noise XX server static public keys, each SHA-256 pinned in the externally digested config; all-zero, altered or identical keys are rejected. The corresponding client private keys are deliberately not accepted as plaintext files in this preflight.
 
 The executable reports the verified network/profile, Q6GD commitment, full Genesis snapshot digest/state root, Founder atoms, Provider ID/endpoint, Q6EA Anchor ID/endpoint, Q6TS epoch and whether Q6PN includes a Q6QA quote-asset pin.
 
@@ -59,6 +60,10 @@ Example config shape (all identity values below are placeholders and must be rep
   "q6ea_anchor_id": "<64 lowercase hex characters>",
   "q6ea_receipt_key_id": "<64 lowercase hex characters, distinct from Provider receipt key ID>",
   "q6ea_receipt_public_key_path": ".\\trust\\q6ea-anchor-mldsa65.pub",
+  "provider_noise_server_key_path": ".\\trust\\provider-noise-static.pub",
+  "provider_noise_server_key_sha256": "<64 lowercase hex characters, independently pinned SHA-256>",
+  "q6ea_anchor_noise_server_key_path": ".\\trust\\q6ea-noise-static.pub",
+  "q6ea_anchor_noise_server_key_sha256": "<64 lowercase hex characters, independently pinned SHA-256>",
   "provider_endpoint": "<numeric-ip>:<port>",
   "q6ea_anchor_endpoint": "<different-numeric-ip>:<port>"
 }

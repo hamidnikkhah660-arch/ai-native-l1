@@ -53,6 +53,10 @@ struct Config {
     q6ea_anchor_id: [u8; 32],
     q6ea_receipt_key_id: [u8; 32],
     q6ea_receipt_public_key_path: PathBuf,
+    provider_noise_server_key_path: PathBuf,
+    provider_noise_server_key_sha256: [u8; 32],
+    q6ea_anchor_noise_server_key_path: PathBuf,
+    q6ea_anchor_noise_server_key_sha256: [u8; 32],
     provider_endpoint: SocketAddr,
     q6ea_anchor_endpoint: SocketAddr,
 }
@@ -66,6 +70,8 @@ struct PreflightSummary {
     genesis_snapshot_sha256: [u8; 32],
     founder_genesis_atoms: u128,
     q6ea_anchor_id: [u8; 32],
+    provider_noise_server_key_sha256: [u8; 32],
+    q6ea_anchor_noise_server_key_sha256: [u8; 32],
     provider_endpoint: SocketAddr,
     q6ea_anchor_endpoint: SocketAddr,
     trust_epoch: u64,
@@ -137,6 +143,31 @@ fn parse_service_endpoint(name: &str, value: &str) -> Result<SocketAddr, String>
         ));
     }
     Ok(address)
+}
+
+fn read_pinned_noise_server_key(
+    path: &Path,
+    expected_sha256: &[u8; 32],
+    label: &str,
+) -> Result<[u8; 32], String> {
+    let bytes = read_bounded(path, 32, label)?;
+    if bytes.len() != 32 {
+        return Err(format!("{label} must be exactly 32 bytes"));
+    }
+    let actual_sha256: [u8; 32] = Sha256::digest(&bytes).into();
+    if &actual_sha256 != expected_sha256 {
+        return Err(format!(
+            "{label} SHA-256 differs from the independently pinned config digest"
+        ));
+    }
+    let key: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("{label} has an invalid length"))?;
+    if key == [0; 32] {
+        return Err(format!("{label} must not be zero"));
+    }
+    Ok(key)
 }
 
 fn validate_distinct_qap1_endpoints(
@@ -246,6 +277,16 @@ fn parse_config(
             required_string(&value, "q6ea_receipt_key_id")?,
         )?,
         q6ea_receipt_public_key_path: path_field("q6ea_receipt_public_key_path")?,
+        provider_noise_server_key_path: path_field("provider_noise_server_key_path")?,
+        provider_noise_server_key_sha256: parse_hex32(
+            "provider_noise_server_key_sha256",
+            required_string(&value, "provider_noise_server_key_sha256")?,
+        )?,
+        q6ea_anchor_noise_server_key_path: path_field("q6ea_anchor_noise_server_key_path")?,
+        q6ea_anchor_noise_server_key_sha256: parse_hex32(
+            "q6ea_anchor_noise_server_key_sha256",
+            required_string(&value, "q6ea_anchor_noise_server_key_sha256")?,
+        )?,
         provider_endpoint: parse_service_endpoint(
             "provider_endpoint",
             required_string(&value, "provider_endpoint")?,
@@ -417,6 +458,21 @@ fn preflight(
             format!("Q6EA Anchor pin is invalid or not independent from Provider: {error:?}")
         })?;
 
+    // Pin the Noise XX server identities separately from the Provider/Anchor receipt keys.
+    let provider_noise_server_key = read_pinned_noise_server_key(
+        &config.provider_noise_server_key_path,
+        &config.provider_noise_server_key_sha256,
+        "Provider Noise XX server static public key",
+    )?;
+    let q6ea_anchor_noise_server_key = read_pinned_noise_server_key(
+        &config.q6ea_anchor_noise_server_key_path,
+        &config.q6ea_anchor_noise_server_key_sha256,
+        "Q6EA Anchor Noise XX server static public key",
+    )?;
+    if provider_noise_server_key == q6ea_anchor_noise_server_key {
+        return Err("Provider and Q6EA Anchor Noise XX server static keys must be distinct".into());
+    }
+
     let envelope = QRunV06SignedProfileTrustEnvelope::decode(&trust_envelope_bytes)
         .map_err(|error| format!("Q6TS signed envelope decode failed: {error}"))?;
     if envelope.record.status != QRunV06ProfileTrustStatus::Active {
@@ -479,6 +535,8 @@ fn preflight(
         genesis_snapshot_sha256: actual_genesis_snapshot_sha256,
         founder_genesis_atoms,
         q6ea_anchor_id: config.q6ea_anchor_id,
+        provider_noise_server_key_sha256: config.provider_noise_server_key_sha256,
+        q6ea_anchor_noise_server_key_sha256: config.q6ea_anchor_noise_server_key_sha256,
         provider_endpoint: config.provider_endpoint,
         q6ea_anchor_endpoint: config.q6ea_anchor_endpoint,
         trust_epoch: envelope.record.trust_epoch,
@@ -547,7 +605,16 @@ fn run(args: &[String]) -> Result<(), String> {
     println!("provider_endpoint={}", summary.provider_endpoint);
     println!("q6ea_anchor_id={}", hex(&summary.q6ea_anchor_id));
     println!("q6ea_anchor_endpoint={}", summary.q6ea_anchor_endpoint);
+    println!(
+        "provider_noise_server_key_sha256={}",
+        hex(&summary.provider_noise_server_key_sha256)
+    );
+    println!(
+        "q6ea_anchor_noise_server_key_sha256={}",
+        hex(&summary.q6ea_anchor_noise_server_key_sha256)
+    );
     println!("provider_anchor_endpoint_distinct=true");
+    println!("provider_anchor_noise_server_keys_distinct=true");
     println!("q6ts_trust_epoch={}", summary.trust_epoch);
     println!(
         "q6qa_quote_asset_pin={}",
@@ -750,6 +817,24 @@ mod tests {
         let mut wrong_domain = anchor;
         wrong_domain.network_id[0] ^= 1;
         assert!(wrong_domain.validate(&provider).is_err());
+    }
+
+    #[test]
+    fn noise_server_public_key_loader_requires_exact_pinned_32_byte_key() {
+        let path = env::temp_dir().join(format!("qrun-qfp6-noise-pin-{}.bin", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let key = [0x41u8; 32];
+        fs::write(&path, key).unwrap();
+        let digest: [u8; 32] = Sha256::digest(key).into();
+        assert_eq!(
+            read_pinned_noise_server_key(&path, &digest, "test Noise key").unwrap(),
+            key
+        );
+        assert!(read_pinned_noise_server_key(&path, &[0x42; 32], "test Noise key").is_err());
+        fs::write(&path, [0u8; 32]).unwrap();
+        let zero_digest: [u8; 32] = Sha256::digest([0u8; 32]).into();
+        assert!(read_pinned_noise_server_key(&path, &zero_digest, "test Noise key").is_err());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
