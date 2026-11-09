@@ -624,6 +624,100 @@ mod tests {
     }
 
     #[test]
+    fn consensus_fingerprint_binds_every_current_consensus_parameter() {
+        let baseline = params();
+        let baseline_fingerprint = qrun_v06_consensus_fingerprint(&baseline).unwrap();
+        let mut variants = Vec::new();
+
+        let mut changed = baseline.clone();
+        changed.protocol_version += 1;
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        changed.target_block_time_secs += 1;
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        changed.difficulty_window_blocks += 1;
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        changed.difficulty_min_ratio_divisor += 1;
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        changed.difficulty_max_ratio += 1;
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        let mut pow_limit = changed.pow_limit.to_be_bytes();
+        pow_limit[31] -= 1;
+        changed.pow_limit = Uint256::from_be_bytes(pow_limit);
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        changed.initial_target = Uint256::from_be_bytes([0x01; 32]);
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        changed.pow.memory_kib += 1;
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        changed.pow.iterations += 1;
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        changed.pow.lanes += 1;
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        changed.issuance = crate::issuance_schedule::IssuanceParameters::new(
+            baseline.issuance.maximum_supply() + 1,
+            baseline.issuance.initial_subsidy(),
+            baseline.issuance.blocks_per_halving(),
+        )
+        .unwrap();
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        changed.issuance = crate::issuance_schedule::IssuanceParameters::new(
+            baseline.issuance.maximum_supply(),
+            baseline.issuance.initial_subsidy() + 1,
+            baseline.issuance.blocks_per_halving(),
+        )
+        .unwrap();
+        variants.push(changed);
+
+        let mut changed = baseline.clone();
+        changed.issuance = crate::issuance_schedule::IssuanceParameters::new(
+            baseline.issuance.maximum_supply(),
+            baseline.issuance.initial_subsidy(),
+            baseline.issuance.blocks_per_halving() + 1,
+        )
+        .unwrap();
+        variants.push(changed);
+
+        assert_eq!(variants.len(), 13);
+        for (index, variant) in variants.iter().enumerate() {
+            variant.validate().unwrap();
+            let fingerprint = qrun_v06_consensus_fingerprint(variant).unwrap();
+            assert_ne!(
+                fingerprint, baseline_fingerprint,
+                "consensus parameter mutation at index {index} was not fingerprinted"
+            );
+        }
+
+        let mut invalid_output = baseline;
+        invalid_output.pow.output_bytes -= 1;
+        assert!(matches!(
+            qrun_v06_consensus_fingerprint(&invalid_output),
+            Err(QRunV06CheckpointError::Consensus(
+                crate::consensus::ConsensusError::InvalidPowParameters
+            ))
+        ));
+    }
+    #[test]
     fn checkpoint_requires_external_anchor_and_rejects_cross_profile_or_corruption() {
         let params = params();
         let checkpoint = QRunV06CheckpointCandidate::from_validated_branch(
