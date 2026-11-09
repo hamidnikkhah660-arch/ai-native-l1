@@ -142,6 +142,8 @@ pub mod qrun_v06_genesis_descriptor_candidate;
 pub mod qrun_v06_historical_trust_candidate;
 /// CP-0547/0550/0551 QFP6 admission, bounded peer ingress/ACK and per-session replay guard; no production listener wiring yet.
 pub mod qrun_v06_node_runtime_candidate;
+/// CP-0568 supervised QFP6 QAP1 peer-service lifecycle; injected resources only, no public Mainnet activation.
+pub mod qrun_v06_node_supervisor_candidate;
 /// CP-0552 domain-separated pinned Noise XX transport for QFP6 peer sessions; candidate-only.
 pub mod qrun_v06_noise_transport_candidate;
 /// Isolated deterministic v0.6 LOB state candidate; not wired into QFP5/QFB5 consensus.
