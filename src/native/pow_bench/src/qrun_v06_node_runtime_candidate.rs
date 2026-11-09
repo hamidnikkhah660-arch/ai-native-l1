@@ -675,6 +675,12 @@ impl<A: QRunV06NodeAnchorGate> QRunV06NodeRuntime<A> {
     pub fn requires_reopen(&self) -> bool {
         self.recovery_required
     }
+
+    /// Whether this runtime was recovered/configured to require the QAP1 admission path.
+    /// A network-facing supervisor must require this to be true before binding its listener.
+    pub fn requires_qap1(&self) -> bool {
+        self.qap1_required
+    }
 }
 
 /// Minimal bounded QFP6 peer block frame. This codec is intentionally separate from the
