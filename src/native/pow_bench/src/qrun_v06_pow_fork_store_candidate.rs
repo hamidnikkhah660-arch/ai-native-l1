@@ -2100,7 +2100,9 @@ fn atomic_install_new(_source: &Path, _destination: &Path) -> Result<(), QRunV06
     ))
 }
 
-fn consensus_fingerprint(params: &ConsensusParameters) -> Result<[u8; 32], QRunV06ForkStoreError> {
+pub(crate) fn consensus_fingerprint(
+    params: &ConsensusParameters,
+) -> Result<[u8; 32], QRunV06ForkStoreError> {
     params.validate()?;
     let mut hash = Sha256::new();
     hash.update(CONSENSUS_FINGERPRINT_DOMAIN);

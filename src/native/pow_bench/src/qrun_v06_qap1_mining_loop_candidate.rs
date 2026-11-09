@@ -12,7 +12,6 @@ use crate::{
     qrun_v06_canonical_execution_candidate::{
         QRunV06BlockOperation, QRunV06CanonicalExecutionState,
     },
-    qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint,
     qrun_v06_miner_candidate::{
         mine_qfp6_block_on_tip_with_quote_asset_authorization, QRunV06MinedBlock,
         QRunV06MiningError, QRUN_V06_MAX_NONCE_ATTEMPTS_PER_JOB,
@@ -131,7 +130,9 @@ fn validate_anchor_graph(
     params
         .validate()
         .map_err(|error| QRunV06Qap1MiningLoopError::ForkChoice(error.to_string()))?;
-    let fingerprint = qrun_v06_consensus_fingerprint(params)
+    // Q6EA/Manifest intentionally use the Store fingerprint domain. The separate
+    // Checkpoint fingerprint domain must not be substituted here.
+    let fingerprint = crate::qrun_v06_pow_fork_store_candidate::consensus_fingerprint(params)
         .map_err(|error| QRunV06Qap1MiningLoopError::ForkChoice(error.to_string()))?;
     let tip = fork_choice.canonical_tip();
     let state = fork_choice.canonical_state();
@@ -357,7 +358,7 @@ mod tests {
             PROFILE,
             OWNER,
             1,
-            qrun_v06_consensus_fingerprint(&params).unwrap(),
+            crate::qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint(&params).unwrap(),
             tokenomics.policy_fingerprint(),
         )
         .unwrap();
@@ -386,7 +387,10 @@ mod tests {
             genesis_digest: [0xC4; 32],
             genesis_descriptor_commitment: genesis.genesis_descriptor_commitment().unwrap(),
             profile_id: PROFILE,
-            consensus_fingerprint: qrun_v06_consensus_fingerprint(params).unwrap(),
+            consensus_fingerprint: crate::qrun_v06_pow_fork_store_candidate::consensus_fingerprint(
+                params,
+            )
+            .unwrap(),
             segment_base_height: graph.base_height(),
             segment_base_tip: graph.base_tip(),
             checkpoint_anchor: [0; 32],
@@ -403,6 +407,11 @@ mod tests {
     fn anchor_binding_requires_exact_genesis_consensus_tip_and_chainwork() {
         let (params, genesis, graph) = setup();
         let anchor = anchor_for(&params, &genesis, &graph);
+        // Store/Q6EA and Checkpoint are separately domain-separated commitments.
+        assert_ne!(
+            crate::qrun_v06_pow_fork_store_candidate::consensus_fingerprint(&params).unwrap(),
+            crate::qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint(&params).unwrap()
+        );
         assert!(validate_anchor_graph(&anchor, &graph).is_ok());
 
         let mut wrong_tip = anchor.clone();
