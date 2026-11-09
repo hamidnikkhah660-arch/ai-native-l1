@@ -2782,6 +2782,266 @@ mod tests {
     }
 
     #[test]
+    fn durable_protocol_burn_reserve_retirement_survives_restart_and_rejects_replay() {
+        let dir = TestDir::new();
+        let params = params();
+        let founder = Ed25519TransactionSigner::from_seed([0xD1; 32]);
+        let founder_id = founder.account_id();
+        let authenticator = Ed25519TransactionAuthenticator::select(
+            TransactionAuthenticatorKind::Ed25519V1,
+            [AccountPublicKey {
+                account_id: founder_id,
+                public_key: founder.public_key(),
+            }],
+        )
+        .unwrap();
+        let genesis = genesis_state_for_founder(founder_id);
+        let policy_fingerprint = genesis.tokenomics().unwrap().policy_fingerprint();
+        let mut retirement =
+            crate::qrun_v06_tokenomics_candidate::QRunV06SignedBurnReserveRetirement {
+                network_id: NETWORK,
+                policy_fingerprint,
+                expected_burned_atoms: 0,
+                amount_atoms: 77_000,
+                valid_until_timestamp: 10_000,
+                purpose_digest: [0xD2; 32],
+                evidence_digest: [0xD3; 32],
+                founder_signature: Vec::new(),
+            };
+        retirement.founder_signature = founder.sign_digest(&retirement.signing_digest().unwrap());
+        let replay_retirement = retirement.clone();
+
+        let mut store = QRunV06DurableForkStore::open(
+            &dir.0,
+            genesis.clone(),
+            params.clone(),
+            &authenticator,
+            None,
+        )
+        .unwrap();
+        let tip0 = store.graph().unwrap().base_tip();
+        let target1 = store.graph().unwrap().expected_next_target(&tip0).unwrap();
+        let parent = store.graph().unwrap().canonical_state().clone();
+        let (burn_envelope, tip1) = candidate_with_operations(
+            &parent,
+            tip0,
+            100,
+            target1,
+            &params,
+            vec![QRunV06BlockOperation::ProtocolBurnReserveRetirement(
+                retirement,
+            )],
+            &authenticator,
+        );
+        store.submit(&burn_envelope, &authenticator).unwrap();
+        assert_eq!(store.canonical_tip().unwrap(), tip1);
+
+        let expected_root = store.canonical_state_root().unwrap();
+        let expected_anchor = store.manifest_anchor().unwrap();
+        let expected_generation = store.generation().unwrap();
+        let state = store.graph().unwrap().canonical_state();
+        let tokenomics = state.tokenomics().unwrap();
+        assert_eq!(tokenomics.burned_atoms(), 77_000);
+        assert_eq!(
+            tokenomics.issued_by_bucket_atoms(QRunV06AllocationBucket::ProtocolBurnReserve),
+            77_000
+        );
+        drop(store);
+
+        // Reopen from Genesis and replay the persisted QFB6 v5 / QFP6 v4 envelope.
+        let mut reopened = QRunV06DurableForkStore::open(
+            &dir.0,
+            genesis,
+            params.clone(),
+            &authenticator,
+            Some(expected_anchor),
+        )
+        .unwrap();
+        assert_eq!(reopened.canonical_tip().unwrap(), tip1);
+        assert_eq!(reopened.canonical_state_root().unwrap(), expected_root);
+        assert_eq!(reopened.manifest_anchor().unwrap(), expected_anchor);
+        assert_eq!(reopened.generation().unwrap(), expected_generation);
+        let restored = reopened.graph().unwrap().canonical_state();
+        assert_eq!(restored.tokenomics().unwrap().burned_atoms(), 77_000);
+        assert_eq!(
+            restored
+                .tokenomics()
+                .unwrap()
+                .issued_by_bucket_atoms(QRunV06AllocationBucket::ProtocolBurnReserve),
+            77_000
+        );
+
+        // A byte-identical stale authorization is rejected after restart and cannot
+        // advance the canonical tip, state root, generation, or manifest anchor.
+        let replay_target = reopened
+            .graph()
+            .unwrap()
+            .expected_next_target(&tip1)
+            .unwrap();
+        let replay_envelope = invalid_candidate_with_operations(
+            restored,
+            tip1,
+            180,
+            replay_target,
+            &params,
+            vec![QRunV06BlockOperation::ProtocolBurnReserveRetirement(
+                replay_retirement,
+            )],
+        );
+        assert!(matches!(
+            reopened.submit(&replay_envelope, &authenticator),
+            Err(QRunV06ForkStoreError::Fork(
+                QRunV06ForkChoiceError::Execution(QRunV06ExecutionError::Tokenomics(
+                    QRunV06TokenomicsError::BurnCounterMismatch {
+                        expected: 77_000,
+                        actual: 0,
+                    }
+                ))
+            ))
+        ));
+        assert_eq!(reopened.canonical_tip().unwrap(), tip1);
+        assert_eq!(reopened.canonical_state_root().unwrap(), expected_root);
+        assert_eq!(reopened.generation().unwrap(), expected_generation);
+        assert_eq!(reopened.manifest_anchor().unwrap(), expected_anchor);
+    }
+
+    #[test]
+    fn durable_reorg_removes_protocol_burn_retirement_from_losing_branch_after_restart() {
+        let dir = TestDir::new();
+        let params = params();
+        let founder = Ed25519TransactionSigner::from_seed([0xE1; 32]);
+        let founder_id = founder.account_id();
+        let authenticator = Ed25519TransactionAuthenticator::select(
+            TransactionAuthenticatorKind::Ed25519V1,
+            [AccountPublicKey {
+                account_id: founder_id,
+                public_key: founder.public_key(),
+            }],
+        )
+        .unwrap();
+        let genesis = genesis_state_for_founder(founder_id);
+        let policy_fingerprint = genesis.tokenomics().unwrap().policy_fingerprint();
+        let mut retirement =
+            crate::qrun_v06_tokenomics_candidate::QRunV06SignedBurnReserveRetirement {
+                network_id: NETWORK,
+                policy_fingerprint,
+                expected_burned_atoms: 0,
+                amount_atoms: 88_000,
+                valid_until_timestamp: 10_000,
+                purpose_digest: [0xE2; 32],
+                evidence_digest: [0xE3; 32],
+                founder_signature: Vec::new(),
+            };
+        retirement.founder_signature = founder.sign_digest(&retirement.signing_digest().unwrap());
+
+        let mut store = QRunV06DurableForkStore::open(
+            &dir.0,
+            genesis.clone(),
+            params.clone(),
+            &authenticator,
+            None,
+        )
+        .unwrap();
+        let base = store.graph().unwrap().base_tip();
+        let target1 = store.graph().unwrap().expected_next_target(&base).unwrap();
+        let (burn_branch, burn_tip) = candidate_with_operations(
+            &genesis,
+            base,
+            100,
+            target1,
+            &params,
+            vec![QRunV06BlockOperation::ProtocolBurnReserveRetirement(
+                retirement,
+            )],
+            &authenticator,
+        );
+        store.submit(&burn_branch, &authenticator).unwrap();
+        assert_eq!(
+            store
+                .graph()
+                .unwrap()
+                .state_for_tip(&burn_tip)
+                .unwrap()
+                .tokenomics()
+                .unwrap()
+                .burned_atoms(),
+            88_000
+        );
+
+        // A competing no-burn sibling plus its higher-work child becomes canonical.
+        let (plain_branch, plain_tip) = candidate(&genesis, base, 100, target1, &params);
+        store.submit(&plain_branch, &authenticator).unwrap();
+        let plain_state = store
+            .graph()
+            .unwrap()
+            .state_for_tip(&plain_tip)
+            .unwrap()
+            .clone();
+        let target2 = store
+            .graph()
+            .unwrap()
+            .expected_next_target(&plain_tip)
+            .unwrap();
+        let (plain_child, canonical_tip) =
+            candidate(&plain_state, plain_tip, 130, target2, &params);
+        store.submit(&plain_child, &authenticator).unwrap();
+        assert_eq!(store.canonical_tip().unwrap(), canonical_tip);
+        assert!(
+            store.graph().unwrap().branch_work(&canonical_tip).unwrap()
+                > store.graph().unwrap().branch_work(&burn_tip).unwrap()
+        );
+
+        let expected_root = store.canonical_state_root().unwrap();
+        let expected_anchor = store.manifest_anchor().unwrap();
+        let expected_generation = store.generation().unwrap();
+        let canonical_state = store.graph().unwrap().canonical_state();
+        assert_eq!(canonical_state.tokenomics().unwrap().burned_atoms(), 0);
+        assert_eq!(
+            canonical_state
+                .tokenomics()
+                .unwrap()
+                .issued_by_bucket_atoms(QRunV06AllocationBucket::ProtocolBurnReserve),
+            0
+        );
+        assert_eq!(
+            canonical_state.unified().ledger().total_value().unwrap(),
+            canonical_state
+                .tokenomics()
+                .unwrap()
+                .live_supply_atoms()
+                .unwrap()
+        );
+        drop(store);
+
+        // The reorg decision and no-burn state must survive a complete durable reopen.
+        let reopened = QRunV06DurableForkStore::open(
+            &dir.0,
+            genesis,
+            params,
+            &authenticator,
+            Some(expected_anchor),
+        )
+        .unwrap();
+        assert_eq!(reopened.canonical_tip().unwrap(), canonical_tip);
+        assert_eq!(reopened.canonical_state_root().unwrap(), expected_root);
+        assert_eq!(reopened.manifest_anchor().unwrap(), expected_anchor);
+        assert_eq!(reopened.generation().unwrap(), expected_generation);
+        let restored = reopened.graph().unwrap().canonical_state();
+        assert_eq!(restored.tokenomics().unwrap().burned_atoms(), 0);
+        assert_eq!(
+            restored
+                .tokenomics()
+                .unwrap()
+                .issued_by_bucket_atoms(QRunV06AllocationBucket::ProtocolBurnReserve),
+            0
+        );
+        assert_eq!(
+            restored.unified().ledger().total_value().unwrap(),
+            restored.tokenomics().unwrap().live_supply_atoms().unwrap()
+        );
+    }
+
+    #[test]
     fn durable_reorg_never_leaks_signed_release_from_losing_branch_after_restart() {
         let dir = TestDir::new();
         let params = params();

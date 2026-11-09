@@ -318,6 +318,125 @@ impl QRunV06MiningScheduleCandidate {
     }
 }
 
+pub const MAX_QRUN_V06_BURN_RESERVE_SIGNATURE_BYTES: usize = 4 * 1024;
+pub const MAX_QRUN_V06_BURN_RESERVE_RETIREMENT_BYTES: usize = 16 * 1024;
+const BURN_RESERVE_RETIREMENT_MAGIC: [u8; 4] = *b"Q6BR";
+const BURN_RESERVE_RETIREMENT_VERSION: u16 = 1;
+
+/// Founder-authorized, one-way retirement of unissued ProtocolBurnReserve capacity.
+///
+/// This does not debit user balances or burn circulating coins. In one canonical
+/// transition the reserve bucket is issued to a network/policy-derived sink and
+/// immediately removed from Ledger; gross issuance and burned counters rise equally,
+/// so live supply is unchanged and future issuance headroom is reduced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QRunV06SignedBurnReserveRetirement {
+    pub network_id: Digest32,
+    pub policy_fingerprint: Digest32,
+    /// Compare-and-swap guard: must equal the current cumulative reserve-burn counter.
+    pub expected_burned_atoms: u128,
+    pub amount_atoms: u128,
+    pub valid_until_timestamp: u64,
+    pub purpose_digest: Digest32,
+    pub evidence_digest: Digest32,
+    pub founder_signature: Vec<u8>,
+}
+
+impl QRunV06SignedBurnReserveRetirement {
+    pub fn signing_digest(&self) -> Result<Digest32, QRunV06TokenomicsError> {
+        if self.network_id == [0; 32]
+            || self.policy_fingerprint == [0; 32]
+            || self.amount_atoms == 0
+            || self.valid_until_timestamp == 0
+            || self.purpose_digest == [0; 32]
+            || self.evidence_digest == [0; 32]
+        {
+            return Err(QRunV06TokenomicsError::InvalidProtocolBurn);
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"QRUN-V06-CP0566E-BURN-RESERVE-RETIREMENT-V1\0");
+        hash.update(self.network_id);
+        hash.update(self.policy_fingerprint);
+        hash.update(self.expected_burned_atoms.to_be_bytes());
+        hash.update(self.amount_atoms.to_be_bytes());
+        hash.update(self.valid_until_timestamp.to_be_bytes());
+        hash.update(self.purpose_digest);
+        hash.update(self.evidence_digest);
+        Ok(hash.finalize().into())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, QRunV06TokenomicsError> {
+        let _ = self.signing_digest()?;
+        if self.founder_signature.is_empty()
+            || self.founder_signature.len() > MAX_QRUN_V06_BURN_RESERVE_SIGNATURE_BYTES
+        {
+            return Err(QRunV06TokenomicsError::InvalidProtocolBurn);
+        }
+        let signature_len = u16::try_from(self.founder_signature.len())
+            .map_err(|_| QRunV06TokenomicsError::InvalidProtocolBurn)?;
+        let mut out = Vec::with_capacity(192 + self.founder_signature.len());
+        out.extend_from_slice(&BURN_RESERVE_RETIREMENT_MAGIC);
+        out.extend_from_slice(&BURN_RESERVE_RETIREMENT_VERSION.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&self.network_id);
+        out.extend_from_slice(&self.policy_fingerprint);
+        out.extend_from_slice(&self.expected_burned_atoms.to_be_bytes());
+        out.extend_from_slice(&self.amount_atoms.to_be_bytes());
+        out.extend_from_slice(&self.valid_until_timestamp.to_be_bytes());
+        out.extend_from_slice(&self.purpose_digest);
+        out.extend_from_slice(&self.evidence_digest);
+        out.extend_from_slice(&signature_len.to_be_bytes());
+        out.extend_from_slice(&self.founder_signature);
+        if out.len() > MAX_QRUN_V06_BURN_RESERVE_RETIREMENT_BYTES {
+            return Err(QRunV06TokenomicsError::InvalidProtocolBurn);
+        }
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, QRunV06TokenomicsError> {
+        const MIN_LEN: usize = 4 + 2 + 2 + 32 + 32 + 16 + 16 + 8 + 32 + 32 + 2 + 1;
+        if bytes.len() < MIN_LEN || bytes.len() > MAX_QRUN_V06_BURN_RESERVE_RETIREMENT_BYTES {
+            return Err(QRunV06TokenomicsError::InvalidProtocolBurn);
+        }
+        let mut cursor = 0usize;
+        if take_array::<4>(bytes, &mut cursor)? != BURN_RESERVE_RETIREMENT_MAGIC
+            || take_u16(bytes, &mut cursor)? != BURN_RESERVE_RETIREMENT_VERSION
+            || take_u16(bytes, &mut cursor)? != 0
+        {
+            return Err(QRunV06TokenomicsError::InvalidProtocolBurn);
+        }
+        let network_id = take_array::<32>(bytes, &mut cursor)?;
+        let policy_fingerprint = take_array::<32>(bytes, &mut cursor)?;
+        let expected_burned_atoms = take_u128(bytes, &mut cursor)?;
+        let amount_atoms = take_u128(bytes, &mut cursor)?;
+        let valid_until_timestamp = take_u64(bytes, &mut cursor)?;
+        let purpose_digest = take_array::<32>(bytes, &mut cursor)?;
+        let evidence_digest = take_array::<32>(bytes, &mut cursor)?;
+        let signature_len = take_u16(bytes, &mut cursor)? as usize;
+        if signature_len == 0
+            || signature_len > MAX_QRUN_V06_BURN_RESERVE_SIGNATURE_BYTES
+            || cursor.checked_add(signature_len) != Some(bytes.len())
+        {
+            return Err(QRunV06TokenomicsError::InvalidProtocolBurn);
+        }
+        let value = Self {
+            network_id,
+            policy_fingerprint,
+            expected_burned_atoms,
+            amount_atoms,
+            valid_until_timestamp,
+            purpose_digest,
+            evidence_digest,
+            founder_signature: bytes[cursor..].to_vec(),
+        };
+        let _ = value.signing_digest()?;
+        if value.encode()?.as_slice() != bytes {
+            return Err(QRunV06TokenomicsError::InvalidProtocolBurn);
+        }
+        Ok(value)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QRunV06TokenomicsError {
     InvalidNetwork,
@@ -326,6 +445,8 @@ pub enum QRunV06TokenomicsError {
     InvalidHeight,
     InvalidAmount,
     InvalidCategoryRelease,
+    InvalidProtocolBurn,
+    BurnCounterMismatch { expected: u128, actual: u128 },
     InvalidReleaseNonce { expected: u64, actual: u64 },
     ReleaseNonceOverflow,
     ArithmeticOverflow,
@@ -523,8 +644,30 @@ impl QRunV06TokenomicsState {
         Ok(())
     }
 
-    /// Record a burn only from the already-issued protocol burn-reserve bucket.
-    /// A canonical burn operation must also remove the same amount from Ledger.
+    /// Retire unissued burn-reserve capacity under a founder-signed QFB6 operation.
+    /// The enclosing executor debits the same amount from the deterministic sink in Ledger.
+    pub(crate) fn record_protocol_burn_reserve_retirement(
+        &mut self,
+        amount_atoms: u128,
+        expected_burned_atoms: u128,
+    ) -> Result<(), QRunV06TokenomicsError> {
+        if amount_atoms == 0 {
+            return Err(QRunV06TokenomicsError::InvalidAmount);
+        }
+        if self.burned_atoms != expected_burned_atoms {
+            return Err(QRunV06TokenomicsError::BurnCounterMismatch {
+                expected: self.burned_atoms,
+                actual: expected_burned_atoms,
+            });
+        }
+        let mut next = self.clone();
+        next.record_issuance(QRunV06AllocationBucket::ProtocolBurnReserve, amount_atoms)?;
+        next.record_burn_from_reserve(amount_atoms)?;
+        *self = next;
+        Ok(())
+    }
+
+    /// Internal cumulative burn counter; call only after the matching Ledger debit.
     pub(crate) fn record_burn_from_reserve(
         &mut self,
         amount_atoms: u128,
@@ -921,6 +1064,51 @@ mod tests {
             Err(QRunV06TokenomicsError::BurnExceedsIssuedReserve)
         );
         assert_eq!(state, before);
+    }
+
+    #[test]
+    fn protocol_burn_reserve_retirement_is_monotonic_bounded_and_keeps_live_supply_constant() {
+        let mut state = state();
+        let amount = 123_456u128;
+        let expected_burned = state.burned_atoms();
+        state
+            .record_protocol_burn_reserve_retirement(amount, expected_burned)
+            .unwrap();
+
+        assert_eq!(
+            state.issued_by_bucket_atoms(QRunV06AllocationBucket::ProtocolBurnReserve),
+            amount
+        );
+        assert_eq!(state.burned_atoms(), amount);
+        assert_eq!(
+            state.gross_issued_atoms().unwrap(),
+            QRUN_V06_FOUNDER_GENESIS_ATOMS + amount
+        );
+        assert_eq!(
+            state.live_supply_atoms().unwrap(),
+            QRUN_V06_FOUNDER_GENESIS_ATOMS
+        );
+        assert_eq!(
+            state
+                .unissued_by_bucket_atoms(QRunV06AllocationBucket::ProtocolBurnReserve)
+                .unwrap(),
+            QRunV06AllocationBucket::ProtocolBurnReserve.budget_atoms() - amount
+        );
+
+        let before_replay = state.clone();
+        assert_eq!(
+            state.record_protocol_burn_reserve_retirement(amount, expected_burned),
+            Err(QRunV06TokenomicsError::BurnCounterMismatch {
+                expected: amount,
+                actual: expected_burned,
+            })
+        );
+        assert_eq!(state, before_replay);
+
+        let snapshot = state.encode_snapshot().unwrap();
+        let restored = QRunV06TokenomicsState::decode_snapshot(&snapshot, &NETWORK).unwrap();
+        assert_eq!(restored, state);
+        assert_eq!(restored.state_root().unwrap(), state.state_root().unwrap());
     }
 
     #[test]

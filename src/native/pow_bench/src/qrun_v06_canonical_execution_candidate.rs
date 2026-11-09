@@ -1,6 +1,6 @@
 //! Isolated QFP6 canonical block codec and deterministic execution candidate.
 //!
-//! QFP5/QFB5 encodings are untouched. QFB6 v4 commits CP-0528 issuance counters and signed category releases,
+//! QFP5/QFB5 encodings are untouched. QFB6 v5 commits CP-0528 issuance counters, signed category releases,
 //! the Founder Genesis policy and the mining-security reward schedule in the execution root.
 //! The candidate also executes native TXN2 transfers, signed AMM operations, signed asset
 //! registrations and issuer-admin operations in the canonical order carried by QFB6. The root is computed
@@ -20,8 +20,9 @@ use crate::qrun_v06_orderbook_candidate::{
 };
 use crate::qrun_v06_profile_trust_candidate::QRunV06TrustAuthorizedQuoteAsset;
 use crate::qrun_v06_tokenomics_candidate::{
-    QRunV06MiningScheduleCandidate, QRunV06SignedCategoryRelease, QRunV06TokenomicsError,
-    QRunV06TokenomicsState, QRUN_V06_FOUNDER_GENESIS_ATOMS, QRUN_V06_TOKENOMICS_SNAPSHOT_BYTES,
+    QRunV06AllocationBucket, QRunV06MiningScheduleCandidate, QRunV06SignedBurnReserveRetirement,
+    QRunV06SignedCategoryRelease, QRunV06TokenomicsError, QRunV06TokenomicsState,
+    QRUN_V06_FOUNDER_GENESIS_ATOMS, QRUN_V06_TOKENOMICS_SNAPSHOT_BYTES,
 };
 use crate::qrun_v06_unified_asset_candidate::{
     orderbook_vault_account, QRunV06UnifiedAssetState, UnifiedAssetError,
@@ -30,19 +31,19 @@ use crate::qzxb_amm_candidate::{
     AmmError, AmmOperation, AmmSignedOperation, QzxbAmmStateCandidate, MAX_AMM_SNAPSHOT_BYTES,
 };
 use crate::state_machine::{
-    decode_transaction, encode_transaction, transaction_id, LedgerState, NetworkId, StateError,
-    Transaction, TransactionAuthenticator, MAX_ENCODED_SNAPSHOT_BYTES,
+    decode_transaction, encode_transaction, transaction_id, AccountId, LedgerState, NetworkId,
+    StateError, Transaction, TransactionAuthenticator, MAX_ENCODED_SNAPSHOT_BYTES,
 };
 use sha2::{Digest, Sha256};
 use std::io::{Cursor, Read};
 
 pub const QRUN_V06_BLOCK_MAGIC: [u8; 4] = *b"QFB6";
-pub const QRUN_V06_BLOCK_VERSION: u16 = 4;
+pub const QRUN_V06_BLOCK_VERSION: u16 = 5;
 pub const MAX_QRUN_V06_BLOCK_OPERATIONS: usize = 512;
 pub const MAX_QRUN_V06_BLOCK_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_QRUN_V06_ASSET_SIGNATURE_BYTES: usize = 4 * 1024;
 
-const BLOCK_ID_DOMAIN: &[u8] = b"QRUN-V06-CANONICAL-BLOCK-ID-V4\0";
+const BLOCK_ID_DOMAIN: &[u8] = b"QRUN-V06-CANONICAL-BLOCK-ID-V5\0";
 const EXECUTION_ROOT_DOMAIN: &[u8] = b"QRUN-V06-CANONICAL-EXECUTION-ROOT-V5\0";
 const EXECUTION_SNAPSHOT_MAGIC: [u8; 4] = *b"Q6SN";
 const EXECUTION_SNAPSHOT_VERSION: u16 = 5;
@@ -54,6 +55,15 @@ const QUOTE_ASSET_EXECUTION_PIN_BYTES: usize = 32 * 3 + 8 * 4;
 const QUOTE_ASSET_EXECUTION_PIN_DOMAIN: &[u8] = b"QRUN-V06-EXECUTION-QUOTE-ASSET-AUTH-PIN-V1\0";
 const MAX_NAME_BYTES: usize = 64;
 const MAX_SYMBOL_BYTES: usize = 16;
+const PROTOCOL_BURN_SINK_DOMAIN: &[u8] = b"QRUN-V06-CP0566E-PROTOCOL-BURN-SINK-V1\0";
+
+fn protocol_burn_sink_account(network_id: NetworkId, policy_fingerprint: [u8; 32]) -> AccountId {
+    let mut hash = Sha256::new();
+    hash.update(PROTOCOL_BURN_SINK_DOMAIN);
+    hash.update(network_id);
+    hash.update(policy_fingerprint);
+    hash.finalize().into()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QRunV06ExecutionError {
@@ -87,6 +97,8 @@ pub enum QRunV06ExecutionError {
     InvalidAssetRegistration,
     InvalidAssetAdminOperation,
     InvalidCategoryRelease,
+    InvalidProtocolBurn,
+    ProtocolBurnSinkNotEmpty,
     OrderBook(OrderBookError),
     State(StateError),
     Amm(AmmError),
@@ -155,6 +167,7 @@ pub enum QRunV06BlockOperation {
     AssetAdmin(SignedAssetAdminOperation),
     OrderBook(QRunV06SignedOrderBookOperation),
     CategoryRelease(QRunV06SignedCategoryRelease),
+    ProtocolBurnReserveRetirement(QRunV06SignedBurnReserveRetirement),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +195,7 @@ pub struct QRunV06BlockApplySummary {
     pub asset_admin_operations: usize,
     pub orderbook_operations: usize,
     pub category_releases: usize,
+    pub protocol_burns: usize,
     pub orders_expired: usize,
     pub fees_paid_to_producer: u64,
 }
@@ -501,6 +515,56 @@ impl QRunV06CanonicalExecutionState {
         Ok(())
     }
 
+    /// Founder-authorized retirement of unissued ProtocolBurnReserve capacity.
+    /// It cannot debit a user account and never leaves a spendable sink balance.
+    fn apply_signed_burn_reserve_retirement<A: TransactionAuthenticator>(
+        &mut self,
+        retirement: &QRunV06SignedBurnReserveRetirement,
+        inclusion_timestamp: u64,
+        authenticator: &A,
+    ) -> Result<(), QRunV06ExecutionError> {
+        if inclusion_timestamp == 0
+            || retirement.network_id != self.network_id()
+            || retirement.valid_until_timestamp < inclusion_timestamp
+        {
+            return Err(QRunV06ExecutionError::InvalidProtocolBurn);
+        }
+        let policy = self
+            .tokenomics
+            .as_ref()
+            .ok_or(QRunV06ExecutionError::TokenomicsGenesisRequiresEmptyLedger)?;
+        if retirement.policy_fingerprint != policy.policy_fingerprint()
+            || retirement.amount_atoms
+                > policy.unissued_by_bucket_atoms(QRunV06AllocationBucket::ProtocolBurnReserve)?
+        {
+            return Err(QRunV06ExecutionError::InvalidProtocolBurn);
+        }
+        let founder = policy.founder_account();
+        let digest = retirement.signing_digest()?;
+        authenticator
+            .verify(&founder, &digest, &retirement.founder_signature)
+            .map_err(|_| QRunV06ExecutionError::InvalidProtocolBurn)?;
+
+        let sink = protocol_burn_sink_account(self.network_id(), retirement.policy_fingerprint);
+        if sink == [0; 32] {
+            return Err(QRunV06ExecutionError::InvalidProtocolBurn);
+        }
+
+        let mut next = self.clone();
+        next.tokenomics
+            .as_mut()
+            .ok_or(QRunV06ExecutionError::TokenomicsGenesisRequiresEmptyLedger)?
+            .record_protocol_burn_reserve_retirement(
+                retirement.amount_atoms,
+                retirement.expected_burned_atoms,
+            )?;
+        next.unified
+            .apply_v06_protocol_burn_reserve_retirement(sink, retirement.amount_atoms)?;
+        next.verify_invariants()?;
+        *self = next;
+        Ok(())
+    }
+
     /// The active QFP6 consensus profile must use the same subsidy schedule as Q6TM.
     pub fn validate_consensus_parameters(
         &self,
@@ -550,6 +614,11 @@ impl QRunV06CanonicalExecutionState {
                 return Err(QRunV06ExecutionError::WrongNetwork);
             }
             tokenomics.validate_against_ledger(self.unified.ledger().total_value()?)?;
+            let burn_sink =
+                protocol_burn_sink_account(self.network_id(), tokenomics.policy_fingerprint());
+            if self.unified.ledger().account(&burn_sink).is_some() {
+                return Err(QRunV06ExecutionError::ProtocolBurnSinkNotEmpty);
+            }
             if let Some(descriptor) = &self.genesis_descriptor {
                 descriptor.validate_binding(
                     &self.network_id(),
@@ -719,7 +788,8 @@ impl QRunV06CanonicalExecutionState {
                 QRunV06BlockOperation::NativeTransfer(_)
                 | QRunV06BlockOperation::AssetRegistration(_)
                 | QRunV06BlockOperation::AssetAdmin(_)
-                | QRunV06BlockOperation::CategoryRelease(_) => {}
+                | QRunV06BlockOperation::CategoryRelease(_)
+                | QRunV06BlockOperation::ProtocolBurnReserveRetirement(_) => {}
             }
         }
         Ok(required)
@@ -1296,6 +1366,7 @@ impl QRunV06CanonicalExecutionState {
         let mut asset_admin_operations = 0usize;
         let mut orderbook_operations = 0usize;
         let mut category_releases = 0usize;
+        let mut protocol_burns = 0usize;
 
         for (operation_index, operation) in block.operations.iter().enumerate() {
             match operation {
@@ -1349,6 +1420,14 @@ impl QRunV06CanonicalExecutionState {
                     self.apply_signed_category_release(release, block.timestamp, authenticator)?;
                     category_releases += 1;
                 }
+                QRunV06BlockOperation::ProtocolBurnReserveRetirement(retirement) => {
+                    self.apply_signed_burn_reserve_retirement(
+                        retirement,
+                        block.timestamp,
+                        authenticator,
+                    )?;
+                    protocol_burns += 1;
+                }
             }
         }
 
@@ -1389,6 +1468,7 @@ impl QRunV06CanonicalExecutionState {
             asset_admin_operations,
             orderbook_operations,
             category_releases,
+            protocol_burns,
             orders_expired,
             fees_paid_to_producer,
         })
@@ -1595,6 +1675,9 @@ fn encode_operation(
         }
         QRunV06BlockOperation::OrderBook(operation) => Ok((5, operation.encode()?)),
         QRunV06BlockOperation::CategoryRelease(operation) => Ok((6, operation.encode()?)),
+        QRunV06BlockOperation::ProtocolBurnReserveRetirement(operation) => {
+            Ok((7, operation.encode()?))
+        }
     }
 }
 
@@ -1620,6 +1703,9 @@ fn decode_operation(
         )),
         6 => Ok(QRunV06BlockOperation::CategoryRelease(
             QRunV06SignedCategoryRelease::decode(payload)?,
+        )),
+        7 => Ok(QRunV06BlockOperation::ProtocolBurnReserveRetirement(
+            QRunV06SignedBurnReserveRetirement::decode(payload)?,
         )),
         _ => Err(QRunV06ExecutionError::Malformed),
     }
@@ -2033,6 +2119,32 @@ mod tests {
         signed
     }
 
+    fn signed_burn_reserve_retirement(
+        expected_burned_atoms: u128,
+        amount_atoms: u128,
+        valid_until_timestamp: u64,
+    ) -> QRunV06SignedBurnReserveRetirement {
+        let policy_fingerprint = QRunV06TokenomicsState::genesis(
+            NETWORK,
+            ALICE,
+            QRunV06MiningScheduleCandidate::cp0422_research_candidate(),
+        )
+        .unwrap()
+        .policy_fingerprint();
+        let mut retirement = QRunV06SignedBurnReserveRetirement {
+            network_id: NETWORK,
+            policy_fingerprint,
+            expected_burned_atoms,
+            amount_atoms,
+            valid_until_timestamp,
+            purpose_digest: [0xD4; 32],
+            evidence_digest: [0xD5; 32],
+            founder_signature: Vec::new(),
+        };
+        retirement.founder_signature = retirement.signing_digest().unwrap().to_vec();
+        retirement
+    }
+
     fn signed_category_release(
         bucket: crate::qrun_v06_tokenomics_candidate::QRunV06AllocationBucket,
         nonce: u64,
@@ -2086,7 +2198,7 @@ mod tests {
     }
 
     #[test]
-    fn qfb6_v4_roundtrips_signed_category_release_canonically() {
+    fn qfb6_v5_roundtrips_signed_category_release_canonically() {
         let state = cp0528_state(ALICE);
         let release = signed_category_release(
             crate::qrun_v06_tokenomics_candidate::QRunV06AllocationBucket::CommunityAirdrop,
@@ -2103,7 +2215,204 @@ mod tests {
         let decoded = decode_qrun_v06_block(&encoded).unwrap();
         assert_eq!(decoded, block);
         assert_eq!(encoded[4..6], QRUN_V06_BLOCK_VERSION.to_be_bytes());
-        assert_eq!(QRUN_V06_BLOCK_VERSION, 4);
+        assert_eq!(QRUN_V06_BLOCK_VERSION, 5);
+    }
+
+    #[test]
+    fn qfb6_v5_roundtrips_and_executes_signed_burn_reserve_retirement_atomically() {
+        let mut state = cp0528_state(ALICE);
+        let retirement = signed_burn_reserve_retirement(0, 123_456, 10_000);
+        let sink =
+            protocol_burn_sink_account(NETWORK, state.tokenomics().unwrap().policy_fingerprint());
+        let ledger_before = state.unified().ledger().total_value().unwrap();
+        let founder_before = state.unified().ledger().account(&ALICE).unwrap().balance;
+
+        let mut block = block_for(
+            &state,
+            vec![QRunV06BlockOperation::ProtocolBurnReserveRetirement(
+                retirement.clone(),
+            )],
+        );
+        let encoded = encode_qrun_v06_block(&block).unwrap();
+        assert_eq!(u16::from_be_bytes([encoded[4], encoded[5]]), 5);
+        assert_eq!(decode_qrun_v06_block(&encoded).unwrap(), block);
+        block.state_root = state
+            .preview_state_root_after(&block, &DigestAuthenticator)
+            .unwrap();
+        let summary = state.apply_block(&block, &DigestAuthenticator).unwrap();
+
+        let tokenomics = state.tokenomics().unwrap();
+        assert_eq!(summary.protocol_burns, 1);
+        assert_eq!(
+            tokenomics.issued_by_bucket_atoms(QRunV06AllocationBucket::ProtocolBurnReserve),
+            123_456
+        );
+        assert_eq!(tokenomics.burned_atoms(), 123_456);
+        assert_eq!(
+            tokenomics.live_supply_atoms().unwrap(),
+            QRUN_V06_FOUNDER_GENESIS_ATOMS + summary.mining_reward_atoms
+        );
+        assert_eq!(
+            tokenomics
+                .unissued_by_bucket_atoms(QRunV06AllocationBucket::ProtocolBurnReserve)
+                .unwrap(),
+            QRunV06AllocationBucket::ProtocolBurnReserve.budget_atoms() - 123_456
+        );
+        assert_eq!(
+            state.unified().ledger().total_value().unwrap(),
+            ledger_before + summary.mining_reward_atoms
+        );
+        assert_eq!(
+            state.unified().ledger().account(&ALICE).unwrap().balance,
+            founder_before
+        );
+        assert!(state.unified().ledger().account(&sink).is_none());
+
+        let before_replay = state.clone();
+        let replay = block_for(
+            &state,
+            vec![QRunV06BlockOperation::ProtocolBurnReserveRetirement(
+                retirement,
+            )],
+        );
+        assert_eq!(
+            state.preview_state_root_after(&replay, &DigestAuthenticator),
+            Err(QRunV06ExecutionError::Tokenomics(
+                QRunV06TokenomicsError::BurnCounterMismatch {
+                    expected: 123_456,
+                    actual: 0,
+                }
+            ))
+        );
+        assert_eq!(state, before_replay);
+    }
+
+    #[test]
+    fn protocol_burn_sink_cannot_receive_block_mining_reward() {
+        let state = cp0528_state(ALICE);
+        let retirement = signed_burn_reserve_retirement(0, 77_000, 10_000);
+        let sink =
+            protocol_burn_sink_account(NETWORK, state.tokenomics().unwrap().policy_fingerprint());
+        let mut block = block_for(
+            &state,
+            vec![QRunV06BlockOperation::ProtocolBurnReserveRetirement(
+                retirement,
+            )],
+        );
+        block.producer = sink;
+
+        assert_eq!(
+            state.preview_state_root_after(&block, &DigestAuthenticator),
+            Err(QRunV06ExecutionError::ProtocolBurnSinkNotEmpty)
+        );
+        assert_eq!(state.tokenomics().unwrap().burned_atoms(), 0);
+        assert!(state.unified().ledger().account(&sink).is_none());
+    }
+
+    #[test]
+    fn burn_reserve_retirement_verifies_real_ed25519_founder_signature_and_fails_closed() {
+        let founder = Ed25519TransactionSigner::from_seed([0xE6; 32]);
+        let mut state = cp0528_state(founder.account_id());
+        let policy_fingerprint = state.tokenomics().unwrap().policy_fingerprint();
+        let mut retirement = QRunV06SignedBurnReserveRetirement {
+            network_id: NETWORK,
+            policy_fingerprint,
+            expected_burned_atoms: 0,
+            amount_atoms: 77_000,
+            valid_until_timestamp: 10_000,
+            purpose_digest: [0xE7; 32],
+            evidence_digest: [0xE8; 32],
+            founder_signature: Vec::new(),
+        };
+        retirement.founder_signature = founder.sign_digest(&retirement.signing_digest().unwrap());
+        let authenticator = Ed25519TransactionAuthenticator::select(
+            TransactionAuthenticatorKind::Ed25519V1,
+            [AccountPublicKey {
+                account_id: founder.account_id(),
+                public_key: founder.public_key(),
+            }],
+        )
+        .unwrap();
+
+        let mut block = block_for(
+            &state,
+            vec![QRunV06BlockOperation::ProtocolBurnReserveRetirement(
+                retirement.clone(),
+            )],
+        );
+        block.state_root = state
+            .preview_state_root_after(&block, &authenticator)
+            .unwrap();
+        let summary = state.apply_block(&block, &authenticator).unwrap();
+        assert_eq!(state.tokenomics().unwrap().burned_atoms(), 77_000);
+        assert_eq!(
+            state.tokenomics().unwrap().live_supply_atoms().unwrap(),
+            QRUN_V06_FOUNDER_GENESIS_ATOMS + summary.mining_reward_atoms
+        );
+
+        let before = state.clone();
+        let mut wrong_signature = retirement;
+        wrong_signature.founder_signature[0] ^= 0x80;
+        let bad = block_for(
+            &state,
+            vec![QRunV06BlockOperation::ProtocolBurnReserveRetirement(
+                wrong_signature,
+            )],
+        );
+        assert_eq!(
+            state.preview_state_root_after(&bad, &authenticator),
+            Err(QRunV06ExecutionError::InvalidProtocolBurn)
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn burn_reserve_retirement_rejects_expiry_wrong_policy_and_over_cap_atomically() {
+        let state = cp0528_state(ALICE);
+        let before = state.clone();
+
+        let expired = signed_burn_reserve_retirement(0, 100, 99);
+        let expired_block = block_for(
+            &state,
+            vec![QRunV06BlockOperation::ProtocolBurnReserveRetirement(
+                expired,
+            )],
+        );
+        assert_eq!(
+            state.preview_state_root_after(&expired_block, &DigestAuthenticator),
+            Err(QRunV06ExecutionError::InvalidProtocolBurn)
+        );
+
+        let mut wrong_policy = signed_burn_reserve_retirement(0, 100, 10_000);
+        wrong_policy.policy_fingerprint[0] ^= 1;
+        wrong_policy.founder_signature = wrong_policy.signing_digest().unwrap().to_vec();
+        let wrong_policy_block = block_for(
+            &state,
+            vec![QRunV06BlockOperation::ProtocolBurnReserveRetirement(
+                wrong_policy,
+            )],
+        );
+        assert_eq!(
+            state.preview_state_root_after(&wrong_policy_block, &DigestAuthenticator),
+            Err(QRunV06ExecutionError::InvalidProtocolBurn)
+        );
+
+        let over_cap = signed_burn_reserve_retirement(
+            0,
+            QRunV06AllocationBucket::ProtocolBurnReserve.budget_atoms() + 1,
+            10_000,
+        );
+        let over_cap_block = block_for(
+            &state,
+            vec![QRunV06BlockOperation::ProtocolBurnReserveRetirement(
+                over_cap,
+            )],
+        );
+        assert_eq!(
+            state.preview_state_root_after(&over_cap_block, &DigestAuthenticator),
+            Err(QRunV06ExecutionError::InvalidProtocolBurn)
+        );
+        assert_eq!(state, before);
     }
 
     #[test]
@@ -2371,7 +2680,7 @@ mod tests {
     }
 
     #[test]
-    fn qfb6_v4_roundtrips_each_operation_family_canonically() {
+    fn qfb6_v5_roundtrips_each_operation_family_canonically() {
         let signer = Ed25519TransactionSigner::from_seed([0x55; 32]);
         let issuer = signer.account_id();
         let mut registration = AssetRegistration {
@@ -3887,7 +4196,7 @@ mod tests {
     }
 
     #[test]
-    fn qfb6_v4_decoder_rejects_legacy_v3_bytes_instead_of_reinterpreting_them() {
+    fn qfb6_v5_decoder_rejects_legacy_v3_bytes_instead_of_reinterpreting_them() {
         let state = fixture();
         let block = block_for(&state, Vec::new());
         let mut legacy_v3 = encode_qrun_v06_block(&block).unwrap();
