@@ -1,22 +1,27 @@
-# CP-0573 — QFP6 standalone bootstrap preflight (phase A)
+# CP-0573 — QFP6 standalone bootstrap preflight
 
 **Status:** implementation candidate; preflight only.
+**Branch:** feat/cp0573-qfp6-node-bootstrap-preflight-20261109
 **Base:** CP-0572 / 899ec769261780e4dd9770afc1b2876b31580f78.
 
-## Delivered in this phase
+## Implemented
 
-Adds the auto-discovered Cargo executable **qrun_v06_node**. Its explicit **--preflight** mode:
+The auto-discovered Cargo executable **qrun_v06_node** exposes a fail-closed **--preflight** command. No runtime mode is enabled in this phase.
 
-1. Reads a bounded JSON config and bounded regular-file artifacts; symbolic links are refused.
-2. Verifies the exact SHA-256 of the complete config against a digest passed separately on the command line. The digest must come from an independently administered/reviewed channel; reading the digest from the same config or an adjacent file defeats this protection.
-3. Decodes Q6PN only against a commitment pinned inside that externally-digested config; the commitment is not derived from the Q6PN file.
-4. Checks Q6GD network, profile, Founder, consensus and CP-0528 tokenomics fingerprints against separately pinned values in the config.
-5. Decodes Q6TS, requires Active status, and checks exact network/profile/Q6PN binding.
-6. Loads Ed25519 and ML-DSA-65 authority public keys and checks their keyset ID against the pinned Q6TS keyset ID in the externally-digested config.
-7. Loads the Q6TS monotonic floor using the strongly consistent, read-only AWS DynamoDB adapter and verifies both signatures.
-8. Requires the signed Q6TS envelope to be the exact current floor head. It does not provision or advance the floor.
+The preflight requires an out-of-band SHA-256 for the complete configuration and then:
 
-The executable reports the verified identity and exits. It does **not** open a QFP6 data directory, mutate the QFP6 store or trust floor, bind the node P2P listener, instantiate consensus, or mine. The AWS CLI performs a read-only network request to DynamoDB and may use its normal credential/cache behavior outside the QFP6 data directory. **--run** is intentionally rejected.
+1. Reads bounded JSON/configuration and bounded regular-file artifacts; symbolic links are refused.
+2. Verifies the complete configuration SHA-256 against the digest supplied separately on the command line. The expected digest must arrive through an independently administered/reviewed channel. Reading it from the same config or adjacent untrusted directory defeats this protection.
+3. Decodes Q6PN only against the Q6PN commitment pinned in the externally digested config; it never derives the commitment from the Q6PN file.
+4. Checks the Q6GD network, profile, Founder, consensus fingerprint and CP-0528 tokenomics policy fingerprint against the pinned configuration values.
+5. Reads the **complete canonical QFB6 Genesis execution snapshot**, checks its separately pinned SHA-256, decodes it with the expected network/profile and runs the execution-state invariants.
+6. Requires the complete snapshot's embedded Q6GD descriptor to equal the Q6PN descriptor, requires height zero, CP-0528 tokenomics state and the exact 1,000,000,000 QZXB Founder Genesis balance (100,000,000,000,000,000 atoms). The tokenomics validation also ties total Ledger value to the issued-supply counters, so the Founder amount cannot be accompanied by extra spendable Genesis supply.
+7. Computes and reports the full Genesis state root; a corrupt snapshot, wrong descriptor, wrong consensus fingerprint, policy drift or Founder allocation mismatch is rejected.
+8. Decodes Q6TS, requires Active status, and checks exact network/profile/Q6PN commitment binding.
+9. Loads Ed25519 and ML-DSA-65 authority public keys and checks their keyset ID against the independently pinned Q6TS authority keyset ID.
+10. Loads the Q6TS monotonic floor through the strongly consistent, read-only AWS DynamoDB adapter, verifies both signatures and requires the signed envelope to be the exact current floor head. It never provisions or advances the floor.
+
+The executable reports the verified network/profile, Q6GD commitment, full Genesis snapshot digest/state root, Founder atoms, Provider ID, Q6TS epoch and whether Q6PN includes a Q6QA quote-asset pin.
 
 ## Invocation
 
@@ -39,6 +44,8 @@ Example config shape (all identity values below are placeholders and must be rep
   "founder_account": "<64 lowercase hex characters>",
   "consensus_fingerprint": "<64 lowercase hex characters>",
   "tokenomics_policy_fingerprint": "<64 lowercase hex characters>",
+  "genesis_snapshot_path": ".\\genesis\\qfp6-genesis.q6gs",
+  "genesis_snapshot_sha256": "<64 lowercase hex characters, independently pinned full snapshot SHA-256>",
   "q6pn_path": ".\\trust\\q6pn.bin",
   "q6ts_path": ".\\trust\\q6ts.bin",
   "q6ts_ed25519_authority_public_key_path": ".\\trust\\q6ts-authority-ed25519.pub",
@@ -50,12 +57,14 @@ Example config shape (all identity values below are placeholders and must be rep
 }
 ```
 
-A bare **aws** executable name is resolved by the operating-system PATH; an explicit relative executable path is resolved relative to the config file. AWS credentials are resolved by the AWS CLI credential chain. The table must already exist and contain the independently provisioned floor; a missing floor is a hard failure. The config file's own SHA-256 must be independently pinned and passed on the command line. The Q6TS floor's AWS account/table must be administered separately from the node; a table in the same operator's account does not by itself prove independent trust.
+A bare **aws** executable name is resolved through the operating-system PATH. Explicit relative executable paths resolve relative to the config file; Windows drive-letter and UNC paths are recognized even when preflight is tested on Linux. AWS credentials are resolved by the AWS CLI credential chain. The table must already exist and contain the independently provisioned floor; a missing floor is a hard failure. The config file's own SHA-256 and the full Genesis snapshot SHA-256 must be independently pinned. The Q6TS floor's AWS account/table must be administered separately from the node; a table in the same operator's account does not by itself prove independent trust.
 
-The ML-DSA verifier currently used is **LibcruxMlDsa65VerifierCandidate**, which repository documentation explicitly classifies as candidate-only, not production-approved. This preflight is not a substitute for external cryptographic review, hardware/key custody review, AWS IAM/SCP separation or an audit of the trust bootstrap.
+## Scope and remaining production gates
 
-## Remaining before a runnable QFP6 node
+This phase remains **preflight-only**. It does not open or mutate a QFP6 durable store, connect to Provider/Q6EA services, recover a QAP1 intent, bind a node P2P listener, start consensus, accept transactions or mine. The read-only AWS CLI lookup does use network access to DynamoDB and may use its normal credential/cache behavior outside the QFP6 data directory. **--run** intentionally returns a nonzero refusal.
 
-This phase is not the node runtime. Still required: production-approved crypto/key custody; independently administered Q6TS and Q6EA/Provider services and pins; durable QFP6 store creation/reopen bound to an external manifest anchor; QAP1 intent recovery using the exact provider and anchor transports; transaction authentication and quote-asset authorization; node identity/key provisioning; externally reachable P2P policy; full-history synchronization and anti-rollback; and independent cross-operator qualification/security review. The existing provider/floor adapters are candidate implementations and have not been presented as deployed production services.
+The config's consensus fingerprint is checked against Q6GD, but this phase does not yet load and instantiate a frozen production QFP6 consensus-parameter artifact. Candidate testnet/v0.5 settings are not substituted.
 
-A successful preflight therefore means only that the supplied configuration, Q6GD/Q6PN/Q6TS artifacts, dual signatures and current Q6TS floor agree. It is not a Mainnet go decision.
+Still required before a runnable QFP6 node: independently reviewed/frozen v0.6 consensus and issuance parameters; production-approved crypto and key custody (the current **LibcruxMlDsa65VerifierCandidate** remains candidate-only); separately administered and provisioned Q6TS floor, Provider and Q6EA/Anchor services with distinct keys/operators; durable QFP6 store open/recovery tied to the exact external manifest anchor; QAP1 intent recovery through the pinned Provider/Anchor transports; actual transaction key registry/custody; Q6QA signed quote-asset qualification where external quote assets are intended; operational Noise peer identities; externally reachable P2P policy; complete history sync and anti-rollback qualification; multi-operator testing and independent security review.
+
+A successful preflight means only that the pinned configuration, full Genesis snapshot, Q6GD/Q6PN/Q6TS artifacts, dual signatures and current Q6TS floor agree. It is not node-runtime readiness, public Devnet approval or a Mainnet go decision.

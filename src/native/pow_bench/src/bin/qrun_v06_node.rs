@@ -6,6 +6,7 @@
 //! It is intentionally preflight-only until the production QAP1/Provider/Anchor/runtime wiring
 //! and independent deployment qualifications are complete.
 use ai_native_l1_pow_bench::{
+    qrun_v06_canonical_execution_candidate::QRunV06CanonicalExecutionState,
     qrun_v06_profile_pin_candidate::QRunV06VerifiedProfilePin,
     qrun_v06_profile_trust_candidate::{
         verify_qrun_v06_profile_trust_envelope, MonotonicQRunV06ProfileTrustFloorStore,
@@ -13,6 +14,7 @@ use ai_native_l1_pow_bench::{
         QRunV06ProfileTrustStatus, QRunV06SignedProfileTrustEnvelope,
     },
     qrun_v06_profile_trust_dynamodb_floor_candidate::AwsDynamoDbQ6tsProfileTrustFloorStore,
+    qrun_v06_tokenomics_candidate::QRUN_V06_FOUNDER_GENESIS_ATOMS,
     v4_fat1_mldsa65_candidate::LibcruxMlDsa65VerifierCandidate,
     v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES,
 };
@@ -26,6 +28,7 @@ use std::{
 
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_BOOTSTRAP_BYTES: u64 = 16 * 1024;
+const MAX_GENESIS_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 struct Config {
@@ -35,6 +38,8 @@ struct Config {
     founder_account: [u8; 32],
     consensus_fingerprint: [u8; 32],
     tokenomics_policy_fingerprint: [u8; 32],
+    genesis_snapshot_sha256: [u8; 32],
+    genesis_snapshot_path: PathBuf,
     profile_pin_path: PathBuf,
     trust_envelope_path: PathBuf,
     authority_ed25519_path: PathBuf,
@@ -50,6 +55,9 @@ struct PreflightSummary {
     network_id: [u8; 32],
     profile_id: [u8; 32],
     genesis_commitment: [u8; 32],
+    genesis_state_root: [u8; 32],
+    genesis_snapshot_sha256: [u8; 32],
+    founder_genesis_atoms: u128,
     trust_epoch: u64,
     has_quote_asset_pin: bool,
     provider_id: [u8; 32],
@@ -100,9 +108,20 @@ fn resolve_path(base: &Path, value: &str) -> PathBuf {
     }
 }
 
+fn is_windows_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\'))
+        || value.starts_with("\\\\")
+}
+
 fn resolve_executable(base: &Path, value: &str) -> PathBuf {
     let path = PathBuf::from(value);
-    if path.is_absolute() || value.contains('/') || value.contains('\\') {
+    if path.is_absolute() || is_windows_absolute_path(value) {
+        path
+    } else if value.contains('/') || value.contains('\\') {
         resolve_path(base, value)
     } else {
         // A bare executable name is resolved by the OS PATH lookup (e.g. `aws` or `aws.exe`).
@@ -173,6 +192,11 @@ fn parse_config(
             "tokenomics_policy_fingerprint",
             required_string(&value, "tokenomics_policy_fingerprint")?,
         )?,
+        genesis_snapshot_sha256: parse_hex32(
+            "genesis_snapshot_sha256",
+            required_string(&value, "genesis_snapshot_sha256")?,
+        )?,
+        genesis_snapshot_path: path_field("genesis_snapshot_path")?,
         profile_pin_path: path_field("q6pn_path")?,
         trust_envelope_path: path_field("q6ts_path")?,
         authority_ed25519_path: path_field("q6ts_ed25519_authority_public_key_path")?,
@@ -185,6 +209,65 @@ fn parse_config(
         aws_region: required_string(&value, "aws_region")?.to_owned(),
         trust_floor_table: required_string(&value, "q6ts_floor_table")?.to_owned(),
     })
+}
+
+fn verify_genesis_snapshot(
+    bytes: &[u8],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    founder_account: &[u8; 32],
+    consensus_fingerprint: &[u8; 32],
+    tokenomics_policy_fingerprint: &[u8; 32],
+    expected_descriptor: &ai_native_l1_pow_bench::qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
+) -> Result<([u8; 32], u128), String> {
+    let state = QRunV06CanonicalExecutionState::decode_snapshot(bytes, network_id, profile_id)
+        .map_err(|error| format!("full QFP6 Genesis execution snapshot is invalid: {error:?}"))?;
+    state
+        .verify_invariants()
+        .map_err(|error| format!("QFP6 Genesis execution invariants failed: {error:?}"))?;
+    if state.height() != 0 {
+        return Err("configured Genesis execution snapshot must be at height zero".into());
+    }
+    let descriptor = state.genesis_descriptor().ok_or_else(|| {
+        "full Genesis snapshot is missing its immutable Q6GD descriptor".to_string()
+    })?;
+    if descriptor != expected_descriptor
+        || descriptor.founder_account() != *founder_account
+        || descriptor.consensus_fingerprint() != *consensus_fingerprint
+        || descriptor.tokenomics_policy_fingerprint() != *tokenomics_policy_fingerprint
+        || state.last_timestamp() != descriptor.genesis_timestamp()
+    {
+        return Err("full Q6GD descriptor/timestamp differs from the independently pinned Q6PN profile identity".into());
+    }
+    let tokenomics = state
+        .tokenomics()
+        .ok_or_else(|| "full Genesis snapshot is missing CP-0528 tokenomics state".to_string())?;
+    if tokenomics.founder_account() != *founder_account
+        || tokenomics.policy_fingerprint() != *tokenomics_policy_fingerprint
+    {
+        return Err(
+            "full Genesis CP-0528 policy or Founder binding differs from the pinned identity"
+                .into(),
+        );
+    }
+    let founder_balance = state
+        .unified()
+        .ledger()
+        .account(founder_account)
+        .map_or(0u128, |account| account.balance as u128);
+    if founder_balance != QRUN_V06_FOUNDER_GENESIS_ATOMS {
+        return Err(format!(
+            "Genesis Founder allocation must be exactly {} atoms; found {founder_balance}",
+            QRUN_V06_FOUNDER_GENESIS_ATOMS
+        ));
+    }
+    // verify_invariants binds Ledger total value to the CP-0528 live-supply counters. Since the
+    // only live Genesis issuance is the exact Founder allocation checked above, there is no
+    // remaining spendable supply available to another account.
+    let state_root = state
+        .state_root()
+        .map_err(|error| format!("QFP6 Genesis state-root verification failed: {error:?}"))?;
+    Ok((state_root, founder_balance))
 }
 
 fn preflight(
@@ -236,6 +319,27 @@ fn preflight(
     {
         return Err("Q6GD Genesis descriptor does not match the independently supplied network/profile/founder/consensus/tokenomics identity".into());
     }
+
+    // Validate the complete canonical Genesis state, not merely its descriptor. The external
+    // SHA-256 binds every nested ledger/AMM/registry/orderbook/tokenomics byte to the pinned config.
+    let genesis_snapshot_bytes = read_bounded(
+        &config.genesis_snapshot_path,
+        MAX_GENESIS_SNAPSHOT_BYTES,
+        "full QFP6 Genesis execution snapshot",
+    )?;
+    let actual_genesis_snapshot_sha256: [u8; 32] = Sha256::digest(&genesis_snapshot_bytes).into();
+    if actual_genesis_snapshot_sha256 != config.genesis_snapshot_sha256 {
+        return Err("full QFP6 Genesis snapshot SHA-256 differs from the independently pinned config digest".into());
+    }
+    let (genesis_state_root, founder_genesis_atoms) = verify_genesis_snapshot(
+        &genesis_snapshot_bytes,
+        &config.network_id,
+        &config.profile_id,
+        &config.founder_account,
+        &config.consensus_fingerprint,
+        &config.tokenomics_policy_fingerprint,
+        descriptor,
+    )?;
 
     let envelope = QRunV06SignedProfileTrustEnvelope::decode(&trust_envelope_bytes)
         .map_err(|error| format!("Q6TS signed envelope decode failed: {error}"))?;
@@ -295,6 +399,9 @@ fn preflight(
         network_id: config.network_id,
         profile_id: config.profile_id,
         genesis_commitment: descriptor.commitment(),
+        genesis_state_root,
+        genesis_snapshot_sha256: actual_genesis_snapshot_sha256,
+        founder_genesis_atoms,
         trust_epoch: envelope.record.trust_epoch,
         has_quote_asset_pin: profile_pin.quote_asset_trust_pin().is_some(),
         provider_id: profile_pin.bundle().external_cas_pin().provider_id,
@@ -319,7 +426,7 @@ fn print_help() {
            qrun_v06_node --preflight --config <path> --config-sha256 <64-hex>\n\
            qrun_v06_node --help\n\
          \n\
-         This build verifies Q6GD/Q6PN/Q6TS and the independent AWS DynamoDB Q6TS floor.\n\
+         This build verifies the full QFB6 Genesis snapshot, Q6GD/Q6PN/Q6TS and the independent AWS DynamoDB Q6TS floor.\n\
          It is preflight-only: it does not open a QFP6 data directory, bind P2P, or start a node."
     );
 }
@@ -351,6 +458,12 @@ fn run(args: &[String]) -> Result<(), String> {
         "genesis_descriptor_commitment={}",
         hex(&summary.genesis_commitment)
     );
+    println!(
+        "genesis_snapshot_sha256={}",
+        hex(&summary.genesis_snapshot_sha256)
+    );
+    println!("genesis_state_root={}", hex(&summary.genesis_state_root));
+    println!("genesis_founder_atoms={}", summary.founder_genesis_atoms);
     println!("provider_id={}", hex(&summary.provider_id));
     println!("q6ts_trust_epoch={}", summary.trust_epoch);
     println!(
@@ -385,6 +498,10 @@ mod tests {
     use super::*;
     use ai_native_l1_pow_bench::qrun_v06_profile_trust_candidate::{
         QRunV06ProfileTrustRecord, TrustedQRunV06ProfileTrustFloor,
+    };
+    use ai_native_l1_pow_bench::{
+        qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
+        qrun_v06_tokenomics_candidate::{QRunV06MiningScheduleCandidate, QRunV06TokenomicsState},
     };
     use ed25519_dalek::{Signer, SigningKey};
     use libcrux_ml_dsa::ml_dsa_65::portable;
@@ -457,6 +574,67 @@ mod tests {
     }
 
     #[test]
+    fn full_genesis_snapshot_is_verified_against_q6gd_and_exact_founder_allocation() {
+        let schedule = QRunV06MiningScheduleCandidate::new(35_673_515_981, 4_204_800).unwrap();
+        let tokenomics =
+            QRunV06TokenomicsState::genesis(TEST_NETWORK, [0xA3; 32], schedule).unwrap();
+        let policy = tokenomics.policy_fingerprint();
+        let descriptor = QRunV06GenesisDescriptor::new(
+            TEST_NETWORK,
+            TEST_PROFILE,
+            [0xA3; 32],
+            1_800_000_000,
+            [0xA4; 32],
+            policy,
+        )
+        .unwrap();
+        let state = QRunV06CanonicalExecutionState::cp0528_genesis_candidate_with_descriptor(
+            descriptor.clone(),
+            schedule,
+        )
+        .unwrap();
+        let bytes = state.encode_snapshot().unwrap();
+        let (root, founder_balance) = verify_genesis_snapshot(
+            &bytes,
+            &TEST_NETWORK,
+            &TEST_PROFILE,
+            &[0xA3; 32],
+            &[0xA4; 32],
+            &policy,
+            &descriptor,
+        )
+        .unwrap();
+        assert_eq!(root, state.state_root().unwrap());
+        assert_eq!(founder_balance, QRUN_V06_FOUNDER_GENESIS_ATOMS);
+
+        let mut corrupted = bytes.clone();
+        let last_byte = corrupted.len() - 1;
+        corrupted[last_byte] ^= 1;
+        assert!(verify_genesis_snapshot(
+            &corrupted,
+            &TEST_NETWORK,
+            &TEST_PROFILE,
+            &[0xA3; 32],
+            &[0xA4; 32],
+            &policy,
+            &descriptor,
+        )
+        .is_err());
+
+        let wrong_consensus = [0xA5; 32];
+        assert!(verify_genesis_snapshot(
+            &bytes,
+            &TEST_NETWORK,
+            &TEST_PROFILE,
+            &[0xA3; 32],
+            &wrong_consensus,
+            &policy,
+            &descriptor,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn help_is_available_without_loading_any_artifact() {
         assert!(run(&["--help".into()]).is_ok());
     }
@@ -478,6 +656,14 @@ mod tests {
         assert_eq!(
             resolve_executable(base, "C:/AWS/aws.exe"),
             PathBuf::from("C:/AWS/aws.exe")
+        );
+        assert_eq!(
+            resolve_executable(base, "C:\\AWS\\aws.exe"),
+            PathBuf::from("C:\\AWS\\aws.exe")
+        );
+        assert_eq!(
+            resolve_executable(base, r"\\server\share\aws.exe"),
+            PathBuf::from(r"\\server\share\aws.exe")
         );
     }
 
