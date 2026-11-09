@@ -13,6 +13,9 @@ use ai_native_l1_pow_bench::{
     external_cas_offhost_anchor_protocol_candidate::ExternalCasOffhostAnchorPin,
     noise_key_provisioning::load_protected_noise_private_key,
     qrun_v06_canonical_execution_candidate::QRunV06CanonicalExecutionState,
+    qrun_v06_consensus_profile_candidate::{
+        QRunV06ConsensusProfile, QRUN_V06_CONSENSUS_PROFILE_MAX_BYTES,
+    },
     qrun_v06_external_anchor_candidate::{QRunV06ExternalAnchorPin, QRunV06ExternalAnchorState},
     qrun_v06_profile_pin_candidate::QRunV06VerifiedProfilePin,
     qrun_v06_profile_trust_candidate::{
@@ -38,6 +41,7 @@ use std::{
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_BOOTSTRAP_BYTES: u64 = 16 * 1024;
 const MAX_GENESIS_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_CONSENSUS_PROFILE_BYTES: u64 = QRUN_V06_CONSENSUS_PROFILE_MAX_BYTES as u64;
 
 #[derive(Debug)]
 struct Config {
@@ -46,6 +50,8 @@ struct Config {
     profile_pin_commitment: [u8; 32],
     founder_account: [u8; 32],
     consensus_fingerprint: [u8; 32],
+    consensus_profile_path: PathBuf,
+    consensus_profile_sha256: [u8; 32],
     tokenomics_policy_fingerprint: [u8; 32],
     genesis_snapshot_sha256: [u8; 32],
     genesis_snapshot_path: PathBuf,
@@ -80,6 +86,19 @@ struct PreflightSummary {
     genesis_commitment: [u8; 32],
     genesis_state_root: [u8; 32],
     genesis_snapshot_sha256: [u8; 32],
+    consensus_profile_sha256: [u8; 32],
+    consensus_fingerprint: [u8; 32],
+    consensus_protocol_version: u16,
+    target_block_time_secs: u64,
+    difficulty_window_blocks: u64,
+    initial_target: [u8; 32],
+    pow_limit: [u8; 32],
+    pow_memory_kib: u32,
+    pow_iterations: u32,
+    pow_lanes: u32,
+    issuance_maximum_supply_atoms: u128,
+    issuance_initial_subsidy_atoms: u128,
+    issuance_blocks_per_halving: u64,
     founder_genesis_atoms: u128,
     q6ea_anchor_id: [u8; 32],
     provider_noise_server_key_sha256: [u8; 32],
@@ -279,6 +298,11 @@ fn parse_config(
             "consensus_fingerprint",
             required_string(&value, "consensus_fingerprint")?,
         )?,
+        consensus_profile_path: path_field("consensus_profile_path")?,
+        consensus_profile_sha256: parse_hex32(
+            "consensus_profile_sha256",
+            required_string(&value, "consensus_profile_sha256")?,
+        )?,
         tokenomics_policy_fingerprint: parse_hex32(
             "tokenomics_policy_fingerprint",
             required_string(&value, "tokenomics_policy_fingerprint")?,
@@ -392,6 +416,33 @@ fn verify_genesis_snapshot(
     Ok((state_root, founder_balance))
 }
 
+fn load_pinned_q6cp_profile(
+    path: &Path,
+    independently_pinned_sha256: &[u8; 32],
+    expected_descriptor: &ai_native_l1_pow_bench::qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
+) -> Result<([u8; 32], QRunV06ConsensusProfile), String> {
+    let bytes = read_bounded(
+        path,
+        MAX_CONSENSUS_PROFILE_BYTES,
+        "Q6CP full consensus-parameters artifact",
+    )?;
+    let actual_sha256: [u8; 32] = Sha256::digest(&bytes).into();
+    if &actual_sha256 != independently_pinned_sha256 {
+        return Err(
+            "Q6CP consensus-parameters SHA-256 differs from the independently pinned config digest"
+                .into(),
+        );
+    }
+    let profile = QRunV06ConsensusProfile::decode(&bytes)
+        .map_err(|error| format!("Q6CP canonical consensus profile decode failed: {error:?}"))?;
+    profile
+        .validate_against(expected_descriptor)
+        .map_err(|error| {
+            format!("Q6CP identity/fingerprint does not match Q6GD/Q6PN: {error:?}")
+        })?;
+    Ok((actual_sha256, profile))
+}
+
 fn preflight(
     config_path: &Path,
     independently_pinned_config_digest: &[u8; 32],
@@ -441,6 +492,21 @@ fn preflight(
     {
         return Err("Q6GD Genesis descriptor does not match the independently supplied network/profile/founder/consensus/tokenomics identity".into());
     }
+
+    // Decode the complete fixed-width Q6CP artifact, verify its out-of-band file hash and
+    // recompute every consensus parameter against the immutable Q6GD descriptor.
+    let (actual_consensus_profile_sha256, consensus_profile) = load_pinned_q6cp_profile(
+        &config.consensus_profile_path,
+        &config.consensus_profile_sha256,
+        descriptor,
+    )?;
+    if consensus_profile.network_id() != config.network_id
+        || consensus_profile.profile_id() != config.profile_id
+        || consensus_profile.consensus_fingerprint() != config.consensus_fingerprint
+    {
+        return Err("Q6CP network/profile/fingerprint differs from the independently supplied bootstrap identity".into());
+    }
+    let consensus_params = consensus_profile.parameters();
 
     // Validate the complete canonical Genesis state, not merely its descriptor. The external
     // SHA-256 binds every nested ledger/AMM/registry/orderbook/tokenomics byte to the pinned config.
@@ -568,6 +634,19 @@ fn preflight(
         genesis_commitment: descriptor.commitment(),
         genesis_state_root,
         genesis_snapshot_sha256: actual_genesis_snapshot_sha256,
+        consensus_profile_sha256: actual_consensus_profile_sha256,
+        consensus_fingerprint: consensus_profile.consensus_fingerprint(),
+        consensus_protocol_version: consensus_params.protocol_version,
+        target_block_time_secs: consensus_params.target_block_time_secs,
+        difficulty_window_blocks: consensus_params.difficulty_window_blocks,
+        initial_target: consensus_params.initial_target.to_be_bytes(),
+        pow_limit: consensus_params.pow_limit.to_be_bytes(),
+        pow_memory_kib: consensus_params.pow.memory_kib,
+        pow_iterations: consensus_params.pow.iterations,
+        pow_lanes: consensus_params.pow.lanes,
+        issuance_maximum_supply_atoms: consensus_params.issuance.maximum_supply(),
+        issuance_initial_subsidy_atoms: consensus_params.issuance.initial_subsidy(),
+        issuance_blocks_per_halving: consensus_params.issuance.blocks_per_halving(),
         founder_genesis_atoms,
         q6ea_anchor_id: config.q6ea_anchor_id,
         provider_noise_server_key_sha256: config.provider_noise_server_key_sha256,
@@ -766,7 +845,7 @@ fn print_help() {
            qrun_v06_node --probe-qap1 --config <path> --config-sha256 <64-hex>\n\
            qrun_v06_node --help\n\
          \n\
-         --preflight verifies the pinned Genesis/Q6PN/Q6TS/Q6EA bootstrap package.\n\
+         --preflight verifies the pinned Genesis/Q6CP/Q6PN/Q6TS/Q6EA bootstrap package.\n\
          --probe-qap1 additionally performs read-only signed Provider and Q6EA Anchor reads over pinned Noise endpoints.\n\
          Neither command starts a node, mutates a store/floor, admits transactions, or mines."
     );
@@ -809,6 +888,45 @@ fn run(args: &[String]) -> Result<(), String> {
         "genesis_snapshot_sha256={}",
         hex(&summary.genesis_snapshot_sha256)
     );
+    println!(
+        "q6cp_profile_sha256={}",
+        hex(&summary.consensus_profile_sha256)
+    );
+    println!(
+        "q6cp_consensus_fingerprint={}",
+        hex(&summary.consensus_fingerprint)
+    );
+    println!(
+        "q6cp_protocol_version={}",
+        summary.consensus_protocol_version
+    );
+    println!(
+        "q6cp_target_block_time_secs={}",
+        summary.target_block_time_secs
+    );
+    println!(
+        "q6cp_difficulty_window_blocks={}",
+        summary.difficulty_window_blocks
+    );
+    println!("q6cp_initial_target={}", hex(&summary.initial_target));
+    println!("q6cp_pow_limit={}", hex(&summary.pow_limit));
+    println!("q6cp_pow_algorithm=Argon2id");
+    println!("q6cp_pow_memory_kib={}", summary.pow_memory_kib);
+    println!("q6cp_pow_iterations={}", summary.pow_iterations);
+    println!("q6cp_pow_lanes={}", summary.pow_lanes);
+    println!(
+        "q6cp_maximum_supply_atoms={}",
+        summary.issuance_maximum_supply_atoms
+    );
+    println!(
+        "q6cp_initial_subsidy_atoms={}",
+        summary.issuance_initial_subsidy_atoms
+    );
+    println!(
+        "q6cp_blocks_per_halving={}",
+        summary.issuance_blocks_per_halving
+    );
+    println!("q6cp_qualification=CANDIDATE_ONLY_NOT_MAINNET_APPROVED");
     println!("genesis_state_root={}", hex(&summary.genesis_state_root));
     println!("genesis_founder_atoms={}", summary.founder_genesis_atoms);
     println!("provider_id={}", hex(&summary.provider_id));
@@ -873,14 +991,16 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use ai_native_l1_pow_bench::{
+        consensus::ConsensusParameters,
+        qrun_v06_consensus_profile_candidate::QRunV06ConsensusProfile,
+        qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
+        qrun_v06_tokenomics_candidate::{QRunV06MiningScheduleCandidate, QRunV06TokenomicsState},
+    };
+    use ai_native_l1_pow_bench::{
         external_cas_anchor_candidate::ExternalCasPin,
         qrun_v06_profile_trust_candidate::{
             QRunV06ProfileTrustRecord, TrustedQRunV06ProfileTrustFloor,
         },
-    };
-    use ai_native_l1_pow_bench::{
-        qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
-        qrun_v06_tokenomics_candidate::{QRunV06MiningScheduleCandidate, QRunV06TokenomicsState},
     };
     use ed25519_dalek::{Signer, SigningKey};
     use libcrux_ml_dsa::ml_dsa_65::portable;
@@ -888,6 +1008,62 @@ mod tests {
     const TEST_NETWORK: [u8; 32] = [0xA1; 32];
     const TEST_PROFILE: [u8; 32] = [0xA2; 32];
     const TEST_Q6PN_COMMITMENT: [u8; 32] = [0xA3; 32];
+
+    #[test]
+    fn preflight_loads_q6cp_only_with_exact_file_hash_and_q6gd_identity() {
+        let mut params = ConsensusParameters::candidate_testnet().unwrap();
+        params.protocol_version =
+            ai_native_l1_pow_bench::qrun_v06_pow_wire_candidate::QRUN_V06_PROTOCOL_VERSION;
+        let fingerprint = QRunV06ConsensusProfile::fingerprint_parameters(&params).unwrap();
+        let descriptor = QRunV06GenesisDescriptor::new(
+            TEST_NETWORK,
+            TEST_PROFILE,
+            [0xA3; 32],
+            1_800_000_000,
+            fingerprint,
+            [0xA4; 32],
+        )
+        .unwrap();
+        let profile = QRunV06ConsensusProfile::new(
+            TEST_NETWORK,
+            TEST_PROFILE,
+            descriptor.commitment(),
+            params,
+        )
+        .unwrap();
+        let encoded = profile.encode().unwrap();
+        let path = env::temp_dir().join(format!(
+            "qrun-qfp6-q6cp-preflight-{}.bin",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        fs::write(&path, encoded).unwrap();
+        let digest: [u8; 32] = Sha256::digest(encoded).into();
+        let (loaded_digest, loaded) =
+            load_pinned_q6cp_profile(&path, &digest, &descriptor).unwrap();
+        assert_eq!(loaded_digest, digest);
+        assert_eq!(loaded, profile);
+
+        assert!(load_pinned_q6cp_profile(&path, &[0x55; 32], &descriptor).is_err());
+
+        let wrong_descriptor = QRunV06GenesisDescriptor::new(
+            TEST_NETWORK,
+            [0xB2; 32],
+            [0xA3; 32],
+            1_800_000_000,
+            fingerprint,
+            [0xA4; 32],
+        )
+        .unwrap();
+        assert!(load_pinned_q6cp_profile(&path, &digest, &wrong_descriptor).is_err());
+
+        let mut corrupted = encoded;
+        corrupted[206] ^= 1;
+        fs::write(&path, corrupted).unwrap();
+        let corrupted_digest: [u8; 32] = Sha256::digest(corrupted).into();
+        assert!(load_pinned_q6cp_profile(&path, &corrupted_digest, &descriptor).is_err());
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn preflight_config_does_not_require_qap1_client_secrets_or_provider_floor() {
@@ -902,6 +1078,8 @@ mod tests {
             "profile_pin_commitment": "03".repeat(32),
             "founder_account": "04".repeat(32),
             "consensus_fingerprint": "05".repeat(32),
+            "consensus_profile_path": "consensus.q6cp",
+            "consensus_profile_sha256": "0e".repeat(32),
             "tokenomics_policy_fingerprint": "06".repeat(32),
             "genesis_snapshot_sha256": "07".repeat(32),
             "genesis_snapshot_path": "genesis.q6gs",
@@ -928,6 +1106,11 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
         let basic = parse_config(&path, &digest).unwrap();
+        assert_eq!(
+            basic.consensus_profile_path,
+            env::temp_dir().join("consensus.q6cp")
+        );
+        assert_eq!(basic.consensus_profile_sha256, [0x0e; 32]);
         assert!(basic.provider_noise_client_key_path.is_none());
         assert!(basic.q6ea_anchor_noise_client_key_path.is_none());
         assert!(basic.provider_floor_store_path.is_none());

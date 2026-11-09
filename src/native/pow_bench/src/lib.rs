@@ -134,6 +134,8 @@ pub mod qrun_v06_asset_registry_candidate;
 pub mod qrun_v06_canonical_execution_candidate;
 /// M2i QFP6 full-state checkpoints binding QFB6 snapshots, target history, consensus work and an external anchor.
 pub mod qrun_v06_checkpoint_candidate;
+/// CP-0575 canonical full Q6CP consensus parameters bound to Q6GD/Q6PN; candidate-only, not Mainnet approval.
+pub mod qrun_v06_consensus_profile_candidate;
 /// CP-0527 QFP6 bridge from durable segment state to signed external monotonic CAS anchors.
 pub mod qrun_v06_external_anchor_candidate;
 /// Immutable QFP6 Genesis descriptor binding timestamp, profile, consensus and CP-0528 policy.
