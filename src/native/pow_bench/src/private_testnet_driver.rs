@@ -1,4 +1,4 @@
-﻿//! Private-testnet consensus chain driver for CP-W.
+//! Private-testnet consensus chain driver for CP-W.
 //!
 //! This driver keeps target history, cumulative work, and canonical state together without
 //! changing the legacy BLK2 body encoding. It is deliberately small and explicit so a later
@@ -7,15 +7,18 @@
 use crate::{
     chain_admission::{BlockAdmissionReceipt, ChainAdmissionBoundary, ReferenceTimeProvider},
     consensus::{
-        block_work, compare_chain_tips, ChainTip, ConsensusError, ConsensusParameters, Uint256,
+        block_work, compare_chain_tips, verify_pow, ChainTip, ConsensusError, ConsensusParameters,
+        PowHeader, Uint256,
     },
     private_testnet_checkpoint_candidate::{Pcp4CheckpointRecord, Pcp4ValidationContext},
     private_testnet_consensus::{
         admit_live as admit_candidate_live, CandidateConsensusBlock, PrivateConsensusError,
     },
     private_testnet_pfm5_manifest_candidate::Pfm5CheckpointManifest,
+    qrun_v05_fee_pow_wire_candidate::qrun_v05_fee_pow_state_commitment,
     state_machine::{
-        Block, LedgerState, MonetaryBlock, MonetaryLedgerState, TransactionAuthenticator,
+        Block, LedgerState, MonetaryBlock, MonetaryLedgerState, QRunV05FeeBlock,
+        TransactionAuthenticator,
     },
 };
 use std::collections::VecDeque;
@@ -357,7 +360,7 @@ impl TargetHistory {
     /// Validate the next history record before a state transition is applied. Keeping this
     /// check separate prevents a rejected timestamp/height/target from leaving chain state
     /// advanced while target history and the consensus tip remain at the parent.
-    fn validate_next(
+    pub(crate) fn validate_next(
         &self,
         height: u64,
         target: Uint256,
@@ -396,7 +399,7 @@ impl TargetHistory {
         Ok(())
     }
 
-    fn record_next(
+    pub(crate) fn record_next(
         &mut self,
         height: u64,
         target: Uint256,
@@ -454,6 +457,14 @@ impl std::fmt::Display for Pfm5CheckpointRestoreError {
 
 impl std::error::Error for Pfm5CheckpointRestoreError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainExecutionMode {
+    Unset,
+    Legacy,
+    Monetary,
+    QRunV05FeeOnly,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrivateTestnetChain {
     /// Public legacy-state view retained for existing PTB2 callers. On a monetary
@@ -466,6 +477,7 @@ pub struct PrivateTestnetChain {
     /// Consensus tip identifier. This includes PoW-header uniqueness; BLK2 state tip hashes
     /// intentionally do not include nonce/target and therefore cannot identify PoW forks alone.
     tip_consensus_hash: [u8; 32],
+    execution_mode: ChainExecutionMode,
 }
 
 impl PrivateTestnetChain {
@@ -477,6 +489,52 @@ impl PrivateTestnetChain {
             target_history: TargetHistory::new(params)?,
             cumulative_work: Uint256::ZERO,
             tip_consensus_hash,
+            execution_mode: ChainExecutionMode::Unset,
+        })
+    }
+
+    /// Restore the QRun ledger/consensus baseline after its checkpoint has been validated against
+    /// an independently protected commitment and monotonic height floor. This constructor checks
+    /// local snapshot/history consistency; it does not authenticate the checkpoint on its own.
+    pub(crate) fn from_qrun_checkpoint(
+        state: LedgerState,
+        params: ConsensusParameters,
+        target_history_checkpoint: &TargetHistoryCheckpoint,
+        cumulative_work: Uint256,
+        tip_consensus_hash: [u8; 32],
+    ) -> Result<Self, String> {
+        state
+            .total_value()
+            .map_err(|error| format!("checkpoint state invariant: {error:?}"))?;
+        let target_history =
+            TargetHistory::from_checkpoint_snapshot(params, target_history_checkpoint)
+                .map_err(|error| format!("checkpoint target history: {error}"))?;
+        if target_history.height() != state.height() {
+            return Err("checkpoint target history height differs from ledger height".into());
+        }
+        if state.height() == 0 {
+            if tip_consensus_hash != state.tip_hash() || cumulative_work != Uint256::ZERO {
+                return Err(
+                    "Genesis checkpoint must have zero chainwork and the Genesis ledger tip".into(),
+                );
+            }
+        } else if tip_consensus_hash == [0; 32] || cumulative_work == Uint256::ZERO {
+            return Err(
+                "non-Genesis checkpoint must have a nonzero consensus tip and chainwork".into(),
+            );
+        }
+        let execution_mode = if state.height() == 0 {
+            ChainExecutionMode::Unset
+        } else {
+            ChainExecutionMode::Legacy
+        };
+        Ok(Self {
+            state,
+            monetary_state: None,
+            target_history,
+            cumulative_work,
+            tip_consensus_hash,
+            execution_mode,
         })
     }
 
@@ -551,6 +609,7 @@ impl PrivateTestnetChain {
             target_history,
             cumulative_work: checkpoint.cumulative_chainwork,
             tip_consensus_hash: checkpoint.consensus_tip_digest,
+            execution_mode: ChainExecutionMode::Monetary,
         })
     }
 
@@ -569,11 +628,45 @@ impl PrivateTestnetChain {
             target_history: TargetHistory::new(params)?,
             cumulative_work: Uint256::ZERO,
             tip_consensus_hash,
+            execution_mode: ChainExecutionMode::Monetary,
         })
     }
 
     pub fn monetary_state(&self) -> Option<&MonetaryLedgerState> {
         self.monetary_state.as_ref()
+    }
+
+    pub(crate) fn uses_qrun_v05_fee_only_execution(&self) -> bool {
+        matches!(self.execution_mode, ChainExecutionMode::QRunV05FeeOnly)
+    }
+    /// Historical CP-0450 compatibility shorthand. Wallet-bound checkpoint restoration must
+    /// call enable_qrun_v05_fee_only_execution_for_genesis after validating the QRCP bytes against
+    /// the exact owner-bound Genesis commitment.
+    pub(crate) fn enable_qrun_v05_fee_only_execution(&mut self) -> Result<(), String> {
+        self.enable_qrun_v05_fee_only_execution_for_genesis(
+            crate::qrun_v05_profile_identity_candidate::PROPOSED_GENESIS_COMMITMENT,
+        )
+    }
+
+    /// Enable QFP5 only after the caller has authenticated this checkpoint chain against the
+    /// supplied original Genesis commitment. The checkpoint state is height N, so it cannot
+    /// independently reproduce the height-zero Genesis commitment; that binding is checked by
+    /// QRunV05PowCheckpoint::restore_chain_anchored before this method is called.
+    pub(crate) fn enable_qrun_v05_fee_only_execution_for_genesis(
+        &mut self,
+        genesis_commitment: [u8; 32],
+    ) -> Result<(), String> {
+        if genesis_commitment.iter().all(|byte| *byte == 0)
+            || self.execution_mode != ChainExecutionMode::Legacy
+            || self.monetary_state.is_some()
+            || self.state.height() == 0
+            || self.state.network_id().iter().all(|byte| *byte == 0)
+            || self.state.total_value().ok() != Some(crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS)
+        {
+            return Err("checkpoint chain does not match the QRun v0.5 fee-only profile".into());
+        }
+        self.execution_mode = ChainExecutionMode::QRunV05FeeOnly;
+        Ok(())
     }
 
     pub fn state(&self) -> &LedgerState {
@@ -622,6 +715,15 @@ impl PrivateTestnetChain {
         authenticator: &A,
         clock: &dyn ReferenceTimeProvider,
     ) -> Result<(BlockAdmissionReceipt, [u8; 32]), PrivateConsensusError> {
+        match self.execution_mode {
+            ChainExecutionMode::QRunV05FeeOnly => {
+                return Err(PrivateConsensusError::LegacyBlockOnFeeOnlyChain);
+            }
+            ChainExecutionMode::Monetary => {
+                return Err(PrivateConsensusError::LegacyBlockOnMonetaryChain);
+            }
+            ChainExecutionMode::Unset | ChainExecutionMode::Legacy => {}
+        }
         if self.monetary_state.is_some() {
             return Err(PrivateConsensusError::LegacyBlockOnMonetaryChain);
         }
@@ -652,7 +754,172 @@ impl PrivateTestnetChain {
             .record_next(next_height, pow_header.target, pow_header.timestamp)?;
         self.cumulative_work = next_cumulative_work;
         self.tip_consensus_hash = digest;
+        self.execution_mode = ChainExecutionMode::Legacy;
 
+        Ok((receipt, digest))
+    }
+
+    /// Validate a QFP5 header and apply its producer-inclusive QFB5 state transition. The
+    /// execution mode is locked on the first accepted block and legacy/monetary modes cannot mix.
+    pub fn append_qrun_v05_fee_live<A: TransactionAuthenticator>(
+        &mut self,
+        block: &QRunV05FeeBlock,
+        pow_header: &PowHeader,
+        measured_window_elapsed_secs: Option<u64>,
+        authenticator: &A,
+        clock: &dyn ReferenceTimeProvider,
+    ) -> Result<(BlockAdmissionReceipt, [u8; 32]), PrivateConsensusError> {
+        match self.execution_mode {
+            ChainExecutionMode::Legacy => {
+                return Err(PrivateConsensusError::FeeOnlyBlockOnLegacyChain);
+            }
+            ChainExecutionMode::Monetary => {
+                return Err(PrivateConsensusError::FeeOnlyBlockOnMonetaryChain);
+            }
+            ChainExecutionMode::Unset | ChainExecutionMode::QRunV05FeeOnly => {}
+        }
+        if self.monetary_state.is_some() {
+            return Err(PrivateConsensusError::FeeOnlyBlockOnMonetaryChain);
+        }
+
+        let body = &block.body;
+        let next_height =
+            self.state
+                .height()
+                .checked_add(1)
+                .ok_or(PrivateConsensusError::Consensus(
+                    ConsensusError::InvalidNextBlockHeight,
+                ))?;
+        let expected_target = self
+            .target_history
+            .expected_target(next_height, measured_window_elapsed_secs)?;
+        if pow_header.network_id != self.state.network_id() {
+            return Err(PrivateConsensusError::NetworkMismatch);
+        }
+        if pow_header.protocol_version != self.target_history.params.protocol_version {
+            return Err(PrivateConsensusError::HeaderBodyMismatch(
+                "protocol_version",
+            ));
+        }
+        if pow_header.height != body.height {
+            return Err(PrivateConsensusError::HeaderBodyMismatch("height"));
+        }
+        if pow_header.timestamp != body.timestamp {
+            return Err(PrivateConsensusError::HeaderBodyMismatch("timestamp"));
+        }
+        if pow_header.parent_hash != body.parent_hash {
+            return Err(PrivateConsensusError::HeaderBodyMismatch("parent_hash"));
+        }
+        if pow_header.previous_consensus_hash != self.tip_consensus_hash {
+            return Err(PrivateConsensusError::HeaderBodyMismatch(
+                "previous_consensus_hash",
+            ));
+        }
+        let expected_state_commitment = qrun_v05_fee_pow_state_commitment(block)
+            .map_err(|_| PrivateConsensusError::HeaderBodyMismatch("fee_pow_state_commitment"))?;
+        if pow_header.state_root != expected_state_commitment {
+            return Err(PrivateConsensusError::HeaderBodyMismatch(
+                "fee_pow_state_commitment",
+            ));
+        }
+        if pow_header.target != expected_target {
+            return Err(PrivateConsensusError::ExpectedTargetMismatch);
+        }
+        self.target_history
+            .validate_next(next_height, pow_header.target, pow_header.timestamp)?;
+        let next_cumulative_work =
+            checked_cumulative_work_after_block(self.cumulative_work, pow_header.target)?;
+        let digest = verify_pow(pow_header, &self.target_history.params)?;
+        let receipt = ChainAdmissionBoundary::qrun_v05_live()
+            .admit_live_qrun_v05_fee(&mut self.state, block, authenticator, clock)
+            .map_err(PrivateConsensusError::Admission)?;
+
+        self.target_history
+            .record_next(next_height, pow_header.target, pow_header.timestamp)?;
+        self.cumulative_work = next_cumulative_work;
+        self.tip_consensus_hash = digest;
+        self.execution_mode = ChainExecutionMode::QRunV05FeeOnly;
+        Ok((receipt, digest))
+    }
+
+    /// Deterministically replay a QFP5/QFB5 block without consulting wall-clock state.
+    pub fn append_qrun_v05_fee_historical<A: TransactionAuthenticator>(
+        &mut self,
+        block: &QRunV05FeeBlock,
+        pow_header: &PowHeader,
+        measured_window_elapsed_secs: Option<u64>,
+        authenticator: &A,
+    ) -> Result<(BlockAdmissionReceipt, [u8; 32]), PrivateConsensusError> {
+        match self.execution_mode {
+            ChainExecutionMode::Legacy => {
+                return Err(PrivateConsensusError::FeeOnlyBlockOnLegacyChain);
+            }
+            ChainExecutionMode::Monetary => {
+                return Err(PrivateConsensusError::FeeOnlyBlockOnMonetaryChain);
+            }
+            ChainExecutionMode::Unset | ChainExecutionMode::QRunV05FeeOnly => {}
+        }
+        if self.monetary_state.is_some() {
+            return Err(PrivateConsensusError::FeeOnlyBlockOnMonetaryChain);
+        }
+
+        let body = &block.body;
+        let next_height =
+            self.state
+                .height()
+                .checked_add(1)
+                .ok_or(PrivateConsensusError::Consensus(
+                    ConsensusError::InvalidNextBlockHeight,
+                ))?;
+        let expected_target = self
+            .target_history
+            .expected_target(next_height, measured_window_elapsed_secs)?;
+        if pow_header.network_id != self.state.network_id() {
+            return Err(PrivateConsensusError::NetworkMismatch);
+        }
+        if pow_header.protocol_version != self.target_history.params.protocol_version {
+            return Err(PrivateConsensusError::HeaderBodyMismatch(
+                "protocol_version",
+            ));
+        }
+        if pow_header.height != body.height {
+            return Err(PrivateConsensusError::HeaderBodyMismatch("height"));
+        }
+        if pow_header.timestamp != body.timestamp {
+            return Err(PrivateConsensusError::HeaderBodyMismatch("timestamp"));
+        }
+        if pow_header.parent_hash != body.parent_hash {
+            return Err(PrivateConsensusError::HeaderBodyMismatch("parent_hash"));
+        }
+        if pow_header.previous_consensus_hash != self.tip_consensus_hash {
+            return Err(PrivateConsensusError::HeaderBodyMismatch(
+                "previous_consensus_hash",
+            ));
+        }
+        let expected_state_commitment = qrun_v05_fee_pow_state_commitment(block)
+            .map_err(|_| PrivateConsensusError::HeaderBodyMismatch("fee_pow_state_commitment"))?;
+        if pow_header.state_root != expected_state_commitment {
+            return Err(PrivateConsensusError::HeaderBodyMismatch(
+                "fee_pow_state_commitment",
+            ));
+        }
+        if pow_header.target != expected_target {
+            return Err(PrivateConsensusError::ExpectedTargetMismatch);
+        }
+        self.target_history
+            .validate_next(next_height, pow_header.target, pow_header.timestamp)?;
+        let next_cumulative_work =
+            checked_cumulative_work_after_block(self.cumulative_work, pow_header.target)?;
+        let digest = verify_pow(pow_header, &self.target_history.params)?;
+        let receipt = ChainAdmissionBoundary::testnet()
+            .replay_qrun_v05_fee(&mut self.state, block, authenticator)
+            .map_err(PrivateConsensusError::Admission)?;
+
+        self.target_history
+            .record_next(next_height, pow_header.target, pow_header.timestamp)?;
+        self.cumulative_work = next_cumulative_work;
+        self.tip_consensus_hash = digest;
+        self.execution_mode = ChainExecutionMode::QRunV05FeeOnly;
         Ok((receipt, digest))
     }
 
@@ -1016,6 +1283,19 @@ mod tests {
         }
     }
 
+    struct ClockAt(u64);
+    impl ReferenceTimeProvider for ClockAt {
+        fn sample(
+            &self,
+        ) -> Result<ReferenceTimeSample, crate::chain_admission::ReferenceTimeError> {
+            Ok(ReferenceTimeSample {
+                unix_seconds: self.0,
+                provenance: ReferenceTimeProvenance::ConfiguredProvider,
+                source_id: "qrun-v05-genesis-time-anchor-probe",
+            })
+        }
+    }
+
     fn params() -> ConsensusParameters {
         let mut params = ConsensusParameters::candidate_testnet().unwrap();
         params.initial_target = Uint256::MAX;
@@ -1116,6 +1396,265 @@ mod tests {
             target,
             nonce,
         }
+    }
+
+    fn qrun_fee_block(state: &LedgerState, timestamp: u64, producer: AccountId) -> QRunV05FeeBlock {
+        let mut block = QRunV05FeeBlock {
+            body: Block {
+                height: state.height() + 1,
+                timestamp,
+                parent_hash: state.tip_hash(),
+                state_root: [0; 32],
+                transactions: Vec::new(),
+            },
+            producer,
+        };
+        block.body.state_root = state
+            .preview_qrun_v05_fee_state_root_after(&block, &EmptyAuthenticator)
+            .unwrap();
+        block
+    }
+
+    fn qrun_fee_header(
+        chain: &PrivateTestnetChain,
+        block: &QRunV05FeeBlock,
+        params: &ConsensusParameters,
+        nonce: u64,
+    ) -> PowHeader {
+        PowHeader {
+            protocol_version: params.protocol_version,
+            network_id: chain.state().network_id(),
+            height: block.body.height,
+            timestamp: block.body.timestamp,
+            parent_hash: block.body.parent_hash,
+            previous_consensus_hash: chain.chain_tip().tip_hash,
+            state_root: qrun_v05_fee_pow_state_commitment(block).unwrap(),
+            target: chain.expected_target(None).unwrap(),
+            nonce,
+        }
+    }
+
+    #[test]
+    fn qrun_v05_live_chain_enforces_the_committed_genesis_time_floor() {
+        let mut params = params();
+        params.difficulty_window_blocks = 8;
+        params.target_block_time_secs = 30;
+        params.pow.memory_kib = 8;
+        let genesis_timestamp = 1_800_000_000;
+        let genesis =
+            crate::qrun_v05_genesis_candidate::QRunGenesisV05::new_with_genesis_timestamp(
+                [0x51; 32],
+                [0x2a; 32],
+                genesis_timestamp,
+            )
+            .unwrap();
+        let mut chain = PrivateTestnetChain::new(genesis.ledger().clone(), params.clone()).unwrap();
+
+        let mut rejected_block = qrun_fee_block(chain.state(), genesis_timestamp + 1, [0x77; 32]);
+        // Build a fully formed block, then backdate only its timestamp to exercise live admission.
+        rejected_block.body.timestamp = genesis_timestamp;
+        let mut rejected_header = qrun_fee_header(&chain, &rejected_block, &params, 0);
+        while Uint256::from_be_bytes(
+            crate::consensus::pow_digest(&rejected_header, params.pow).unwrap(),
+        ) > rejected_header.target
+        {
+            rejected_header.nonce = rejected_header.nonce.checked_add(1).expect("nonce budget");
+        }
+        let before = chain.clone();
+        assert_eq!(
+            chain.append_qrun_v05_fee_live(
+                &rejected_block,
+                &rejected_header,
+                None,
+                &EmptyAuthenticator,
+                &ClockAt(genesis_timestamp),
+            ),
+            Err(PrivateConsensusError::Admission(
+                ChainAdmissionError::State(StateError::TimestampNotIncreasing {
+                    previous: genesis_timestamp,
+                    actual: genesis_timestamp,
+                })
+            ))
+        );
+        assert_eq!(chain, before, "the Genesis time floor rejects atomically");
+
+        let first_valid_timestamp = genesis_timestamp + 1;
+        let valid_block = qrun_fee_block(chain.state(), first_valid_timestamp, [0x77; 32]);
+        let mut valid_header = qrun_fee_header(&chain, &valid_block, &params, 0);
+        while Uint256::from_be_bytes(
+            crate::consensus::pow_digest(&valid_header, params.pow).unwrap(),
+        ) > valid_header.target
+        {
+            valid_header.nonce = valid_header.nonce.checked_add(1).expect("nonce budget");
+        }
+        chain
+            .append_qrun_v05_fee_live(
+                &valid_block,
+                &valid_header,
+                None,
+                &EmptyAuthenticator,
+                &ClockAt(first_valid_timestamp),
+            )
+            .unwrap();
+        assert_eq!(chain.state().height(), 1);
+        assert_eq!(chain.state().last_timestamp(), first_valid_timestamp);
+    }
+
+    #[test]
+    fn qrun_v05_live_time_window_rejects_backdating_and_bounds_first_retarget_warp() {
+        let mut params = params();
+        params.difficulty_window_blocks = 8;
+        params.target_block_time_secs = 30;
+        params.initial_target = Uint256::from_be_bytes([0x3F; 32]);
+        params.pow_limit = Uint256::MAX;
+        params.pow.memory_kib = 8;
+
+        let initial_target = params.initial_target;
+
+        // A block timestamped far behind the local reference clock is rejected before
+        // the ledger, target history, cumulative work or consensus tip can advance.
+        let mut stale_chain = PrivateTestnetChain::new(state(), params.clone()).unwrap();
+        let stale_block = qrun_fee_block(stale_chain.state(), 1, [0x77; 32]);
+        let mut stale_header = qrun_fee_header(&stale_chain, &stale_block, &params, 0);
+        while Uint256::from_be_bytes(
+            crate::consensus::pow_digest(&stale_header, params.pow).unwrap(),
+        ) > stale_header.target
+        {
+            stale_header.nonce = stale_header.nonce.checked_add(1).expect("nonce budget");
+        }
+        let stale_before = stale_chain.clone();
+        assert_eq!(
+            stale_chain.append_qrun_v05_fee_live(
+                &stale_block,
+                &stale_header,
+                None,
+                &EmptyAuthenticator,
+                &ClockAt(1_000_000),
+            ),
+            Err(PrivateConsensusError::Admission(
+                ChainAdmissionError::State(StateError::TimestampTooFarInPast {
+                    earliest_allowed: 999_700,
+                    actual: 1,
+                })
+            ))
+        );
+        assert_eq!(
+            stale_chain, stale_before,
+            "stale timestamp rejection is atomic"
+        );
+
+        // The longer mining-latency allowance widens the local backdate envelope, but
+        // the future edge remains 120 seconds. Across this eight-block fixture the maximum
+        // derived retarget observation is 660s (2.75x the nominal 240s), still below the
+        // configured 4x clamp. This is a node-local Public Alpha admission bound, not a
+        // canonical Mainnet timestamp rule.
+        let mut chain = PrivateTestnetChain::new(state(), params.clone()).unwrap();
+        for height in 1..=8 {
+            let reference_time = 1_000_000 + (height - 1) * params.target_block_time_secs;
+            let policy = crate::timestamp_policy::TimestampPolicy::qrun_v05_live();
+            let timestamp = if height == 8 {
+                reference_time + policy.max_future_drift_secs
+            } else {
+                reference_time - policy.max_past_drift_secs.unwrap()
+            };
+            let block = qrun_fee_block(chain.state(), timestamp, [0x77; 32]);
+            let mut header = qrun_fee_header(&chain, &block, &params, 0);
+            while Uint256::from_be_bytes(crate::consensus::pow_digest(&header, params.pow).unwrap())
+                > header.target
+            {
+                header.nonce = header.nonce.checked_add(1).expect("nonce budget");
+            }
+            chain
+                .append_qrun_v05_fee_live(
+                    &block,
+                    &header,
+                    None,
+                    &EmptyAuthenticator,
+                    &ClockAt(reference_time),
+                )
+                .unwrap();
+        }
+
+        let observed = chain.expected_target(None).unwrap();
+        assert_eq!(observed, initial_target.mul_div_u64(11, 4).unwrap());
+        assert_eq!(chain.state().height(), 8);
+    }
+
+    #[test]
+    fn qrun_fee_only_pow_chain_commits_producer_and_refuses_legacy_mode_mixing() {
+        let params = params();
+        let mut chain = PrivateTestnetChain::new(state(), params.clone()).unwrap();
+        let fee_block = qrun_fee_block(chain.state(), 100, [0x77; 32]);
+        let fee_header = qrun_fee_header(&chain, &fee_block, &params, 0);
+        let (receipt, digest) = chain
+            .append_qrun_v05_fee_live(
+                &fee_block,
+                &fee_header,
+                None,
+                &EmptyAuthenticator,
+                &FixedClock,
+            )
+            .unwrap();
+
+        assert_eq!(
+            receipt.mode,
+            crate::chain_admission::BlockApplicationMode::LiveAdmission
+        );
+        assert_eq!(receipt.summary.height, 1);
+        assert_eq!(chain.state().height(), 1);
+        assert_eq!(chain.chain_tip().tip_hash, digest);
+        assert_eq!(
+            chain.cumulative_work(),
+            block_work(params.initial_target).unwrap()
+        );
+
+        let before = chain.clone();
+        let legacy_block = body(chain.state(), 101);
+        let legacy_header = header(
+            chain.state(),
+            &legacy_block,
+            &params,
+            chain.expected_target(None).unwrap(),
+            0,
+        );
+        assert_eq!(
+            chain.append_live(
+                &legacy_block,
+                &legacy_header,
+                None,
+                &EmptyAuthenticator,
+                &FixedClock
+            ),
+            Err(PrivateConsensusError::LegacyBlockOnFeeOnlyChain)
+        );
+        assert_eq!(chain, before);
+
+        let mut legacy_chain = PrivateTestnetChain::new(state(), params.clone()).unwrap();
+        let legacy = body(legacy_chain.state(), 100);
+        let legacy_pow = header(
+            legacy_chain.state(),
+            &legacy,
+            &params,
+            params.initial_target,
+            0,
+        );
+        legacy_chain
+            .append_live(&legacy, &legacy_pow, None, &EmptyAuthenticator, &FixedClock)
+            .unwrap();
+        let before = legacy_chain.clone();
+        let fee_block = qrun_fee_block(legacy_chain.state(), 101, [0x77; 32]);
+        let fee_header = qrun_fee_header(&legacy_chain, &fee_block, &params, 0);
+        assert_eq!(
+            legacy_chain.append_qrun_v05_fee_live(
+                &fee_block,
+                &fee_header,
+                None,
+                &EmptyAuthenticator,
+                &FixedClock,
+            ),
+            Err(PrivateConsensusError::FeeOnlyBlockOnLegacyChain)
+        );
+        assert_eq!(legacy_chain, before);
     }
 
     #[test]
@@ -1350,6 +1889,88 @@ mod tests {
             restored_again.expected_target(2 * window + 1, None),
             history.expected_target(2 * window + 1, None)
         );
+    }
+
+    #[test]
+    fn retarget_timestamp_extremes_are_clamped_across_checkpoint_recovery() {
+        let mut params = params();
+        params.difficulty_window_blocks = 8;
+        let initial = params.initial_target;
+        let target_interval = params.target_block_time_secs;
+        let mut history = TargetHistory::new(params.clone()).unwrap();
+
+        // A deliberately compressed first window cannot tighten difficulty by more than 4x.
+        for height in 1..=8 {
+            history.record_next(height, initial, height).unwrap();
+        }
+        let first_checkpoint = history.checkpoint_snapshot().unwrap();
+        let mut restored =
+            TargetHistory::from_checkpoint_snapshot(params.clone(), &first_checkpoint).unwrap();
+        let compressed = restored.expected_target(9, None).unwrap();
+        assert_eq!(compressed, initial.mul_div_u64(1, 4).unwrap());
+        restored.record_next(9, compressed, 9).unwrap();
+
+        // A deliberately expanded second window cannot ease difficulty by more than 4x.
+        for height in 10..=16 {
+            let expected = restored.expected_target(height, None).unwrap();
+            assert_eq!(expected, compressed, "compressed window height {height}");
+            let timestamp = 9 + (height - 9) * (target_interval * 10);
+            restored.record_next(height, expected, timestamp).unwrap();
+        }
+        let expanded = restored.expected_target(17, None).unwrap();
+        let independently_bounded =
+            crate::consensus::retarget_target(compressed, target_interval * 71, &params).unwrap();
+        assert_eq!(expanded, independently_bounded);
+        assert_eq!(expanded, compressed.mul_div_u64(4, 1).unwrap());
+
+        // A second checkpoint/restart must preserve the exact next retarget decision.
+        let second_checkpoint = restored.checkpoint_snapshot().unwrap();
+        let mut restored_again =
+            TargetHistory::from_checkpoint_snapshot(params.clone(), &second_checkpoint).unwrap();
+        assert_eq!(
+            restored_again.expected_target(17, None),
+            restored.expected_target(17, None)
+        );
+        let second_window_end = 9 + 7 * target_interval * 10;
+        let third_window_start = second_window_end + target_interval;
+        restored_again
+            .record_next(17, expanded, third_window_start)
+            .unwrap();
+
+        // A nominal third window must return exactly the same target after restart.
+        for height in 18..=24 {
+            let expected = restored_again.expected_target(height, None).unwrap();
+            assert_eq!(expected, expanded, "expanded window height {height}");
+            let timestamp = third_window_start + (height - 17) * target_interval;
+            restored_again
+                .record_next(height, expected, timestamp)
+                .unwrap();
+        }
+        assert_eq!(restored_again.expected_target(25, None), Ok(expanded));
+    }
+
+    #[test]
+    fn retarget_timestamp_elapsed_overflow_fails_closed_after_checkpoint_restore() {
+        let mut params = params();
+        params.difficulty_window_blocks = 8;
+        let mut history = TargetHistory::new(params.clone()).unwrap();
+        for height in 1..=7 {
+            history
+                .record_next(height, params.initial_target, height)
+                .unwrap();
+        }
+        history
+            .record_next(8, params.initial_target, u64::MAX - 10)
+            .unwrap();
+
+        let overflow = Err(PrivateConsensusError::Consensus(
+            crate::consensus::ConsensusError::DifficultyOverflow,
+        ));
+        assert_eq!(history.expected_target(9, None), overflow);
+
+        let checkpoint = history.checkpoint_snapshot().unwrap();
+        let restored = TargetHistory::from_checkpoint_snapshot(params, &checkpoint).unwrap();
+        assert_eq!(restored.expected_target(9, None), overflow);
     }
 
     #[test]
