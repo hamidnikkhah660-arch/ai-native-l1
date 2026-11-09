@@ -20,8 +20,10 @@ The preflight requires an out-of-band SHA-256 for the complete configuration and
 8. Decodes Q6TS, requires Active status, and checks exact network/profile/Q6PN commitment binding.
 9. Loads Ed25519 and ML-DSA-65 authority public keys and checks their keyset ID against the independently pinned Q6TS authority keyset ID.
 10. Loads the Q6TS monotonic floor through the strongly consistent, read-only AWS DynamoDB adapter, verifies both signatures and requires the signed envelope to be the exact current floor head. It never provisions or advances the floor.
+11. Requires a Q6EA Anchor pin bound to the Provider ID, network ID and Genesis digest embedded in Q6PN. The Anchor receipt key ID and ML-DSA-65 public key must both differ from the Provider receipt key ID/public key.
+12. Requires Provider and Q6EA Anchor endpoints to be distinct numeric SocketAddr values with nonzero ports and specified unicast IP addresses. DNS names, wildcard and multicast addresses are refused. This catches malformed/identical endpoint configuration but does not establish independent operators.
 
-The executable reports the verified network/profile, Q6GD commitment, full Genesis snapshot digest/state root, Founder atoms, Provider ID, Q6TS epoch and whether Q6PN includes a Q6QA quote-asset pin.
+The executable reports the verified network/profile, Q6GD commitment, full Genesis snapshot digest/state root, Founder atoms, Provider ID/endpoint, Q6EA Anchor ID/endpoint, Q6TS epoch and whether Q6PN includes a Q6QA quote-asset pin.
 
 ## Invocation
 
@@ -53,7 +55,12 @@ Example config shape (all identity values below are placeholders and must be rep
   "q6ts_authority_keyset_id": "<64 lowercase hex characters, independently pinned keyset ID>",
   "aws_cli_path": "aws",
   "aws_region": "<independently administered AWS region>",
-  "q6ts_floor_table": "<pre-provisioned Q6TS trust-floor table>"
+  "q6ts_floor_table": "<pre-provisioned Q6TS trust-floor table>",
+  "q6ea_anchor_id": "<64 lowercase hex characters>",
+  "q6ea_receipt_key_id": "<64 lowercase hex characters, distinct from Provider receipt key ID>",
+  "q6ea_receipt_public_key_path": ".\\trust\\q6ea-anchor-mldsa65.pub",
+  "provider_endpoint": "<numeric-ip>:<port>",
+  "q6ea_anchor_endpoint": "<different-numeric-ip>:<port>"
 }
 ```
 
@@ -67,4 +74,4 @@ The config's consensus fingerprint is checked against Q6GD, but this phase does 
 
 Still required before a runnable QFP6 node: independently reviewed/frozen v0.6 consensus and issuance parameters; production-approved crypto and key custody (the current **LibcruxMlDsa65VerifierCandidate** remains candidate-only); separately administered and provisioned Q6TS floor, Provider and Q6EA/Anchor services with distinct keys/operators; durable QFP6 store open/recovery tied to the exact external manifest anchor; QAP1 intent recovery through the pinned Provider/Anchor transports; actual transaction key registry/custody; Q6QA signed quote-asset qualification where external quote assets are intended; operational Noise peer identities; externally reachable P2P policy; complete history sync and anti-rollback qualification; multi-operator testing and independent security review.
 
-A successful preflight means only that the pinned configuration, full Genesis snapshot, Q6GD/Q6PN/Q6TS artifacts, dual signatures and current Q6TS floor agree. It is not node-runtime readiness, public Devnet approval or a Mainnet go decision.
+A successful preflight means only that the pinned configuration, full Genesis snapshot, Q6GD/Q6PN/Q6TS artifacts, dual signatures, current Q6TS floor and structural Q6EA/Provider pin/endpoint bindings agree. It does not prove that either remote service is online, that distinct endpoint operators are independent, or that either service has been security-reviewed. It is not node-runtime readiness, public Devnet approval or a Mainnet go decision.

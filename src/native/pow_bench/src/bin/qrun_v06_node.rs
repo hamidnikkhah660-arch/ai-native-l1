@@ -6,6 +6,7 @@
 //! It is intentionally preflight-only until the production QAP1/Provider/Anchor/runtime wiring
 //! and independent deployment qualifications are complete.
 use ai_native_l1_pow_bench::{
+    external_cas_offhost_anchor_protocol_candidate::ExternalCasOffhostAnchorPin,
     qrun_v06_canonical_execution_candidate::QRunV06CanonicalExecutionState,
     qrun_v06_profile_pin_candidate::QRunV06VerifiedProfilePin,
     qrun_v06_profile_trust_candidate::{
@@ -22,6 +23,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     env, fs,
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -48,6 +50,11 @@ struct Config {
     aws_cli_path: PathBuf,
     aws_region: String,
     trust_floor_table: String,
+    q6ea_anchor_id: [u8; 32],
+    q6ea_receipt_key_id: [u8; 32],
+    q6ea_receipt_public_key_path: PathBuf,
+    provider_endpoint: SocketAddr,
+    q6ea_anchor_endpoint: SocketAddr,
 }
 
 #[derive(Debug)]
@@ -58,6 +65,9 @@ struct PreflightSummary {
     genesis_state_root: [u8; 32],
     genesis_snapshot_sha256: [u8; 32],
     founder_genesis_atoms: u128,
+    q6ea_anchor_id: [u8; 32],
+    provider_endpoint: SocketAddr,
+    q6ea_anchor_endpoint: SocketAddr,
     trust_epoch: u64,
     has_quote_asset_pin: bool,
     provider_id: [u8; 32],
@@ -115,6 +125,28 @@ fn is_windows_absolute_path(value: &str) -> bool {
         && bytes[1] == b':'
         && matches!(bytes[2], b'/' | b'\\'))
         || value.starts_with("\\\\")
+}
+
+fn parse_service_endpoint(name: &str, value: &str) -> Result<SocketAddr, String> {
+    let address: SocketAddr = value
+        .parse()
+        .map_err(|_| format!("{name} must be a numeric SocketAddr; DNS names are not accepted"))?;
+    if address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast() {
+        return Err(format!(
+            "{name} must use a nonzero port and a unicast, specified IP address"
+        ));
+    }
+    Ok(address)
+}
+
+fn validate_distinct_qap1_endpoints(
+    provider: SocketAddr,
+    anchor: SocketAddr,
+) -> Result<(), String> {
+    if provider == anchor {
+        return Err("Provider and Q6EA Anchor endpoints must be distinct".into());
+    }
+    Ok(())
 }
 
 fn resolve_executable(base: &Path, value: &str) -> PathBuf {
@@ -208,6 +240,20 @@ fn parse_config(
         aws_cli_path: resolve_executable(base, required_string(&value, "aws_cli_path")?),
         aws_region: required_string(&value, "aws_region")?.to_owned(),
         trust_floor_table: required_string(&value, "q6ts_floor_table")?.to_owned(),
+        q6ea_anchor_id: parse_hex32("q6ea_anchor_id", required_string(&value, "q6ea_anchor_id")?)?,
+        q6ea_receipt_key_id: parse_hex32(
+            "q6ea_receipt_key_id",
+            required_string(&value, "q6ea_receipt_key_id")?,
+        )?,
+        q6ea_receipt_public_key_path: path_field("q6ea_receipt_public_key_path")?,
+        provider_endpoint: parse_service_endpoint(
+            "provider_endpoint",
+            required_string(&value, "provider_endpoint")?,
+        )?,
+        q6ea_anchor_endpoint: parse_service_endpoint(
+            "q6ea_anchor_endpoint",
+            required_string(&value, "q6ea_anchor_endpoint")?,
+        )?,
     })
 }
 
@@ -341,6 +387,36 @@ fn preflight(
         descriptor,
     )?;
 
+    // Q6EA must have its own receipt key and endpoint. Its pin is bound to the exact Provider,
+    // network and genesis domain embedded in Q6PN; it is never inferred from the local Node.
+    validate_distinct_qap1_endpoints(config.provider_endpoint, config.q6ea_anchor_endpoint)?;
+    let q6ea_public_key_bytes = read_bounded(
+        &config.q6ea_receipt_public_key_path,
+        ML_DSA_65_PUBLIC_KEY_BYTES as u64,
+        "Q6EA Anchor ML-DSA-65 receipt public key",
+    )?;
+    if q6ea_public_key_bytes.len() != ML_DSA_65_PUBLIC_KEY_BYTES {
+        return Err(format!(
+            "Q6EA Anchor ML-DSA-65 receipt key must be exactly {ML_DSA_65_PUBLIC_KEY_BYTES} bytes"
+        ));
+    }
+    let q6ea_anchor_pin = ExternalCasOffhostAnchorPin {
+        anchor_id: config.q6ea_anchor_id,
+        provider_id: profile_pin.bundle().external_cas_pin().provider_id,
+        network_id: config.network_id,
+        genesis_digest: profile_pin.bundle().external_cas_pin().genesis_digest,
+        receipt_key_id: config.q6ea_receipt_key_id,
+        receipt_public_key: q6ea_public_key_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| "invalid Q6EA Anchor receipt public key length")?,
+    };
+    q6ea_anchor_pin
+        .validate(profile_pin.bundle().external_cas_pin())
+        .map_err(|error| {
+            format!("Q6EA Anchor pin is invalid or not independent from Provider: {error:?}")
+        })?;
+
     let envelope = QRunV06SignedProfileTrustEnvelope::decode(&trust_envelope_bytes)
         .map_err(|error| format!("Q6TS signed envelope decode failed: {error}"))?;
     if envelope.record.status != QRunV06ProfileTrustStatus::Active {
@@ -402,6 +478,9 @@ fn preflight(
         genesis_state_root,
         genesis_snapshot_sha256: actual_genesis_snapshot_sha256,
         founder_genesis_atoms,
+        q6ea_anchor_id: config.q6ea_anchor_id,
+        provider_endpoint: config.provider_endpoint,
+        q6ea_anchor_endpoint: config.q6ea_anchor_endpoint,
         trust_epoch: envelope.record.trust_epoch,
         has_quote_asset_pin: profile_pin.quote_asset_trust_pin().is_some(),
         provider_id: profile_pin.bundle().external_cas_pin().provider_id,
@@ -465,6 +544,10 @@ fn run(args: &[String]) -> Result<(), String> {
     println!("genesis_state_root={}", hex(&summary.genesis_state_root));
     println!("genesis_founder_atoms={}", summary.founder_genesis_atoms);
     println!("provider_id={}", hex(&summary.provider_id));
+    println!("provider_endpoint={}", summary.provider_endpoint);
+    println!("q6ea_anchor_id={}", hex(&summary.q6ea_anchor_id));
+    println!("q6ea_anchor_endpoint={}", summary.q6ea_anchor_endpoint);
+    println!("provider_anchor_endpoint_distinct=true");
     println!("q6ts_trust_epoch={}", summary.trust_epoch);
     println!(
         "q6qa_quote_asset_pin={}",
@@ -496,8 +579,11 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_native_l1_pow_bench::qrun_v06_profile_trust_candidate::{
-        QRunV06ProfileTrustRecord, TrustedQRunV06ProfileTrustFloor,
+    use ai_native_l1_pow_bench::{
+        external_cas_anchor_candidate::ExternalCasPin,
+        qrun_v06_profile_trust_candidate::{
+            QRunV06ProfileTrustRecord, TrustedQRunV06ProfileTrustFloor,
+        },
     };
     use ai_native_l1_pow_bench::{
         qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
@@ -632,6 +718,50 @@ mod tests {
             &descriptor,
         )
         .is_err());
+    }
+
+    #[test]
+    fn q6ea_anchor_pin_must_bind_provider_domain_with_distinct_receipt_key() {
+        let provider = ExternalCasPin {
+            provider_id: [0x11; 32],
+            network_id: TEST_NETWORK,
+            genesis_digest: [0x12; 32],
+            receipt_key_id: [0x13; 32],
+            receipt_public_key: [0x14; ML_DSA_65_PUBLIC_KEY_BYTES],
+        };
+        let anchor = ExternalCasOffhostAnchorPin {
+            anchor_id: [0x21; 32],
+            provider_id: provider.provider_id,
+            network_id: provider.network_id,
+            genesis_digest: provider.genesis_digest,
+            receipt_key_id: [0x22; 32],
+            receipt_public_key: [0x23; ML_DSA_65_PUBLIC_KEY_BYTES],
+        };
+        assert!(anchor.validate(&provider).is_ok());
+
+        let mut reused_key_id = anchor.clone();
+        reused_key_id.receipt_key_id = provider.receipt_key_id;
+        assert!(reused_key_id.validate(&provider).is_err());
+
+        let mut reused_public_key = anchor.clone();
+        reused_public_key.receipt_public_key = provider.receipt_public_key;
+        assert!(reused_public_key.validate(&provider).is_err());
+
+        let mut wrong_domain = anchor;
+        wrong_domain.network_id[0] ^= 1;
+        assert!(wrong_domain.validate(&provider).is_err());
+    }
+
+    #[test]
+    fn qap1_service_endpoints_are_numeric_unicast_and_distinct() {
+        let provider = parse_service_endpoint("provider_endpoint", "192.0.2.10:9100").unwrap();
+        let anchor = parse_service_endpoint("q6ea_anchor_endpoint", "[2001:db8::10]:9200").unwrap();
+        assert!(validate_distinct_qap1_endpoints(provider, anchor).is_ok());
+        assert!(validate_distinct_qap1_endpoints(provider, provider).is_err());
+        assert!(parse_service_endpoint("provider_endpoint", "provider.example:9100").is_err());
+        assert!(parse_service_endpoint("provider_endpoint", "0.0.0.0:9100").is_err());
+        assert!(parse_service_endpoint("provider_endpoint", "224.0.0.1:9100").is_err());
+        assert!(parse_service_endpoint("provider_endpoint", "192.0.2.10:0").is_err());
     }
 
     #[test]
