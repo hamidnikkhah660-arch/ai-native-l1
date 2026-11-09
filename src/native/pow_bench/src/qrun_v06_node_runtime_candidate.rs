@@ -2379,6 +2379,224 @@ mod tests {
         fs::remove_dir_all(&service_root).unwrap();
     }
 
+    #[test]
+    fn qfp6_mining_supervisor_admits_real_noise_peer_then_mines_locally_via_durable_qap1() {
+        use crate::external_cas_anchor_candidate::ExternalCasPin;
+        use crate::external_cas_disk_provider_candidate::DurableExternalCasProvider;
+        use crate::external_cas_floor_store_candidate::ExternalCasFloorStore;
+        use crate::external_cas_offhost_anchor_candidate::ExternalCasOffhostAnchorState;
+        use crate::qrun_v06_node_supervisor_candidate::{
+            run_qfp6_mining_supervisor, QRunV06MiningSupervisorConfig,
+            QRunV06NodeSupervisorStopReason,
+        };
+
+        // Build independently persisted Provider and Q6EA services with real Noise endpoints
+        // and pinned ML-DSA-65 receipt keys.
+        let (dir, store) = open_store();
+        let initial = QRunV06ExternalAnchorState::from_store(&store, GENESIS_DIGEST).unwrap();
+        let service_root = dir.0.with_extension("cp0572-supervisor-services");
+        fs::create_dir_all(&service_root).unwrap();
+        let provider_dir = service_root.join("durable-provider");
+        let anchor_dir = service_root.join("durable-q6ea");
+        let floor_dir = service_root.join("durable-provider-floor");
+
+        let provider_keys = portable::generate_key_pair([0xE1; 32]);
+        let anchor_keys = portable::generate_key_pair([0xE2; 32]);
+        let provider_pin = ExternalCasPin {
+            provider_id: [0xE3; 32],
+            network_id: NETWORK,
+            genesis_digest: GENESIS_DIGEST,
+            receipt_key_id: [0xE4; 32],
+            receipt_public_key: *provider_keys.verification_key.as_ref(),
+        };
+        let anchor_pin = ExternalCasOffhostAnchorPin {
+            anchor_id: [0xE5; 32],
+            provider_id: provider_pin.provider_id,
+            network_id: provider_pin.network_id,
+            genesis_digest: provider_pin.genesis_digest,
+            receipt_key_id: [0xE6; 32],
+            receipt_public_key: *anchor_keys.verification_key.as_ref(),
+        };
+        let bootstrap_record = ExternalCasRecord {
+            generation: 0,
+            provider_id: provider_pin.provider_id,
+            network_id: provider_pin.network_id,
+            genesis_digest: provider_pin.genesis_digest,
+            previous_record_digest: [0; 32],
+            previous_state_digest: [0; 32],
+            next_state_digest: initial.digest().unwrap(),
+            operation_id: [0xE7; 32],
+            request_digest: [0xE8; 32],
+        };
+        let bootstrap_anchor = ExternalCasOffhostAnchorState::provision_bootstrap(
+            &provider_pin,
+            bootstrap_record.clone(),
+            1,
+        )
+        .unwrap();
+
+        let provider_signing_key = Arc::new(provider_keys.signing_key);
+        let provider_init_signer_key = Arc::clone(&provider_signing_key);
+        let provider = DurableExternalCasProvider::initialize(
+            &provider_dir,
+            provider_pin.clone(),
+            bootstrap_record.clone(),
+            move |digest| {
+                let signature = portable::sign(&provider_init_signer_key, digest, &[], [0xC1; 32])
+                    .map_err(|error| format!("{error:?}"))?;
+                Ok(*signature.as_ref())
+            },
+        )
+        .unwrap();
+        drop(provider);
+        ExternalCasFloorStore::initialize(&floor_dir, provider_pin.clone(), bootstrap_record, 1)
+            .unwrap();
+
+        let anchor_signer = Qap1TestSigner {
+            key: Arc::new(anchor_keys.signing_key),
+        };
+        let anchor_server = start_durable_anchor_noise_server(
+            &anchor_dir,
+            provider_pin.clone(),
+            anchor_pin.clone(),
+            bootstrap_anchor,
+            anchor_signer,
+        );
+        let provider_server = start_durable_provider_noise_server(
+            &provider_dir,
+            provider_pin.clone(),
+            Arc::clone(&provider_signing_key),
+        );
+
+        // The Runtime is recovered and QAP1-required before the Supervisor can serve.
+        let gate = MockAnchorGate {
+            current: initial.clone(),
+            fail_next_advance: false,
+            advance_calls: 0,
+        };
+        let mut recovery_quote = quote_provider();
+        let recovery_coordinator = durable_noise_qap1_coordinator(
+            &provider_server,
+            &anchor_server,
+            provider_pin.clone(),
+            anchor_pin.clone(),
+            &initial,
+            &floor_dir,
+        );
+        let mut runtime = QRunV06NodeRuntime::recover_qap1_after_process_restart(
+            store,
+            gate,
+            recovery_coordinator,
+            GENESIS_DIGEST,
+            &EmptyAuthenticator,
+            &mut recovery_quote,
+        )
+        .unwrap();
+        assert!(runtime.qap1_recovery_verified());
+
+        let mut quote = quote_provider();
+        let mut coordinator = durable_noise_qap1_coordinator(
+            &provider_server,
+            &anchor_server,
+            provider_pin.clone(),
+            anchor_pin.clone(),
+            &initial,
+            &floor_dir,
+        );
+
+        // A distinct pinned Noise peer submits a valid Genesis-child block. The Supervisor
+        // must QAP1-commit it, refresh ForkChoice from the durable store, then mine height 2.
+        let (node_private, node_public) = qap1_noise_keypair();
+        let (peer_private, peer_public) = qap1_noise_keypair();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener_address = listener.local_addr().unwrap();
+        let peer_envelope = first_block(&runtime.store);
+        let peer_frame = encode_qrun_v06_peer_block_request(1, &peer_envelope).unwrap();
+
+        let peer = thread::spawn(move || {
+            let mut stream = TcpStream::connect(listener_address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(15)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(15)))
+                .unwrap();
+            let mut noise = QRunV06NoiseSession::connect(
+                &mut stream,
+                &peer_private,
+                &node_public,
+                &NETWORK,
+                &PROFILE,
+            )
+            .unwrap();
+            noise.write_q6pb_request(&mut stream, &peer_frame).unwrap();
+            let response = noise.read_q6pa_response(&mut stream, 1).unwrap();
+            u16::from_be_bytes([response[6], response[7]])
+        });
+
+        let shutdown = AtomicBool::new(false);
+        let mut template_calls = 0usize;
+        let mut config = QRunV06MiningSupervisorConfig::default();
+        config.peer.install_os_signal_handler = false;
+        config.peer.max_total_sessions = 1;
+        config.peer.listener.max_requests_per_session = 1;
+        config.peer.listener.accept_poll_interval = Duration::from_millis(10);
+        config.listener_round_timeout = Duration::from_millis(250);
+        config.mining.max_blocks_per_run = 2;
+        config.mining.max_nonce_attempts_per_block = 100_000;
+
+        let report = run_qfp6_mining_supervisor(
+            &listener,
+            config,
+            &node_private,
+            &[peer_public],
+            &NETWORK,
+            &PROFILE,
+            &shutdown,
+            &mut runtime,
+            &EmptyAuthenticator,
+            &mut quote,
+            &mut coordinator,
+            PRODUCER,
+            |parent| {
+                template_calls += 1;
+                if template_calls == 2 {
+                    // Stop only after the first local mining attempt was ACKed.
+                    shutdown.store(true, std::sync::atomic::Ordering::Release);
+                }
+                Ok((parent.last_timestamp() + 60, Vec::new()))
+            },
+        )
+        .unwrap();
+
+        let peer_status = peer.join().unwrap();
+        assert_eq!(peer_status, QRunV06PeerAdmissionStatus::Accepted as u16);
+        assert_eq!(report.listener_rounds, 1);
+        assert_eq!(report.mining_rounds, 1);
+        assert_eq!(report.stats.accepted_connections, 1);
+        assert_eq!(report.stats.authenticated_sessions, 1);
+        assert_eq!(report.stats.requests_received, 1);
+        assert_eq!(report.stats.responses_written, 1);
+        assert_eq!(report.blocks_acknowledged, 1);
+        assert_eq!(report.ending_height, 2);
+        assert_eq!(
+            report.stop_reason,
+            QRunV06NodeSupervisorStopReason::ShutdownRequested
+        );
+        assert_eq!(runtime.canonical_height().unwrap(), 2);
+        assert_eq!(runtime.manifest_generation().unwrap(), 2);
+        assert!(!runtime.store.has_qap1_intent().unwrap());
+        coordinator
+            .verify_current(runtime.committed_anchor_state())
+            .unwrap();
+
+        drop(coordinator);
+        drop(runtime);
+        anchor_server.shutdown_and_join();
+        provider_server.shutdown_and_join();
+        fs::remove_dir_all(&service_root).unwrap();
+    }
+
     struct DigestAuthenticator;
     impl TransactionAuthenticator for DigestAuthenticator {
         fn verify(
