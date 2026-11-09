@@ -10,7 +10,9 @@ use crate::{
     qrun_v06_external_anchor_candidate::{
         QRunV06ExternalAnchorCoordinator, QRunV06ExternalAnchorError, QRunV06ExternalAnchorState,
     },
-    qrun_v06_pow_fork_choice_candidate::QRunV06QuoteAssetAuthorizationProvider,
+    qrun_v06_pow_fork_choice_candidate::{
+        QRunV06PowForkChoice, QRunV06QuoteAssetAuthorizationProvider,
+    },
     qrun_v06_pow_fork_store_candidate::{
         QRunV06DurableCommit, QRunV06DurableForkStore, QRunV06ForkStoreError,
     },
@@ -671,6 +673,15 @@ impl<A: QRunV06NodeAnchorGate> QRunV06NodeRuntime<A> {
 
     pub fn committed_anchor_state(&self) -> &QRunV06ExternalAnchorState {
         &self.committed_anchor_state
+    }
+
+    /// Return a fresh in-memory fork-choice view rebuilt from this Runtime's durable store.
+    /// Supervisors must call this after peer QAP1 admission before the local miner chooses a tip.
+    pub fn fork_choice_snapshot(&self) -> Result<QRunV06PowForkChoice, QRunV06NodeRuntimeError> {
+        self.store
+            .graph()
+            .cloned()
+            .map_err(|error| QRunV06NodeRuntimeError::ForkStore(format!("{error:?}")))
     }
 
     pub fn has_pending_external_anchor(&self) -> bool {
