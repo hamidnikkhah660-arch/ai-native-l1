@@ -3451,6 +3451,185 @@ mod tests {
     }
 
     #[test]
+    fn qap1_q6ha_hybrid_transfer_is_admitted_and_acknowledged_only_after_anchor_finalize() {
+        use crate::{
+            qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
+            qrun_v06_hybrid_auth_candidate::{
+                QRunV06HybridTransactionAuthenticator, QRunV06HybridTransactionSigner,
+            },
+            qrun_v06_tokenomics_candidate::QRunV06MiningScheduleCandidate,
+            qrun_v06_tokenomics_candidate::QRunV06TokenomicsState,
+            state_machine::{transaction_signing_digest, Transaction},
+            v4_fat1_mldsa65_candidate::LibcruxMlDsa65VerifierCandidate,
+        };
+
+        const RECIPIENT: [u8; 32] = [0x7C; 32];
+        let signer = QRunV06HybridTransactionSigner::from_seeds([0x81; 32], [0x82; 32]).unwrap();
+        let founder = signer.account_id();
+        let authenticator =
+            QRunV06HybridTransactionAuthenticator::new(LibcruxMlDsa65VerifierCandidate);
+
+        // Fund the exact hybrid Q6HA account in this disposable Genesis fixture. No legacy
+        // Ed25519 account is aliased to it.
+        let params = params();
+        let schedule = QRunV06MiningScheduleCandidate::cp0422_research_candidate();
+        let tokenomics = QRunV06TokenomicsState::genesis(NETWORK, founder, schedule).unwrap();
+        let descriptor = QRunV06GenesisDescriptor::new(
+            NETWORK,
+            PROFILE,
+            founder,
+            1,
+            crate::qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint(&params).unwrap(),
+            tokenomics.policy_fingerprint(),
+        )
+        .unwrap();
+        let genesis = QRunV06CanonicalExecutionState::cp0528_genesis_candidate_with_descriptor(
+            descriptor, schedule,
+        )
+        .unwrap();
+
+        let dir = TestDir::new();
+        let descriptor_commitment = genesis.genesis_descriptor_commitment().unwrap();
+        let store = QRunV06DurableForkStore::open_with_expected_genesis_descriptor_commitment(
+            &dir.0,
+            genesis,
+            params.clone(),
+            &authenticator,
+            None,
+            descriptor_commitment,
+        )
+        .unwrap();
+        let initial = QRunV06ExternalAnchorState::from_store(&store, GENESIS_DIGEST).unwrap();
+        let gate = MockAnchorGate {
+            current: initial.clone(),
+            fail_next_advance: false,
+            advance_calls: 0,
+        };
+        let mut runtime =
+            QRunV06NodeRuntime::new(store, gate, GENESIS_DIGEST, initial.clone()).unwrap();
+
+        let graph = runtime.store.graph().unwrap();
+        let parent = graph.canonical_state().clone();
+        let parent_tip = graph.canonical_tip().tip_hash;
+        let target = graph.expected_next_target(&parent_tip).unwrap();
+        let mut transaction = Transaction {
+            network_id: NETWORK,
+            sender: founder,
+            recipient: RECIPIENT,
+            nonce: 1,
+            amount: 5_000,
+            fee: 10,
+            expires_at: parent.last_timestamp() + 10_000,
+            signature: Vec::new(),
+        };
+        signer.sign_transaction(&mut transaction).unwrap();
+        let signing_digest = transaction_signing_digest(&transaction).unwrap();
+        assert_eq!(
+            authenticator.verify(&transaction.sender, &signing_digest, &transaction.signature,),
+            Ok(())
+        );
+        let legacy_ed25519 = ed25519_dalek::SigningKey::from_bytes(&[0x83; 32]);
+        let legacy_signature =
+            ed25519_dalek::Signer::sign(&legacy_ed25519, &signing_digest).to_bytes();
+        assert_eq!(
+            authenticator.verify(&founder, &signing_digest, &legacy_signature),
+            Err(()),
+            "QFP6 hybrid auth must not accept a legacy Ed25519-only signature",
+        );
+        let mut block = QRunV06Block {
+            network_id: NETWORK,
+            profile_id: PROFILE,
+            height: parent.height() + 1,
+            timestamp: parent.last_timestamp() + 60,
+            parent_hash: parent.tip_hash(),
+            state_root: [0; 32],
+            producer: PRODUCER,
+            operations: vec![QRunV06BlockOperation::NativeTransfer(transaction)],
+        };
+        block.state_root = parent
+            .preview_state_root_after(&block, &authenticator)
+            .unwrap();
+
+        let mut header = PowHeader {
+            protocol_version: 6,
+            network_id: NETWORK,
+            height: block.height,
+            timestamp: block.timestamp,
+            parent_hash: block.parent_hash,
+            previous_consensus_hash: parent_tip,
+            state_root: qrun_v06_pow_state_commitment(&block).unwrap(),
+            target,
+            nonce: 0,
+        };
+        let mut envelope = None;
+        for nonce in 0..4_096u64 {
+            header.nonce = nonce;
+            if Uint256::from_be_bytes(pow_digest(&header, params.pow).unwrap()) <= target {
+                envelope = Some(encode_qrun_v06_pow_block(&header, &block).unwrap());
+                break;
+            }
+        }
+        let envelope = envelope.expect("Q6HA integration test PoW search exhausted");
+        let frame = encode_qrun_v06_peer_block_request(6_581, &envelope).unwrap();
+        let mut replay_guard = QRunV06PeerReplayGuard::new();
+        let mut quote = quote_provider();
+        let fixture = qap1_coordinator(&dir, &initial);
+        let mut coordinator = fixture.coordinator();
+
+        let accepted = process_qrun_v06_peer_block_frame_with_qap1(
+            &mut runtime,
+            &mut replay_guard,
+            &frame,
+            &authenticator,
+            &mut quote,
+            &mut coordinator,
+        )
+        .unwrap();
+        assert_eq!(accepted.request_id(), 6_581);
+        assert_eq!(accepted.status(), QRunV06PeerAdmissionStatus::Accepted);
+        assert!(accepted.is_positive_ack());
+        assert_eq!(runtime.canonical_height().unwrap(), 1);
+        assert_eq!(runtime.manifest_generation().unwrap(), 1);
+        assert!(!runtime.store.has_qap1_intent().unwrap());
+        coordinator
+            .verify_current(runtime.committed_anchor_state())
+            .unwrap();
+
+        let committed = runtime.store.graph().unwrap().canonical_state().clone();
+        let recipient = committed
+            .unified()
+            .ledger()
+            .account(&RECIPIENT)
+            .expect("Q6HA recipient ledger account should be created");
+        assert_eq!(recipient.balance, 5_000);
+        assert_eq!(recipient.nonce, 0);
+        let founder_account = committed
+            .unified()
+            .ledger()
+            .account(&founder)
+            .expect("Q6HA founder ledger account must remain present");
+        assert_eq!(founder_account.nonce, 1);
+
+        let generation = runtime.manifest_generation().unwrap();
+        let replayed = process_qrun_v06_peer_block_frame_with_qap1(
+            &mut runtime,
+            &mut replay_guard,
+            &frame,
+            &authenticator,
+            &mut quote,
+            &mut coordinator,
+        )
+        .unwrap();
+        assert_eq!(replayed.status(), QRunV06PeerAdmissionStatus::Rejected);
+        assert!(!replayed.is_positive_ack());
+        assert_eq!(runtime.canonical_height().unwrap(), 1);
+        assert_eq!(runtime.manifest_generation().unwrap(), generation);
+        coordinator
+            .verify_current(runtime.committed_anchor_state())
+            .unwrap();
+    }
+
+    #[test]
     fn qap1_runtime_recovers_exact_anchor_cas_after_lost_response_and_restart() {
         let (dir, store) = open_store();
         let initial = QRunV06ExternalAnchorState::from_store(&store, GENESIS_DIGEST).unwrap();
