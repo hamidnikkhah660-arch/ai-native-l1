@@ -31,8 +31,10 @@ use crate::qzxb_amm_candidate::{
     AmmError, AmmOperation, AmmSignedOperation, QzxbAmmStateCandidate, MAX_AMM_SNAPSHOT_BYTES,
 };
 use crate::state_machine::{
-    decode_transaction, encode_transaction, transaction_id, AccountId, LedgerState, NetworkId,
-    StateError, Transaction, TransactionAuthenticator, MAX_ENCODED_SNAPSHOT_BYTES,
+    decode_transaction_with_signature_limit, encode_transaction_with_signature_limit,
+    transaction_id_with_signature_limit, AccountId, LedgerState, NetworkId, StateError,
+    Transaction, TransactionAuthenticator, MAX_ENCODED_SNAPSHOT_BYTES,
+    QRUN_V06_MAX_NATIVE_TX_SIGNATURE_BYTES,
 };
 use sha2::{Digest, Sha256};
 use std::io::{Cursor, Read};
@@ -1371,7 +1373,10 @@ impl QRunV06CanonicalExecutionState {
         for (operation_index, operation) in block.operations.iter().enumerate() {
             match operation {
                 QRunV06BlockOperation::NativeTransfer(transaction) => {
-                    let txid = transaction_id(transaction)?;
+                    let txid = transaction_id_with_signature_limit(
+                        transaction,
+                        QRUN_V06_MAX_NATIVE_TX_SIGNATURE_BYTES,
+                    )?;
                     if !txids.insert(txid) {
                         return Err(QRunV06ExecutionError::DuplicateTransaction);
                     }
@@ -1665,7 +1670,10 @@ fn encode_operation(
     operation: &QRunV06BlockOperation,
 ) -> Result<(u8, Vec<u8>), QRunV06ExecutionError> {
     match operation {
-        QRunV06BlockOperation::NativeTransfer(tx) => Ok((1, encode_transaction(tx)?)),
+        QRunV06BlockOperation::NativeTransfer(tx) => Ok((
+            1,
+            encode_transaction_with_signature_limit(tx, QRUN_V06_MAX_NATIVE_TX_SIGNATURE_BYTES)?,
+        )),
         QRunV06BlockOperation::Amm(operation) => Ok((2, operation.encode()?)),
         QRunV06BlockOperation::AssetRegistration(registration) => {
             Ok((3, encode_asset_registration(registration)?))
@@ -1686,9 +1694,12 @@ fn decode_operation(
     payload: &[u8],
 ) -> Result<QRunV06BlockOperation, QRunV06ExecutionError> {
     match tag {
-        1 => Ok(QRunV06BlockOperation::NativeTransfer(decode_transaction(
-            payload,
-        )?)),
+        1 => Ok(QRunV06BlockOperation::NativeTransfer(
+            decode_transaction_with_signature_limit(
+                payload,
+                QRUN_V06_MAX_NATIVE_TX_SIGNATURE_BYTES,
+            )?,
+        )),
         2 => Ok(QRunV06BlockOperation::Amm(AmmSignedOperation::decode(
             payload,
         )?)),
