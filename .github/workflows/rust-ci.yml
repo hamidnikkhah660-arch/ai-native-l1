@@ -66,6 +66,10 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Test QZKW2 Windows DPAPI hybrid wallet and Q6HA transaction signing
+        shell: pwsh
+        run: cargo test --manifest-path src/native/pow_bench/Cargo.toml --bin qzxb_wallet --locked -- --test-threads=1
+
       - name: Run signed TXN4 submit, invalid-signature rejection, peer propagation and replay
         shell: pwsh
         run: ./simulations/cp0363_txn4_two_node_loopback.ps1

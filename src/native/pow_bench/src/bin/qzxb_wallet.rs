@@ -7,9 +7,12 @@
 #[cfg(windows)]
 mod windows_wallet {
     use ai_native_l1_pow_bench::{
+        qrun_v06_hybrid_auth_candidate::QRunV06HybridTransactionSigner,
         qzbe_tx_ingress_candidate::{decode_ack, encode_request, TxIngressStatus, ACK_BYTES},
         state_machine::{
-            encode_transaction, transaction_id, transaction_signing_digest, Transaction,
+            encode_transaction, encode_transaction_with_signature_limit, transaction_id,
+            transaction_id_with_signature_limit, transaction_signing_digest, Transaction,
+            QRUN_V06_MAX_NATIVE_TX_SIGNATURE_BYTES,
         },
         transaction_auth::Ed25519TransactionSigner,
     };
@@ -27,7 +30,12 @@ mod windows_wallet {
 
     const MAGIC: &[u8; 4] = b"QZKW";
     const VERSION: u16 = 1;
+    const HYBRID_VERSION: u16 = 2;
+    const HYBRID_HEADER_LEN: usize = 4 + 2 + 32 + 1_952 + 32 + 4;
     const HEADER_LEN: usize = 4 + 2 + 32 + 32 + 4;
+    const HYBRID_WALLET_DOMAIN: &[u8] = b"QUANTUMZXB-QFP6-HYBRID-WALLET-DPAPI-V1\0";
+    const HYBRID_ED25519_SEED_DOMAIN: &[u8] = b"QUANTUMZXB-ED25519-SEED-FROM-BIP39-V1\0";
+    const HYBRID_MLDSA65_SEED_DOMAIN: &[u8] = b"QUANTUMZXB-QFP6-MLDSA65-SEED-FROM-BIP39-V1\0";
     const MAX_PROTECTED_BLOB: usize = 64 * 1024;
     const MAX_FILE_LEN: usize = HEADER_LEN + MAX_PROTECTED_BLOB;
     const WALLET_DOMAIN: &[u8] = b"QUANTUMZXB-ED25519-WALLET-DPAPI-V1\0";
@@ -55,6 +63,15 @@ mod windows_wallet {
         },
         Restore {
             output: PathBuf,
+        },
+        CreateHybrid {
+            output: PathBuf,
+        },
+        RestoreHybrid {
+            output: PathBuf,
+        },
+        HybridAddress {
+            wallet: PathBuf,
         },
         Address {
             wallet: PathBuf,
@@ -398,6 +415,30 @@ mod windows_wallet {
                 }
                 Ok(Command::Restore { output })
             }
+            "create-qfp6-hybrid" => {
+                let values = options(&args[1..], &["--output"])?;
+                let output = PathBuf::from(required(&values, "--output")?);
+                if !output.is_absolute() || output.file_name().is_none() {
+                    return Err("--output must be an absolute file path".into());
+                }
+                Ok(Command::CreateHybrid { output })
+            }
+            "restore-qfp6-hybrid" => {
+                let values = options(&args[1..], &["--output"])?;
+                let output = PathBuf::from(required(&values, "--output")?);
+                if !output.is_absolute() || output.file_name().is_none() {
+                    return Err("--output must be an absolute file path".into());
+                }
+                Ok(Command::RestoreHybrid { output })
+            }
+            "address-qfp6-hybrid" => {
+                let values = options(&args[1..], &["--wallet"])?;
+                let wallet = PathBuf::from(required(&values, "--wallet")?);
+                if !wallet.is_absolute() {
+                    return Err("--wallet must be an absolute file path".into());
+                }
+                Ok(Command::HybridAddress { wallet })
+            }
             "address" => {
                 let values = options(&args[1..], &["--wallet"])?;
                 let wallet = PathBuf::from(required(&values, "--wallet")?);
@@ -656,6 +697,126 @@ mod windows_wallet {
         Ok(std::mem::take(&mut seed))
     }
 
+    fn hybrid_entropy(ed: &[u8; 32], pq: &[u8; 1_952], account: &[u8; 32]) -> Vec<u8> {
+        let mut value = Vec::with_capacity(HYBRID_WALLET_DOMAIN.len() + 32 + 1_952 + 32);
+        value.extend_from_slice(HYBRID_WALLET_DOMAIN);
+        value.extend_from_slice(ed);
+        value.extend_from_slice(pq);
+        value.extend_from_slice(account);
+        value
+    }
+
+    fn dpapi_protect_hybrid(
+        payload: &[u8; 64],
+        ed: &[u8; 32],
+        pq: &[u8; 1_952],
+        account: &[u8; 32],
+    ) -> Result<Vec<u8>, String> {
+        let entropy_bytes = hybrid_entropy(ed, pq, account);
+        let input = DataBlob {
+            cb_data: payload.len() as u32,
+            pb_data: payload.as_ptr() as *mut u8,
+        };
+        let optional_entropy = DataBlob {
+            cb_data: entropy_bytes.len() as u32,
+            pb_data: entropy_bytes.as_ptr() as *mut u8,
+        };
+        let mut output = DataBlob {
+            cb_data: 0,
+            pb_data: ptr::null_mut(),
+        };
+        let ok = unsafe {
+            CryptProtectData(
+                &input,
+                ptr::null(),
+                &optional_entropy,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+        };
+        if ok == 0 {
+            return Err(format!(
+                "Windows CurrentUser DPAPI hybrid-wallet protection failed (Win32 error {})",
+                unsafe { GetLastError() }
+            ));
+        }
+        if output.pb_data.is_null()
+            || output.cb_data == 0
+            || output.cb_data as usize > MAX_PROTECTED_BLOB
+        {
+            if !output.pb_data.is_null() {
+                unsafe {
+                    ptr::write_bytes(output.pb_data, 0, output.cb_data as usize);
+                    LocalFree(output.pb_data as *mut c_void);
+                }
+            }
+            return Err("DPAPI returned an invalid protected hybrid-wallet blob".into());
+        }
+        let protected =
+            unsafe { std::slice::from_raw_parts(output.pb_data, output.cb_data as usize).to_vec() };
+        unsafe {
+            ptr::write_bytes(output.pb_data, 0, output.cb_data as usize);
+            LocalFree(output.pb_data as *mut c_void);
+        }
+        Ok(protected)
+    }
+
+    fn dpapi_unprotect_hybrid(
+        blob: &[u8],
+        ed: &[u8; 32],
+        pq: &[u8; 1_952],
+        account: &[u8; 32],
+    ) -> Result<Vec<u8>, String> {
+        if blob.is_empty() || blob.len() > u32::MAX as usize {
+            return Err("protected hybrid-wallet blob has an invalid length".into());
+        }
+        let entropy_bytes = hybrid_entropy(ed, pq, account);
+        let input = DataBlob {
+            cb_data: blob.len() as u32,
+            pb_data: blob.as_ptr() as *mut u8,
+        };
+        let optional_entropy = DataBlob {
+            cb_data: entropy_bytes.len() as u32,
+            pb_data: entropy_bytes.as_ptr() as *mut u8,
+        };
+        let mut output = DataBlob {
+            cb_data: 0,
+            pb_data: ptr::null_mut(),
+        };
+        let ok = unsafe {
+            CryptUnprotectData(
+                &input,
+                ptr::null_mut(),
+                &optional_entropy,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+        };
+        if ok == 0 {
+            return Err(format!("hybrid wallet could not be unprotected for the current Windows user (Win32 error {})", unsafe { GetLastError() }));
+        }
+        if output.pb_data.is_null() || output.cb_data != 64 {
+            if !output.pb_data.is_null() {
+                unsafe {
+                    ptr::write_bytes(output.pb_data, 0, output.cb_data as usize);
+                    LocalFree(output.pb_data as *mut c_void);
+                }
+            }
+            return Err("unprotected hybrid-wallet seed payload must be exactly 64 bytes".into());
+        }
+        let mut secret =
+            unsafe { std::slice::from_raw_parts(output.pb_data, output.cb_data as usize).to_vec() };
+        unsafe {
+            ptr::write_bytes(output.pb_data, 0, output.cb_data as usize);
+            LocalFree(output.pb_data as *mut c_void);
+        }
+        Ok(std::mem::take(&mut secret))
+    }
+
     fn save_new_wallet(path: &Path, envelope: &[u8]) -> Result<(), String> {
         let parent = path
             .parent()
@@ -743,6 +904,218 @@ mod windows_wallet {
             println!("recovery_phrase={phrase}");
             println!("recovery_phrase_warning=write_on_paper; never_share_or_store_in_cloud");
         }
+        Ok(())
+    }
+
+    struct HybridSecretSeeds {
+        ed25519: [u8; 32],
+        mldsa65: [u8; 32],
+    }
+    impl Drop for HybridSecretSeeds {
+        fn drop(&mut self) {
+            self.ed25519.fill(0);
+            self.mldsa65.fill(0);
+        }
+    }
+    struct LoadedHybridWallet {
+        seeds: HybridSecretSeeds,
+        ed25519_public_key: [u8; 32],
+        mldsa65_public_key: [u8; 1_952],
+        account_id: [u8; 32],
+    }
+
+    fn derive_domain_seed(domain: &[u8], mnemonic_seed: &[u8; 64]) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(domain);
+        hash.update(mnemonic_seed);
+        hash.finalize().into()
+    }
+    fn derive_hybrid_seeds(mnemonic: &bip39::Mnemonic) -> HybridSecretSeeds {
+        let mut mnemonic_seed = mnemonic.to_seed("");
+        let ed25519 = derive_domain_seed(HYBRID_ED25519_SEED_DOMAIN, &mnemonic_seed);
+        let mldsa65 = derive_domain_seed(HYBRID_MLDSA65_SEED_DOMAIN, &mnemonic_seed);
+        mnemonic_seed.fill(0);
+        HybridSecretSeeds { ed25519, mldsa65 }
+    }
+
+    fn save_hybrid_wallet(
+        path: &Path,
+        seeds: &HybridSecretSeeds,
+        phrase: Option<&str>,
+    ) -> Result<(), String> {
+        let signer = QRunV06HybridTransactionSigner::from_seeds(seeds.ed25519, seeds.mldsa65)
+            .map_err(|e| format!("QFP6 hybrid key derivation failed: {e:?}"))?;
+        let ed = signer.ed25519_public_key();
+        let pq = signer.mldsa65_public_key();
+        let account = signer.account_id();
+        let mut secret_payload = [0u8; 64];
+        secret_payload[..32].copy_from_slice(&seeds.ed25519);
+        secret_payload[32..].copy_from_slice(&seeds.mldsa65);
+        let protected_result = dpapi_protect_hybrid(&secret_payload, &ed, &pq, &account);
+        secret_payload.fill(0);
+        let protected = protected_result?;
+        if protected.is_empty() || protected.len() > MAX_PROTECTED_BLOB {
+            return Err("protected QFP6 hybrid-wallet blob length is invalid".into());
+        }
+        let mut envelope = Vec::with_capacity(HYBRID_HEADER_LEN + protected.len());
+        envelope.extend_from_slice(MAGIC);
+        envelope.extend_from_slice(&HYBRID_VERSION.to_be_bytes());
+        envelope.extend_from_slice(&ed);
+        envelope.extend_from_slice(&pq);
+        envelope.extend_from_slice(&account);
+        envelope.extend_from_slice(&(protected.len() as u32).to_be_bytes());
+        envelope.extend_from_slice(&protected);
+        save_new_wallet(path, &envelope)?;
+        println!("wallet_file={}", path.display());
+        println!("wallet_format=QZKW2_QFP6_HYBRID_Windows_CurrentUser_DPAPI");
+        println!("wallet_derivation=QFP6-BIP39-12-HYBRID-ED25519-MLDSA65-v1");
+        println!("public_account_id_hex={}", hex(&account));
+        println!("ed25519_public_key_hex={}", hex(&ed));
+        println!("mldsa65_public_key_hex={}", hex(&pq));
+        println!("private_key_output=none");
+        println!("mainnet_balance=not_created");
+        if let Some(phrase) = phrase {
+            println!("recovery_phrase_words=12");
+            println!("recovery_phrase={phrase}");
+            println!("recovery_phrase_warning=write_on_paper; never_share_or_store_in_cloud");
+        }
+        Ok(())
+    }
+
+    fn create_hybrid_wallet(path: &Path) -> Result<(), String> {
+        let mut entropy = [0u8; 16];
+        getrandom::getrandom(&mut entropy)
+            .map_err(|_| "operating-system random entropy generation failed".to_string())?;
+        if entropy.iter().all(|b| *b == 0) {
+            entropy.fill(0);
+            return Err("operating-system random source returned invalid entropy".into());
+        }
+        let mnemonic = bip39::Mnemonic::from_entropy_in(bip39::Language::English, &entropy)
+            .map_err(|_| {
+                "could not create a standard 12-word English BIP39 mnemonic".to_string()
+            })?;
+        entropy.fill(0);
+        let mut phrase = mnemonic.to_string();
+        let seeds = derive_hybrid_seeds(&mnemonic);
+        let result = save_hybrid_wallet(path, &seeds, Some(&phrase));
+        wipe_string(&mut phrase);
+        result
+    }
+
+    fn restore_hybrid_wallet(path: &Path) -> Result<(), String> {
+        eprintln!("Enter the 12-word English BIP39 recovery phrase. Console input is masked.");
+        let mut phrase = read_secret_line()?;
+        let mut normalized = phrase.split_whitespace().collect::<Vec<_>>().join(" ");
+        wipe_string(&mut phrase);
+        let mnemonic = match bip39::Mnemonic::parse_in(bip39::Language::English, &normalized) {
+            Ok(value) => value,
+            Err(_) => {
+                wipe_string(&mut normalized);
+                return Err("recovery phrase is invalid: expected a valid 12-word English BIP39 phrase and checksum".into());
+            }
+        };
+        wipe_string(&mut normalized);
+        let seeds = derive_hybrid_seeds(&mnemonic);
+        save_hybrid_wallet(path, &seeds, None)?;
+        println!("restore_status=success");
+        println!("recovery_phrase_saved_to_disk=no");
+        Ok(())
+    }
+
+    fn load_hybrid_wallet(path: &Path) -> Result<LoadedHybridWallet, String> {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|_| "hybrid wallet file could not be inspected".to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("hybrid wallet path must be a regular non-symlink file".into());
+        }
+        if metadata.len() < (HYBRID_HEADER_LEN + 1) as u64
+            || metadata.len() > (HYBRID_HEADER_LEN + MAX_PROTECTED_BLOB) as u64
+        {
+            return Err("QZKW2 hybrid wallet file length is invalid".into());
+        }
+        let file =
+            File::open(path).map_err(|_| "hybrid wallet file could not be opened".to_string())?;
+        let mut envelope = Vec::with_capacity(metadata.len() as usize);
+        file.take((HYBRID_HEADER_LEN + MAX_PROTECTED_BLOB + 1) as u64)
+            .read_to_end(&mut envelope)
+            .map_err(|_| "hybrid wallet file could not be read".to_string())?;
+        if envelope.len() < HYBRID_HEADER_LEN + 1
+            || envelope.len() > HYBRID_HEADER_LEN + MAX_PROTECTED_BLOB
+            || &envelope[..4] != MAGIC
+            || u16::from_be_bytes([envelope[4], envelope[5]]) != HYBRID_VERSION
+        {
+            return Err("QZKW2 hybrid wallet magic, version or length is invalid".into());
+        }
+        let ed: [u8; 32] = envelope[6..38]
+            .try_into()
+            .map_err(|_| "QZKW2 Ed25519 public key is malformed")?;
+        let pq: [u8; 1_952] = envelope[38..1_990]
+            .try_into()
+            .map_err(|_| "QZKW2 ML-DSA-65 public key is malformed")?;
+        let account: [u8; 32] = envelope[1_990..2_022]
+            .try_into()
+            .map_err(|_| "QZKW2 account ID is malformed")?;
+        if ed.iter().all(|b| *b == 0)
+            || pq.iter().all(|b| *b == 0)
+            || account.iter().all(|b| *b == 0)
+        {
+            return Err("QZKW2 public identifiers must be nonzero".into());
+        }
+        let protected_len = u32::from_be_bytes(
+            envelope[2_022..2_026]
+                .try_into()
+                .map_err(|_| "QZKW2 protected length is malformed")?,
+        ) as usize;
+        if protected_len == 0
+            || protected_len > MAX_PROTECTED_BLOB
+            || HYBRID_HEADER_LEN.checked_add(protected_len) != Some(envelope.len())
+        {
+            return Err("QZKW2 protected payload length is invalid".into());
+        }
+        let mut raw = dpapi_unprotect_hybrid(&envelope[HYBRID_HEADER_LEN..], &ed, &pq, &account)?;
+        if raw.len() != 64
+            || raw[..32].iter().all(|b| *b == 0)
+            || raw[32..].iter().all(|b| *b == 0)
+            || raw[..32] == raw[32..]
+        {
+            raw.fill(0);
+            return Err("QZKW2 hybrid seed payload is invalid".into());
+        }
+        let mut ed_seed = [0u8; 32];
+        let mut pq_seed = [0u8; 32];
+        ed_seed.copy_from_slice(&raw[..32]);
+        pq_seed.copy_from_slice(&raw[32..]);
+        raw.fill(0);
+        let seeds = HybridSecretSeeds {
+            ed25519: ed_seed,
+            mldsa65: pq_seed,
+        };
+        let signer = QRunV06HybridTransactionSigner::from_seeds(seeds.ed25519, seeds.mldsa65)
+            .map_err(|e| format!("QZKW2 key reconstruction failed: {e:?}"))?;
+        if signer.ed25519_public_key() != ed
+            || signer.mldsa65_public_key() != pq
+            || signer.account_id() != account
+        {
+            return Err(
+                "QZKW2 protected seeds do not match both public keys and account ID".into(),
+            );
+        }
+        Ok(LoadedHybridWallet {
+            seeds,
+            ed25519_public_key: ed,
+            mldsa65_public_key: pq,
+            account_id: account,
+        })
+    }
+
+    fn hybrid_address(path: &Path) -> Result<(), String> {
+        let wallet = load_hybrid_wallet(path)?;
+        println!("wallet_file={}", path.display());
+        println!("wallet_format=QZKW2_QFP6_HYBRID_Windows_CurrentUser_DPAPI");
+        println!("account_id_hex={}", hex(&wallet.account_id));
+        println!("ed25519_public_key_hex={}", hex(&wallet.ed25519_public_key));
+        println!("mldsa65_public_key_hex={}", hex(&wallet.mldsa65_public_key));
+        println!("private_key_output=none");
         Ok(())
     }
 
@@ -885,7 +1258,61 @@ mod windows_wallet {
         Ok(())
     }
 
+    fn wallet_version(path: &Path) -> Result<u16, String> {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|_| "wallet file could not be inspected".to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() < 6 {
+            return Err("wallet must be a regular file with a complete QZKW header".into());
+        }
+        let mut file =
+            File::open(path).map_err(|_| "wallet file could not be opened".to_string())?;
+        let mut header = [0u8; 6];
+        file.read_exact(&mut header)
+            .map_err(|_| "wallet header could not be read".to_string())?;
+        if &header[..4] != MAGIC {
+            return Err("wallet file has an unsupported magic value".into());
+        }
+        Ok(u16::from_be_bytes([header[4], header[5]]))
+    }
+
     fn sign_transfer(
+        path: &Path,
+        network_id: [u8; 32],
+        recipient: [u8; 32],
+        nonce: u64,
+        amount: u64,
+        fee: u64,
+        expires_at: u64,
+        self_contained: bool,
+        submit_to: Option<SocketAddr>,
+    ) -> Result<(), String> {
+        match wallet_version(path)? {
+            VERSION => sign_transfer_legacy(
+                path,
+                network_id,
+                recipient,
+                nonce,
+                amount,
+                fee,
+                expires_at,
+                self_contained,
+                submit_to,
+            ),
+            HYBRID_VERSION => {
+                if !self_contained {
+                    return Err(
+                        "QZKW2 Q6HA requires self-contained hybrid account authentication".into(),
+                    );
+                }
+                sign_transfer_hybrid(
+                    path, network_id, recipient, nonce, amount, fee, expires_at, submit_to,
+                )
+            }
+            other => Err(format!("unsupported QZKW wallet version: {other}")),
+        }
+    }
+
+    fn sign_transfer_legacy(
         path: &Path,
         network_id: [u8; 32],
         recipient: [u8; 32],
@@ -992,6 +1419,75 @@ mod windows_wallet {
         Ok(())
     }
 
+    fn sign_transfer_hybrid(
+        path: &Path,
+        network_id: [u8; 32],
+        recipient: [u8; 32],
+        nonce: u64,
+        amount: u64,
+        fee: u64,
+        expires_at: u64,
+        submit_to: Option<SocketAddr>,
+    ) -> Result<(), String> {
+        if submit_to.is_some() {
+            return Err("QZKW2 Q6HA transactions cannot be sent through legacy QZTS/1; QFP6 Q6PA transaction ingress is not yet wired".into());
+        }
+        let wallet = load_hybrid_wallet(path)?;
+        if wallet.account_id == recipient {
+            return Err("recipient must differ from the wallet account".into());
+        }
+        let signer =
+            QRunV06HybridTransactionSigner::from_seeds(wallet.seeds.ed25519, wallet.seeds.mldsa65)
+                .map_err(|e| format!("QFP6 hybrid signer initialization failed: {e:?}"))?;
+        let mut tx = Transaction {
+            network_id,
+            sender: wallet.account_id,
+            recipient,
+            nonce,
+            amount,
+            fee,
+            expires_at,
+            signature: Vec::new(),
+        };
+        signer
+            .sign_transaction(&mut tx)
+            .map_err(|e| format!("QFP6 Q6HA transaction signing failed: {e:?}"))?;
+        let digest = transaction_signing_digest(&tx)
+            .map_err(|e| format!("transaction digest failed: {e:?}"))?;
+        let txid = transaction_id_with_signature_limit(&tx, QRUN_V06_MAX_NATIVE_TX_SIGNATURE_BYTES)
+            .map_err(|e| format!("QFP6 transaction ID derivation failed: {e:?}"))?;
+        let encoded =
+            encode_transaction_with_signature_limit(&tx, QRUN_V06_MAX_NATIVE_TX_SIGNATURE_BYTES)
+                .map_err(|e| format!("QFP6 NativeTransfer encoding failed: {e:?}"))?;
+        println!("wallet_protocol=QFP6_Q6HA_v1");
+        println!("tx_network_id_hex={}", hex(&network_id));
+        println!("tx_sender_account_id_hex={}", hex(&wallet.account_id));
+        println!(
+            "tx_sender_ed25519_public_key_hex={}",
+            hex(&wallet.ed25519_public_key)
+        );
+        println!(
+            "tx_sender_mldsa65_public_key_hex={}",
+            hex(&wallet.mldsa65_public_key)
+        );
+        println!("tx_recipient_id_hex={}", hex(&recipient));
+        println!("tx_nonce={nonce}");
+        println!("tx_amount_atoms={amount}");
+        println!("tx_fee_atoms={fee}");
+        println!("tx_expires_at={expires_at}");
+        println!("tx_signing_digest_hex={}", hex(&digest));
+        println!("tx_id_hex={}", hex(&txid));
+        println!("tx_signature_scheme=Q6HA-v1-suite-1-requires-Ed25519-and-ML-DSA-65");
+        println!("tx_signature_bytes={}", tx.signature.len());
+        println!("tx_wire_bytes={}", encoded.len());
+        println!("tx_wire_sha256={}", hex(&Sha256::digest(&encoded)));
+        println!("tx_signature_hex={}", hex(&tx.signature));
+        println!("tx_wire_hex={}", hex(&encoded));
+        println!("tx_submit_status=not_attempted_qfp6_ingress_not_available");
+        println!("network_status=offline_signed_candidate_not_broadcast");
+        Ok(())
+    }
+
     pub fn run() {
         let result = match parse_command() {
             Ok(Command::Help) => {
@@ -1001,11 +1497,15 @@ Usage:\n\
   qzxb_wallet address --wallet ABSOLUTE_PATH\n\
   qzxb_wallet sign-transfer --wallet ABSOLUTE_PATH --network-id-hex HEX64 --recipient-id-hex HEX64 --nonce U64 --amount-atoms U64 --fee-atoms U64 --expires-at UNIX_SECONDS [--signature-mode self-contained|registered] [--submit-to IP:PORT]\n\
 Default signature mode embeds the public key with its Ed25519 signature so the sender account can be derived and checked by any validating node. `--signature-mode registered` is for legacy fixtures. `--submit-to` sends signed TXN2 using QZTS/1 and waits for the node's admission ACK; this does not imply Mainnet status or that the transaction was mined.");
+                println!("QZKW2 commands: create-qfp6-hybrid, restore-qfp6-hybrid, address-qfp6-hybrid. They use Q6HA dual signatures; sign-transfer creates an offline candidate only and refuses QZTS/1 broadcast.");
                 println!("Read-only local RPC: rpc-status --rpc 127.0.0.1:PORT; balance --rpc 127.0.0.1:PORT --account-id-hex HEX64; tx-status --rpc 127.0.0.1:PORT --txid-hex HEX64. These queries are restricted to loopback and require an explicitly read-only RPC response.");
                 Ok(())
             }
             Ok(Command::Create { output }) => create_wallet(&output),
             Ok(Command::Restore { output }) => restore_wallet(&output),
+            Ok(Command::CreateHybrid { output }) => create_hybrid_wallet(&output),
+            Ok(Command::RestoreHybrid { output }) => restore_hybrid_wallet(&output),
+            Ok(Command::HybridAddress { wallet }) => hybrid_address(&wallet),
             Ok(Command::Address { wallet }) => address(&wallet),
             Ok(Command::RpcStatus { rpc }) => rpc_status(rpc),
             Ok(Command::Balance { rpc, account_id }) => rpc_balance(rpc, account_id),
@@ -1106,6 +1606,113 @@ Default signature mode embeds the public key with its Ed25519 signature so the s
                 bip39::Language::English,
                 "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon"
             ).is_err());
+        }
+
+        #[test]
+        fn qfp6_hybrid_bip39_derivation_is_deterministic_and_separate_from_legacy_identity() {
+            let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+            let a = bip39::Mnemonic::parse_in(bip39::Language::English, phrase).unwrap();
+            let b = bip39::Mnemonic::parse_in(bip39::Language::English, phrase).unwrap();
+            let seeds_a = derive_hybrid_seeds(&a);
+            let seeds_b = derive_hybrid_seeds(&b);
+            assert_ne!(seeds_a.ed25519, seeds_a.mldsa65);
+            assert_eq!(seeds_a.ed25519, seeds_b.ed25519);
+            assert_eq!(seeds_a.mldsa65, seeds_b.mldsa65);
+            let signer_a =
+                QRunV06HybridTransactionSigner::from_seeds(seeds_a.ed25519, seeds_a.mldsa65)
+                    .unwrap();
+            let signer_b =
+                QRunV06HybridTransactionSigner::from_seeds(seeds_b.ed25519, seeds_b.mldsa65)
+                    .unwrap();
+            assert_eq!(signer_a.ed25519_public_key(), signer_b.ed25519_public_key());
+            assert_eq!(signer_a.mldsa65_public_key(), signer_b.mldsa65_public_key());
+            assert_eq!(signer_a.account_id(), signer_b.account_id());
+            let legacy_seed = derive_signing_seed(&a);
+            let legacy_signer = Ed25519TransactionSigner::from_seed(legacy_seed.0);
+            assert_ne!(signer_a.account_id(), legacy_signer.account_id());
+        }
+
+        #[test]
+        fn qfp6_hybrid_wallet_dpapi_roundtrip_and_public_identity_binding() {
+            let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+            let mnemonic = bip39::Mnemonic::parse_in(bip39::Language::English, phrase).unwrap();
+            let seeds = derive_hybrid_seeds(&mnemonic);
+            let path = std::env::temp_dir().join(format!(
+                "qzkw2-hybrid-{}-{}.qzw",
+                process::id(),
+                NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_file(&path);
+            save_hybrid_wallet(&path, &seeds, None).unwrap();
+            let loaded = load_hybrid_wallet(&path).unwrap();
+            assert_eq!(loaded.seeds.ed25519, seeds.ed25519);
+            assert_eq!(loaded.seeds.mldsa65, seeds.mldsa65);
+            assert_eq!(wallet_version(&path).unwrap(), HYBRID_VERSION);
+            let mut tampered = fs::read(&path).unwrap();
+            tampered[38] ^= 1;
+            fs::write(&path, tampered).unwrap();
+            assert!(load_hybrid_wallet(&path).is_err());
+            fs::remove_file(&path).unwrap();
+        }
+
+        #[test]
+        fn qfp6_hybrid_wallet_signs_and_verifies_qfb6_transfer_but_legacy_codec_rejects_it() {
+            use ai_native_l1_pow_bench::{
+                qrun_v06_hybrid_auth_candidate::QRunV06HybridTransactionAuthenticator,
+                state_machine::TransactionAuthenticator,
+                v4_fat1_mldsa65_candidate::LibcruxMlDsa65VerifierCandidate,
+            };
+            let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+            let mnemonic = bip39::Mnemonic::parse_in(bip39::Language::English, phrase).unwrap();
+            let seeds = derive_hybrid_seeds(&mnemonic);
+            let signer =
+                QRunV06HybridTransactionSigner::from_seeds(seeds.ed25519, seeds.mldsa65).unwrap();
+            let mut tx = Transaction {
+                network_id: [0xA1; 32],
+                sender: signer.account_id(),
+                recipient: [0xC3; 32],
+                nonce: 1,
+                amount: 10_000,
+                fee: 100,
+                expires_at: 2_000_000_000,
+                signature: Vec::new(),
+            };
+            signer.sign_transaction(&mut tx).unwrap();
+            let digest = transaction_signing_digest(&tx).unwrap();
+            let verifier =
+                QRunV06HybridTransactionAuthenticator::new(LibcruxMlDsa65VerifierCandidate);
+            assert_eq!(verifier.verify(&tx.sender, &digest, &tx.signature), Ok(()));
+            assert_eq!(tx.signature.len(), 5_365);
+            assert!(encode_transaction(&tx).is_err());
+            let qfp6_wire = encode_transaction_with_signature_limit(
+                &tx,
+                QRUN_V06_MAX_NATIVE_TX_SIGNATURE_BYTES,
+            )
+            .unwrap();
+            assert!(!qfp6_wire.is_empty());
+            assert!(transaction_id_with_signature_limit(
+                &tx,
+                QRUN_V06_MAX_NATIVE_TX_SIGNATURE_BYTES
+            )
+            .is_ok());
+            assert!(sign_transfer_hybrid(
+                Path::new("unused"),
+                [0xA1; 32],
+                [0xC3; 32],
+                1,
+                10_000,
+                100,
+                2_000_000_000,
+                Some("127.0.0.1:49340".parse().unwrap())
+            )
+            .unwrap_err()
+            .contains("legacy QZTS/1"));
+        }
+
+        #[test]
+        fn qzkw2_header_and_secret_lengths_are_stable() {
+            assert_eq!(HYBRID_HEADER_LEN, 2_026);
+            assert_eq!(HYBRID_HEADER_LEN + MAX_PROTECTED_BLOB, MAX_FILE_LEN + 1_952);
         }
 
         #[test]
