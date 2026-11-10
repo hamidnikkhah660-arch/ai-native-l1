@@ -267,6 +267,11 @@ pub struct QRunV06DurableStoreAuditReport {
     pub profile_id: [u8; 32],
     pub genesis_descriptor_commitment: [u8; 32],
     pub consensus_fingerprint: [u8; 32],
+    /// None for a Genesis-rooted Store; Some(exact externally pinned checkpoint commitment)
+    /// for a checkpoint-rooted segment.
+    pub checkpoint_anchor: Option<[u8; 32]>,
+    pub segment_base_height: u64,
+    pub segment_base_tip: [u8; 32],
     pub generation: u64,
     pub manifest_anchor: [u8; 32],
     pub canonical_height: u64,
@@ -640,6 +645,7 @@ impl QRunV06DurableForkStore {
             provider_pin.genesis_digest,
             expected_genesis_descriptor_commitment,
             expected_fingerprint,
+            [0; 32],
         )?;
 
         let journal = QRunV06Qap1Journal::audit_latest(
@@ -692,6 +698,289 @@ impl QRunV06DurableForkStore {
             profile_id: local_state.profile_id,
             genesis_descriptor_commitment: local_state.genesis_descriptor_commitment,
             consensus_fingerprint: local_state.consensus_fingerprint,
+            checkpoint_anchor: (local_state.checkpoint_anchor != [0; 32])
+                .then_some(local_state.checkpoint_anchor),
+            segment_base_height: local_state.segment_base_height,
+            segment_base_tip: local_state.segment_base_tip,
+            generation: local_state.manifest_generation,
+            manifest_anchor: local_state.manifest_anchor,
+            canonical_height: local_state.canonical_height,
+            canonical_tip: local_state.canonical_tip,
+            canonical_state_root: local_state.canonical_state_root,
+            cumulative_chainwork: local_state.cumulative_chainwork,
+            archive_entries: latest_manifest.entries.len(),
+            qap1_phase,
+            qap1_disposition,
+            qap1_candidate_digest,
+        })
+    }
+
+    /// Audit an existing checkpoint-rooted QFP6 segment without invoking the mutating open path.
+    /// The caller supplies both the exact checkpoint bytes and its independently retained
+    /// checkpoint commitment; the stored checkpoint file must match byte-for-byte.
+    pub fn audit_existing_checkpoint_segment_with_trust_authorized_profile_pin<
+        A: TransactionAuthenticator,
+        PV: MlDsa65Verifier,
+        AV: MlDsa65Verifier,
+    >(
+        directory: impl AsRef<Path>,
+        checkpoint_bytes: &[u8],
+        params: ConsensusParameters,
+        trusted_checkpoint_anchor: [u8; 32],
+        authenticator: &A,
+        trusted_manifest_anchor: [u8; 32],
+        authorized_profile_pin: &QRunV06TrustAuthorizedProfilePin,
+        anchor_pin: &ExternalCasOffhostAnchorPin,
+        provider_verifier: &PV,
+        anchor_verifier: &AV,
+    ) -> Result<QRunV06DurableStoreAuditReport, QRunV06ForkStoreError> {
+        Self::audit_existing_checkpoint_inner(
+            directory,
+            checkpoint_bytes,
+            params,
+            trusted_checkpoint_anchor,
+            authenticator,
+            trusted_manifest_anchor,
+            authorized_profile_pin,
+            anchor_pin,
+            provider_verifier,
+            anchor_verifier,
+            None,
+        )
+    }
+
+    /// Quote-aware checkpoint-segment audit. Every historical external-quote block after the
+    /// checkpoint must obtain fresh height-correct Q6TS/Q6QA authorization during replay.
+    pub fn audit_existing_checkpoint_segment_with_trust_authorized_profile_pin_and_quote_asset_authorization<
+        A: TransactionAuthenticator,
+        PV: MlDsa65Verifier,
+        AV: MlDsa65Verifier,
+    >(
+        directory: impl AsRef<Path>,
+        checkpoint_bytes: &[u8],
+        params: ConsensusParameters,
+        trusted_checkpoint_anchor: [u8; 32],
+        authenticator: &A,
+        trusted_manifest_anchor: [u8; 32],
+        authorized_profile_pin: &QRunV06TrustAuthorizedProfilePin,
+        anchor_pin: &ExternalCasOffhostAnchorPin,
+        provider_verifier: &PV,
+        anchor_verifier: &AV,
+        quote_authorizer: &mut QRunV06QuoteAssetAuthorizationProvider<'_>,
+    ) -> Result<QRunV06DurableStoreAuditReport, QRunV06ForkStoreError> {
+        Self::audit_existing_checkpoint_inner(
+            directory,
+            checkpoint_bytes,
+            params,
+            trusted_checkpoint_anchor,
+            authenticator,
+            trusted_manifest_anchor,
+            authorized_profile_pin,
+            anchor_pin,
+            provider_verifier,
+            anchor_verifier,
+            Some(quote_authorizer),
+        )
+    }
+
+    fn audit_existing_checkpoint_inner<
+        A: TransactionAuthenticator,
+        PV: MlDsa65Verifier,
+        AV: MlDsa65Verifier,
+    >(
+        directory: impl AsRef<Path>,
+        checkpoint_bytes: &[u8],
+        params: ConsensusParameters,
+        trusted_checkpoint_anchor: [u8; 32],
+        authenticator: &A,
+        trusted_manifest_anchor: [u8; 32],
+        authorized_profile_pin: &QRunV06TrustAuthorizedProfilePin,
+        anchor_pin: &ExternalCasOffhostAnchorPin,
+        provider_verifier: &PV,
+        anchor_verifier: &AV,
+        mut quote_authorizer: Option<&mut QRunV06QuoteAssetAuthorizationProvider<'_>>,
+    ) -> Result<QRunV06DurableStoreAuditReport, QRunV06ForkStoreError> {
+        if params.protocol_version != QRUN_V06_PROTOCOL_VERSION {
+            return Err(QRunV06ForkStoreError::WrongProtocolVersion);
+        }
+        params.validate()?;
+        if trusted_checkpoint_anchor == [0; 32] {
+            return Err(QRunV06ForkStoreError::Checkpoint(
+                QRunV06CheckpointError::InvalidTrustedAnchor,
+            ));
+        }
+        if trusted_manifest_anchor == [0; 32] {
+            return Err(QRunV06ForkStoreError::InvalidTrustedManifestAnchor);
+        }
+
+        let verified_pin = authorized_profile_pin.verified_profile_pin();
+        let descriptor = verified_pin.descriptor();
+        let provider_pin = verified_pin.bundle().external_cas_pin().clone();
+        let expected_genesis_descriptor_commitment = descriptor.commitment();
+        let descriptor_consensus_fingerprint =
+            crate::qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint(&params)?;
+        if descriptor.consensus_fingerprint() != descriptor_consensus_fingerprint {
+            return Err(QRunV06ForkStoreError::ProfilePinConsensusMismatch);
+        }
+        anchor_pin
+            .validate(&provider_pin)
+            .map_err(|error| QRunV06ForkStoreError::Qap1(format!("Q6EA pin: {error:?}")))?;
+        let qfp6_pin = QRunV06ExternalAnchorPin::new(
+            provider_pin.clone(),
+            expected_genesis_descriptor_commitment,
+        )
+        .map_err(|error| QRunV06ForkStoreError::Qap1(format!("QFP6 pin: {error:?}")))?;
+
+        let directory = directory.as_ref().to_path_buf();
+        ensure_real_directory(&directory)?;
+        let lock_path = directory.join(LOCK_NAME);
+        reject_symlink_if_present(&lock_path)?;
+        let _writer_lock = StoreWriterLock::acquire(&directory, LOCK_NAME).map_err(|error| {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                QRunV06ForkStoreError::WriterLockHeld
+            } else {
+                QRunV06ForkStoreError::Io(error.to_string())
+            }
+        })?;
+        validate_root_entries(&directory)?;
+
+        let checkpoint_path = directory.join(CHECKPOINT_FILE);
+        reject_symlink_if_present(&checkpoint_path)?;
+        let stored_checkpoint_bytes =
+            read_bounded(&checkpoint_path, MAX_QRUN_V06_CHECKPOINT_BYTES)?;
+        if stored_checkpoint_bytes != checkpoint_bytes {
+            return Err(QRunV06ForkStoreError::Checkpoint(
+                QRunV06CheckpointError::CheckpointAnchorMismatch,
+            ));
+        }
+        let checkpoint = QRunV06CheckpointCandidate::decode_snapshot(
+            &stored_checkpoint_bytes,
+            &params,
+            &descriptor.network_id(),
+            &descriptor.profile_id(),
+            trusted_checkpoint_anchor,
+        )?;
+        if checkpoint.genesis_descriptor_commitment() != expected_genesis_descriptor_commitment
+            || checkpoint.execution_state().genesis_descriptor() != Some(descriptor)
+            || checkpoint.execution_state().network_id() != descriptor.network_id()
+            || checkpoint.execution_state().profile_id() != descriptor.profile_id()
+        {
+            return Err(QRunV06ForkStoreError::ProfilePinMismatch);
+        }
+        let tokenomics = checkpoint
+            .execution_state()
+            .tokenomics()
+            .ok_or(QRunV06ForkStoreError::ProfilePinTokenomicsMismatch)?;
+        if tokenomics.founder_account() != descriptor.founder_account()
+            || tokenomics.policy_fingerprint() != descriptor.tokenomics_policy_fingerprint()
+        {
+            return Err(QRunV06ForkStoreError::ProfilePinTokenomicsMismatch);
+        }
+
+        let branches_dir = directory.join(BRANCH_DIR);
+        let manifests_dir = directory.join(MANIFEST_DIR);
+        ensure_real_directory(&branches_dir)?;
+        ensure_real_directory(&manifests_dir)?;
+        let qap1_dir = directory.join(QAP1_DIR);
+        if path_exists_no_follow(&qap1_dir)? {
+            ensure_real_directory(&qap1_dir)?;
+        }
+
+        let base_graph =
+            QRunV06PowForkChoice::from_checkpoint_with_expected_genesis_descriptor_commitment(
+                checkpoint,
+                params.clone(),
+                expected_genesis_descriptor_commitment,
+            )?;
+        let expected_fingerprint = consensus_fingerprint(&params)?;
+        let manifest_chain = load_manifest_chain(&manifests_dir)?;
+        let (latest_manifest, latest_anchor) = manifest_chain
+            .last()
+            .ok_or(QRunV06ForkStoreError::ManifestGenerationMismatch)?;
+        if *latest_anchor != trusted_manifest_anchor {
+            return Err(QRunV06ForkStoreError::ManifestAnchorMismatch);
+        }
+        validate_manifest_identity(latest_manifest, &base_graph, expected_fingerprint)?;
+        let envelopes = load_branch_entries(&branches_dir, &latest_manifest.entries, &params)?;
+        let rebuilt = if let Some(provider) = quote_authorizer.as_deref_mut() {
+            base_graph.rebuild_from_current_base_with_quote_asset_authorization(
+                envelopes,
+                authenticator,
+                provider,
+            )?
+        } else {
+            base_graph.rebuild_from_current_base(envelopes, authenticator)?
+        };
+        validate_manifest_graph(latest_manifest, &rebuilt)?;
+        let local_state = external_anchor_state_from_graph(
+            &rebuilt,
+            latest_manifest.generation,
+            *latest_anchor,
+            provider_pin.genesis_digest,
+            expected_genesis_descriptor_commitment,
+            expected_fingerprint,
+            trusted_checkpoint_anchor,
+        )?;
+        if local_state.segment_base_height != rebuilt.base_height()
+            || local_state.segment_base_tip != rebuilt.base_tip()
+            || local_state.checkpoint_anchor != trusted_checkpoint_anchor
+        {
+            return Err(QRunV06ForkStoreError::PreparedCommitMismatch);
+        }
+
+        let journal = QRunV06Qap1Journal::audit_latest(
+            &qap1_dir,
+            &provider_pin,
+            anchor_pin,
+            provider_verifier,
+            anchor_verifier,
+        )?;
+        let mut allowed_staged_candidate: Option<([u8; 32], Vec<u8>)> = None;
+        let (qap1_phase, qap1_disposition, qap1_candidate_digest) = if let Some(journal) = journal {
+            let disposition = audit_qap1_against_store(
+                &journal,
+                &local_state,
+                &rebuilt,
+                latest_manifest,
+                *latest_anchor,
+                &params,
+                authenticator,
+                quote_authorizer.as_deref_mut(),
+                &manifests_dir,
+                &qfp6_pin,
+            )?;
+            let candidate_digest = pow_digest(
+                &decode_qrun_v06_pow_block(journal.candidate_envelope())?.header,
+                params.pow,
+            )?;
+            if disposition
+                == QRunV06Qap1RecoveryDisposition::AnchorConfirmedNeedsLocalManifestPublish
+            {
+                allowed_staged_candidate =
+                    Some((candidate_digest, journal.candidate_envelope().to_vec()));
+            }
+            (Some(journal.phase()), disposition, Some(candidate_digest))
+        } else {
+            (None, QRunV06Qap1RecoveryDisposition::Clean, None)
+        };
+        let allowed_staged_candidate_ref = allowed_staged_candidate
+            .as_ref()
+            .map(|(digest, bytes)| (digest, bytes.as_slice()));
+        audit_branch_directory(
+            &branches_dir,
+            &latest_manifest.entries,
+            &params,
+            allowed_staged_candidate_ref,
+        )?;
+
+        Ok(QRunV06DurableStoreAuditReport {
+            network_id: local_state.network_id,
+            profile_id: local_state.profile_id,
+            genesis_descriptor_commitment: local_state.genesis_descriptor_commitment,
+            consensus_fingerprint: local_state.consensus_fingerprint,
+            checkpoint_anchor: Some(local_state.checkpoint_anchor),
+            segment_base_height: local_state.segment_base_height,
+            segment_base_tip: local_state.segment_base_tip,
             generation: local_state.manifest_generation,
             manifest_anchor: local_state.manifest_anchor,
             canonical_height: local_state.canonical_height,
@@ -2156,6 +2445,7 @@ fn external_anchor_state_from_graph(
     genesis_digest: [u8; 32],
     genesis_descriptor_commitment: [u8; 32],
     consensus_fingerprint: [u8; 32],
+    checkpoint_anchor: [u8; 32],
 ) -> Result<QRunV06ExternalAnchorState, QRunV06ForkStoreError> {
     let tip = graph.canonical_tip();
     let state_root = graph
@@ -2174,7 +2464,7 @@ fn external_anchor_state_from_graph(
         consensus_fingerprint,
         segment_base_height: graph.base_height(),
         segment_base_tip: graph.base_tip(),
-        checkpoint_anchor: [0; 32],
+        checkpoint_anchor,
         manifest_generation: generation,
         manifest_anchor,
         canonical_height: tip.height,
@@ -2285,6 +2575,7 @@ fn audit_qap1_against_store<A: TransactionAuthenticator>(
             successor.genesis_digest,
             successor.genesis_descriptor_commitment,
             successor.consensus_fingerprint,
+            successor.checkpoint_anchor,
         )?;
         if staged_state != *successor {
             return Err(QRunV06ForkStoreError::PreparedCommitMismatch);
@@ -6118,7 +6409,7 @@ mod tests {
             QRunV06DurableForkStore::open_from_checkpoint_with_trust_authorized_profile_pin(
                 &checkpoint_dir.0,
                 &checkpoint_bytes,
-                params,
+                params.clone(),
                 checkpoint_anchor,
                 &authorized,
                 &EmptyAuthenticator,
@@ -6129,6 +6420,332 @@ mod tests {
         assert_eq!(
             resumed.checkpoint_anchor().unwrap(),
             Some(checkpoint_anchor)
+        );
+
+        // Build a nonzero-height checkpoint and persist a second segment over it. The new
+        // audit must verify the file commitment, checkpoint-rooted base, post-checkpoint
+        // manifest replay and exact Q6EA checkpoint_anchor binding.
+        let checkpoint_source_dir = TestDir::new();
+        let mut checkpoint_source =
+            QRunV06DurableForkStore::open_with_trust_authorized_profile_pin(
+                &checkpoint_source_dir.0,
+                genesis.clone(),
+                params.clone(),
+                &EmptyAuthenticator,
+                None,
+                &authorized,
+            )
+            .unwrap();
+        let source_parent = checkpoint_source.graph().unwrap().canonical_tip().tip_hash;
+        let source_target = checkpoint_source
+            .graph()
+            .unwrap()
+            .expected_next_target(&source_parent)
+            .unwrap();
+        let (source_block, _) = candidate(
+            checkpoint_source.graph().unwrap().canonical_state(),
+            source_parent,
+            2,
+            source_target,
+            &params,
+        );
+        checkpoint_source
+            .submit(&source_block, &EmptyAuthenticator)
+            .unwrap();
+        let (segment_checkpoint_bytes, segment_checkpoint_anchor) =
+            checkpoint_source.export_canonical_checkpoint().unwrap();
+        drop(checkpoint_source);
+        let segment_checkpoint = QRunV06CheckpointCandidate::decode_snapshot(
+            &segment_checkpoint_bytes,
+            &params,
+            &NETWORK,
+            &PROFILE,
+            segment_checkpoint_anchor,
+        )
+        .unwrap();
+        assert_eq!(segment_checkpoint.height(), 1);
+
+        let checkpoint_segment_dir = TestDir::new();
+        let mut checkpoint_segment =
+            QRunV06DurableForkStore::open_from_checkpoint_with_trust_authorized_profile_pin(
+                &checkpoint_segment_dir.0,
+                &segment_checkpoint_bytes,
+                params.clone(),
+                segment_checkpoint_anchor,
+                &authorized,
+                &EmptyAuthenticator,
+                None,
+            )
+            .unwrap();
+        let segment_parent = checkpoint_segment.graph().unwrap().canonical_tip().tip_hash;
+        let segment_target = checkpoint_segment
+            .graph()
+            .unwrap()
+            .expected_next_target(&segment_parent)
+            .unwrap();
+        let (segment_block, _) = candidate(
+            checkpoint_segment.graph().unwrap().canonical_state(),
+            segment_parent,
+            3,
+            segment_target,
+            &params,
+        );
+        checkpoint_segment
+            .submit(&segment_block, &EmptyAuthenticator)
+            .unwrap();
+        let checkpoint_manifest_anchor = checkpoint_segment.manifest_anchor().unwrap();
+        assert_eq!(checkpoint_segment.canonical_height().unwrap(), 2);
+        assert_eq!(checkpoint_segment.generation().unwrap(), 1);
+        drop(checkpoint_segment);
+
+        let checkpoint_report =
+            QRunV06DurableForkStore::audit_existing_checkpoint_segment_with_trust_authorized_profile_pin(
+                &checkpoint_segment_dir.0,
+                &segment_checkpoint_bytes,
+                params.clone(),
+                segment_checkpoint_anchor,
+                &EmptyAuthenticator,
+                checkpoint_manifest_anchor,
+                &authorized,
+                &anchor_pin,
+                &pq_verifier,
+                &pq_verifier,
+            )
+            .unwrap();
+        assert_eq!(
+            checkpoint_report.checkpoint_anchor,
+            Some(segment_checkpoint_anchor)
+        );
+        assert_eq!(checkpoint_report.segment_base_height, 1);
+        assert_eq!(
+            checkpoint_report.segment_base_tip,
+            segment_checkpoint.consensus_tip_digest()
+        );
+        assert_eq!(checkpoint_report.canonical_height, 2);
+        assert_eq!(checkpoint_report.generation, 1);
+        assert_eq!(
+            checkpoint_report.manifest_anchor,
+            checkpoint_manifest_anchor
+        );
+        assert_eq!(checkpoint_report.qap1_phase, None);
+        assert_eq!(
+            checkpoint_report.qap1_disposition,
+            QRunV06Qap1RecoveryDisposition::Clean
+        );
+
+        assert!(matches!(
+            QRunV06DurableForkStore::audit_existing_checkpoint_segment_with_trust_authorized_profile_pin(
+                &checkpoint_segment_dir.0,
+                &segment_checkpoint_bytes,
+                params.clone(),
+                [0xE1; 32],
+                &EmptyAuthenticator,
+                checkpoint_manifest_anchor,
+                &authorized,
+                &anchor_pin,
+                &pq_verifier,
+                &pq_verifier,
+            ),
+            Err(QRunV06ForkStoreError::Checkpoint(QRunV06CheckpointError::CheckpointAnchorMismatch))
+        ));
+        assert!(matches!(
+            QRunV06DurableForkStore::audit_existing_checkpoint_segment_with_trust_authorized_profile_pin(
+                &checkpoint_segment_dir.0,
+                &segment_checkpoint_bytes,
+                params.clone(),
+                segment_checkpoint_anchor,
+                &EmptyAuthenticator,
+                [0xE2; 32],
+                &authorized,
+                &anchor_pin,
+                &pq_verifier,
+                &pq_verifier,
+            ),
+            Err(QRunV06ForkStoreError::ManifestAnchorMismatch)
+        ));
+
+        let checkpoint_orphan_digest = [0xD7; 32];
+        let checkpoint_orphan_path = checkpoint_segment_dir
+            .0
+            .join(BRANCH_DIR)
+            .join(branch_filename(&checkpoint_orphan_digest));
+        fs::write(
+            &checkpoint_orphan_path,
+            b"checkpoint segment orphan evidence",
+        )
+        .unwrap();
+        let checkpoint_orphan_bytes = fs::read(&checkpoint_orphan_path).unwrap();
+        assert!(matches!(
+            QRunV06DurableForkStore::audit_existing_checkpoint_segment_with_trust_authorized_profile_pin(
+                &checkpoint_segment_dir.0,
+                &segment_checkpoint_bytes,
+                params.clone(),
+                segment_checkpoint_anchor,
+                &EmptyAuthenticator,
+                checkpoint_manifest_anchor,
+                &authorized,
+                &anchor_pin,
+                &pq_verifier,
+                &pq_verifier,
+            ),
+            Err(QRunV06ForkStoreError::UnexpectedEntry)
+        ));
+        assert_eq!(
+            fs::read(&checkpoint_orphan_path).unwrap(),
+            checkpoint_orphan_bytes
+        );
+        fs::remove_file(checkpoint_orphan_path).unwrap();
+
+        // Persist a Prepared QAP1 intent on the checkpoint-rooted segment. The recovery audit
+        // must retain the checkpoint anchor when replaying the candidate and exact next Manifest.
+        let mut checkpoint_qap1_store =
+            QRunV06DurableForkStore::open_from_checkpoint_with_trust_authorized_profile_pin(
+                &checkpoint_segment_dir.0,
+                &segment_checkpoint_bytes,
+                params.clone(),
+                segment_checkpoint_anchor,
+                &authorized,
+                &EmptyAuthenticator,
+                Some(checkpoint_manifest_anchor),
+            )
+            .unwrap();
+        let checkpoint_predecessor = QRunV06ExternalAnchorState::from_store(
+            &checkpoint_qap1_store,
+            provider_pin.genesis_digest,
+        )
+        .unwrap();
+        assert_eq!(
+            checkpoint_predecessor.checkpoint_anchor,
+            segment_checkpoint_anchor
+        );
+        let checkpoint_parent = checkpoint_qap1_store
+            .graph()
+            .unwrap()
+            .canonical_tip()
+            .tip_hash;
+        let checkpoint_target = checkpoint_qap1_store
+            .graph()
+            .unwrap()
+            .expected_next_target(&checkpoint_parent)
+            .unwrap();
+        let (checkpoint_candidate_bytes, _) = candidate(
+            checkpoint_qap1_store.graph().unwrap().canonical_state(),
+            checkpoint_parent,
+            4,
+            checkpoint_target,
+            &params,
+        );
+        let checkpoint_prepared = checkpoint_qap1_store
+            .prepare(&checkpoint_candidate_bytes, &EmptyAuthenticator)
+            .unwrap()
+            .unwrap();
+        let checkpoint_successor = checkpoint_qap1_store
+            .external_anchor_state_for_prepared(&checkpoint_prepared, provider_pin.genesis_digest)
+            .unwrap();
+        assert_eq!(
+            checkpoint_successor.checkpoint_anchor,
+            segment_checkpoint_anchor
+        );
+
+        let checkpoint_bootstrap_record = ExternalCasRecord {
+            generation: 0,
+            provider_id: provider_pin.provider_id,
+            network_id: provider_pin.network_id,
+            genesis_digest: provider_pin.genesis_digest,
+            previous_record_digest: [0; 32],
+            previous_state_digest: [0; 32],
+            next_state_digest: checkpoint_predecessor.digest().unwrap(),
+            operation_id: [0xC1; 32],
+            request_digest: [0xC2; 32],
+        };
+        let checkpoint_anchor_predecessor = ExternalCasOffhostAnchorState::provision_bootstrap(
+            &provider_pin,
+            checkpoint_bootstrap_record.clone(),
+            1,
+        )
+        .unwrap();
+        let checkpoint_operation_id = [0xC3; 32];
+        let mut checkpoint_provider_request = ExternalCasWriteRequest {
+            request_nonce: [0xC4; 32],
+            operation_id: checkpoint_operation_id,
+            request_digest: [1; 32],
+            expected_generation: 0,
+            expected_object_generation: 1,
+            expected_record_digest: checkpoint_bootstrap_record.digest().unwrap(),
+            expected_state_digest: checkpoint_predecessor.digest().unwrap(),
+            next_record: ExternalCasRecord {
+                generation: 1,
+                provider_id: provider_pin.provider_id,
+                network_id: provider_pin.network_id,
+                genesis_digest: provider_pin.genesis_digest,
+                previous_record_digest: checkpoint_bootstrap_record.digest().unwrap(),
+                previous_state_digest: checkpoint_predecessor.digest().unwrap(),
+                next_state_digest: checkpoint_successor.digest().unwrap(),
+                operation_id: checkpoint_operation_id,
+                request_digest: [0; 32],
+            },
+        };
+        checkpoint_provider_request
+            .bind_request_digest(&provider_pin)
+            .unwrap();
+        let checkpoint_journal = QRunV06Qap1Journal::new(
+            checkpoint_predecessor,
+            checkpoint_successor,
+            checkpoint_anchor_predecessor,
+            checkpoint_provider_request,
+            checkpoint_prepared.candidate_envelope().to_vec(),
+            checkpoint_prepared.manifest_bytes().to_vec(),
+            &provider_pin,
+        )
+        .unwrap();
+        let checkpoint_qap1_dir = checkpoint_qap1_store.qap1_directory().unwrap();
+        checkpoint_journal
+            .persist_prepared(&checkpoint_qap1_dir, &provider_pin)
+            .unwrap();
+        let checkpoint_manifest_path = checkpoint_segment_dir
+            .0
+            .join(MANIFEST_DIR)
+            .join(manifest_filename(1));
+        let checkpoint_manifest_bytes = fs::read(&checkpoint_manifest_path).unwrap();
+        let checkpoint_prepared_path = checkpoint_qap1_dir.join("qfp6-anchor-qap1-01.qap1");
+        let checkpoint_prepared_bytes = fs::read(&checkpoint_prepared_path).unwrap();
+        drop(checkpoint_qap1_store);
+
+        let checkpoint_prepared_report =
+            QRunV06DurableForkStore::audit_existing_checkpoint_segment_with_trust_authorized_profile_pin(
+                &checkpoint_segment_dir.0,
+                &segment_checkpoint_bytes,
+                params.clone(),
+                segment_checkpoint_anchor,
+                &EmptyAuthenticator,
+                checkpoint_manifest_anchor,
+                &authorized,
+                &anchor_pin,
+                &pq_verifier,
+                &pq_verifier,
+            )
+            .unwrap();
+        assert_eq!(
+            checkpoint_prepared_report.checkpoint_anchor,
+            Some(segment_checkpoint_anchor)
+        );
+        assert_eq!(checkpoint_prepared_report.segment_base_height, 1);
+        assert_eq!(checkpoint_prepared_report.canonical_height, 2);
+        assert_eq!(
+            checkpoint_prepared_report.qap1_phase,
+            Some(QRunV06Qap1Phase::Prepared)
+        );
+        assert_eq!(
+            checkpoint_prepared_report.qap1_disposition,
+            QRunV06Qap1RecoveryDisposition::PreparedNeedsRemoteReconciliation
+        );
+        assert_eq!(
+            fs::read(&checkpoint_manifest_path).unwrap(),
+            checkpoint_manifest_bytes
+        );
+        assert_eq!(
+            fs::read(&checkpoint_prepared_path).unwrap(),
+            checkpoint_prepared_bytes
         );
     }
 }
