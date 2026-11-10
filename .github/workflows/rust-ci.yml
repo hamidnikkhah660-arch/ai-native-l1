@@ -2,7 +2,7 @@ name: Rust validation
 
 on:
   push:
-    branches: [main, "ci/**", "public/**", "feat/cp0584-q6ti-q6ta-noise-transaction-ingress-20261110"]
+    branches: [main, "ci/**", "public/**", "feat/cp0584-q6ti-q6ta-noise-transaction-ingress-20261110", "feat/cp0585-q6ti-supervised-mining-20261110"]
   pull_request:
     branches: [main]
   workflow_dispatch:
