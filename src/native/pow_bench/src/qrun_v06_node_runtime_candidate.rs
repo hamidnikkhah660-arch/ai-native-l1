@@ -2385,9 +2385,13 @@ mod tests {
         use crate::external_cas_disk_provider_candidate::DurableExternalCasProvider;
         use crate::external_cas_floor_store_candidate::ExternalCasFloorStore;
         use crate::external_cas_offhost_anchor_candidate::ExternalCasOffhostAnchorState;
-        use crate::qrun_v06_node_supervisor_candidate::{
-            run_qfp6_mining_supervisor, QRunV06MiningSupervisorConfig,
-            QRunV06NodeSupervisorStopReason,
+        use crate::{
+            qrun_v06_node_supervisor_candidate::{
+                run_qfp6_mining_supervisor, QRunV06MiningSupervisorConfig,
+                QRunV06NodeSupervisorStopReason,
+            },
+            qrun_v06_transaction_journal_candidate::QRunV06TransactionJournal,
+            qrun_v06_transaction_mempool_candidate::QRunV06MempoolLimits,
         };
 
         // Build independently persisted Provider and Q6EA services with real Noise endpoints
@@ -2544,6 +2548,11 @@ mod tests {
         config.listener_round_timeout = Duration::from_millis(250);
         config.mining.max_blocks_per_run = 2;
         config.mining.max_nonce_attempts_per_block = 100_000;
+        let mut transaction_journal = QRunV06TransactionJournal::open(
+            dir.0.join("q6ti-pending-journal"),
+            QRunV06MempoolLimits::default(),
+        )
+        .unwrap();
 
         let report = run_qfp6_mining_supervisor(
             &listener,
@@ -2558,6 +2567,7 @@ mod tests {
             &mut quote,
             &mut coordinator,
             PRODUCER,
+            &mut transaction_journal,
             |parent| {
                 template_calls += 1;
                 if template_calls == 2 {
