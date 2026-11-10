@@ -328,7 +328,16 @@ mod tests {
         QRunV06CanonicalExecutionState,
         QRunV06PowForkChoice,
     ) {
-        let params = params(initial_target);
+        setup_with_params(params(initial_target))
+    }
+
+    fn setup_with_params(
+        params: ConsensusParameters,
+    ) -> (
+        ConsensusParameters,
+        QRunV06CanonicalExecutionState,
+        QRunV06PowForkChoice,
+    ) {
         let schedule = QRunV06MiningScheduleCandidate::cp0422_research_candidate();
         let tokenomics = QRunV06TokenomicsState::genesis(NETWORK, OWNER, schedule).unwrap();
         let descriptor = QRunV06GenesisDescriptor::new(
@@ -380,6 +389,40 @@ mod tests {
         assert_eq!(imported.canonical_height, 1);
         assert_eq!(imported.canonical_tip, mined.block_digest);
         assert_eq!(graph.canonical_state().height(), 1);
+    }
+
+    #[test]
+    fn qfp6_miner_and_fork_choice_use_the_sha256d_v06_profile() {
+        let mut sha256d_params = params(Uint256::MAX);
+        sha256d_params.pow = PowParameters {
+            algorithm: PowAlgorithm::Sha256d,
+            memory_kib: 0,
+            iterations: 0,
+            lanes: 0,
+            output_bytes: 32,
+        };
+        sha256d_params.validate().unwrap();
+        let (params, _genesis, mut graph) = setup_with_params(sha256d_params);
+        let parent_tip = graph.canonical_tip().tip_hash;
+        let cancellation = AtomicBool::new(false);
+        let mined = mine_qfp6_block_on_tip(
+            &graph,
+            &parent_tip,
+            31,
+            PRODUCER,
+            Vec::<QRunV06BlockOperation>::new(),
+            &EmptyAuthenticator,
+            1,
+            &cancellation,
+        )
+        .unwrap();
+        let imported = graph
+            .insert_encoded(&mined.envelope, &EmptyAuthenticator)
+            .unwrap();
+        assert_eq!(imported.canonical_height, 1);
+        assert_eq!(imported.canonical_tip, mined.block_digest);
+        assert_eq!(graph.canonical_state().height(), 1);
+        assert_eq!(params.pow.algorithm, PowAlgorithm::Sha256d);
     }
 
     #[test]

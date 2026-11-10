@@ -132,6 +132,7 @@ pub fn qrun_consensus_profile_fingerprint(
     bytes.extend_from_slice(&params.initial_target.to_be_bytes());
     bytes.push(match params.pow.algorithm {
         PowAlgorithm::Argon2id => 1,
+        PowAlgorithm::Sha256d => 2,
     });
     bytes.extend_from_slice(&params.pow.memory_kib.to_be_bytes());
     bytes.extend_from_slice(&params.pow.iterations.to_be_bytes());

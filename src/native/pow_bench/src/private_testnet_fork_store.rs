@@ -2323,6 +2323,7 @@ fn profile_fingerprint(
     canonical.extend_from_slice(&params.initial_target.to_be_bytes());
     canonical.push(match params.pow.algorithm {
         PowAlgorithm::Argon2id => 1,
+        PowAlgorithm::Sha256d => 2,
     });
     canonical.extend_from_slice(&params.pow.memory_kib.to_be_bytes());
     canonical.extend_from_slice(&params.pow.iterations.to_be_bytes());

@@ -1105,6 +1105,7 @@ fn consensus_parameters_fingerprint(params: &ConsensusParameters) -> [u8; 32] {
     preimage.extend_from_slice(&params.initial_target.to_be_bytes());
     preimage.push(match params.pow.algorithm {
         ai_native_l1_pow_bench::consensus::PowAlgorithm::Argon2id => 1,
+        ai_native_l1_pow_bench::consensus::PowAlgorithm::Sha256d => 2,
     });
     preimage.extend_from_slice(&params.pow.memory_kib.to_be_bytes());
     preimage.extend_from_slice(&params.pow.iterations.to_be_bytes());

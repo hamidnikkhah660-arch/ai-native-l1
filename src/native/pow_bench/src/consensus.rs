@@ -9,6 +9,7 @@
 //! required before those rules can become consensus-critical.
 
 use argon2::{Algorithm, Argon2, Params, Version};
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 
 use crate::issuance_schedule::{IssuanceError, IssuanceParameters};
@@ -204,6 +205,7 @@ impl Uint256 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PowAlgorithm {
     Argon2id,
+    Sha256d,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,11 +219,20 @@ pub struct PowParameters {
 
 impl PowParameters {
     pub fn validate(self) -> Result<(), ConsensusError> {
-        if self.memory_kib < 8 {
-            return Err(ConsensusError::InvalidPowMemory);
-        }
-        if self.iterations == 0 || self.lanes == 0 {
-            return Err(ConsensusError::InvalidPowParameters);
+        match self.algorithm {
+            PowAlgorithm::Argon2id => {
+                if self.memory_kib < 8 {
+                    return Err(ConsensusError::InvalidPowMemory);
+                }
+                if self.iterations == 0 || self.lanes == 0 {
+                    return Err(ConsensusError::InvalidPowParameters);
+                }
+            }
+            PowAlgorithm::Sha256d => {
+                if self.memory_kib != 0 || self.iterations != 0 || self.lanes != 0 {
+                    return Err(ConsensusError::InvalidPowParameters);
+                }
+            }
         }
         if self.output_bytes as usize != POW_OUTPUT_BYTES {
             return Err(ConsensusError::InvalidPowParameters);
@@ -278,6 +289,22 @@ impl ConsensusParameters {
             },
             issuance,
         })
+    }
+
+    /// QRun v0.6 SHA-256d profile candidate. Difficulty remains a smoke-test candidate and is
+    /// not calibrated or frozen for a public network.
+    pub fn qrun_v06_sha256d_candidate() -> Result<Self, ConsensusError> {
+        let mut params = Self::candidate_testnet()?;
+        params.protocol_version = 6;
+        params.pow = PowParameters {
+            algorithm: PowAlgorithm::Sha256d,
+            memory_kib: 0,
+            iterations: 0,
+            lanes: 0,
+            output_bytes: POW_OUTPUT_BYTES as u8,
+        };
+        params.validate()?;
+        Ok(params)
     }
 
     /// Measured QRun v0.5 parameter candidate. Its initial target is derived from the lowest
@@ -449,7 +476,7 @@ impl std::fmt::Display for ConsensusError {
 
 impl std::error::Error for ConsensusError {}
 
-/// Hash a complete candidate block header with the selected memory-hard PoW construction.
+/// Hash a complete candidate block header with the selected proof-of-work construction.
 pub fn pow_digest(header: &PowHeader, pow: PowParameters) -> Result<[u8; 32], ConsensusError> {
     pow.validate()?;
     let preimage = header.canonical_bytes()?;
@@ -469,6 +496,10 @@ pub fn pow_digest(header: &PowHeader, pow: PowParameters) -> Result<[u8; 32], Co
                 .hash_password_into(&preimage, POW_SALT, &mut output)
                 .map_err(|_| ConsensusError::PowHashFailed)?;
             Ok(output)
+        }
+        PowAlgorithm::Sha256d => {
+            let first: [u8; 32] = Sha256::digest(&preimage).into();
+            Ok(Sha256::digest(first).into())
         }
     }
 }
@@ -733,6 +764,40 @@ mod tests {
         assert_eq!(
             verify_pow(&zero_header, &params),
             Err(ConsensusError::InvalidTarget)
+        );
+    }
+
+    #[test]
+    fn qrun_v06_sha256d_candidate_has_a_stable_double_sha256_golden_vector() {
+        let params = ConsensusParameters::qrun_v06_sha256d_candidate().unwrap();
+        assert_eq!(params.protocol_version, 6);
+        assert_eq!(params.pow.algorithm, PowAlgorithm::Sha256d);
+        assert_eq!(params.pow.memory_kib, 0);
+        assert_eq!(params.pow.iterations, 0);
+        assert_eq!(params.pow.lanes, 0);
+        params.pow.validate().unwrap();
+
+        let mut header = test_header(params.initial_target, 7);
+        header.protocol_version = 6;
+        let digest = pow_digest(&header, params.pow).unwrap();
+        assert_eq!(
+            digest,
+            [
+                0xdc, 0x5e, 0xa6, 0xf4, 0x2f, 0x0d, 0x0a, 0x50, 0x4a, 0x96, 0x8d, 0xad, 0xbe, 0xd9,
+                0x08, 0x53, 0x09, 0x9e, 0xd3, 0x5e, 0x7c, 0x85, 0xe3, 0x46, 0x51, 0x2b, 0x2c, 0x71,
+                0x18, 0xa0, 0x97, 0x1c,
+            ]
+        );
+        let preimage = header.canonical_bytes().unwrap();
+        let first: [u8; 32] = Sha256::digest(&preimage).into();
+        let independently_computed: [u8; 32] = Sha256::digest(first).into();
+        assert_eq!(digest, independently_computed);
+
+        let mut invalid = params.pow;
+        invalid.memory_kib = 1;
+        assert_eq!(
+            invalid.validate(),
+            Err(ConsensusError::InvalidPowParameters)
         );
     }
 

@@ -910,7 +910,7 @@ fn run(args: &[String]) -> Result<(), String> {
     );
     println!("q6cp_initial_target={}", hex(&summary.initial_target));
     println!("q6cp_pow_limit={}", hex(&summary.pow_limit));
-    println!("q6cp_pow_algorithm=Argon2id");
+    println!("q6cp_pow_algorithm=SHA-256d");
     println!("q6cp_pow_memory_kib={}", summary.pow_memory_kib);
     println!("q6cp_pow_iterations={}", summary.pow_iterations);
     println!("q6cp_pow_lanes={}", summary.pow_lanes);
@@ -1011,9 +1011,7 @@ mod tests {
 
     #[test]
     fn preflight_loads_q6cp_only_with_exact_file_hash_and_q6gd_identity() {
-        let mut params = ConsensusParameters::candidate_testnet().unwrap();
-        params.protocol_version =
-            ai_native_l1_pow_bench::qrun_v06_pow_wire_candidate::QRUN_V06_PROTOCOL_VERSION;
+        let params = ConsensusParameters::qrun_v06_sha256d_candidate().unwrap();
         let fingerprint = QRunV06ConsensusProfile::fingerprint_parameters(&params).unwrap();
         let descriptor = QRunV06GenesisDescriptor::new(
             TEST_NETWORK,

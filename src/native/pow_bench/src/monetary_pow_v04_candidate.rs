@@ -229,6 +229,7 @@ pub fn pow_consensus_profile_fingerprint(
     hash.update(params.initial_target.to_be_bytes());
     match params.pow.algorithm {
         crate::consensus::PowAlgorithm::Argon2id => hash.update([1]),
+        crate::consensus::PowAlgorithm::Sha256d => hash.update([2]),
     }
     hash.update(params.pow.memory_kib.to_be_bytes());
     hash.update(params.pow.iterations.to_be_bytes());
