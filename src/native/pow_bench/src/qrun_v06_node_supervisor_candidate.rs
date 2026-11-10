@@ -8,10 +8,10 @@
 //! Startup fails closed unless the runtime is QAP1-required, matches the supplied network/profile,
 //! has no unresolved anchor transition and does not require recovery. Only loopback/private/LAN/
 //! overlay binding remains accepted by the underlying listener. The mining-supervisor variant
-//! routes Q6TI submissions into a bounded process-local native-transfer pool and selects them for
-//! QAP1 mining. The pool is not durable across process restarts. This remains a candidate service
-//! seam, not a standalone production launcher, RPC server, peer-discovery service, full-history
-//! sync daemon or public Mainnet binary.
+//! routes Q6TI submissions into a bounded pool, persists accepted pending transactions in an
+//! immutable-generation journal, restores/revalidates them against recovered QAP1 state, and
+//! selects them for QAP1 mining. This remains a candidate service seam, not a standalone
+//! production launcher, RPC server, peer-discovery service, full-history sync daemon or Mainnet.
 
 use crate::{
     external_cas_anchor_candidate::{ExternalCasPin, ExternalCasProviderTransport},
@@ -34,10 +34,12 @@ use crate::{
     qrun_v06_qap1_mining_loop_candidate::{
         run_qfp6_qap1_mining_loop, QRunV06Qap1MiningLoopConfig, QRunV06Qap1MiningStopReason,
     },
-    qrun_v06_transaction_ingress_candidate::{process_q6ti_transaction_frame, Q6TI_MAGIC},
-    qrun_v06_transaction_mempool_candidate::{
-        QRunV06MempoolLimits, QRunV06NativeTransactionMempool,
+    qrun_v06_transaction_ingress_candidate::{
+        decode_q6ta_response, process_q6ti_transaction_frame, QRunV06TransactionSubmitStatus,
+        Q6TI_MAGIC,
     },
+    qrun_v06_transaction_journal_candidate::QRunV06TransactionJournal,
+    qrun_v06_transaction_mempool_candidate::QRunV06NativeTransactionMempool,
     state_machine::TransactionAuthenticator,
     v4_fat1_trust_candidate::MlDsa65Verifier,
 };
@@ -142,10 +144,12 @@ pub struct QRunV06MiningSupervisorReport {
     pub mining_rounds: u64,
     pub blocks_acknowledged: u64,
     pub ending_height: u64,
-    /// Transactions still pending in this process-local pool when the supervisor stops.
+    /// Transactions still pending in the bounded pool when the supervisor stops.
     pub pending_mempool_transactions: usize,
-    /// Encoded bytes still pending in this process-local pool when the supervisor stops.
+    /// Encoded bytes still pending in the bounded pool when the supervisor stops.
     pub pending_mempool_bytes: usize,
+    /// Durable pending-transaction journal generation installed before shutdown.
+    pub mempool_journal_generation: u64,
     pub stats: QRunV06PeerListenerStats,
     pub stop_reason: QRunV06NodeSupervisorStopReason,
 }
@@ -168,6 +172,7 @@ pub enum QRunV06NodeSupervisorError {
     RuntimePoisoned,
     Runtime(String),
     Mempool(String),
+    Journal(String),
     Mining(String),
 }
 
@@ -308,6 +313,7 @@ pub fn process_qfp6_application_frame_with_qap1<A, T, P, PV, AV, Q>(
     runtime: &mut QRunV06NodeRuntime<A>,
     replay_guard: &mut QRunV06PeerReplayGuard,
     mempool: &mut QRunV06NativeTransactionMempool,
+    journal: &mut QRunV06TransactionJournal,
     frame: &[u8],
     authenticator: &T,
     producer: [u8; 32],
@@ -331,7 +337,11 @@ where
             .map_err(|error| format!("cannot snapshot canonical state for Q6TI: {error}"))?;
         let state = fork_choice.canonical_state();
         let candidate_timestamp = current_candidate_timestamp(state)?;
-        return process_q6ti_transaction_frame(
+        let request =
+            crate::qrun_v06_transaction_ingress_candidate::decode_q6ti_transaction_request(frame)
+                .map_err(|error| format!("Q6TI request decode failed: {error:?}"))?;
+        let before_submit = mempool.clone();
+        let response = process_q6ti_transaction_frame(
             frame,
             replay_guard,
             mempool,
@@ -340,7 +350,16 @@ where
             producer,
             candidate_timestamp,
         )
-        .map_err(|error| format!("Q6TI transaction submission failed: {error:?}"));
+        .map_err(|error| format!("Q6TI transaction submission failed: {error:?}"))?;
+        let decoded = decode_q6ta_response(&response, request.request_id)
+            .map_err(|error| format!("Q6TA response decode failed: {error:?}"))?;
+        if decoded.status == QRunV06TransactionSubmitStatus::Accepted {
+            if let Err(error) = journal.persist_pool(mempool) {
+                *mempool = before_submit;
+                return Err(format!("Q6TI durable journal write failed: {error}"));
+            }
+        }
+        return Ok(response);
     }
 
     let response = process_qfp6_peer_frame_with_qap1(
@@ -367,6 +386,9 @@ where
         candidate_timestamp,
         &[],
     );
+    journal
+        .persist_pool(mempool)
+        .map_err(|error| format!("Q6TI journal update after Q6PB failed: {error}"))?;
     Ok(response)
 }
 
@@ -611,9 +633,10 @@ where
 /// Alternate a finite authenticated peer-ingress window with a bounded QFP6 mining batch.
 ///
 /// Ingress and mining share one QAP1 Runtime/coordinator. Q6TI transactions are validated into
-/// a bounded process-local mempool, revalidated after canonical changes, and appended to the next
-/// mining template. Q6TA Accepted still means pending only; it is not block confirmation. The
-/// pool is discarded on process restart and is not a persistent transaction journal.
+/// a bounded mempool, persisted in immutable journal snapshots and revalidated after canonical
+/// changes before being appended to mining templates. Q6TA Accepted means pending and journaled,
+/// not block confirmation or QAP1 finality. Startup revalidates snapshots against the recovered
+/// canonical state; the journal stores pending transactions, not canonical chain history.
 ///
 /// After each peer window the fork-choice view is refreshed from the Runtime's durable store
 /// before mining, so a peer-admitted block cannot leave the miner extending a stale in-memory tip.
@@ -633,6 +656,7 @@ pub fn run_qfp6_mining_supervisor<A, T, P, PV, AV, Q, F>(
     quote_authorizer: &mut QRunV06QuoteAssetAuthorizationProvider<'_>,
     coordinator: &mut QRunV06Qap1ExternalCoordinator<P, PV, AV, Q>,
     producer: [u8; 32],
+    transaction_journal: &mut QRunV06TransactionJournal,
     mut next_template: F,
 ) -> Result<QRunV06MiningSupervisorReport, QRunV06NodeSupervisorError>
 where
@@ -660,10 +684,24 @@ where
         return Err(QRunV06NodeSupervisorError::InvalidIdentity);
     }
 
-    // CP-0585 wires authenticated Q6TI submission into this supervised lifecycle.
-    // This pool is bounded and process-local; it is not a durable transaction queue.
-    let mut mempool = QRunV06NativeTransactionMempool::new(QRunV06MempoolLimits::default())
+    // Restore pending transactions only after QAP1 canonical recovery has completed.
+    let mut mempool = QRunV06NativeTransactionMempool::new(transaction_journal.limits())
         .map_err(|error| QRunV06NodeSupervisorError::Mempool(format!("{error:?}")))?;
+    let startup_fork_choice = runtime
+        .fork_choice_snapshot()
+        .map_err(|error| QRunV06NodeSupervisorError::Runtime(error.to_string()))?;
+    let startup_state = startup_fork_choice.canonical_state();
+    let startup_timestamp =
+        current_candidate_timestamp(startup_state).map_err(QRunV06NodeSupervisorError::Journal)?;
+    transaction_journal
+        .restore_into_pool(
+            &mut mempool,
+            startup_state,
+            authenticator,
+            producer,
+            startup_timestamp,
+        )
+        .map_err(|error| QRunV06NodeSupervisorError::Journal(error.to_string()))?;
 
     let signal = if config.peer.install_os_signal_handler {
         Some(
@@ -727,13 +765,17 @@ where
                         runtime,
                         guard,
                         &mut mempool,
+                        transaction_journal,
                         frame,
                         authenticator,
                         producer,
                         quote_authorizer,
                         coordinator,
                     );
-                    if runtime.requires_reopen() || runtime.has_pending_external_anchor() {
+                    if response.is_err()
+                        || runtime.requires_reopen()
+                        || runtime.has_pending_external_anchor()
+                    {
                         shutdown_requested.store(true, Ordering::Release);
                     }
                     response
@@ -796,6 +838,11 @@ where
                             timestamp,
                             &mut operations,
                         )?;
+                        transaction_journal
+                            .persist_pool(&mempool)
+                            .map_err(|error| {
+                                format!("Q6TI journal persistence before mining failed: {error}")
+                            })?;
                         Ok((timestamp, operations))
                     },
                 )
@@ -811,6 +858,23 @@ where
                 if runtime.requires_reopen() || runtime.has_pending_external_anchor() {
                     return Err(QRunV06NodeSupervisorError::RuntimePoisoned);
                 }
+                let latest_fork_choice = runtime
+                    .fork_choice_snapshot()
+                    .map_err(|error| QRunV06NodeSupervisorError::Runtime(error.to_string()))?;
+                let latest_state = latest_fork_choice.canonical_state();
+                let latest_timestamp = current_candidate_timestamp(latest_state)
+                    .map_err(QRunV06NodeSupervisorError::Journal)?;
+                let _ = mempool.reconcile_after_canonical_change(
+                    latest_state,
+                    authenticator,
+                    producer,
+                    latest_timestamp,
+                    &[],
+                );
+                transaction_journal
+                    .persist_pool(&mempool)
+                    .map_err(|error| QRunV06NodeSupervisorError::Journal(error.to_string()))?;
+
                 if mining_report.stop_reason == QRunV06Qap1MiningStopReason::ShutdownRequested
                     || shutdown_requested.load(Ordering::Acquire)
                 {
@@ -828,6 +892,7 @@ where
                     .map_err(|error| QRunV06NodeSupervisorError::Runtime(error.to_string()))?,
                 pending_mempool_transactions: mempool.len(),
                 pending_mempool_bytes: mempool.total_bytes(),
+                mempool_journal_generation: transaction_journal.generation(),
                 stats: aggregate,
                 stop_reason,
             })

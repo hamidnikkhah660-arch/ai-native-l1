@@ -180,6 +180,8 @@ pub mod qrun_v06_quote_asset_qualification_candidate;
 pub mod qrun_v06_tokenomics_candidate;
 /// CP-0584 Q6TI/Q6TA bounded QFP6 native-transfer submission over an authenticated Noise application session.
 pub mod qrun_v06_transaction_ingress_candidate;
+/// CP-0586 bounded durable snapshots for pending QFP6 NativeTransfer transactions.
+pub mod qrun_v06_transaction_journal_candidate;
 /// CP-0583 bounded process-local QFP6 NativeTransfer mempool with the versioned Q6HA 8 KiB signature codec; not node-wired.
 pub mod qrun_v06_transaction_mempool_candidate;
 /// M2b/M2c candidate joining native ledger, AMM projection and asset metadata registry.
