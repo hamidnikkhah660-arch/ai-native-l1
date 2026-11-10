@@ -7,15 +7,17 @@
 //!
 //! Startup fails closed unless the runtime is QAP1-required, matches the supplied network/profile,
 //! has no unresolved anchor transition and does not require recovery. Only loopback/private/LAN/
-//! overlay binding remains accepted by the underlying listener. The service is serial (one peer at
-//! a time) and bounded by a total accepted-connection budget. It is not yet a miner, RPC server,
-//! peer-discovery service, full-history sync daemon or public Mainnet binary.
+//! overlay binding remains accepted by the underlying listener. The mining-supervisor variant
+//! routes Q6TI submissions into a bounded process-local native-transfer pool and selects them for
+//! QAP1 mining. The pool is not durable across process restarts. This remains a candidate service
+//! seam, not a standalone production launcher, RPC server, peer-discovery service, full-history
+//! sync daemon or public Mainnet binary.
 
 use crate::{
     external_cas_anchor_candidate::{ExternalCasPin, ExternalCasProviderTransport},
     qrun_node_shutdown_signal_candidate::QRunNodeShutdownSignalCandidate,
     qrun_v06_canonical_execution_candidate::{
-        QRunV06BlockOperation, QRunV06CanonicalExecutionState,
+        QRunV06BlockOperation, QRunV06CanonicalExecutionState, MAX_QRUN_V06_BLOCK_OPERATIONS,
     },
     qrun_v06_external_anchor_candidate::{QRunV06ExternalAnchorPin, QRunV06ExternalAnchorState},
     qrun_v06_node_runtime_candidate::{
@@ -32,6 +34,10 @@ use crate::{
     qrun_v06_qap1_mining_loop_candidate::{
         run_qfp6_qap1_mining_loop, QRunV06Qap1MiningLoopConfig, QRunV06Qap1MiningStopReason,
     },
+    qrun_v06_transaction_ingress_candidate::{process_q6ti_transaction_frame, Q6TI_MAGIC},
+    qrun_v06_transaction_mempool_candidate::{
+        QRunV06MempoolLimits, QRunV06NativeTransactionMempool,
+    },
     state_machine::TransactionAuthenticator,
     v4_fat1_trust_candidate::MlDsa65Verifier,
 };
@@ -39,7 +45,7 @@ use std::{
     net::TcpListener,
     sync::atomic::{AtomicBool, Ordering},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub const QRUN_V06_SUPERVISOR_MAX_TOTAL_SESSIONS: usize = 1_000_000;
@@ -136,6 +142,10 @@ pub struct QRunV06MiningSupervisorReport {
     pub mining_rounds: u64,
     pub blocks_acknowledged: u64,
     pub ending_height: u64,
+    /// Transactions still pending in this process-local pool when the supervisor stops.
+    pub pending_mempool_transactions: usize,
+    /// Encoded bytes still pending in this process-local pool when the supervisor stops.
+    pub pending_mempool_bytes: usize,
     pub stats: QRunV06PeerListenerStats,
     pub stop_reason: QRunV06NodeSupervisorStopReason,
 }
@@ -157,6 +167,7 @@ pub enum QRunV06NodeSupervisorError {
     ShutdownWatcherPanicked,
     RuntimePoisoned,
     Runtime(String),
+    Mempool(String),
     Mining(String),
 }
 
@@ -253,6 +264,110 @@ fn validate_startup<A: QRunV06NodeAnchorGate>(
         return Err(QRunV06NodeSupervisorError::ProfileMismatch);
     }
     Ok(())
+}
+
+fn current_candidate_timestamp(state: &QRunV06CanonicalExecutionState) -> Result<u64, String> {
+    let wall_clock = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("system clock is before the Unix epoch: {error}"))?
+        .as_secs();
+    let after_parent = state
+        .last_timestamp()
+        .checked_add(1)
+        .ok_or_else(|| "canonical block timestamp overflow".to_string())?;
+    Ok(wall_clock.max(after_parent))
+}
+
+fn append_pending_mempool_transfers<A: TransactionAuthenticator>(
+    mempool: &mut QRunV06NativeTransactionMempool,
+    parent: &QRunV06CanonicalExecutionState,
+    authenticator: &A,
+    producer: [u8; 32],
+    timestamp: u64,
+    operations: &mut Vec<QRunV06BlockOperation>,
+) -> Result<usize, String> {
+    if timestamp <= parent.last_timestamp() {
+        return Err("mining template timestamp must advance the canonical parent".to_string());
+    }
+    let _ =
+        mempool.reconcile_after_canonical_change(parent, authenticator, producer, timestamp, &[]);
+    let capacity = MAX_QRUN_V06_BLOCK_OPERATIONS.saturating_sub(operations.len());
+    let mut appended = 0usize;
+    for transaction in mempool.ordered_transactions().into_iter().take(capacity) {
+        operations.push(QRunV06BlockOperation::NativeTransfer(transaction));
+        appended += 1;
+    }
+    Ok(appended)
+}
+
+/// Dispatch one authenticated QFP6 application frame to either Q6PB durable admission
+/// or Q6TI transaction submission. Q6TA Accepted remains process-local mempool admission;
+/// it is never represented as block confirmation or QAP1 finality.
+#[allow(clippy::too_many_arguments)]
+pub fn process_qfp6_application_frame_with_qap1<A, T, P, PV, AV, Q>(
+    runtime: &mut QRunV06NodeRuntime<A>,
+    replay_guard: &mut QRunV06PeerReplayGuard,
+    mempool: &mut QRunV06NativeTransactionMempool,
+    frame: &[u8],
+    authenticator: &T,
+    producer: [u8; 32],
+    quote_authorizer: &mut QRunV06QuoteAssetAuthorizationProvider<'_>,
+    coordinator: &mut QRunV06Qap1ExternalCoordinator<P, PV, AV, Q>,
+) -> Result<
+    [u8; crate::qrun_v06_node_runtime_candidate::QRUN_V06_PEER_ADMISSION_RESPONSE_BYTES],
+    String,
+>
+where
+    A: QRunV06NodeAnchorGate,
+    T: TransactionAuthenticator,
+    P: ExternalCasProviderTransport,
+    PV: MlDsa65Verifier + Clone,
+    AV: MlDsa65Verifier,
+    Q: QRunV06Qap1AnchorTransport,
+{
+    if frame.get(..4) == Some(&Q6TI_MAGIC) {
+        let fork_choice = runtime
+            .fork_choice_snapshot()
+            .map_err(|error| format!("cannot snapshot canonical state for Q6TI: {error}"))?;
+        let state = fork_choice.canonical_state();
+        let candidate_timestamp = current_candidate_timestamp(state)?;
+        return process_q6ti_transaction_frame(
+            frame,
+            replay_guard,
+            mempool,
+            state,
+            authenticator,
+            producer,
+            candidate_timestamp,
+        )
+        .map_err(|error| format!("Q6TI transaction submission failed: {error:?}"));
+    }
+
+    let response = process_qfp6_peer_frame_with_qap1(
+        runtime,
+        replay_guard,
+        frame,
+        authenticator,
+        quote_authorizer,
+        coordinator,
+    )
+    .map_err(|error| error.to_string())?;
+
+    // A peer block may advance or reorg the canonical state. Revalidate pending transfers
+    // against the resulting state before they can be selected for local mining.
+    let fork_choice = runtime
+        .fork_choice_snapshot()
+        .map_err(|error| format!("cannot refresh canonical state after Q6PB: {error}"))?;
+    let state = fork_choice.canonical_state();
+    let candidate_timestamp = current_candidate_timestamp(state)?;
+    let _ = mempool.reconcile_after_canonical_change(
+        state,
+        authenticator,
+        producer,
+        candidate_timestamp,
+        &[],
+    );
+    Ok(response)
 }
 
 /// Run the supervised QFP6 peer service using already-recovered, QAP1-required state.
@@ -495,10 +610,15 @@ where
 
 /// Alternate a finite authenticated peer-ingress window with a bounded QFP6 mining batch.
 ///
-/// Ingress and mining share one QAP1 Runtime/coordinator. After each peer window the fork-choice
-/// view is refreshed from the Runtime's durable store before mining, so a peer-admitted block
-/// cannot leave the miner extending a stale in-memory tip. The miner publishes its staged graph
-/// only after the ACK-safe QAP1 path completes. LAN/overlay/loopback bind policy remains enforced.
+/// Ingress and mining share one QAP1 Runtime/coordinator. Q6TI transactions are validated into
+/// a bounded process-local mempool, revalidated after canonical changes, and appended to the next
+/// mining template. Q6TA Accepted still means pending only; it is not block confirmation. The
+/// pool is discarded on process restart and is not a persistent transaction journal.
+///
+/// After each peer window the fork-choice view is refreshed from the Runtime's durable store
+/// before mining, so a peer-admitted block cannot leave the miner extending a stale in-memory tip.
+/// The miner publishes its staged graph only after the ACK-safe QAP1 path completes.
+/// LAN/overlay/loopback bind policy remains enforced.
 #[allow(clippy::too_many_arguments)]
 pub fn run_qfp6_mining_supervisor<A, T, P, PV, AV, Q, F>(
     listener: &TcpListener,
@@ -539,6 +659,11 @@ where
     {
         return Err(QRunV06NodeSupervisorError::InvalidIdentity);
     }
+
+    // CP-0585 wires authenticated Q6TI submission into this supervised lifecycle.
+    // This pool is bounded and process-local; it is not a durable transaction queue.
+    let mut mempool = QRunV06NativeTransactionMempool::new(QRunV06MempoolLimits::default())
+        .map_err(|error| QRunV06NodeSupervisorError::Mempool(format!("{error:?}")))?;
 
     let signal = if config.peer.install_os_signal_handler {
         Some(
@@ -598,11 +723,13 @@ where
                             "QFP6 runtime is poisoned; reconcile QAP1 before service".to_string()
                         );
                     }
-                    let response = process_qfp6_peer_frame_with_qap1(
+                    let response = process_qfp6_application_frame_with_qap1(
                         runtime,
                         guard,
+                        &mut mempool,
                         frame,
                         authenticator,
+                        producer,
                         quote_authorizer,
                         coordinator,
                     );
@@ -657,7 +784,20 @@ where
                     coordinator,
                     config.mining,
                     shutdown_requested,
-                    |parent| next_template(parent),
+                    |parent| {
+                        let (timestamp, mut operations) = next_template(parent)?;
+                        // The callback supplies protocol/system operations. Native transfers
+                        // are selected from authenticated Q6TI submissions in the mempool.
+                        let _ = append_pending_mempool_transfers(
+                            &mut mempool,
+                            parent,
+                            authenticator,
+                            producer,
+                            timestamp,
+                            &mut operations,
+                        )?;
+                        Ok((timestamp, operations))
+                    },
                 )
                 .map_err(|error| QRunV06NodeSupervisorError::Mining(error.to_string()))?;
 
@@ -686,6 +826,8 @@ where
                 ending_height: runtime
                     .canonical_height()
                     .map_err(|error| QRunV06NodeSupervisorError::Runtime(error.to_string()))?,
+                pending_mempool_transactions: mempool.len(),
+                pending_mempool_bytes: mempool.total_bytes(),
                 stats: aggregate,
                 stop_reason,
             })
@@ -715,7 +857,126 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES;
+    use crate::{
+        consensus::{ConsensusParameters, PowAlgorithm, PowParameters, Uint256},
+        qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
+        qrun_v06_hybrid_auth_candidate::{
+            QRunV06HybridTransactionAuthenticator, QRunV06HybridTransactionSigner,
+        },
+        qrun_v06_tokenomics_candidate::{QRunV06MiningScheduleCandidate, QRunV06TokenomicsState},
+        qrun_v06_transaction_mempool_candidate::QRunV06MempoolLimits,
+        state_machine::Transaction,
+        v4_fat1_mldsa65_candidate::LibcruxMlDsa65VerifierCandidate,
+        v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES,
+    };
+
+    #[test]
+    fn q6ti_pending_transfers_are_selected_for_mining_and_pruned_after_canonical_execution() {
+        const NETWORK: [u8; 32] = [0x91; 32];
+        const PROFILE: [u8; 32] = [0x92; 32];
+        const PRODUCER: [u8; 32] = [0x93; 32];
+        const RECIPIENT: [u8; 32] = [0x94; 32];
+
+        let signer = QRunV06HybridTransactionSigner::from_seeds([0xA1; 32], [0xA2; 32]).unwrap();
+        let mut params = ConsensusParameters::candidate_testnet().unwrap();
+        params.protocol_version = 6;
+        params.target_block_time_secs = 30;
+        params.difficulty_window_blocks = 2;
+        params.difficulty_min_ratio_divisor = 4;
+        params.difficulty_max_ratio = 4;
+        params.initial_target = Uint256::from_be_bytes([0x7F; 32]);
+        params.pow_limit = Uint256::MAX;
+        params.pow = PowParameters {
+            algorithm: PowAlgorithm::Argon2id,
+            memory_kib: 8,
+            iterations: 1,
+            lanes: 1,
+            output_bytes: 32,
+        };
+        params.validate().unwrap();
+
+        let schedule = QRunV06MiningScheduleCandidate::cp0422_research_candidate();
+        let economics =
+            QRunV06TokenomicsState::genesis(NETWORK, signer.account_id(), schedule).unwrap();
+        let descriptor = QRunV06GenesisDescriptor::new(
+            NETWORK,
+            PROFILE,
+            signer.account_id(),
+            1,
+            crate::qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint(&params).unwrap(),
+            economics.policy_fingerprint(),
+        )
+        .unwrap();
+        let mut state = QRunV06CanonicalExecutionState::cp0528_genesis_candidate_with_descriptor(
+            descriptor, schedule,
+        )
+        .unwrap();
+        let authenticator =
+            QRunV06HybridTransactionAuthenticator::new(LibcruxMlDsa65VerifierCandidate);
+        let mut transaction = Transaction {
+            network_id: NETWORK,
+            sender: signer.account_id(),
+            recipient: RECIPIENT,
+            nonce: 1,
+            amount: 10_000,
+            fee: 10,
+            expires_at: 10_000,
+            signature: Vec::new(),
+        };
+        signer.sign_transaction(&mut transaction).unwrap();
+
+        let mut mempool =
+            QRunV06NativeTransactionMempool::new(QRunV06MempoolLimits::default()).unwrap();
+        let first_timestamp = state.last_timestamp() + 60;
+        mempool
+            .submit(
+                transaction.clone(),
+                &state,
+                &authenticator,
+                PRODUCER,
+                first_timestamp,
+            )
+            .unwrap();
+
+        let mut operations = Vec::new();
+        assert_eq!(
+            append_pending_mempool_transfers(
+                &mut mempool,
+                &state,
+                &authenticator,
+                PRODUCER,
+                first_timestamp,
+                &mut operations,
+            )
+            .unwrap(),
+            1
+        );
+        assert!(matches!(
+            operations.as_slice(),
+            [QRunV06BlockOperation::NativeTransfer(_)]
+        ));
+
+        let block = mempool
+            .build_block(&state, &authenticator, PRODUCER, first_timestamp)
+            .unwrap();
+        state.apply_block(&block, &authenticator).unwrap();
+
+        let mut next_operations = Vec::new();
+        assert_eq!(
+            append_pending_mempool_transfers(
+                &mut mempool,
+                &state,
+                &authenticator,
+                PRODUCER,
+                state.last_timestamp() + 60,
+                &mut next_operations,
+            )
+            .unwrap(),
+            0
+        );
+        assert!(next_operations.is_empty());
+        assert!(mempool.is_empty());
+    }
 
     #[test]
     fn supervisor_requires_the_recovery_coordinator_provider_and_genesis_pins_to_match() {
