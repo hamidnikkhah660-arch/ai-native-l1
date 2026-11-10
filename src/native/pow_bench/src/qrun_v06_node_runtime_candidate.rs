@@ -3459,7 +3459,17 @@ mod tests {
             },
             qrun_v06_tokenomics_candidate::QRunV06MiningScheduleCandidate,
             qrun_v06_tokenomics_candidate::QRunV06TokenomicsState,
-            state_machine::{transaction_signing_digest, Transaction},
+            qrun_v06_transaction_ingress_candidate::{
+                decode_q6ta_response, encode_q6ti_transaction_request,
+                process_q6ti_transaction_frame, QRunV06TransactionSubmitStatus,
+            },
+            qrun_v06_transaction_mempool_candidate::{
+                QRunV06MempoolLimits, QRunV06NativeTransactionMempool,
+            },
+            state_machine::{
+                transaction_id_with_signature_limit, transaction_signing_digest, Transaction,
+                QRUN_V06_MAX_NATIVE_TX_SIGNATURE_BYTES,
+            },
             v4_fat1_mldsa65_candidate::LibcruxMlDsa65VerifierCandidate,
         };
 
@@ -3536,19 +3546,65 @@ mod tests {
             Err(()),
             "QFP6 hybrid auth must not accept a legacy Ed25519-only signature",
         );
-        let mut block = QRunV06Block {
-            network_id: NETWORK,
-            profile_id: PROFILE,
-            height: parent.height() + 1,
-            timestamp: parent.last_timestamp() + 60,
-            parent_hash: parent.tip_hash(),
-            state_root: [0; 32],
-            producer: PRODUCER,
-            operations: vec![QRunV06BlockOperation::NativeTransfer(transaction)],
-        };
-        block.state_root = parent
-            .preview_state_root_after(&block, &authenticator)
+        // Route the signed transfer through Q6TI and the bounded mempool before block production.
+        let candidate_timestamp = parent.last_timestamp() + 60;
+        let mut mempool =
+            QRunV06NativeTransactionMempool::new(QRunV06MempoolLimits::default()).unwrap();
+        let mut transaction_replay_guard = QRunV06PeerReplayGuard::new();
+        let txid = transaction_id_with_signature_limit(
+            &transaction,
+            QRUN_V06_MAX_NATIVE_TX_SIGNATURE_BYTES,
+        )
+        .unwrap();
+        let submit_frame = encode_q6ti_transaction_request(6_580, &transaction).unwrap();
+        let submit_ack = process_q6ti_transaction_frame(
+            &submit_frame,
+            &mut transaction_replay_guard,
+            &mut mempool,
+            &parent,
+            &authenticator,
+            PRODUCER,
+            candidate_timestamp,
+        )
+        .unwrap();
+        let accepted_submit = decode_q6ta_response(&submit_ack, 6_580).unwrap();
+        assert_eq!(
+            accepted_submit.status,
+            QRunV06TransactionSubmitStatus::Accepted
+        );
+        assert_eq!(accepted_submit.transaction_id, txid);
+        assert_eq!(accepted_submit.mempool_count, 1);
+        assert!(accepted_submit.mempool_bytes > 4 * 1024);
+        assert_eq!(accepted_submit.canonical_height, parent.height());
+
+        let duplicate_frame = encode_q6ti_transaction_request(6_581, &transaction).unwrap();
+        let duplicate_ack = process_q6ti_transaction_frame(
+            &duplicate_frame,
+            &mut transaction_replay_guard,
+            &mut mempool,
+            &parent,
+            &authenticator,
+            PRODUCER,
+            candidate_timestamp,
+        )
+        .unwrap();
+        let duplicate = decode_q6ta_response(&duplicate_ack, 6_581).unwrap();
+        assert_eq!(duplicate.status, QRunV06TransactionSubmitStatus::Duplicate);
+        assert_eq!(duplicate.transaction_id, txid);
+        assert_eq!(duplicate.mempool_count, 1);
+
+        let block = mempool
+            .build_block(&parent, &authenticator, PRODUCER, candidate_timestamp)
             .unwrap();
+        assert_eq!(block.height, parent.height() + 1);
+        assert_eq!(block.parent_hash, parent.tip_hash());
+        assert_eq!(block.operations.len(), 1);
+        assert_eq!(
+            block.state_root,
+            parent
+                .preview_state_root_after(&block, &authenticator)
+                .unwrap()
+        );
 
         let mut header = PowHeader {
             protocol_version: 6,
@@ -3570,7 +3626,7 @@ mod tests {
             }
         }
         let envelope = envelope.expect("Q6HA integration test PoW search exhausted");
-        let frame = encode_qrun_v06_peer_block_request(6_581, &envelope).unwrap();
+        let frame = encode_qrun_v06_peer_block_request(6_582, &envelope).unwrap();
         let mut replay_guard = QRunV06PeerReplayGuard::new();
         let mut quote = quote_provider();
         let fixture = qap1_coordinator(&dir, &initial);
@@ -3585,12 +3641,14 @@ mod tests {
             &mut coordinator,
         )
         .unwrap();
-        assert_eq!(accepted.request_id(), 6_581);
+        assert_eq!(accepted.request_id(), 6_582);
         assert_eq!(accepted.status(), QRunV06PeerAdmissionStatus::Accepted);
         assert!(accepted.is_positive_ack());
         assert_eq!(runtime.canonical_height().unwrap(), 1);
         assert_eq!(runtime.manifest_generation().unwrap(), 1);
         assert!(!runtime.store.has_qap1_intent().unwrap());
+        assert_eq!(mempool.remove_included(&[transaction.clone()]), 1);
+        assert!(mempool.is_empty());
         coordinator
             .verify_current(runtime.committed_anchor_state())
             .unwrap();

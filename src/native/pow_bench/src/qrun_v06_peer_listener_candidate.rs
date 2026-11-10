@@ -46,7 +46,7 @@ pub struct QRunV06PeerListenerConfig {
     /// The number of TCP connections accepted before this supervised run returns.
     /// Each connection is handled serially; at most one peer session is active.
     pub max_sessions: usize,
-    /// The maximum number of encrypted Q6PB/Q6PA exchanges on one authenticated session.
+    /// The maximum number of encrypted Q6PB/Q6PA or Q6TI/Q6TA exchanges on one authenticated session.
     pub max_requests_per_session: usize,
     /// Fail closed after this many unauthenticated/invalid Noise handshakes in one run.
     pub max_failed_handshakes: usize,
@@ -157,11 +157,14 @@ fn validate_peer_pins(keys: &[[u8; 32]]) -> Result<(), QRunV06PeerListenerError>
     Ok(())
 }
 
-fn validate_q6pa_response(
+fn validate_q6_application_response(
     response: &[u8; QRUN_V06_PEER_ADMISSION_RESPONSE_BYTES],
     expected_request_id: u64,
 ) -> bool {
-    if response[..4] != QRUN_V06_PEER_ADMISSION_MAGIC
+    let is_block_ack = response[..4] == QRUN_V06_PEER_ADMISSION_MAGIC;
+    let is_transaction_ack =
+        response[..4] == crate::qrun_v06_transaction_ingress_candidate::Q6TA_MAGIC;
+    if (!is_block_ack && !is_transaction_ack)
         || u16::from_be_bytes([response[4], response[5]]) != QRUN_V06_PEER_FRAME_VERSION
         || u64::from_be_bytes(response[8..16].try_into().unwrap()) != expected_request_id
         || !matches!(u16::from_be_bytes([response[6], response[7]]), 1..=3)
@@ -169,7 +172,10 @@ fn validate_q6pa_response(
         return false;
     }
     let status = u16::from_be_bytes([response[6], response[7]]);
-    if status != QRunV06PeerAdmissionStatus::Accepted as u16
+    // Q6PA non-Accepted responses must not carry durable commit fields. Q6TA deliberately
+    // carries TXID and mempool/canonical metadata for Accepted, Duplicate and Rejected.
+    if is_block_ack
+        && status != QRunV06PeerAdmissionStatus::Accepted as u16
         && response[16..].iter().any(|byte| *byte != 0)
     {
         return false;
@@ -351,11 +357,27 @@ where
                 | Err(QRunV06NoiseError::OversizedTrustSet)
                 | Err(QRunV06NoiseError::DuplicateTrustedKey) => break,
             };
-            let request = match decode_qrun_v06_peer_block_request(&frame) {
-                Ok(request) => request,
-                Err(_) => {
-                    stats.handler_failures += 1;
-                    break;
+            // Dispatch by the application-frame magic before invoking the handler. Both
+            // protocols share a request-ID field but have distinct codecs and ACK semantics.
+            let request_id = if frame.get(..4)
+                == Some(&crate::qrun_v06_transaction_ingress_candidate::Q6TI_MAGIC)
+            {
+                match crate::qrun_v06_transaction_ingress_candidate::decode_q6ti_transaction_request(
+                    &frame,
+                ) {
+                    Ok(request) => request.request_id,
+                    Err(_) => {
+                        stats.handler_failures += 1;
+                        break;
+                    }
+                }
+            } else {
+                match decode_qrun_v06_peer_block_request(&frame) {
+                    Ok(request) => request.request_id,
+                    Err(_) => {
+                        stats.handler_failures += 1;
+                        break;
+                    }
                 }
             };
             stats.requests_received += 1;
@@ -366,7 +388,7 @@ where
                     break;
                 }
             };
-            if !validate_q6pa_response(&response, request.request_id) {
+            if !validate_q6_application_response(&response, request_id) {
                 stats.malformed_responses += 1;
                 break;
             }
@@ -385,8 +407,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::qrun_v06_node_runtime_candidate::{
-        encode_qrun_v06_peer_block_request, QRUN_V06_PEER_ADMISSION_MAGIC,
+    use crate::{
+        qrun_v06_canonical_execution_candidate::QRunV06CanonicalExecutionState,
+        qrun_v06_node_runtime_candidate::{
+            encode_qrun_v06_peer_block_request, QRUN_V06_PEER_ADMISSION_MAGIC,
+        },
+        qrun_v06_transaction_ingress_candidate::{
+            decode_q6ta_response, encode_q6ti_transaction_request,
+            QRunV06TransactionSubmitResponse, QRunV06TransactionSubmitStatus,
+        },
+        state_machine::Transaction,
     };
     use snow::Builder;
     use std::{
@@ -544,6 +574,254 @@ mod tests {
         assert_eq!(report.stats.requests_received, 2);
         assert_eq!(report.stats.responses_written, 2);
         assert_eq!(report.stats.sessions_closed, 2);
+    }
+
+    #[test]
+    fn qfp6_listener_routes_signed_q6ha_over_noise_into_real_mempool() {
+        use crate::{
+            consensus::{ConsensusParameters, PowAlgorithm, PowParameters, Uint256},
+            qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
+            qrun_v06_hybrid_auth_candidate::{
+                QRunV06HybridTransactionAuthenticator, QRunV06HybridTransactionSigner,
+            },
+            qrun_v06_tokenomics_candidate::{
+                QRunV06MiningScheduleCandidate, QRunV06TokenomicsState,
+            },
+            qrun_v06_transaction_ingress_candidate::process_q6ti_transaction_frame,
+            qrun_v06_transaction_mempool_candidate::{
+                QRunV06MempoolLimits, QRunV06NativeTransactionMempool,
+            },
+            v4_fat1_mldsa65_candidate::LibcruxMlDsa65VerifierCandidate,
+        };
+
+        const PRODUCER: [u8; 32] = [0x93; 32];
+        const RECIPIENT: [u8; 32] = [0x94; 32];
+        let signer = QRunV06HybridTransactionSigner::from_seeds([0xB1; 32], [0xB2; 32]).unwrap();
+        let mut params = ConsensusParameters::candidate_testnet().unwrap();
+        params.protocol_version = 6;
+        params.target_block_time_secs = 30;
+        params.difficulty_window_blocks = 2;
+        params.difficulty_min_ratio_divisor = 4;
+        params.difficulty_max_ratio = 4;
+        params.initial_target = Uint256::from_be_bytes([0x7F; 32]);
+        params.pow_limit = Uint256::MAX;
+        params.pow = PowParameters {
+            algorithm: PowAlgorithm::Argon2id,
+            memory_kib: 8,
+            iterations: 1,
+            lanes: 1,
+            output_bytes: 32,
+        };
+        params.validate().unwrap();
+        let schedule = QRunV06MiningScheduleCandidate::cp0422_research_candidate();
+        let economics =
+            QRunV06TokenomicsState::genesis(NETWORK, signer.account_id(), schedule).unwrap();
+        let descriptor = QRunV06GenesisDescriptor::new(
+            NETWORK,
+            PROFILE,
+            signer.account_id(),
+            1,
+            crate::qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint(&params).unwrap(),
+            economics.policy_fingerprint(),
+        )
+        .unwrap();
+        let state = QRunV06CanonicalExecutionState::cp0528_genesis_candidate_with_descriptor(
+            descriptor, schedule,
+        )
+        .unwrap();
+        let authenticator =
+            QRunV06HybridTransactionAuthenticator::new(LibcruxMlDsa65VerifierCandidate);
+        let candidate_timestamp = state.last_timestamp() + 60;
+        let mut mempool =
+            QRunV06NativeTransactionMempool::new(QRunV06MempoolLimits::default()).unwrap();
+
+        let (server_private, server_public) = keypair();
+        let (client_private, client_public) = keypair();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = AtomicBool::new(false);
+        let server = thread::spawn(move || {
+            let mut handler = |guard: &mut QRunV06PeerReplayGuard, frame: &[u8]| {
+                process_q6ti_transaction_frame(
+                    frame,
+                    guard,
+                    &mut mempool,
+                    &state,
+                    &authenticator,
+                    PRODUCER,
+                    candidate_timestamp,
+                )
+                .map_err(|error| format!("{error:?}"))
+            };
+            let report = serve_qfp6_noise_listener(
+                &listener,
+                QRunV06PeerListenerConfig {
+                    max_sessions: 1,
+                    max_requests_per_session: 2,
+                    max_failed_handshakes: 1,
+                    accept_poll_interval: Duration::from_millis(10),
+                },
+                &server_private,
+                &[client_public],
+                &NETWORK,
+                &PROFILE,
+                &shutdown,
+                &mut handler,
+            )
+            .unwrap();
+            (report, mempool.len(), mempool.total_bytes())
+        });
+
+        let mut transaction = Transaction {
+            network_id: NETWORK,
+            sender: signer.account_id(),
+            recipient: RECIPIENT,
+            nonce: 1,
+            amount: 1_000,
+            fee: 10,
+            expires_at: 20_000,
+            signature: Vec::new(),
+        };
+        signer.sign_transaction(&mut transaction).unwrap();
+        assert_eq!(transaction.signature.len(), 5_365);
+        let expected_txid = crate::state_machine::transaction_id_with_signature_limit(
+            &transaction,
+            crate::state_machine::QRUN_V06_MAX_NATIVE_TX_SIGNATURE_BYTES,
+        )
+        .unwrap();
+
+        let mut stream = connect_until(address);
+        let mut noise = QRunV06NoiseSession::connect(
+            &mut stream,
+            &client_private,
+            &server_public,
+            &NETWORK,
+            &PROFILE,
+        )
+        .unwrap();
+        let first = encode_q6ti_transaction_request(201, &transaction).unwrap();
+        noise.write_record(&mut stream, &first).unwrap();
+        let first_response = noise.read_record(&mut stream).unwrap();
+        let accepted = decode_q6ta_response(&first_response, 201).unwrap();
+        assert_eq!(accepted.status, QRunV06TransactionSubmitStatus::Accepted);
+        assert_eq!(accepted.transaction_id, expected_txid);
+        assert_eq!(accepted.mempool_count, 1);
+        assert!(accepted.mempool_bytes > 4 * 1024);
+        assert_eq!(accepted.canonical_height, 0);
+
+        let second = encode_q6ti_transaction_request(202, &transaction).unwrap();
+        noise.write_record(&mut stream, &second).unwrap();
+        let second_response = noise.read_record(&mut stream).unwrap();
+        let duplicate = decode_q6ta_response(&second_response, 202).unwrap();
+        assert_eq!(duplicate.status, QRunV06TransactionSubmitStatus::Duplicate);
+        assert_eq!(duplicate.transaction_id, expected_txid);
+        assert_eq!(duplicate.mempool_count, 1);
+
+        let (report, mempool_count, mempool_bytes) = server.join().unwrap();
+        assert_eq!(
+            report.stop_reason,
+            QRunV06PeerListenerStopReason::SessionLimitReached
+        );
+        assert_eq!(report.stats.authenticated_sessions, 1);
+        assert_eq!(report.stats.requests_received, 2);
+        assert_eq!(report.stats.responses_written, 2);
+        assert_eq!(report.stats.handler_failures, 0);
+        assert_eq!(report.stats.malformed_responses, 0);
+        assert_eq!(mempool_count, 1);
+        assert!(mempool_bytes > 4 * 1024);
+    }
+
+    #[test]
+    fn qfp6_listener_dispatches_q6ti_over_pinned_noise_and_returns_q6ta() {
+        let (server_private, server_public) = keypair();
+        let (client_private, client_public) = keypair();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = AtomicBool::new(false);
+        let server = thread::spawn(move || {
+            let mut handler =
+                |guard: &mut QRunV06PeerReplayGuard, frame: &[u8]| {
+                    let request = crate::qrun_v06_transaction_ingress_candidate::
+                    decode_q6ti_transaction_request(frame).unwrap();
+                    let status = if guard.accept(request.request_id).is_ok() {
+                        QRunV06TransactionSubmitStatus::Accepted
+                    } else {
+                        QRunV06TransactionSubmitStatus::Rejected
+                    };
+                    Ok(QRunV06TransactionSubmitResponse {
+                        request_id: request.request_id,
+                        status,
+                        transaction_id: [0xA5; 32],
+                        mempool_count: 1,
+                        mempool_bytes: 5_500,
+                        canonical_height: 0,
+                        canonical_tip: [0xB6; 32],
+                        canonical_state_root: [0xC7; 32],
+                    }
+                    .encode())
+                };
+            serve_qfp6_noise_listener(
+                &listener,
+                QRunV06PeerListenerConfig {
+                    max_sessions: 1,
+                    max_requests_per_session: 2,
+                    max_failed_handshakes: 1,
+                    accept_poll_interval: Duration::from_millis(10),
+                },
+                &server_private,
+                &[client_public],
+                &NETWORK,
+                &PROFILE,
+                &shutdown,
+                &mut handler,
+            )
+            .unwrap()
+        });
+
+        let mut stream = connect_until(address);
+        let mut noise = QRunV06NoiseSession::connect(
+            &mut stream,
+            &client_private,
+            &server_public,
+            &NETWORK,
+            &PROFILE,
+        )
+        .unwrap();
+        let transaction = Transaction {
+            network_id: NETWORK,
+            sender: [0xD1; 32],
+            recipient: [0xD2; 32],
+            nonce: 1,
+            amount: 100,
+            fee: 1,
+            expires_at: 10_000,
+            signature: vec![0xE3; 5_365],
+        };
+        let first = encode_q6ti_transaction_request(101, &transaction).unwrap();
+        noise.write_record(&mut stream, &first).unwrap();
+        let response = noise.read_record(&mut stream).unwrap();
+        assert_eq!(
+            decode_q6ta_response(&response, 101).unwrap().status,
+            QRunV06TransactionSubmitStatus::Accepted
+        );
+
+        let second = encode_q6ti_transaction_request(102, &transaction).unwrap();
+        noise.write_record(&mut stream, &second).unwrap();
+        let response = noise.read_record(&mut stream).unwrap();
+        let decoded = decode_q6ta_response(&response, 102).unwrap();
+        assert_eq!(decoded.status, QRunV06TransactionSubmitStatus::Accepted);
+        assert_eq!(decoded.mempool_bytes, 5_500);
+
+        let report = server.join().unwrap();
+        assert_eq!(
+            report.stop_reason,
+            QRunV06PeerListenerStopReason::SessionLimitReached
+        );
+        assert_eq!(report.stats.authenticated_sessions, 1);
+        assert_eq!(report.stats.requests_received, 2);
+        assert_eq!(report.stats.responses_written, 2);
+        assert_eq!(report.stats.handler_failures, 0);
+        assert_eq!(report.stats.malformed_responses, 0);
     }
 
     #[test]

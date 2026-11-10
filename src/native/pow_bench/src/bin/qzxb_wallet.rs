@@ -8,6 +8,11 @@
 mod windows_wallet {
     use ai_native_l1_pow_bench::{
         qrun_v06_hybrid_auth_candidate::QRunV06HybridTransactionSigner,
+        qrun_v06_noise_transport_candidate::QRunV06NoiseSession,
+        qrun_v06_transaction_ingress_candidate::{
+            decode_q6ta_response, encode_q6ti_transaction_request,
+            QRunV06TransactionSubmitResponse, QRunV06TransactionSubmitStatus,
+        },
         qzbe_tx_ingress_candidate::{decode_ack, encode_request, TxIngressStatus, ACK_BYTES},
         state_machine::{
             encode_transaction, encode_transaction_with_signature_limit, transaction_id,
@@ -39,6 +44,10 @@ mod windows_wallet {
     const MAX_PROTECTED_BLOB: usize = 64 * 1024;
     const MAX_FILE_LEN: usize = HEADER_LEN + MAX_PROTECTED_BLOB;
     const WALLET_DOMAIN: &[u8] = b"QUANTUMZXB-ED25519-WALLET-DPAPI-V1\0";
+    const Q6NK_MAGIC: &[u8; 4] = b"Q6NK";
+    const Q6NK_VERSION: u16 = 1;
+    const Q6NK_HEADER_LEN: usize = 4 + 2 + 32 + 32 + 4;
+    const Q6NK_ID_DOMAIN: &[u8] = b"QUANTUMZXB-QFP6-NOISE-IDENTITY-V1\0";
     const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -57,9 +66,22 @@ mod windows_wallet {
         value.clear();
     }
 
+    struct Qfp6SubmitOptions {
+        endpoint: SocketAddr,
+        profile_id: [u8; 32],
+        noise_identity_file: PathBuf,
+        trusted_peer_static_public_key: [u8; 32],
+    }
+
     enum Command {
         Create {
             output: PathBuf,
+        },
+        CreateNoiseIdentity {
+            output: PathBuf,
+        },
+        NoiseIdentity {
+            identity: PathBuf,
         },
         Restore {
             output: PathBuf,
@@ -86,6 +108,7 @@ mod windows_wallet {
             expires_at: u64,
             self_contained: bool,
             submit_to: Option<SocketAddr>,
+            qfp6_submit: Option<Qfp6SubmitOptions>,
         },
         RpcStatus {
             rpc: SocketAddr,
@@ -399,6 +422,22 @@ mod windows_wallet {
             return Ok(Command::Help);
         }
         match subcommand {
+            "create-qfp6-noise-identity" => {
+                let values = options(&args[1..], &["--output"])?;
+                let output = PathBuf::from(required(&values, "--output")?);
+                if !output.is_absolute() || output.file_name().is_none() {
+                    return Err("--output must be an absolute file path".into());
+                }
+                Ok(Command::CreateNoiseIdentity { output })
+            }
+            "noise-identity" => {
+                let values = options(&args[1..], &["--identity"])?;
+                let identity = PathBuf::from(required(&values, "--identity")?);
+                if !identity.is_absolute() {
+                    return Err("--identity must be an absolute file path".into());
+                }
+                Ok(Command::NoiseIdentity { identity })
+            }
             "create" => {
                 let values = options(&args[1..], &["--output"])?;
                 let output = PathBuf::from(required(&values, "--output")?);
@@ -477,6 +516,10 @@ mod windows_wallet {
                         "--expires-at",
                         "--signature-mode",
                         "--submit-to",
+                        "--qfp6-submit-to",
+                        "--qfp6-profile-id-hex",
+                        "--qfp6-noise-identity-file",
+                        "--qfp6-peer-static-public-key-hex",
                     ],
                 )?;
                 let wallet = PathBuf::from(required(&values, "--wallet")?);
@@ -514,6 +557,53 @@ mod windows_wallet {
                         })
                     })
                     .transpose()?;
+                let qfp6_fields = [
+                    "--qfp6-submit-to",
+                    "--qfp6-profile-id-hex",
+                    "--qfp6-noise-identity-file",
+                    "--qfp6-peer-static-public-key-hex",
+                ];
+                let qfp6_present = qfp6_fields
+                    .iter()
+                    .filter(|key| values.contains_key(**key))
+                    .count();
+                let qfp6_submit = if qfp6_present == 0 {
+                    None
+                } else if qfp6_present != qfp6_fields.len() {
+                    return Err(
+                        "QFP6 submission requires all four --qfp6-* options together".into(),
+                    );
+                } else {
+                    let endpoint = required(&values, "--qfp6-submit-to")?
+                        .parse::<SocketAddr>()
+                        .map_err(|_| {
+                            "--qfp6-submit-to must be a numeric IP:port socket address".to_string()
+                        })?;
+                    let noise_identity_file =
+                        PathBuf::from(required(&values, "--qfp6-noise-identity-file")?);
+                    if !noise_identity_file.is_absolute() {
+                        return Err(
+                            "--qfp6-noise-identity-file must be an absolute file path".into()
+                        );
+                    }
+                    Some(Qfp6SubmitOptions {
+                        endpoint,
+                        profile_id: parse_hex32(
+                            required(&values, "--qfp6-profile-id-hex")?,
+                            "QFP6 profile ID",
+                        )?,
+                        noise_identity_file,
+                        trusted_peer_static_public_key: parse_hex32(
+                            required(&values, "--qfp6-peer-static-public-key-hex")?,
+                            "pinned QFP6 peer static public key",
+                        )?,
+                    })
+                };
+                if submit_to.is_some() && qfp6_submit.is_some() {
+                    return Err(
+                        "legacy --submit-to and QFP6 Noise submission cannot be combined".into(),
+                    );
+                }
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_err(|_| "system clock is before the Unix epoch".to_string())?
@@ -536,6 +626,7 @@ mod windows_wallet {
                     expires_at,
                     self_contained,
                     submit_to,
+                    qfp6_submit,
                 })
             }
             _ => Err(format!("unknown subcommand: {subcommand}")),
@@ -1275,6 +1366,222 @@ mod windows_wallet {
         Ok(u16::from_be_bytes([header[4], header[5]]))
     }
 
+    fn q6nk_identity_id(public_key: &[u8; 32]) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(Q6NK_ID_DOMAIN);
+        hash.update(public_key);
+        hash.finalize().into()
+    }
+
+    struct LoadedNoiseIdentity {
+        private_key: SecretSeed,
+        public_key: [u8; 32],
+        identity_id: [u8; 32],
+    }
+
+    fn create_noise_identity(path: &Path) -> Result<(), String> {
+        let params: snow::params::NoiseParams = "Noise_XX_25519_ChaChaPoly_SHA256"
+            .parse()
+            .map_err(|_| "QFP6 Noise XX parameters could not be parsed".to_string())?;
+        let mut pair = snow::Builder::new(params)
+            .generate_keypair()
+            .map_err(|error| format!("QFP6 Noise X25519 key generation failed: {error}"))?;
+        if pair.private.len() != 32 || pair.public.len() != 32 {
+            pair.private.fill(0);
+            pair.public.fill(0);
+            return Err("QFP6 Noise key generator returned an invalid key length".into());
+        }
+        let mut private_bytes = [0u8; 32];
+        let mut public_key = [0u8; 32];
+        private_bytes.copy_from_slice(&pair.private);
+        public_key.copy_from_slice(&pair.public);
+        pair.private.fill(0);
+        pair.public.fill(0);
+        if private_bytes.iter().all(|b| *b == 0) || public_key.iter().all(|b| *b == 0) {
+            private_bytes.fill(0);
+            return Err("QFP6 Noise key generator returned a zero key".into());
+        }
+        let identity_id = q6nk_identity_id(&public_key);
+        let private_key = SecretSeed(private_bytes);
+        let protected = dpapi_protect(&private_key.0, &public_key, &identity_id)?;
+        if protected.is_empty() || protected.len() > MAX_PROTECTED_BLOB {
+            return Err("Q6NK1 DPAPI-protected key payload length is invalid".into());
+        }
+        let mut envelope = Vec::with_capacity(Q6NK_HEADER_LEN + protected.len());
+        envelope.extend_from_slice(Q6NK_MAGIC);
+        envelope.extend_from_slice(&Q6NK_VERSION.to_be_bytes());
+        envelope.extend_from_slice(&public_key);
+        envelope.extend_from_slice(&identity_id);
+        envelope.extend_from_slice(&(protected.len() as u32).to_be_bytes());
+        envelope.extend_from_slice(&protected);
+        save_new_wallet(path, &envelope)?;
+        println!("noise_identity_file={}", path.display());
+        println!("noise_identity_format=Q6NK1_Windows_CurrentUser_DPAPI");
+        println!("noise_static_public_key_hex={}", hex(&public_key));
+        println!("noise_identity_id_hex={}", hex(&identity_id));
+        println!("noise_private_key_output=none");
+        println!("noise_peer_pin_action=register_the_public_key_with_the_QFP6_node_operator");
+        Ok(())
+    }
+
+    fn load_noise_identity(path: &Path) -> Result<LoadedNoiseIdentity, String> {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|_| "QFP6 Noise identity file could not be inspected".to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("QFP6 Noise identity path must be a regular non-symlink file".into());
+        }
+        if metadata.len() < (Q6NK_HEADER_LEN + 1) as u64
+            || metadata.len() > (Q6NK_HEADER_LEN + MAX_PROTECTED_BLOB) as u64
+        {
+            return Err("Q6NK1 identity file length is invalid".into());
+        }
+        let file = File::open(path)
+            .map_err(|_| "QFP6 Noise identity file could not be opened".to_string())?;
+        let mut envelope = Vec::with_capacity(metadata.len() as usize);
+        file.take((Q6NK_HEADER_LEN + MAX_PROTECTED_BLOB + 1) as u64)
+            .read_to_end(&mut envelope)
+            .map_err(|_| "QFP6 Noise identity file could not be read".to_string())?;
+        if envelope.len() < Q6NK_HEADER_LEN + 1
+            || envelope.len() > Q6NK_HEADER_LEN + MAX_PROTECTED_BLOB
+            || &envelope[..4] != Q6NK_MAGIC
+            || u16::from_be_bytes([envelope[4], envelope[5]]) != Q6NK_VERSION
+        {
+            return Err("Q6NK1 magic, version or file length is invalid".into());
+        }
+        let public_key: [u8; 32] = envelope[6..38]
+            .try_into()
+            .map_err(|_| "Q6NK1 Noise public key is malformed")?;
+        let identity_id: [u8; 32] = envelope[38..70]
+            .try_into()
+            .map_err(|_| "Q6NK1 identity ID is malformed")?;
+        if public_key.iter().all(|b| *b == 0)
+            || identity_id.iter().all(|b| *b == 0)
+            || q6nk_identity_id(&public_key) != identity_id
+        {
+            return Err("Q6NK1 public key/identity binding is invalid".into());
+        }
+        let protected_len = u32::from_be_bytes(
+            envelope[70..74]
+                .try_into()
+                .map_err(|_| "Q6NK1 protected length is malformed")?,
+        ) as usize;
+        if protected_len == 0
+            || protected_len > MAX_PROTECTED_BLOB
+            || Q6NK_HEADER_LEN.checked_add(protected_len) != Some(envelope.len())
+        {
+            return Err("Q6NK1 protected payload length is invalid".into());
+        }
+        let mut raw = dpapi_unprotect(&envelope[Q6NK_HEADER_LEN..], &public_key, &identity_id)?;
+        if raw.len() != 32 || raw.iter().all(|b| *b == 0) {
+            raw.fill(0);
+            return Err("Q6NK1 unprotected X25519 private key is invalid".into());
+        }
+        let mut private_bytes = [0u8; 32];
+        private_bytes.copy_from_slice(&raw);
+        raw.fill(0);
+        Ok(LoadedNoiseIdentity {
+            private_key: SecretSeed(private_bytes),
+            public_key,
+            identity_id,
+        })
+    }
+
+    fn noise_identity_info(path: &Path) -> Result<(), String> {
+        let identity = load_noise_identity(path)?;
+        println!("noise_identity_file={}", path.display());
+        println!("noise_identity_format=Q6NK1_Windows_CurrentUser_DPAPI");
+        println!("noise_static_public_key_hex={}", hex(&identity.public_key));
+        println!("noise_identity_id_hex={}", hex(&identity.identity_id));
+        println!("noise_private_key_output=none");
+        Ok(())
+    }
+
+    fn qfp6_submit_endpoint_is_private(address: SocketAddr) -> bool {
+        match address.ip() {
+            std::net::IpAddr::V4(ip) => {
+                let o = ip.octets();
+                ip.is_loopback()
+                    || ip.is_private()
+                    || ip.is_link_local()
+                    || (o[0] == 100 && (64..=127).contains(&o[1]))
+            }
+            std::net::IpAddr::V6(ip) => {
+                let o = ip.octets();
+                ip.is_loopback() || (o[0] & 0xFE == 0xFC) || (o[0] == 0xFE && o[1] & 0xC0 == 0x80)
+            }
+        }
+    }
+
+    fn submit_q6ti_over_noise(
+        options: &Qfp6SubmitOptions,
+        network_id: &[u8; 32],
+        transaction: &Transaction,
+        expected_txid: &[u8; 32],
+    ) -> Result<QRunV06TransactionSubmitResponse, String> {
+        if !qfp6_submit_endpoint_is_private(options.endpoint) {
+            return Err(
+                "QFP6 transaction submission is restricted to loopback/private/NetBird endpoints"
+                    .into(),
+            );
+        }
+        if network_id.iter().all(|b| *b == 0)
+            || options.profile_id.iter().all(|b| *b == 0)
+            || options
+                .trusted_peer_static_public_key
+                .iter()
+                .all(|b| *b == 0)
+        {
+            return Err("QFP6 network/profile and pinned Noise peer key must be nonzero".into());
+        }
+        let mut request_bytes = [0u8; 8];
+        getrandom::getrandom(&mut request_bytes)
+            .map_err(|_| "operating-system random request-ID generation failed".to_string())?;
+        let mut request_id = u64::from_be_bytes(request_bytes);
+        if request_id == 0 {
+            request_id = 1;
+        }
+        request_bytes.fill(0);
+        let request = encode_q6ti_transaction_request(request_id, transaction)
+            .map_err(|error| format!("encode Q6TI transaction request: {error:?}"))?;
+        let identity = load_noise_identity(&options.noise_identity_file)?;
+        let mut stream =
+            TcpStream::connect_timeout(&options.endpoint, std::time::Duration::from_secs(5))
+                .map_err(|error| {
+                    format!(
+                        "connect to pinned QFP6 transaction endpoint {}: {error}",
+                        options.endpoint
+                    )
+                })?;
+        stream
+            .set_nodelay(true)
+            .map_err(|error| format!("configure QFP6 Noise TCP_NODELAY: {error}"))?;
+        let mut noise = QRunV06NoiseSession::connect(
+            &mut stream,
+            &identity.private_key.0,
+            &options.trusted_peer_static_public_key,
+            network_id,
+            &options.profile_id,
+        )
+        .map_err(|error| format!("authenticate pinned QFP6 Noise peer: {error}"))?;
+        if noise.remote_static_public_key() != &options.trusted_peer_static_public_key {
+            return Err("QFP6 Noise remote static identity changed after the handshake".into());
+        }
+        noise
+            .write_record(&mut stream, &request)
+            .map_err(|error| format!("send encrypted Q6TI transaction: {error}"))?;
+        let response = noise
+            .read_admission_response(&mut stream)
+            .map_err(|error| format!("read encrypted Q6TA response: {error}"))?;
+        let acknowledgement = decode_q6ta_response(&response, request_id)
+            .map_err(|error| format!("decode Q6TA response: {error:?}"))?;
+        if &acknowledgement.transaction_id != expected_txid {
+            return Err(
+                "Q6TA response TXID does not match the locally signed Q6HA transaction".into(),
+            );
+        }
+        Ok(acknowledgement)
+    }
+
     fn sign_transfer(
         path: &Path,
         network_id: [u8; 32],
@@ -1285,27 +1592,46 @@ mod windows_wallet {
         expires_at: u64,
         self_contained: bool,
         submit_to: Option<SocketAddr>,
+        qfp6_submit: Option<Qfp6SubmitOptions>,
     ) -> Result<(), String> {
         match wallet_version(path)? {
-            VERSION => sign_transfer_legacy(
-                path,
-                network_id,
-                recipient,
-                nonce,
-                amount,
-                fee,
-                expires_at,
-                self_contained,
-                submit_to,
-            ),
+            VERSION => {
+                if qfp6_submit.is_some() {
+                    return Err(
+                        "Q6TI/Q6TA requires a QZKW2 hybrid wallet; QZKW1 remains on legacy TXN2"
+                            .into(),
+                    );
+                }
+                sign_transfer_legacy(
+                    path,
+                    network_id,
+                    recipient,
+                    nonce,
+                    amount,
+                    fee,
+                    expires_at,
+                    self_contained,
+                    submit_to,
+                )
+            }
             HYBRID_VERSION => {
                 if !self_contained {
                     return Err(
                         "QZKW2 Q6HA requires self-contained hybrid account authentication".into(),
                     );
                 }
+                if submit_to.is_some() {
+                    return Err("QZKW2 Q6HA transactions cannot use legacy QZTS/1; use the Q6TI Noise options".into());
+                }
                 sign_transfer_hybrid(
-                    path, network_id, recipient, nonce, amount, fee, expires_at, submit_to,
+                    path,
+                    network_id,
+                    recipient,
+                    nonce,
+                    amount,
+                    fee,
+                    expires_at,
+                    qfp6_submit,
                 )
             }
             other => Err(format!("unsupported QZKW wallet version: {other}")),
@@ -1427,11 +1753,8 @@ mod windows_wallet {
         amount: u64,
         fee: u64,
         expires_at: u64,
-        submit_to: Option<SocketAddr>,
+        qfp6_submit: Option<Qfp6SubmitOptions>,
     ) -> Result<(), String> {
-        if submit_to.is_some() {
-            return Err("QZKW2 Q6HA transactions cannot be sent through legacy QZTS/1; QFP6 Q6PA transaction ingress is not yet wired".into());
-        }
         let wallet = load_hybrid_wallet(path)?;
         if wallet.account_id == recipient {
             return Err("recipient must differ from the wallet account".into());
@@ -1483,8 +1806,46 @@ mod windows_wallet {
         println!("tx_wire_sha256={}", hex(&Sha256::digest(&encoded)));
         println!("tx_signature_hex={}", hex(&tx.signature));
         println!("tx_wire_hex={}", hex(&encoded));
-        println!("tx_submit_status=not_attempted_qfp6_ingress_not_available");
-        println!("network_status=offline_signed_candidate_not_broadcast");
+        if let Some(options) = qfp6_submit {
+            let acknowledgement = submit_q6ti_over_noise(&options, &network_id, &tx, &txid)?;
+            println!("tx_submit_protocol=Q6TI_Q6TA_over_pinned_Noise_XX");
+            println!("tx_submit_request_id_status=one_shot_random_nonzero");
+            println!(
+                "tx_submit_transaction_id_hex={}",
+                hex(&acknowledgement.transaction_id)
+            );
+            println!("tx_submit_mempool_count={}", acknowledgement.mempool_count);
+            println!("tx_submit_mempool_bytes={}", acknowledgement.mempool_bytes);
+            println!(
+                "tx_submit_canonical_height={}",
+                acknowledgement.canonical_height
+            );
+            println!(
+                "tx_submit_canonical_tip_hex={}",
+                hex(&acknowledgement.canonical_tip)
+            );
+            println!(
+                "tx_submit_canonical_state_root_hex={}",
+                hex(&acknowledgement.canonical_state_root)
+            );
+            match acknowledgement.status {
+                QRunV06TransactionSubmitStatus::Accepted => {
+                    println!("tx_submit_status=accepted_pending_mempool");
+                    println!("tx_submit_finality=pending_only_not_confirmed");
+                }
+                QRunV06TransactionSubmitStatus::Duplicate => {
+                    println!("tx_submit_status=duplicate_pending");
+                    println!("tx_submit_finality=pending_only_not_confirmed");
+                }
+                QRunV06TransactionSubmitStatus::Rejected => {
+                    println!("tx_submit_status=rejected");
+                    return Err("QFP6 Q6TI ingress rejected the signed hybrid transaction".into());
+                }
+            }
+        } else {
+            println!("tx_submit_status=not_attempted_qfp6_noise_options_not_set");
+            println!("network_status=offline_signed_candidate_not_broadcast");
+        }
         Ok(())
     }
 
@@ -1520,6 +1881,7 @@ Default signature mode embeds the public key with its Ed25519 signature so the s
                 expires_at,
                 self_contained,
                 submit_to,
+                qfp6_submit,
             }) => sign_transfer(
                 &wallet,
                 network_id,
@@ -1530,7 +1892,10 @@ Default signature mode embeds the public key with its Ed25519 signature so the s
                 expires_at,
                 self_contained,
                 submit_to,
+                qfp6_submit,
             ),
+            Ok(Command::CreateNoiseIdentity { output }) => create_noise_identity(&output),
+            Ok(Command::NoiseIdentity { identity }) => noise_identity_info(&identity),
             Err(error) => Err(error),
         };
         if let Err(error) = result {
@@ -1695,18 +2060,84 @@ Default signature mode embeds the public key with its Ed25519 signature so the s
                 QRUN_V06_MAX_NATIVE_TX_SIGNATURE_BYTES
             )
             .is_ok());
-            assert!(sign_transfer_hybrid(
-                Path::new("unused"),
+            let wallet_path = std::env::temp_dir().join(format!(
+                "qzkw2-legacy-submit-{}-{}.qzw",
+                process::id(),
+                NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_file(&wallet_path);
+            save_hybrid_wallet(&wallet_path, &seeds, None).unwrap();
+            assert!(sign_transfer(
+                &wallet_path,
                 [0xA1; 32],
                 [0xC3; 32],
                 1,
                 10_000,
                 100,
                 2_000_000_000,
-                Some("127.0.0.1:49340".parse().unwrap())
+                true,
+                Some("127.0.0.1:49340".parse().unwrap()),
+                None,
             )
             .unwrap_err()
             .contains("legacy QZTS/1"));
+            fs::remove_file(&wallet_path).unwrap();
+        }
+
+        #[test]
+        fn qfp6_noise_identity_dpapi_roundtrip_binds_private_key_to_public_key() {
+            let identity_path = std::env::temp_dir().join(format!(
+                "q6nk-noise-identity-{}-{}.q6nk",
+                process::id(),
+                NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_file(&identity_path);
+            create_noise_identity(&identity_path).unwrap();
+            let identity = load_noise_identity(&identity_path).unwrap();
+            assert_eq!(identity.identity_id, q6nk_identity_id(&identity.public_key));
+
+            let params: snow::params::NoiseParams =
+                "Noise_XX_25519_ChaChaPoly_SHA256".parse().unwrap();
+            let mut pair = snow::Builder::new(params).generate_keypair().unwrap();
+            let mut server_private = [0u8; 32];
+            let mut server_public = [0u8; 32];
+            server_private.copy_from_slice(&pair.private);
+            server_public.copy_from_slice(&pair.public);
+            pair.private.fill(0);
+            pair.public.fill(0);
+
+            let network_id = [0xD1; 32];
+            let profile_id = [0xD2; 32];
+            let trusted_client_public = identity.public_key;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let trusted = [trusted_client_public];
+                QRunV06NoiseSession::accept(
+                    &mut stream,
+                    &server_private,
+                    &trusted,
+                    &network_id,
+                    &profile_id,
+                )
+                .unwrap()
+                .remote_static_public_key()
+                .to_owned()
+            });
+
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            let client = QRunV06NoiseSession::connect(
+                &mut stream,
+                &identity.private_key.0,
+                &server_public,
+                &network_id,
+                &profile_id,
+            )
+            .unwrap();
+            assert_eq!(client.remote_static_public_key(), &server_public);
+            assert_eq!(server.join().unwrap(), identity.public_key);
+            fs::remove_file(&identity_path).unwrap();
         }
 
         #[test]
