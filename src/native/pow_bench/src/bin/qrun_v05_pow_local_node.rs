@@ -1937,6 +1937,7 @@ fn profile_id(
     hash.update(params.initial_target.to_be_bytes());
     hash.update(match params.pow.algorithm {
         PowAlgorithm::Argon2id => [1u8],
+        PowAlgorithm::Sha256d => [2u8],
     });
     hash.update(params.pow.memory_kib.to_be_bytes());
     hash.update(params.pow.iterations.to_be_bytes());

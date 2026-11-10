@@ -14,7 +14,7 @@ use crate::{
     qrun_v06_pow_wire_candidate::QRUN_V06_PROTOCOL_VERSION,
 };
 pub const QRUN_V06_CONSENSUS_PROFILE_MAGIC: &[u8; 4] = b"Q6CP";
-pub const QRUN_V06_CONSENSUS_PROFILE_VERSION: u16 = 1;
+pub const QRUN_V06_CONSENSUS_PROFILE_VERSION: u16 = 2;
 pub const QRUN_V06_CONSENSUS_PROFILE_BYTES: usize = 294;
 pub const QRUN_V06_CONSENSUS_PROFILE_MAX_BYTES: usize = QRUN_V06_CONSENSUS_PROFILE_BYTES;
 
@@ -131,7 +131,7 @@ impl QRunV06ConsensusProfile {
         Ok(())
     }
 
-    /// Canonical fixed-width Q6CP v1 encoding. The trailing consensus fingerprint is recomputed
+    /// Canonical fixed-width Q6CP v2 encoding. The trailing consensus fingerprint is recomputed
     /// from every preceding parameter and is not trusted during decode.
     pub fn encode(
         &self,
@@ -159,6 +159,7 @@ impl QRunV06ConsensusProfile {
         bytes.extend_from_slice(&params.initial_target.to_be_bytes());
         match params.pow.algorithm {
             PowAlgorithm::Argon2id => bytes.push(1),
+            PowAlgorithm::Sha256d => bytes.push(2),
         }
         bytes.extend_from_slice(&[0, 0, 0]);
         bytes.extend_from_slice(&params.pow.memory_kib.to_be_bytes());
@@ -207,6 +208,7 @@ impl QRunV06ConsensusProfile {
         let initial_target = Uint256::from_be_bytes(take::<32>(bytes, &mut cursor)?);
         let algorithm = match take::<1>(bytes, &mut cursor)?[0] {
             1 => PowAlgorithm::Argon2id,
+            2 => PowAlgorithm::Sha256d,
             _ => return Err(QRunV06ConsensusProfileError::UnsupportedPowAlgorithm),
         };
         if take::<3>(bytes, &mut cursor)? != [0, 0, 0] {
@@ -278,7 +280,11 @@ fn validate_parameters(
     }
     parameters
         .validate_monetary_execution_compatibility()
-        .map_err(|_| QRunV06ConsensusProfileError::MonetaryIssuanceProfileMismatch)
+        .map_err(|_| QRunV06ConsensusProfileError::MonetaryIssuanceProfileMismatch)?;
+    if parameters.pow.algorithm != PowAlgorithm::Sha256d {
+        return Err(QRunV06ConsensusProfileError::UnsupportedPowAlgorithm);
+    }
+    Ok(())
 }
 
 fn take<const N: usize>(
@@ -309,9 +315,7 @@ mod tests {
     const POLICY: [u8; 32] = [0xA4; 32];
 
     fn params() -> ConsensusParameters {
-        let mut params = ConsensusParameters::candidate_testnet().unwrap();
-        params.protocol_version = QRUN_V06_PROTOCOL_VERSION;
-        params
+        ConsensusParameters::qrun_v06_sha256d_candidate().unwrap()
     }
 
     fn descriptor(params: &ConsensusParameters) -> QRunV06GenesisDescriptor {
@@ -375,12 +379,35 @@ mod tests {
             Err(QRunV06ConsensusProfileError::NonCanonicalReservedBytes)
         );
 
-        let mut changed_memory = encoded;
-        // memory_kib begins at the fixed Q6CP byte offset 206.
-        changed_memory[206] ^= 1;
+        let mut changed_target = encoded;
+        // initial_target begins at the fixed Q6CP byte offset 170.
+        changed_target[170] ^= 1;
         assert_eq!(
-            QRunV06ConsensusProfile::decode(&changed_memory),
+            QRunV06ConsensusProfile::decode(&changed_target),
             Err(QRunV06ConsensusProfileError::WrongConsensusFingerprint)
+        );
+    }
+
+    #[test]
+    fn q6cp_v2_is_sha256d_only_and_refuses_argon2id_profiles() {
+        let params = params();
+        let descriptor = descriptor(&params);
+        let profile =
+            QRunV06ConsensusProfile::new(NETWORK, PROFILE, descriptor.commitment(), params)
+                .unwrap();
+        let mut encoded = profile.encode().unwrap();
+        assert_eq!(u16::from_be_bytes([encoded[4], encoded[5]]), 2);
+        encoded[5] = 1;
+        assert_eq!(
+            QRunV06ConsensusProfile::decode(&encoded),
+            Err(QRunV06ConsensusProfileError::UnsupportedVersion)
+        );
+
+        let mut argon = ConsensusParameters::candidate_testnet().unwrap();
+        argon.protocol_version = QRUN_V06_PROTOCOL_VERSION;
+        assert_eq!(
+            QRunV06ConsensusProfile::new(NETWORK, PROFILE, [0xB3; 32], argon),
+            Err(QRunV06ConsensusProfileError::UnsupportedPowAlgorithm)
         );
     }
 

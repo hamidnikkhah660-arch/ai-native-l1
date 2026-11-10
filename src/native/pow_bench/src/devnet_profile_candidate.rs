@@ -351,6 +351,7 @@ fn consensus_digest(consensus: &ConsensusParameters) -> [u8; 32] {
     bytes.extend_from_slice(&consensus.initial_target.to_be_bytes());
     bytes.push(match consensus.pow.algorithm {
         PowAlgorithm::Argon2id => 1,
+        PowAlgorithm::Sha256d => 2,
     });
     bytes.extend_from_slice(&consensus.pow.memory_kib.to_be_bytes());
     bytes.extend_from_slice(&consensus.pow.iterations.to_be_bytes());

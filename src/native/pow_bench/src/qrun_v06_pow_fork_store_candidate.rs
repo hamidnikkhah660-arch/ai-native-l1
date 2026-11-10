@@ -2932,6 +2932,7 @@ pub(crate) fn consensus_fingerprint(
     hash.update(params.initial_target.to_be_bytes());
     match params.pow.algorithm {
         PowAlgorithm::Argon2id => hash.update([1]),
+        PowAlgorithm::Sha256d => hash.update([2]),
     }
     hash.update(params.pow.memory_kib.to_be_bytes());
     hash.update(params.pow.iterations.to_be_bytes());
