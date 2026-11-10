@@ -46,7 +46,7 @@ The first full cargo test --all-targets attempt exposed a stale Argon2id preflig
 ## Not claimed / still required
 
 - The candidate-testnet target is not suitable for a public Mainnet. SHA-256d difficulty, target spacing, retarget bounds, expected hashrate, hardware economics, and attack-cost assumptions require independent calibration and review.
-- The SHA-256d path must be independently reimplemented and cross-client vectors checked before any consensus freeze.
+- CP-0579 adds an independent Python header-serialization/digest reference and fixed conformance vectors. This is one independent fixture oracle, not an independently operated production client or consensus approval.
 - QFP6 producer, importer, fork choice, durable store, recovery, snapshots, and independent peers must all consume the same Q6CP v2 profile on an actual separately operated Devnet.
 - The node executable remains preflight/probe-only. This change does not enable --run, create a Genesis, start public P2P, issue coins, or authorize Mainnet.
 - ML-DSA-65 remains candidate-only in the current node preflight. SHA-256d does not make the chain post-quantum; production signature verification, wallet key migration, and independent cryptographic review remain separate gates.
