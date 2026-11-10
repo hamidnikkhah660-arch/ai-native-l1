@@ -20,8 +20,12 @@ pub type NetworkId = [u8; 32];
 pub const TX_MAGIC: [u8; 4] = *b"TXN2";
 pub const BLOCK_MAGIC: [u8; 4] = *b"BLK2";
 pub const STATE_VERSION: u16 = 2;
+/// Legacy/common TXN2 wire cap retained for v0.5 and all unversioned callers.
 pub const MAX_SIGNATURE_BYTES: usize = 4 * 1024;
 pub const MAX_TRANSACTION_BYTES: usize = 136 + MAX_SIGNATURE_BYTES;
+/// QFP6-native TXN2 transfer envelope cap. This larger bound is used only inside QFB6 v0.6;
+/// legacy TXN2 encoders/decoders continue to enforce MAX_SIGNATURE_BYTES (4 KiB).
+pub const QRUN_V06_MAX_NATIVE_TX_SIGNATURE_BYTES: usize = 8 * 1024;
 pub const MAX_TRANSACTIONS_PER_BLOCK: usize = 1024;
 pub const MAX_ENCODED_BLOCK_BYTES: usize = 5 * 1024 * 1024;
 pub const MAX_ACCOUNTS: usize = 100_000;
@@ -250,14 +254,30 @@ pub fn transaction_signing_digest(tx: &Transaction) -> Result<[u8; 32], StateErr
 }
 
 pub fn encode_transaction(tx: &Transaction) -> Result<Vec<u8>, StateError> {
+    encode_transaction_with_signature_limit(tx, MAX_SIGNATURE_BYTES)
+}
+
+/// Encode a TXN2 transaction with an explicit protocol-context signature limit.
+/// Legacy/unversioned callers must use encode_transaction; the larger QFP6-only ceiling
+/// is supplied only by the QFB6 native-transfer codec.
+pub fn encode_transaction_with_signature_limit(
+    tx: &Transaction,
+    max_signature_bytes: usize,
+) -> Result<Vec<u8>, StateError> {
+    if max_signature_bytes == 0 || max_signature_bytes > u16::MAX as usize {
+        return Err(StateError::Malformed);
+    }
+    let max_transaction_bytes = TX_FIXED_LEN
+        .checked_add(max_signature_bytes)
+        .ok_or(StateError::Malformed)?;
     let unsigned = encode_unsigned_transaction(tx)?;
     if tx.signature.is_empty() {
         return Err(StateError::EmptySignature);
     }
-    if tx.signature.len() > MAX_SIGNATURE_BYTES {
+    if tx.signature.len() > max_signature_bytes {
         return Err(StateError::Oversize {
             actual: tx.signature.len(),
-            limit: MAX_SIGNATURE_BYTES,
+            limit: max_signature_bytes,
         });
     }
     let signature_len = u16::try_from(tx.signature.len()).map_err(|_| StateError::Malformed)?;
@@ -265,10 +285,10 @@ pub fn encode_transaction(tx: &Transaction) -> Result<Vec<u8>, StateError> {
     out.extend_from_slice(&unsigned);
     out.extend_from_slice(&signature_len.to_be_bytes());
     out.extend_from_slice(&tx.signature);
-    if out.len() > MAX_TRANSACTION_BYTES {
+    if out.len() > max_transaction_bytes {
         return Err(StateError::Oversize {
             actual: out.len(),
-            limit: MAX_TRANSACTION_BYTES,
+            limit: max_transaction_bytes,
         });
     }
     Ok(out)
@@ -306,10 +326,26 @@ fn read_prefix(cursor: &mut Cursor<&[u8]>, expected: &[u8; 4]) -> Result<(), Sta
 }
 
 pub fn decode_transaction(bytes: &[u8]) -> Result<Transaction, StateError> {
-    if bytes.len() > MAX_TRANSACTION_BYTES {
+    decode_transaction_with_signature_limit(bytes, MAX_SIGNATURE_BYTES)
+}
+
+/// Decode a TXN2 transaction under an explicit protocol-context signature limit.
+/// QFB6 v0.6 native-transfer decoding uses its 8 KiB limit; the legacy decoder above
+/// remains capped at 4 KiB.
+pub fn decode_transaction_with_signature_limit(
+    bytes: &[u8],
+    max_signature_bytes: usize,
+) -> Result<Transaction, StateError> {
+    if max_signature_bytes == 0 || max_signature_bytes > u16::MAX as usize {
+        return Err(StateError::Malformed);
+    }
+    let max_transaction_bytes = TX_FIXED_LEN
+        .checked_add(max_signature_bytes)
+        .ok_or(StateError::Malformed)?;
+    if bytes.len() > max_transaction_bytes {
         return Err(StateError::Oversize {
             actual: bytes.len(),
-            limit: MAX_TRANSACTION_BYTES,
+            limit: max_transaction_bytes,
         });
     }
     if bytes.len() < TX_FIXED_LEN {
@@ -328,10 +364,10 @@ pub fn decode_transaction(bytes: &[u8]) -> Result<Transaction, StateError> {
     if signature_len == 0 {
         return Err(StateError::EmptySignature);
     }
-    if signature_len > MAX_SIGNATURE_BYTES {
+    if signature_len > max_signature_bytes {
         return Err(StateError::Oversize {
             actual: signature_len,
-            limit: MAX_SIGNATURE_BYTES,
+            limit: max_signature_bytes,
         });
     }
     let mut signature = vec![0u8; signature_len];
@@ -356,7 +392,14 @@ pub fn decode_transaction(bytes: &[u8]) -> Result<Transaction, StateError> {
 }
 
 pub fn transaction_id(tx: &Transaction) -> Result<[u8; 32], StateError> {
-    let canonical = encode_transaction(tx)?;
+    transaction_id_with_signature_limit(tx, MAX_SIGNATURE_BYTES)
+}
+
+pub fn transaction_id_with_signature_limit(
+    tx: &Transaction,
+    max_signature_bytes: usize,
+) -> Result<[u8; 32], StateError> {
+    let canonical = encode_transaction_with_signature_limit(tx, max_signature_bytes)?;
     Ok(hash_domain(b"AIN1-TX-ID-V2\0", &[&canonical]))
 }
 
@@ -917,7 +960,7 @@ impl LedgerState {
         authenticator: &A,
     ) -> Result<[u8; 32], StateError> {
         // Structural validation, including bounded signature bytes, precedes state mutation.
-        encode_transaction(tx)?;
+        encode_transaction_with_signature_limit(tx, QRUN_V06_MAX_NATIVE_TX_SIGNATURE_BYTES)?;
         if tx.network_id != self.network_id {
             return Err(StateError::WrongNetwork);
         }
@@ -931,7 +974,7 @@ impl LedgerState {
         authenticator
             .verify(&tx.sender, &digest, &tx.signature)
             .map_err(|_| StateError::Unauthorized)?;
-        let txid = transaction_id(tx)?;
+        let txid = transaction_id_with_signature_limit(tx, QRUN_V06_MAX_NATIVE_TX_SIGNATURE_BYTES)?;
         let before = self.total_value()?;
         let mut next = self.clone();
         next.apply_transaction(tx)?;
