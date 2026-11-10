@@ -633,9 +633,10 @@ where
 /// Alternate a finite authenticated peer-ingress window with a bounded QFP6 mining batch.
 ///
 /// Ingress and mining share one QAP1 Runtime/coordinator. Q6TI transactions are validated into
-/// a bounded process-local mempool, revalidated after canonical changes, and appended to the next
-/// mining template. Q6TA Accepted still means pending only; it is not block confirmation. The
-/// pool is discarded on process restart and is not a persistent transaction journal.
+/// a bounded mempool, persisted in immutable journal snapshots and revalidated after canonical
+/// changes before being appended to mining templates. Q6TA Accepted means pending and journaled,
+/// not block confirmation or QAP1 finality. Startup revalidates snapshots against the recovered
+/// canonical state; the journal stores pending transactions, not canonical chain history.
 ///
 /// After each peer window the fork-choice view is refreshed from the Runtime's durable store
 /// before mining, so a peer-admitted block cannot leave the miner extending a stale in-memory tip.
