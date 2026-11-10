@@ -178,6 +178,8 @@ pub mod qrun_v06_qap1_mining_loop_candidate;
 pub mod qrun_v06_quote_asset_qualification_candidate;
 /// CP-0528 QFP6 eight-bucket monetary state, 1B-Founder Genesis and candidate mining schedule.
 pub mod qrun_v06_tokenomics_candidate;
+/// CP-0584 Q6TI/Q6TA bounded QFP6 native-transfer submission over an authenticated Noise application session.
+pub mod qrun_v06_transaction_ingress_candidate;
 /// CP-0583 bounded process-local QFP6 NativeTransfer mempool with the versioned Q6HA 8 KiB signature codec; not node-wired.
 pub mod qrun_v06_transaction_mempool_candidate;
 /// M2b/M2c candidate joining native ledger, AMM projection and asset metadata registry.
