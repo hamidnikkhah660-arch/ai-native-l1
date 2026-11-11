@@ -59,3 +59,13 @@ These are same-host multi-process/local CI checks only. The separate-host NetBir
 ## Release gate
 
 This branch remains a Draft engineering candidate until exact-head CI and the updated two-host NetBird run pass with the Q6TI/Q6MJ markers above. Missing Actions secrets, unavailable second-host connectivity, or any marker mismatch must fail closed. Do not merge or describe the result as Mainnet readiness.
+
+
+## Latest cross-host gate check ? 2026-11-11
+
+- Exact-head workflow dispatch: run 43009457111, SHA 7578bae719700860ecccb8539a7f79c3d023bbed.
+- Result: stopped during private-secret validation. Both QRUN_CP0566C_NETBIRD_SETUP_KEY and QRUN_QFP6_QAP1_RUNNER_CONFIG_JSON were absent; NetBird installation/enrollment and Q6TI/Q6MJ remote steps were skipped.
+- Laptop NetBird client 0.82.0 reports Management/Signal connected, but peer count is 0/0.
+- Existing Windows Firewall rule QZXB-NetBird-CP0586-NodeA allows TCP 49661-49663 from all of 100.64.0.0/10 for any program. This is broader than the desired two-peer trust boundary; inspect and confirm the NetBird group/tag ACL before dispatch. Do not treat overlay membership alone as sufficient authorization.
+- The legacy controller at D:\Temp\ASUS\qrun-v06-qfp6-qap1-node-a-controller-hotfix8.ps1 is stale: it targets branch feat/qzxb-usdt-trading-gate-20261104 and a different checkout. It must not be run for CP-0587 without adaptation.
+- No independent-host Q6TI/Q6MJ qualification has passed on CP-0587.
