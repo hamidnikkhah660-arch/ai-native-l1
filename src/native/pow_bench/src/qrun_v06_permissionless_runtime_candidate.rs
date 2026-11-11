@@ -9,6 +9,7 @@
 use crate::consensus::ConsensusParameters;
 use crate::{
     qrun_v06_canonical_execution_candidate::QRunV06CanonicalExecutionState,
+    qrun_v06_pow_fork_choice_candidate::QRunV06PowForkChoice,
     qrun_v06_pow_fork_store_candidate::{
         QRunV06DurableCommit, QRunV06DurableForkStore, QRunV06ForkStoreError,
     },
@@ -103,6 +104,14 @@ impl QRunV06PermissionlessNodeRuntime {
             return Err(QRunV06PermissionlessRuntimeError::UnresolvedQap1Intent);
         }
         Ok(self.store.submit(envelope, authenticator)?)
+    }
+
+    /// Return an immutable branch-graph snapshot for mempool validation and mining-template
+    /// construction. The durable store remains the sole authority for subsequent commits.
+    pub fn fork_choice_snapshot(
+        &self,
+    ) -> Result<QRunV06PowForkChoice, QRunV06PermissionlessRuntimeError> {
+        Ok(self.store.graph()?.clone())
     }
 
     pub fn status(
