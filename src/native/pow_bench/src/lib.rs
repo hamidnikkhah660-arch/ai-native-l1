@@ -142,6 +142,8 @@ pub mod qrun_v06_external_anchor_candidate;
 pub mod qrun_v06_genesis_descriptor_candidate;
 /// CP-0546 append-only historical Q6TS/Q6PN/Q6QA trust-history and pinned checkpoint verifier candidate.
 pub mod qrun_v06_historical_trust_candidate;
+/// CP-0596 bounded Q6HS request and chunked Q6HC/Q6HP canonical-history response codec.
+pub mod qrun_v06_history_sync_wire_candidate;
 /// CP-0580 candidate QFP6 self-contained Ed25519 + ML-DSA-65 transaction authentication; not runtime activated.
 pub mod qrun_v06_hybrid_auth_candidate;
 /// CP-0569 branch-local QFP6 block-template construction and bounded Argon2id nonce search; caller performs durable QAP1 admission.
