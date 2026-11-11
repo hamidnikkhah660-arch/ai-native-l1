@@ -15,12 +15,14 @@ use crate::{
     external_cas_anchor_candidate::ExternalCasProviderTransport,
     qrun_v06_node_runtime_candidate::{
         decode_qrun_v06_peer_block_request, process_qrun_v06_peer_block_frame,
-        process_qrun_v06_peer_block_frame_with_qap1, QRunV06NodeAnchorGate, QRunV06NodeRuntime,
-        QRunV06PeerAdmissionResponse, QRunV06PeerAdmissionStatus, QRunV06PeerIngressError,
-        QRunV06PeerReplayGuard, QRUN_V06_PEER_ADMISSION_MAGIC,
+        process_qrun_v06_peer_block_frame_with_qap1,
+        process_qrun_v06_permissionless_peer_block_frame, QRunV06NodeAnchorGate,
+        QRunV06NodeRuntime, QRunV06PeerAdmissionResponse, QRunV06PeerAdmissionStatus,
+        QRunV06PeerIngressError, QRunV06PeerReplayGuard, QRUN_V06_PEER_ADMISSION_MAGIC,
         QRUN_V06_PEER_ADMISSION_RESPONSE_BYTES, QRUN_V06_PEER_FRAME_VERSION,
     },
     qrun_v06_noise_transport_candidate::{QRunV06NoiseError, QRunV06NoiseSession},
+    qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessNodeRuntime,
     qrun_v06_pow_fork_choice_candidate::QRunV06QuoteAssetAuthorizationProvider,
     qrun_v06_qap1_coordinator_candidate::{
         QRunV06Qap1AnchorTransport, QRunV06Qap1ExternalCoordinator,
@@ -205,6 +207,25 @@ where
         frame,
         authenticator,
         quote_authorizer,
+    )
+    .map_err(|error: QRunV06PeerIngressError| error.to_string())?;
+    Ok(response.encode())
+}
+
+/// Bridge one Q6PB frame to the permissionless Genesis-rooted runtime and encode Q6PA.
+/// Use only after the Noise session has authenticated a pinned peer. The replay guard must
+/// be owned by that session. Accepted confirms a local durable commit only, not global finality.
+pub fn process_qfp6_peer_frame_with_permissionless_runtime<T: TransactionAuthenticator>(
+    runtime: &mut QRunV06PermissionlessNodeRuntime,
+    replay_guard: &mut QRunV06PeerReplayGuard,
+    frame: &[u8],
+    authenticator: &T,
+) -> Result<[u8; QRUN_V06_PEER_ADMISSION_RESPONSE_BYTES], String> {
+    let response = process_qrun_v06_permissionless_peer_block_frame(
+        runtime,
+        replay_guard,
+        frame,
+        authenticator,
     )
     .map_err(|error: QRunV06PeerIngressError| error.to_string())?;
     Ok(response.encode())
