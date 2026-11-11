@@ -71,6 +71,9 @@ impl Cp0604FounderControlledSupply {
     pub fn last_mining_height(&self) -> u64 {
         self.last_mining_height
     }
+    pub fn mining_schedule(&self) -> QRunV06MiningScheduleCandidate {
+        self.schedule
+    }
     pub fn gross_issued_atoms(&self) -> Result<u128, Cp0604Error> {
         CP0604_FOUNDER_GENESIS_ATOMS
             .checked_add(self.mining_issued_atoms)

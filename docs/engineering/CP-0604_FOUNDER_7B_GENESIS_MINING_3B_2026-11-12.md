@@ -1,6 +1,6 @@
 ﻿# CP-0604 — Founder-controlled 7B Genesis / 3B mining supply candidate
 
-Status: candidate-only; not wired to canonical QFP6 execution, Genesis descriptor, Ledger block application, or Mainnet.
+Status: wired into the QFB6 canonical execution candidate and Q6SN v6 snapshot path; not activated by the production QFP6 node/runtime, not a signed Mainnet Genesis, and not Mainnet-ready.
 
 ## Monetary model
 
@@ -13,6 +13,10 @@ Status: candidate-only; not wired to canonical QFP6 execution, Genesis descripto
 
 ## Compatibility and safety
 
-CP-0604 is a new versioned candidate and does not alter CP-0528 constants or its Q6TM/Q6SN historical snapshot encoding. Its Q604 snapshot binds the network, founder account, 10B/7B/3B limits, mining schedule, cumulative mining issuance, height, policy fingerprint, and checksum. The state root is domain-separated.
+CP-0604 does not alter CP-0528 constants or its historical Q6TM encoding. The canonical execution state now supports a mutually exclusive CP-0604 policy path, including Genesis constructors with and without a profile-bound Genesis descriptor. The descriptor binding commits the CP-0604 policy fingerprint. The canonical Ledger Genesis credits exactly 7B to the founder; the 3B mining cap is not pre-minted.
 
-The module deliberately does not claim canonical runtime activation. Before any Mainnet use, a separate reviewed integration must add a CP-0604 Genesis descriptor/profile pin, credit exactly 7B to the founder in the canonical Ledger, atomically couple mining reward credits with this issuance counter, enforce hybrid founder authorization on native transfers, and add snapshot/replay/fork-choice compatibility tests. Until then this code is an isolated candidate only.
+Canonical block application derives mining rewards from the selected schedule and advances the CP-0604 height/cumulative counter in the same cloned state transition as the Ledger credit. A failed block transition is discarded atomically. Legacy CP-0528 category-release and burn-reserve mint operations fail closed under CP-0604. Native transfers remain ordinary Ledger transfers and do not alter gross issuance.
+
+The aggregate execution snapshot is now Q6SN v6 and includes a bounded, checksummed Q604 policy component. The reader retains Q6SN v4/v5 compatibility; the historical state-root calculation is unchanged when CP-0604 is absent. Tests cover 7B Genesis credit, a native transfer, block-derived mining reward, snapshot restore and continuation, legacy mint-operation rejection, and legacy snapshot decoding.
+
+This is still a canonical execution **candidate**, not production runtime activation. Remaining gates include wiring the CP-0604 Genesis descriptor/profile into the actual QFP6 node bootstrap and consensus configuration, confirming the production hybrid authenticator at the node callsite, and exercising independent-node sync, fork-choice/reorg, persistent restart, and public Devnet recovery. No signed Mainnet Genesis was modified or published.
