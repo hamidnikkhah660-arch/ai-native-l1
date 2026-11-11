@@ -2391,6 +2391,105 @@ mod tests {
     }
 
     #[test]
+    fn qfp6_history_sync_wire_chunks_roundtrip_a_parent_bound_canonical_page() {
+        let params = params(2);
+        let genesis = genesis_state(&params);
+        let mut graph = QRunV06PowForkChoice::new(genesis.clone(), params.clone()).unwrap();
+        let base_tip = graph.base_tip();
+        let mut operations = Vec::new();
+        for nonce in 1..=500u64 {
+            let mut transaction = Transaction {
+                network_id: NETWORK,
+                sender: ALICE,
+                recipient: BOB,
+                nonce,
+                amount: 1,
+                fee: 0,
+                expires_at: 100_000,
+                signature: Vec::new(),
+            };
+            transaction.signature = transaction_signing_digest(&transaction).unwrap().to_vec();
+            operations.push(QRunV06BlockOperation::NativeTransfer(transaction));
+        }
+        let target = graph.expected_next_target(&base_tip).unwrap();
+        let (first_envelope, first_digest) =
+            make_candidate(&genesis, base_tip, 130, target, operations, &params);
+        graph
+            .insert_encoded(&first_envelope, &DigestAuthenticator)
+            .unwrap();
+        let first_state = graph.canonical_state().clone();
+        let second_target = graph.expected_next_target(&first_digest).unwrap();
+        let (second_envelope, _) = make_candidate(
+            &first_state,
+            first_digest,
+            160,
+            second_target,
+            Vec::new(),
+            &params,
+        );
+        graph
+            .insert_encoded(&second_envelope, &DigestAuthenticator)
+            .unwrap();
+
+        let snapshot = graph.clone();
+        let page = snapshot.canonical_history_page(1, 2, 1024 * 1024).unwrap();
+        let request = crate::qrun_v06_history_sync_wire_candidate::QRunV06HistorySyncRequest {
+            request_id: 77,
+            network_id: NETWORK,
+            profile_id: PROFILE,
+            snapshot_tip: snapshot.canonical_tip().tip_hash,
+            expected_parent_consensus_hash: base_tip,
+            expected_parent_execution_hash: genesis.tip_hash(),
+            start_height: 1,
+            max_blocks: 2,
+            max_bytes: 1024 * 1024,
+        };
+        let chunks =
+            crate::qrun_v06_history_sync_wire_candidate::encode_q6hp_page_chunks(&request, &page)
+                .unwrap();
+        assert!(
+            chunks.len() > 1,
+            "large canonical block must span multiple Noise-sized chunks"
+        );
+        assert!(chunks.iter().all(|chunk| {
+            chunk.len()
+                <= crate::qrun_v06_history_sync_wire_candidate::Q6HC_CHUNK_HEADER_BYTES
+                    + crate::qrun_v06_history_sync_wire_candidate::Q6HC_CHUNK_PAYLOAD_BYTES
+        }));
+
+        let mut assembler =
+            crate::qrun_v06_history_sync_wire_candidate::QRunV06HistoryPageChunkAssembler::new(
+                request.clone(),
+                params.clone(),
+            )
+            .unwrap();
+        let mut decoded = None;
+        for chunk in &chunks {
+            if let Some(complete_page) = assembler.push(chunk).unwrap() {
+                decoded = Some(complete_page);
+            }
+        }
+        assert_eq!(decoded, Some(page));
+
+        let mut tampered_chunks = chunks;
+        let last_index = tampered_chunks.len() - 1;
+        let last = tampered_chunks[last_index].len() - 1;
+        tampered_chunks[last_index][last] ^= 1;
+        let mut tampered_assembler =
+            crate::qrun_v06_history_sync_wire_candidate::QRunV06HistoryPageChunkAssembler::new(
+                request, params,
+            )
+            .unwrap();
+        for chunk in &tampered_chunks[..last_index] {
+            assert_eq!(tampered_assembler.push(chunk).unwrap(), None);
+        }
+        assert_eq!(
+            tampered_assembler.push(&tampered_chunks[last_index]),
+            Err(crate::qrun_v06_history_sync_wire_candidate::Q6HistorySyncWireError::PayloadChecksumMismatch)
+        );
+    }
+
+    #[test]
     fn qfp6_checkpoint_restore_preserves_cp0528_issuance_and_continues_mining() {
         let params = params(2);
         let genesis = genesis_state(&params);
