@@ -20,14 +20,17 @@ use crate::{
         QRunV06BlockOperation, QRunV06CanonicalExecutionState, MAX_QRUN_V06_BLOCK_OPERATIONS,
     },
     qrun_v06_external_anchor_candidate::{QRunV06ExternalAnchorPin, QRunV06ExternalAnchorState},
+    qrun_v06_history_sync_service_candidate::QRunV06HistorySyncResponder,
+    qrun_v06_history_sync_wire_candidate::{decode_q6hs_request, Q6HS_REQUEST_MAGIC},
     qrun_v06_miner_candidate::QRUN_V06_MAX_NONCE_ATTEMPTS_PER_JOB,
     qrun_v06_node_runtime_candidate::{
         QRunV06NodeAnchorGate, QRunV06NodeRuntime, QRunV06PeerReplayGuard,
     },
     qrun_v06_peer_listener_candidate::{
         process_qfp6_peer_frame_with_permissionless_runtime, process_qfp6_peer_frame_with_qap1,
-        serve_qfp6_noise_listener, QRunV06PeerListenerConfig, QRunV06PeerListenerError,
-        QRunV06PeerListenerStats, QRunV06PeerListenerStopReason,
+        serve_qfp6_noise_listener, serve_qfp6_noise_listener_with_history,
+        QRunV06PeerListenerConfig, QRunV06PeerListenerError, QRunV06PeerListenerStats,
+        QRunV06PeerListenerStopReason,
     },
     qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessNodeRuntime,
     qrun_v06_permissionless_service_candidate::{
@@ -682,6 +685,63 @@ where
     })
 }
 
+/// Run one finite combined Q6PB/Q6TI/Q6HS listener window. Q6PA/Q6TA replies remain
+/// fixed-width; Q6HS pages are streamed as prevalidated Q6HC records on the same pinned session.
+fn serve_qfp6_history_listener_round<F>(
+    listener: &TcpListener,
+    config: QRunV06PeerListenerConfig,
+    local_static_private_key: &[u8; 32],
+    trusted_remote_static_public_keys: &[[u8; 32]],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    process_shutdown: &AtomicBool,
+    round_timeout: Duration,
+    on_application_frame: F,
+) -> Result<
+    (
+        crate::qrun_v06_peer_listener_candidate::QRunV06PeerListenerReport,
+        bool,
+    ),
+    QRunV06NodeSupervisorError,
+>
+where
+    F: FnMut(&mut QRunV06PeerReplayGuard, &[u8]) -> Result<Vec<Vec<u8>>, String>,
+{
+    let round_shutdown = AtomicBool::new(false);
+    let watcher_stop = AtomicBool::new(false);
+    thread::scope(|scope| {
+        let watcher = scope.spawn(|| {
+            let deadline = Instant::now() + round_timeout;
+            while !watcher_stop.load(Ordering::Acquire) {
+                if process_shutdown.load(Ordering::Acquire) || Instant::now() >= deadline {
+                    round_shutdown.store(true, Ordering::Release);
+                    break;
+                }
+                thread::sleep(SHUTDOWN_WATCH_INTERVAL);
+            }
+        });
+
+        let report = serve_qfp6_noise_listener_with_history(
+            listener,
+            config,
+            local_static_private_key,
+            trusted_remote_static_public_keys,
+            network_id,
+            profile_id,
+            &round_shutdown,
+            on_application_frame,
+        );
+        watcher_stop.store(true, Ordering::Release);
+        if watcher.join().is_err() {
+            return Err(QRunV06NodeSupervisorError::ShutdownWatcherPanicked);
+        }
+        let process_stopped = process_shutdown.load(Ordering::Acquire);
+        report
+            .map(|report| (report, process_stopped))
+            .map_err(|error| QRunV06NodeSupervisorError::Listener(error.to_string()))
+    })
+}
+
 /// Alternate a finite authenticated peer-ingress window with a bounded QFP6 mining batch.
 ///
 /// Ingress and mining share one QAP1 Runtime/coordinator. Q6TI transactions are validated into
@@ -1024,7 +1084,9 @@ pub fn process_qfp6_application_frame_with_permissionless_runtime<T: Transaction
 
 /// Run the authenticated QFP6 Noise listener and permissionless durable miner in alternating,
 /// bounded windows. The runtime must already be opened from complete Genesis-rooted history with
-/// an independently verified profile pin. This does not perform peer discovery or history sync.
+/// an independently verified profile pin. The same pinned Noise listener serves bounded
+/// Q6HS/Q6HC canonical-history export requests; outbound peer discovery and automatic remote
+/// history import remain separate work.
 #[allow(clippy::too_many_arguments)]
 pub fn run_qfp6_permissionless_mining_supervisor<T: TransactionAuthenticator>(
     listener: &TcpListener,
@@ -1089,6 +1151,7 @@ pub fn run_qfp6_permissionless_mining_supervisor<T: TransactionAuthenticator>(
             let mut mining_rounds = 0u64;
             let mut blocks_durably_committed = 0u64;
             let mut blocks_became_canonical = 0u64;
+            let mut history_responder = QRunV06HistorySyncResponder::default();
             let stop_reason;
 
             loop {
@@ -1109,16 +1172,25 @@ pub fn run_qfp6_permissionless_mining_supervisor<T: TransactionAuthenticator>(
                 round_config.max_sessions = round_config.max_sessions.min(remaining).min(1);
                 let mut on_application_frame =
                     |guard: &mut QRunV06PeerReplayGuard, frame: &[u8]| {
-                        process_qfp6_application_frame_with_permissionless_runtime(
-                            runtime,
-                            guard,
-                            mempool,
-                            frame,
-                            authenticator,
-                            producer,
-                        )
+                        if frame.get(..4) == Some(&Q6HS_REQUEST_MAGIC) {
+                            let request =
+                                decode_q6hs_request(frame).map_err(|error| error.to_string())?;
+                            history_responder
+                                .respond(runtime, &request)
+                                .map_err(|error| error.to_string())
+                        } else {
+                            process_qfp6_application_frame_with_permissionless_runtime(
+                                runtime,
+                                guard,
+                                mempool,
+                                frame,
+                                authenticator,
+                                producer,
+                            )
+                            .map(|response| vec![response.to_vec()])
+                        }
                     };
-                let (listener_report, process_stopped) = serve_qfp6_listener_round(
+                let (listener_report, process_stopped) = serve_qfp6_history_listener_round(
                     listener,
                     round_config,
                     local_static_private_key,

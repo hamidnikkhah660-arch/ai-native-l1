@@ -3,8 +3,8 @@
 //! This module provides a deliberately serial (one active peer at a time), bounded
 //! TCP accept/session loop. It rejects wildcard/public bind addresses, authenticates
 //! peers with the CP-0552 pinned Noise XX transport, creates one replay guard per
-//! authenticated connection, caps accepted sessions and requests, validates Q6PA
-//! responses, and stops on an explicit shutdown flag.
+//! authenticated connection, caps accepted sessions and requests, validates fixed-width
+//! Q6PA/Q6TA replies and ordered multi-record Q6HC history replies, and stops on shutdown.
 //!
 //! It is a library service candidate, not a node binary, production supervisor, miner,
 //! RPC endpoint, mempool, or Mainnet release. External trust-provider callbacks must
@@ -48,7 +48,7 @@ pub struct QRunV06PeerListenerConfig {
     /// The number of TCP connections accepted before this supervised run returns.
     /// Each connection is handled serially; at most one peer session is active.
     pub max_sessions: usize,
-    /// The maximum number of encrypted Q6PB/Q6PA or Q6TI/Q6TA exchanges on one authenticated session.
+    /// The maximum number of encrypted Q6PB/Q6PA, Q6TI/Q6TA or Q6HS/Q6HC exchanges on one authenticated session.
     pub max_requests_per_session: usize,
     /// Fail closed after this many unauthenticated/invalid Noise handshakes in one run.
     pub max_failed_handshakes: usize,
@@ -583,6 +583,196 @@ where
     Ok(QRunV06PeerListenerReport { stats, stop_reason })
 }
 
+/// Combined Q6PB/Q6TI and Q6HS listener for the permissionless production supervisor.
+/// Fixed-width admission replies remain exactly one Q6PA/Q6TA record; Q6HS replies are a
+/// prevalidated ordered Q6HC sequence. All three request families share one Noise session,
+/// replay guard, connection budget and listener socket.
+pub fn serve_qfp6_noise_listener_with_history<F>(
+    listener: &TcpListener,
+    config: QRunV06PeerListenerConfig,
+    local_static_private_key: &[u8; 32],
+    trusted_remote_static_public_keys: &[[u8; 32]],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    shutdown: &AtomicBool,
+    mut on_application_frame: F,
+) -> Result<QRunV06PeerListenerReport, QRunV06PeerListenerError>
+where
+    F: FnMut(&mut QRunV06PeerReplayGuard, &[u8]) -> Result<Vec<Vec<u8>>, String>,
+{
+    use crate::qrun_v06_history_sync_wire_candidate::{
+        decode_q6hs_request, validate_q6hc_response_sequence, Q6HS_REQUEST_MAGIC,
+    };
+    use crate::qrun_v06_noise_transport_candidate::MAX_QFP6_NOISE_RECORD_BYTES;
+    use crate::qrun_v06_transaction_ingress_candidate::{
+        decode_q6ti_transaction_request, Q6TI_MAGIC,
+    };
+
+    config.validate()?;
+    validate_peer_pins(trusted_remote_static_public_keys)?;
+    if local_static_private_key.iter().all(|byte| *byte == 0)
+        || network_id.iter().all(|byte| *byte == 0)
+        || profile_id.iter().all(|byte| *byte == 0)
+    {
+        return Err(QRunV06PeerListenerError::InvalidConfiguration);
+    }
+    let bind_ip = listener
+        .local_addr()
+        .map_err(|error| QRunV06PeerListenerError::Io(error.to_string()))?
+        .ip();
+    if !is_safe_private_or_overlay_ip(bind_ip) {
+        return Err(QRunV06PeerListenerError::UnsafeBindAddress(bind_ip));
+    }
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| QRunV06PeerListenerError::Io(error.to_string()))?;
+
+    let mut stats = QRunV06PeerListenerStats::default();
+    const MAX_HISTORY_SESSION_EGRESS_BYTES: usize = 64 * 1024 * 1024;
+    let stop_reason = loop {
+        if shutdown.load(Ordering::Acquire) {
+            break QRunV06PeerListenerStopReason::ShutdownRequested;
+        }
+        if stats.rejected_handshakes >= config.max_failed_handshakes {
+            break QRunV06PeerListenerStopReason::FailedHandshakeLimitReached;
+        }
+        if stats.accepted_connections >= config.max_sessions {
+            break QRunV06PeerListenerStopReason::SessionLimitReached;
+        }
+        let (mut stream, _) = match listener.accept() {
+            Ok(connection) => connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(config.accept_poll_interval);
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(QRunV06PeerListenerError::Io(error.to_string())),
+        };
+        stats.accepted_connections += 1;
+        if stream.set_nodelay(true).is_err() {
+            stats.handler_failures += 1;
+            continue;
+        }
+        let mut noise = match QRunV06NoiseSession::accept(
+            &mut stream,
+            local_static_private_key,
+            trusted_remote_static_public_keys,
+            network_id,
+            profile_id,
+        ) {
+            Ok(session) => session,
+            Err(_) => {
+                stats.rejected_handshakes += 1;
+                continue;
+            }
+        };
+        stats.authenticated_sessions += 1;
+        let mut replay_guard = QRunV06PeerReplayGuard::new();
+        let mut session_history_egress = 0usize;
+        for _ in 0..config.max_requests_per_session {
+            if shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            let frame = match noise.read_record(&mut stream) {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+            let (request_id, is_history) = if frame.get(..4) == Some(&Q6HS_REQUEST_MAGIC) {
+                match decode_q6hs_request(&frame) {
+                    Ok(request)
+                        if request.network_id == *network_id
+                            && request.profile_id == *profile_id =>
+                    {
+                        (request.request_id, true)
+                    }
+                    _ => {
+                        stats.handler_failures += 1;
+                        break;
+                    }
+                }
+            } else if frame.get(..4) == Some(&Q6TI_MAGIC) {
+                match decode_q6ti_transaction_request(&frame) {
+                    Ok(request) => (request.request_id, false),
+                    Err(_) => {
+                        stats.handler_failures += 1;
+                        break;
+                    }
+                }
+            } else {
+                match decode_qrun_v06_peer_block_request(&frame) {
+                    Ok(request) => (request.request_id, false),
+                    Err(_) => {
+                        stats.handler_failures += 1;
+                        break;
+                    }
+                }
+            };
+            stats.requests_received += 1;
+            if is_history && replay_guard.accept(request_id).is_err() {
+                stats.handler_failures += 1;
+                break;
+            }
+            let responses = match on_application_frame(&mut replay_guard, &frame) {
+                Ok(responses) => responses,
+                Err(_) => {
+                    stats.handler_failures += 1;
+                    break;
+                }
+            };
+            if is_history {
+                if validate_q6hc_response_sequence(
+                    &responses,
+                    request_id,
+                    &decode_q6hs_request(&frame)
+                        .map_err(|_| QRunV06PeerListenerError::InvalidConfiguration)?
+                        .snapshot_tip,
+                )
+                .is_err()
+                {
+                    stats.malformed_responses += 1;
+                    break;
+                }
+            } else if responses.len() != 1
+                || responses[0].len() != QRUN_V06_PEER_ADMISSION_RESPONSE_BYTES
+                || !responses[0].as_slice().try_into().ok().is_some_and(
+                    |response: &[u8; QRUN_V06_PEER_ADMISSION_RESPONSE_BYTES]| {
+                        validate_q6_application_response(response, request_id)
+                    },
+                )
+            {
+                stats.malformed_responses += 1;
+                break;
+            }
+            let mut write_failed = false;
+            for response in &responses {
+                if response.len() > MAX_QFP6_NOISE_RECORD_BYTES {
+                    write_failed = true;
+                    break;
+                }
+                if is_history {
+                    let next = session_history_egress.checked_add(response.len());
+                    if next.is_none_or(|bytes| bytes > MAX_HISTORY_SESSION_EGRESS_BYTES) {
+                        write_failed = true;
+                        break;
+                    }
+                    session_history_egress = next.expect("history egress checked before write");
+                }
+                if noise.write_record(&mut stream, response).is_err() {
+                    write_failed = true;
+                    break;
+                }
+                stats.responses_written += 1;
+            }
+            if write_failed {
+                stats.handler_failures += 1;
+                break;
+            }
+        }
+        stats.sessions_closed += 1;
+    };
+    Ok(QRunV06PeerListenerReport { stats, stop_reason })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1094,7 +1284,7 @@ mod tests {
     #[test]
     fn qfp6_history_listener_transfers_q6hc_chunks_over_pinned_noise_session() {
         use crate::qrun_v06_history_sync_wire_candidate::{
-            encode_q6hp_page_chunks, QRunV06HistorySyncRequest,
+            decode_q6hs_request, encode_q6hp_page_chunks, QRunV06HistorySyncRequest,
         };
         use crate::qrun_v06_noise_transport_candidate::QRunV06NoiseSession;
         use crate::qrun_v06_pow_fork_choice_candidate::QRunV06CanonicalHistoryPage;
@@ -1108,8 +1298,8 @@ mod tests {
         let server = thread::spawn(move || {
             let mut config = QRunV06PeerListenerConfig::default();
             config.max_sessions = 1;
-            config.max_requests_per_session = 1;
-            let report = serve_qfp6_noise_history_listener(
+            config.max_requests_per_session = 2;
+            let report = serve_qfp6_noise_listener_with_history(
                 &listener,
                 config,
                 &server_private,
@@ -1117,7 +1307,8 @@ mod tests {
                 &NETWORK,
                 &PROFILE,
                 &server_shutdown,
-                |request| {
+                |_guard, frame| {
+                    let request = decode_q6hs_request(frame).map_err(|error| error.to_string())?;
                     let page = QRunV06CanonicalHistoryPage {
                         start_height: 1,
                         next_height: 1,
@@ -1126,7 +1317,7 @@ mod tests {
                         complete: true,
                         envelopes: Vec::new(),
                     };
-                    encode_q6hp_page_chunks(request, &page).map_err(|error| error.to_string())
+                    encode_q6hp_page_chunks(&request, &page).map_err(|error| error.to_string())
                 },
             )
             .unwrap();
@@ -1154,6 +1345,7 @@ mod tests {
             max_blocks: 1,
             max_bytes: 128,
         };
+        let replay_request = request.clone();
         let page = crate::qrun_v06_history_sync_service_candidate::request_history_page_over_noise(
             &mut noise,
             &mut stream,
@@ -1165,18 +1357,25 @@ mod tests {
         assert!(page.complete);
         assert!(page.envelopes.is_empty());
 
+        noise
+            .write_record(&mut stream, &replay_request.encode().unwrap())
+            .unwrap();
+        assert!(noise.read_record(&mut stream).is_err());
+
         drop(stream);
         shutdown.store(true, std::sync::atomic::Ordering::Release);
         let report = server.join().unwrap();
         assert_eq!(report.stats.authenticated_sessions, 1);
-        assert_eq!(report.stats.requests_received, 1);
+        assert_eq!(report.stats.requests_received, 2);
+        assert_eq!(report.stats.handler_failures, 1);
         assert_eq!(report.stats.responses_written, 1);
     }
 
     #[test]
     fn qfp6_history_listener_sends_multichunk_page_as_separate_noise_records() {
         use crate::qrun_v06_history_sync_wire_candidate::{
-            encode_q6hp_page_chunks, validate_q6hc_response_chunk, QRunV06HistorySyncRequest,
+            decode_q6hs_request, encode_q6hp_page_chunks, validate_q6hc_response_chunk,
+            QRunV06HistorySyncRequest,
         };
         use crate::qrun_v06_noise_transport_candidate::QRunV06NoiseSession;
         use crate::qrun_v06_pow_fork_choice_candidate::QRunV06CanonicalHistoryPage;
@@ -1191,7 +1390,7 @@ mod tests {
             let mut config = QRunV06PeerListenerConfig::default();
             config.max_sessions = 1;
             config.max_requests_per_session = 1;
-            serve_qfp6_noise_history_listener(
+            serve_qfp6_noise_listener_with_history(
                 &listener,
                 config,
                 &server_private,
@@ -1199,7 +1398,8 @@ mod tests {
                 &NETWORK,
                 &PROFILE,
                 &server_shutdown,
-                |request| {
+                |_guard, frame| {
+                    let request = decode_q6hs_request(frame).map_err(|error| error.to_string())?;
                     let page = QRunV06CanonicalHistoryPage {
                         start_height: 1,
                         next_height: 2,
@@ -1208,7 +1408,7 @@ mod tests {
                         complete: true,
                         envelopes: vec![vec![0xA5; 100_000]],
                     };
-                    encode_q6hp_page_chunks(request, &page).map_err(|error| error.to_string())
+                    encode_q6hp_page_chunks(&request, &page).map_err(|error| error.to_string())
                 },
             )
             .unwrap()
