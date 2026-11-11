@@ -8,7 +8,7 @@
 
 use crate::{
     qrun_v06_canonical_execution_candidate::QRunV06BlockOperation,
-    qrun_v06_miner_candidate::{mine_qfp6_block_on_tip, QRunV06MinedBlock},
+    qrun_v06_miner_candidate::{mine_qfp6_block_on_tip, QRunV06MinedBlock, QRunV06MiningError},
     qrun_v06_node_runtime_candidate::QRunV06PeerReplayGuard,
     qrun_v06_permissionless_runtime_candidate::{
         QRunV06PermissionlessNodeRuntime, QRunV06PermissionlessRuntimeError,
@@ -35,6 +35,7 @@ pub enum QRunV06PermissionlessServiceError {
     Ingress(String),
     Journal(String),
     Mining(String),
+    MiningCancelled,
 }
 
 impl std::fmt::Display for QRunV06PermissionlessServiceError {
@@ -82,6 +83,27 @@ impl QRunV06PermissionlessMempool {
     }
     pub fn journal_generation(&self) -> u64 {
         self.journal.generation()
+    }
+
+    /// Revalidate pending native transfers after a peer-admitted canonical block/reorg and
+    /// durably install the resulting journal generation before the next mining round.
+    pub fn reconcile_after_canonical_change<A: TransactionAuthenticator>(
+        &mut self,
+        runtime: &QRunV06PermissionlessNodeRuntime,
+        authenticator: &A,
+        producer: AccountId,
+        candidate_timestamp: u64,
+    ) -> Result<(), QRunV06PermissionlessServiceError> {
+        let graph = runtime.fork_choice_snapshot()?;
+        let _ = self.pool.reconcile_after_canonical_change(
+            graph.canonical_state(),
+            authenticator,
+            producer,
+            candidate_timestamp,
+            &[],
+        );
+        self.journal.persist_pool(&self.pool)?;
+        Ok(())
     }
 
     /// Restore and revalidate pending transactions against the exact durable canonical state.
@@ -142,9 +164,10 @@ impl QRunV06PermissionlessMempool {
         Ok(response.to_vec())
     }
 
-    /// Mine one bounded native-transfer batch on the exact current canonical parent and submit
-    /// the resulting QFP6 envelope to the durable permissionless store. Pending transactions are
-    /// removed only if this exact mined block becomes canonical. The journal is then refreshed.
+    /// Mine one bounded block (with zero or more pending native transfers) on the exact current
+    /// canonical parent and submit its QFP6 envelope to the durable permissionless store. Pending
+    /// transactions are removed only if this exact mined block becomes canonical. The journal is
+    /// then refreshed. Empty blocks still execute the height-derived consensus issuance schedule.
     pub fn mine_one_batch<A: TransactionAuthenticator>(
         &mut self,
         runtime: &mut QRunV06PermissionlessNodeRuntime,
@@ -154,9 +177,8 @@ impl QRunV06PermissionlessMempool {
         max_nonce_attempts: u64,
         cancellation: &AtomicBool,
     ) -> Result<Option<QRunV06PermissionlessMiningCommit>, QRunV06PermissionlessServiceError> {
-        if self.pool.is_empty() {
-            return Ok(None);
-        }
+        // Empty templates are valid PoW blocks too: issuance is height-derived by consensus,
+        // not conditional on a mempool transaction being present.
         let graph = runtime.fork_choice_snapshot()?;
         let parent_tip = graph.canonical_tip().tip_hash;
         let transactions = self.pool.ordered_transactions();
@@ -175,7 +197,10 @@ impl QRunV06PermissionlessMempool {
             max_nonce_attempts,
             cancellation,
         )
-        .map_err(|error| QRunV06PermissionlessServiceError::Mining(error.to_string()))?;
+        .map_err(|error| match error {
+            QRunV06MiningError::Cancelled => QRunV06PermissionlessServiceError::MiningCancelled,
+            other => QRunV06PermissionlessServiceError::Mining(other.to_string()),
+        })?;
         let durable_commit = runtime.submit_envelope(&mined.envelope, authenticator)?;
         let updated_graph = runtime.fork_choice_snapshot()?;
         let became_canonical =
