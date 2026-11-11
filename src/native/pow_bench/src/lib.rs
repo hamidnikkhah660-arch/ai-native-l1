@@ -527,3 +527,6 @@ pub mod qrun_v05_runtime_candidate;
 
 /// Explicit bounded worker/queue daemon candidate for the off-host Anchor Noise transport; not node startup wiring.
 pub mod external_cas_offhost_anchor_noise_daemon_candidate;
+
+/// CP-0590 Genesis-pinned permissionless full-history base admission runtime; no mandatory Q6EA/QAP1 anchor, not yet a public node launcher.
+pub mod qrun_v06_permissionless_runtime_candidate;
