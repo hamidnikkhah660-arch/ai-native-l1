@@ -425,6 +425,164 @@ where
     Ok(QRunV06PeerListenerReport { stats, stop_reason })
 }
 
+/// Run the bounded authenticated Noise listener for Q6HS/Q6HC history synchronization.
+/// Unlike the transaction/block listener, one request may produce multiple ordered response
+/// records. The handler must return only chunks encoded for the exact request it received.
+pub fn serve_qfp6_noise_history_listener<F>(
+    listener: &TcpListener,
+    config: QRunV06PeerListenerConfig,
+    local_static_private_key: &[u8; 32],
+    trusted_remote_static_public_keys: &[[u8; 32]],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    shutdown: &AtomicBool,
+    mut on_q6hs: F,
+) -> Result<QRunV06PeerListenerReport, QRunV06PeerListenerError>
+where
+    F: FnMut(
+        &crate::qrun_v06_history_sync_wire_candidate::QRunV06HistorySyncRequest,
+    ) -> Result<Vec<Vec<u8>>, String>,
+{
+    use crate::qrun_v06_history_sync_wire_candidate::{
+        decode_q6hs_request, validate_q6hc_response_chunk, validate_q6hc_response_sequence,
+        Q6_HISTORY_SYNC_MAX_CHUNKS,
+    };
+    use crate::qrun_v06_noise_transport_candidate::{
+        QRunV06NoiseSession, MAX_QFP6_NOISE_RECORD_BYTES,
+    };
+    use std::collections::HashSet;
+
+    config.validate()?;
+    validate_peer_pins(trusted_remote_static_public_keys)?;
+    if local_static_private_key.iter().all(|byte| *byte == 0)
+        || network_id.iter().all(|byte| *byte == 0)
+        || profile_id.iter().all(|byte| *byte == 0)
+    {
+        return Err(QRunV06PeerListenerError::InvalidConfiguration);
+    }
+    let bind_ip = listener
+        .local_addr()
+        .map_err(|error| QRunV06PeerListenerError::Io(error.to_string()))?
+        .ip();
+    if !is_safe_private_or_overlay_ip(bind_ip) {
+        return Err(QRunV06PeerListenerError::UnsafeBindAddress(bind_ip));
+    }
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| QRunV06PeerListenerError::Io(error.to_string()))?;
+
+    let mut stats = QRunV06PeerListenerStats::default();
+    const MAX_Q6HS_SESSION_EGRESS_BYTES: usize = 64 * 1024 * 1024;
+    let stop_reason = loop {
+        if shutdown.load(Ordering::Acquire) {
+            break QRunV06PeerListenerStopReason::ShutdownRequested;
+        }
+        if stats.rejected_handshakes >= config.max_failed_handshakes {
+            break QRunV06PeerListenerStopReason::FailedHandshakeLimitReached;
+        }
+        if stats.accepted_connections >= config.max_sessions {
+            break QRunV06PeerListenerStopReason::SessionLimitReached;
+        }
+        let (mut stream, _) = match listener.accept() {
+            Ok(connection) => connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(config.accept_poll_interval);
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(QRunV06PeerListenerError::Io(error.to_string())),
+        };
+        stats.accepted_connections += 1;
+        if stream.set_nodelay(true).is_err() {
+            stats.handler_failures += 1;
+            continue;
+        }
+        let mut noise = match QRunV06NoiseSession::accept(
+            &mut stream,
+            local_static_private_key,
+            trusted_remote_static_public_keys,
+            network_id,
+            profile_id,
+        ) {
+            Ok(session) => session,
+            Err(_) => {
+                stats.rejected_handshakes += 1;
+                continue;
+            }
+        };
+        stats.authenticated_sessions += 1;
+        let mut seen_request_ids = HashSet::new();
+        let mut session_egress_bytes = 0usize;
+        for _ in 0..config.max_requests_per_session {
+            if shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            let frame = match noise.read_record(&mut stream) {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+            let request = match decode_q6hs_request(&frame) {
+                Ok(request)
+                    if request.network_id == *network_id
+                        && request.profile_id == *profile_id
+                        && seen_request_ids.insert(request.request_id) =>
+                {
+                    request
+                }
+                _ => {
+                    stats.handler_failures += 1;
+                    break;
+                }
+            };
+            stats.requests_received += 1;
+            let chunks = match on_q6hs(&request) {
+                Ok(chunks)
+                    if !chunks.is_empty()
+                        && chunks.len() <= Q6_HISTORY_SYNC_MAX_CHUNKS
+                        && validate_q6hc_response_sequence(
+                            &chunks,
+                            request.request_id,
+                            &request.snapshot_tip,
+                        )
+                        .is_ok() =>
+                {
+                    chunks
+                }
+                _ => {
+                    stats.handler_failures += 1;
+                    break;
+                }
+            };
+            let mut response_failed = false;
+            for (index, chunk) in chunks.iter().enumerate() {
+                let next_egress = session_egress_bytes.checked_add(chunk.len());
+                if chunk.len() > MAX_QFP6_NOISE_RECORD_BYTES
+                    || next_egress.is_none_or(|bytes| bytes > MAX_Q6HS_SESSION_EGRESS_BYTES)
+                    || validate_q6hc_response_chunk(
+                        chunk,
+                        request.request_id,
+                        &request.snapshot_tip,
+                        index as u32,
+                    )
+                    .is_err()
+                    || noise.write_record(&mut stream, chunk).is_err()
+                {
+                    response_failed = true;
+                    break;
+                }
+                session_egress_bytes = next_egress.expect("egress checked before Noise write");
+                stats.responses_written += 1;
+            }
+            if response_failed {
+                stats.malformed_responses += 1;
+                break;
+            }
+        }
+        stats.sessions_closed += 1;
+    };
+    Ok(QRunV06PeerListenerReport { stats, stop_reason })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -931,5 +1089,173 @@ mod tests {
             QRunV06PeerListenerStopReason::ShutdownRequested
         );
         assert_eq!(report.stats.accepted_connections, 0);
+    }
+
+    #[test]
+    fn qfp6_history_listener_transfers_q6hc_chunks_over_pinned_noise_session() {
+        use crate::qrun_v06_history_sync_wire_candidate::{
+            encode_q6hp_page_chunks, QRunV06HistorySyncRequest,
+        };
+        use crate::qrun_v06_noise_transport_candidate::QRunV06NoiseSession;
+        use crate::qrun_v06_pow_fork_choice_candidate::QRunV06CanonicalHistoryPage;
+
+        let (server_private, server_public) = keypair();
+        let (client_private, client_public) = keypair();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = thread::spawn(move || {
+            let mut config = QRunV06PeerListenerConfig::default();
+            config.max_sessions = 1;
+            config.max_requests_per_session = 1;
+            let report = serve_qfp6_noise_history_listener(
+                &listener,
+                config,
+                &server_private,
+                &[client_public],
+                &NETWORK,
+                &PROFILE,
+                &server_shutdown,
+                |request| {
+                    let page = QRunV06CanonicalHistoryPage {
+                        start_height: 1,
+                        next_height: 1,
+                        snapshot_height: 0,
+                        snapshot_tip: request.snapshot_tip,
+                        complete: true,
+                        envelopes: Vec::new(),
+                    };
+                    encode_q6hp_page_chunks(request, &page).map_err(|error| error.to_string())
+                },
+            )
+            .unwrap();
+            report
+        });
+
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream.set_nodelay(true).unwrap();
+        let mut noise = QRunV06NoiseSession::connect(
+            &mut stream,
+            &client_private,
+            &server_public,
+            &NETWORK,
+            &PROFILE,
+        )
+        .unwrap();
+        let request = QRunV06HistorySyncRequest {
+            request_id: 9001,
+            network_id: NETWORK,
+            profile_id: PROFILE,
+            snapshot_tip: [0x77; 32],
+            expected_parent_consensus_hash: [0x77; 32],
+            expected_parent_execution_hash: [0x56; 32],
+            start_height: 1,
+            max_blocks: 1,
+            max_bytes: 128,
+        };
+        let page = crate::qrun_v06_history_sync_service_candidate::request_history_page_over_noise(
+            &mut noise,
+            &mut stream,
+            request,
+            crate::consensus::ConsensusParameters::candidate_testnet().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(page.snapshot_height, 0);
+        assert!(page.complete);
+        assert!(page.envelopes.is_empty());
+
+        drop(stream);
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        let report = server.join().unwrap();
+        assert_eq!(report.stats.authenticated_sessions, 1);
+        assert_eq!(report.stats.requests_received, 1);
+        assert_eq!(report.stats.responses_written, 1);
+    }
+
+    #[test]
+    fn qfp6_history_listener_sends_multichunk_page_as_separate_noise_records() {
+        use crate::qrun_v06_history_sync_wire_candidate::{
+            encode_q6hp_page_chunks, validate_q6hc_response_chunk, QRunV06HistorySyncRequest,
+        };
+        use crate::qrun_v06_noise_transport_candidate::QRunV06NoiseSession;
+        use crate::qrun_v06_pow_fork_choice_candidate::QRunV06CanonicalHistoryPage;
+
+        let (server_private, server_public) = keypair();
+        let (client_private, client_public) = keypair();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = thread::spawn(move || {
+            let mut config = QRunV06PeerListenerConfig::default();
+            config.max_sessions = 1;
+            config.max_requests_per_session = 1;
+            serve_qfp6_noise_history_listener(
+                &listener,
+                config,
+                &server_private,
+                &[client_public],
+                &NETWORK,
+                &PROFILE,
+                &server_shutdown,
+                |request| {
+                    let page = QRunV06CanonicalHistoryPage {
+                        start_height: 1,
+                        next_height: 2,
+                        snapshot_height: 1,
+                        snapshot_tip: request.snapshot_tip,
+                        complete: true,
+                        envelopes: vec![vec![0xA5; 100_000]],
+                    };
+                    encode_q6hp_page_chunks(request, &page).map_err(|error| error.to_string())
+                },
+            )
+            .unwrap()
+        });
+
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream.set_nodelay(true).unwrap();
+        let mut noise = QRunV06NoiseSession::connect(
+            &mut stream,
+            &client_private,
+            &server_public,
+            &NETWORK,
+            &PROFILE,
+        )
+        .unwrap();
+        let request = QRunV06HistorySyncRequest {
+            request_id: 9002,
+            network_id: NETWORK,
+            profile_id: PROFILE,
+            snapshot_tip: [0x78; 32],
+            expected_parent_consensus_hash: [0x55; 32],
+            expected_parent_execution_hash: [0x56; 32],
+            start_height: 1,
+            max_blocks: 1,
+            max_bytes: 128 * 1024,
+        };
+        noise
+            .write_record(&mut stream, &request.encode().unwrap())
+            .unwrap();
+        let mut lengths = Vec::new();
+        for index in 0..3u32 {
+            let frame = noise.read_record(&mut stream).unwrap();
+            validate_q6hc_response_chunk(&frame, request.request_id, &request.snapshot_tip, index)
+                .unwrap();
+            lengths.push(frame.len());
+        }
+        assert_eq!(
+            lengths[0],
+            crate::qrun_v06_history_sync_wire_candidate::Q6HC_CHUNK_HEADER_BYTES + 48 * 1024
+        );
+        assert_eq!(lengths[1], lengths[0]);
+        assert!(lengths[2] < lengths[0]);
+
+        drop(stream);
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        let report = server.join().unwrap();
+        assert_eq!(report.stats.requests_received, 1);
+        assert_eq!(report.stats.responses_written, 3);
     }
 }

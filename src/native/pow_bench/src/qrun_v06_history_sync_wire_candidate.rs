@@ -336,6 +336,56 @@ struct ParsedChunk<'a> {
     payload: &'a [u8],
 }
 
+/// Validate one response chunk before a server writes it to an authenticated Noise peer.
+pub fn validate_q6hc_response_chunk(
+    frame: &[u8],
+    request_id: u64,
+    snapshot_tip: &[u8; 32],
+    expected_index: u32,
+) -> Result<(), Q6HistorySyncWireError> {
+    let parsed = parse_chunk(frame)?;
+    if parsed.request_id != request_id || &parsed.snapshot_tip != snapshot_tip {
+        return Err(Q6HistorySyncWireError::WrongRequest);
+    }
+    if parsed.chunk_index != expected_index {
+        return Err(Q6HistorySyncWireError::ChunkOrder);
+    }
+    Ok(())
+}
+
+/// Validate an entire response sequence before any chunk is written to the peer.
+/// This prevents a local handler from emitting a truncated or mixed-metadata page.
+pub fn validate_q6hc_response_sequence(
+    chunks: &[Vec<u8>],
+    request_id: u64,
+    snapshot_tip: &[u8; 32],
+) -> Result<(), Q6HistorySyncWireError> {
+    if chunks.is_empty() || chunks.len() > Q6_HISTORY_SYNC_MAX_CHUNKS {
+        return Err(Q6HistorySyncWireError::Oversized);
+    }
+    let first = parse_chunk(&chunks[0])?;
+    if first.request_id != request_id
+        || &first.snapshot_tip != snapshot_tip
+        || first.chunk_index != 0
+        || first.chunk_count as usize != chunks.len()
+    {
+        return Err(Q6HistorySyncWireError::ChunkMetadataMismatch);
+    }
+    for (index, frame) in chunks.iter().enumerate() {
+        let parsed = parse_chunk(frame)?;
+        if parsed.request_id != request_id
+            || &parsed.snapshot_tip != snapshot_tip
+            || parsed.chunk_index as usize != index
+            || parsed.chunk_count != first.chunk_count
+            || parsed.total_len != first.total_len
+            || parsed.payload_digest != first.payload_digest
+        {
+            return Err(Q6HistorySyncWireError::ChunkMetadataMismatch);
+        }
+    }
+    Ok(())
+}
+
 fn parse_chunk(frame: &[u8]) -> Result<ParsedChunk<'_>, Q6HistorySyncWireError> {
     if frame.len() < Q6HC_CHUNK_HEADER_BYTES || frame[..4] != Q6HC_CHUNK_MAGIC {
         return Err(Q6HistorySyncWireError::MalformedChunk);
@@ -644,6 +694,37 @@ mod tests {
             parse_chunk(&frame),
             Err(Q6HistorySyncWireError::MalformedChunk)
         ));
+    }
+
+    #[test]
+    fn q6hc_response_sequence_rejects_truncation_and_mixed_metadata_before_send() {
+        let request = request();
+        let page = QRunV06CanonicalHistoryPage {
+            start_height: 8,
+            next_height: 9,
+            snapshot_height: 8,
+            snapshot_tip: request.snapshot_tip,
+            complete: true,
+            envelopes: vec![vec![0x99; 100_000]],
+        };
+        let chunks = encode_q6hp_page_chunks(&request, &page).unwrap();
+        assert_eq!(chunks.len(), 3);
+        validate_q6hc_response_sequence(&chunks, request.request_id, &request.snapshot_tip)
+            .unwrap();
+
+        let mut truncated = chunks.clone();
+        truncated.pop();
+        assert_eq!(
+            validate_q6hc_response_sequence(&truncated, request.request_id, &request.snapshot_tip),
+            Err(Q6HistorySyncWireError::ChunkMetadataMismatch)
+        );
+
+        let mut mixed = chunks;
+        mixed[1][64] ^= 1;
+        assert_eq!(
+            validate_q6hc_response_sequence(&mixed, request.request_id, &request.snapshot_tip),
+            Err(Q6HistorySyncWireError::ChunkMetadataMismatch)
+        );
     }
 
     #[test]
