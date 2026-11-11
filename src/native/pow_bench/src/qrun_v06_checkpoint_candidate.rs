@@ -16,10 +16,10 @@ use sha2::{Digest, Sha256};
 use std::io::{Cursor, Read};
 
 const CHECKPOINT_MAGIC: [u8; 4] = *b"Q6CP";
-const CHECKPOINT_VERSION: u16 = 2;
-const CHECKPOINT_CHECKSUM_DOMAIN: &[u8] = b"QRUN-V06-CHECKPOINT-CHECKSUM-V2\0";
-const CHECKPOINT_COMMITMENT_DOMAIN: &[u8] = b"QRUN-V06-CHECKPOINT-COMMITMENT-V2\0";
-const CHECKPOINT_CONSENSUS_DOMAIN: &[u8] = b"QRUN-V06-CHECKPOINT-CONSENSUS-V1\0";
+const CHECKPOINT_VERSION: u16 = 3;
+const CHECKPOINT_CHECKSUM_DOMAIN: &[u8] = b"QRUN-V06-CHECKPOINT-CHECKSUM-V3\0";
+const CHECKPOINT_COMMITMENT_DOMAIN: &[u8] = b"QRUN-V06-CHECKPOINT-COMMITMENT-V3\0";
+const CHECKPOINT_CONSENSUS_DOMAIN: &[u8] = b"QRUN-V06-CHECKPOINT-CONSENSUS-V2\0";
 const CHECKSUM_BYTES: usize = 32;
 const FIXED_HEADER_BYTES: usize = 4 + 2 + 32 + 32 + 32 + 32 + 8 + 8 + 32 + 32 + 32 + 4;
 const HISTORY_ENTRY_BYTES: usize = 8 + 32 + 8;
@@ -413,6 +413,19 @@ impl QRunV06CheckpointCandidate {
                 .target_history
                 .last()
                 .ok_or(QRunV06CheckpointError::CheckpointHistoryMismatch)?;
+            let mut mtp_ancestors = Vec::with_capacity(expected_count + 1);
+            mtp_ancestors.push(genesis_timestamp);
+            mtp_ancestors.extend(
+                self.target_history
+                    .iter()
+                    .take(self.target_history.len().saturating_sub(1))
+                    .map(|entry| entry.timestamp),
+            );
+            crate::qrun_v06_time_consensus_candidate::validate_candidate_timestamp(
+                &mtp_ancestors,
+                self.timestamp,
+            )
+            .map_err(|_| QRunV06CheckpointError::CheckpointHistoryMismatch)?;
             if latest.height != self.height || latest.timestamp != self.timestamp {
                 return Err(QRunV06CheckpointError::CheckpointHistoryMismatch);
             }
@@ -495,7 +508,10 @@ fn checkpoint_history_count(
     {
         return Err(QRunV06CheckpointError::CheckpointHistoryMismatch);
     }
-    usize::try_from(height.min(params.difficulty_window_blocks))
+    let retained = params
+        .difficulty_window_blocks
+        .max((crate::qrun_v06_time_consensus_candidate::QFP6_MEDIAN_TIME_PAST_WINDOW + 1) as u64);
+    usize::try_from(height.min(retained))
         .map_err(|_| QRunV06CheckpointError::CheckpointHistoryMismatch)
 }
 
@@ -506,6 +522,11 @@ pub(crate) fn qrun_v06_consensus_fingerprint(
     let mut hash = Sha256::new();
     hash.update(CHECKPOINT_CONSENSUS_DOMAIN);
     hash.update(params.protocol_version.to_be_bytes());
+    hash.update(
+        (crate::qrun_v06_time_consensus_candidate::QFP6_MEDIAN_TIME_PAST_WINDOW as u64)
+            .to_be_bytes(),
+    );
+    hash.update(b"QFP6-MTP-11-V1");
     hash.update(params.target_block_time_secs.to_be_bytes());
     hash.update(params.difficulty_window_blocks.to_be_bytes());
     hash.update(params.difficulty_min_ratio_divisor.to_be_bytes());
@@ -658,6 +679,15 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn checkpoint_history_retains_mtp_ancestors_even_when_difficulty_window_is_short() {
+        let params = params();
+        assert_eq!(checkpoint_history_count(0, &params).unwrap(), 0);
+        assert_eq!(checkpoint_history_count(4, &params).unwrap(), 4);
+        assert_eq!(checkpoint_history_count(11, &params).unwrap(), 11);
+        assert_eq!(checkpoint_history_count(12, &params).unwrap(), 12);
+        assert_eq!(checkpoint_history_count(30, &params).unwrap(), 12);
+    }
     #[test]
     fn consensus_fingerprint_binds_every_current_consensus_parameter() {
         let baseline = params();

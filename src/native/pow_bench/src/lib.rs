@@ -176,6 +176,8 @@ pub mod qrun_v06_qap1_journal_candidate;
 pub mod qrun_v06_qap1_mining_loop_candidate;
 /// CP-0542 signed Q6QA external quote-asset qualification; required by QFB6 candidate market execution, not reserve proof.
 pub mod qrun_v06_quote_asset_qualification_candidate;
+/// CP-0590 deterministic QFP6 branch-local MTP policy; no wall-clock dependency.
+pub mod qrun_v06_time_consensus_candidate;
 /// CP-0528 QFP6 eight-bucket monetary state, 1B-Founder Genesis and candidate mining schedule.
 pub mod qrun_v06_tokenomics_candidate;
 /// CP-0584 Q6TI/Q6TA bounded QFP6 native-transfer submission over an authenticated Noise application session.
