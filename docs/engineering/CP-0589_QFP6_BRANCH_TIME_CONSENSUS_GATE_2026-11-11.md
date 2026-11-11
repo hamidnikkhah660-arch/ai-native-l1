@@ -56,3 +56,8 @@ The MTP candidate's tests and shared vectors are useful prior work; duplicating 
 ## Explicit non-claims
 
 This CP implements and locally qualifies candidate MTP checks in QFP6 branch-aware fork choice and checkpoint validation. It does not start a node, enable `--run`, create Genesis, establish public peers, issue QZXB, authorize Mainnet, or create QZXB/USDT liquidity. Strict parent-time monotonicity remains additionally required. QFP6 remains not production-ready until exact-head CI, full independent runtime/network/economic/security qualification, frozen Mainnet parameters and authorization are completed.
+
+
+## Independent reference oracle
+
+Added simulations/qfp6_mtp_reference.py, a dependency-free Python reference implementation independent of the Rust module. It checks five fixed median/boundary/window vectors, two competing branch histories (same candidate passes one branch and fails the other), and fail-closed empty ancestry. The Rust CI workflow invokes this oracle before compiling and testing targets. Local result: QFP6_MTP_REFERENCE_VECTORS=PASS.

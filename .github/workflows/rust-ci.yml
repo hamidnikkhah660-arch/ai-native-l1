@@ -42,6 +42,9 @@ jobs:
       - name: Verify independent QFP6 SHA-256d header and PoW vectors
         run: python3 ../../../simulations/qfp6_sha256d_reference.py
 
+      - name: Verify independent QFP6 branch-local MTP vectors
+        run: python3 ../../../simulations/qfp6_mtp_reference.py
+
       - name: Check formatting
         run: cargo +stable fmt --all -- --check
 
