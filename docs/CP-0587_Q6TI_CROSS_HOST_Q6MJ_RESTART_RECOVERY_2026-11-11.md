@@ -3,69 +3,53 @@ Date: 2026-11-11
 
 ## Objective
 
-Extend the existing QFP6/QAP1 NetBird qualification so it tests the CP-0586 durable Q6TI pending-transaction journal across two independent processes on separate hosts. The test must not equate Q6TA Accepted with mining, confirmation, QAP1 finality, or a production transaction.
+Qualify the CP-0586 durable Q6TI pending-transaction journal across two independent processes on separate hosts. Q6TA Accepted is pending/journaled only; it does not mean mined, confirmed, finalized, or tradeable.
 
 ## Exact scope
 
 - Base revision: CP-0586, `83185d4a243be83503321228d75f9c797f796e0e`.
-- Node A runs the existing local QFP6 Provider and Q6EA test services and acts as the pinned Noise peer.
+- Node A runs the QFP6 Provider and Q6EA test services and acts as the pinned Noise peer.
 - Node B is an ephemeral Windows GitHub Actions runner enrolled into the private NetBird overlay.
-- Node A sends one Q6PB block admission and a replay, then sends a signed Q6HA native-transfer transaction over the same pinned Noise session using Q6TI/Q6TA.
-- Node B uses the actual Q6TI application dispatcher, hybrid transaction authenticator and Q6MJ journal. It must persist the accepted pending transaction before returning Q6TA Accepted.
-- A second independent Node B process reopens the same local QFP6 store and Q6MJ journal, first recovers the canonical QAP1 state, then restores/revalidates the pending transfer against that recovered state.
-- The second process must report the exact same TXID and one pending transaction. The journal generation must advance exactly once during startup reconciliation.
-- The QAP1 canonical height, state root, manifest anchor and generation must remain identical before and after process restart.
+- Node A sends a Q6PB block admission and replay, then sends a signed Q6HA native-transfer transaction over the same pinned Noise session using Q6TI/Q6TA.
+- Node B uses the Q6TI application dispatcher, hybrid transaction authenticator and Q6MJ journal. It persists the accepted pending transaction before returning Q6TA Accepted.
+- A second independent Node B process reopens the QFP6 store and Q6MJ journal, recovers canonical QAP1 state, then restores/revalidates the pending transfer.
+- The second process reports the exact same TXID and one pending transaction. Journal generation advances exactly once.
+- QAP1 canonical height, state root, manifest anchor and generation remain identical across restart.
 
-## Expected evidence markers
+## Cross-host qualification: PASS
 
-Node A:
-- `QFP6_QAP1_NODE_A_Q6TI_ACCEPTED=PASS`
-- `QFP6_QAP1_NODE_A_Q6TI_DUPLICATE=PASS`
-- `QFP6_QAP1_NODE_A_Q6TI_TXID=<64 hex>`
+GitHub Actions run [43017541194](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/43017541194) completed successfully on 2026-11-11.
 
-Node B before restart:
-- `QFP6_Q6MJ=PASS`
-- `QFP6_Q6MJ_PENDING_COUNT=1`
-- `QFP6_Q6MJ_GENERATION=4`
-- `QFP6_Q6MJ_TXID=<same 64 hex>`
+- Workflow job `qfp6-qap1-cross-host`: completed / success.
+- All 7 job steps succeeded, including private one-shot configuration validation, NetBird installation, ephemeral peer enrollment, remote admission/recovery, and peer disconnection.
+- Node B overlay endpoint was `100.113.234.124:48664`; Node A callback was ready.
+- Q6TI admission and duplicate handling passed.
+- Q6MJ pending count remained 1.
+- TXID before and after process restart matched exactly: `ae89ddd387768836056cba007104ed62d1f91bb9b634ff1c10160e72210b077d`.
+- Q6MJ generation advanced from 4 to 5.
+- Markers included `QFP6_QAP1_REMOTE_NODE_ADMISSION_AND_RESTART=PASS`, `QFP6_Q6MJ_CROSS_PROCESS_RECOVERY=PASS`, `QFP6_QAP1_NODE_A_Q6MJ_TXID_MATCH=PASS`, and `QFP6_QAP1_NODE_A_RESTART_CALLBACK_SENT=PASS`.
+- The ephemeral Node B peer was disconnected successfully after qualification.
 
-Node B after restart:
-- `QFP6_Q6MJ_RESTART=PASS`
-- `QFP6_Q6MJ_RESTART_PENDING_COUNT=1`
-- `QFP6_Q6MJ_RESTART_TXID=<same 64 hex>`
-- Journal generation advances from 4 to 5 after revalidation/persistence.
+The workflow ran on code commit `7578bae719700860ecccb8539a7f79c3d023bbed`. The PR head was subsequently advanced to `dd59e768ef6d50c2c7bec033a9315a3456ab93d5` by a documentation-only commit; no protocol or workflow code changed after the qualified code commit. This distinction is recorded rather than claiming the workflow ran on the later documentation commit.
 
-## Local verification completed
+## Local verification
 
-- cargo fmt --all -- --check ? passed.
-- cargo check --all-targets --locked --offline ? passed.
-- cargo test --lib --locked --offline q6ti_ -- --nocapture --test-threads=1 ? 6 passed.
-- cargo test --lib --locked --offline qrun_v06_node_runtime_candidate::tests::qap1_peer_ingress_qualifies_separate_qfp6_process -- --exact --nocapture --test-threads=1 ? 1 passed. This exercises Q6PB admission/replay, signed Q6TI Accepted/Duplicate, durable Q6MJ generation 4, and second-process QAP1 recovery plus exact TXID restoration at generation 5.
-- PowerShell parser validation for tools/qrun-v06-qfp6-qap1-runner.ps1 ? passed.
-- The local process test stores Q6MJ in a sibling directory to keep the strict QFP6 Store root free of unrecognized entries.
-- Node A's cross-host callback now includes Node B's recovered Q6MJ generation and TXID; Node A must compare that TXID to the one it submitted before reporting remote restart success.
-
-These are same-host multi-process/local CI checks only. The separate-host NetBird qualification has **not** yet been run on this CP-0587 head.
+- `cargo fmt --all -- --check`: passed.
+- `cargo check --all-targets --locked --offline`: passed.
+- Q6TI/Noise/Supervisor targeted tests: 6 passed.
+- Q6MJ/QAP1 journal tests and separate-process recovery checks passed as recorded in the PR's local verification.
+- PowerShell runner parser, YAML workflow parse, and `git diff --check`: passed.
 
 ## Security and interpretation
 
-- Test-only deterministic Q6HA seeds and candidate testnet Genesis are used only as isolated qualification fixtures. They are not wallet credentials and do not create QZXB mainnet value.
-- The Node B listener is reached over the private NetBird overlay and a pinned Noise XX identity. Noise currently uses classical X25519; this is not post-quantum transport.
-- Provider/Q6EA pins and ML-DSA-65 receipt keys are ephemeral test-service material for this run, not externally governed production trust.
-- Q6TA Accepted means the signed transaction is pending and journaled only. It is not mined, confirmed, finalized, or tradeable.
+- Deterministic Q6HA seeds and candidate-testnet Genesis are test-only fixtures, not wallet credentials and do not create QZXB mainnet value.
+- Node B was reached through the private NetBird overlay and pinned Noise XX identity. Noise uses classical X25519; transport is not post-quantum.
+- Provider/Q6EA pins and ML-DSA-65 receipt keys are ephemeral test-service material, not externally governed production trust.
+- Q6TA Accepted means pending and journaled only. It is not mined, confirmed, finalized, or tradeable.
 - The Q6MJ checksum is local integrity evidence, not an external anti-rollback anchor.
-- This qualification does not enable `qrun_v06_node --run`, public Devnet/Mainnet, public issuance, production mining/payouts, RPC/explorer publication, or QZXB/USDT settlement.
+- This qualification does not enable production node startup, public Devnet/Mainnet, public issuance, production mining/payouts, public RPC/explorer, or QZXB/USDT settlement.
+- The NetBird policy set observed during qualification included a broad All-to-All allow policy; this was not modified. Treat the overlay ACL as requiring least-privilege hardening before any long-lived/public deployment.
 
 ## Release gate
 
-This branch remains a Draft engineering candidate until exact-head CI and the updated two-host NetBird run pass with the Q6TI/Q6MJ markers above. Missing Actions secrets, unavailable second-host connectivity, or any marker mismatch must fail closed. Do not merge or describe the result as Mainnet readiness.
-
-
-## Latest cross-host gate check ? 2026-11-11
-
-- Exact-head workflow dispatch: run 43009457111, SHA 7578bae719700860ecccb8539a7f79c3d023bbed.
-- Result: stopped during private-secret validation. Both QRUN_CP0566C_NETBIRD_SETUP_KEY and QRUN_QFP6_QAP1_RUNNER_CONFIG_JSON were absent; NetBird installation/enrollment and Q6TI/Q6MJ remote steps were skipped.
-- Laptop NetBird client 0.82.0 reports Management/Signal connected, but peer count is 0/0.
-- Existing Windows Firewall rule QZXB-NetBird-CP0586-NodeA allows TCP 49661-49663 from all of 100.64.0.0/10 for any program. This is broader than the desired two-peer trust boundary; inspect and confirm the NetBird group/tag ACL before dispatch. Do not treat overlay membership alone as sufficient authorization.
-- The legacy controller at D:\Temp\ASUS\qrun-v06-qfp6-qap1-node-a-controller-hotfix8.ps1 is stale: it targets branch feat/qzxb-usdt-trading-gate-20261104 and a different checkout. It must not be run for CP-0587 without adaptation.
-- No independent-host Q6TI/Q6MJ qualification has passed on CP-0587.
+CP-0587 cross-host Q6TI/Q6MJ qualification is passed. Keep this PR as an engineering candidate until the latest-head CI/review state is checked and the next production-readiness gates are separately qualified. Do not merge or describe this result as Mainnet readiness.
