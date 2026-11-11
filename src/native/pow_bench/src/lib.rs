@@ -530,3 +530,5 @@ pub mod external_cas_offhost_anchor_noise_daemon_candidate;
 
 /// CP-0590 Genesis-pinned permissionless full-history base admission runtime; no mandatory Q6EA/QAP1 anchor, not yet a public node launcher.
 pub mod qrun_v06_permissionless_runtime_candidate;
+/// CP-0592 permissionless Q6TI journal, native mempool and bounded PoW-to-durable-commit service adapter.
+pub mod qrun_v06_permissionless_service_candidate;
