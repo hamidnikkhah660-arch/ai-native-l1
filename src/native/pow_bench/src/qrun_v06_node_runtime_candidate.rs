@@ -1279,6 +1279,12 @@ mod tests {
 
     fn q6ti_test_transaction() -> Transaction {
         let signer = q6ti_test_signer();
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .checked_add(3_600)
+            .unwrap();
         let mut transaction = Transaction {
             network_id: NETWORK,
             sender: signer.account_id(),
@@ -1286,7 +1292,7 @@ mod tests {
             nonce: 1,
             amount: 10_000,
             fee: 10,
-            expires_at: 10_000,
+            expires_at,
             signature: Vec::new(),
         };
         signer.sign_transaction(&mut transaction).unwrap();
@@ -4677,7 +4683,7 @@ mod tests {
             assert!(!runtime.store.has_qap1_intent().unwrap());
 
             let mut transaction_journal = QRunV06TransactionJournal::open(
-                node_directory.join("q6ti-pending-journal"),
+                node_directory.with_extension("q6ti-pending-journal"),
                 QRunV06MempoolLimits::default(),
             )
             .unwrap();
@@ -4730,7 +4736,7 @@ mod tests {
         }
 
         let mut transaction_journal = QRunV06TransactionJournal::open(
-            node_directory.join("q6ti-pending-journal"),
+            node_directory.with_extension("q6ti-pending-journal"),
             QRunV06MempoolLimits::default(),
         )
         .unwrap();
@@ -5488,7 +5494,7 @@ mod tests {
         use crate::external_cas_offhost_anchor_candidate::ExternalCasOffhostAnchorState;
         use crate::external_cas_offhost_anchor_protocol_candidate::ExternalCasOffhostAnchorPin;
 
-        let (dir, store) = open_store();
+        let (dir, store) = open_store_with_genesis(q6ti_test_genesis_state());
         let initial = QRunV06ExternalAnchorState::from_store(&store, GENESIS_DIGEST).unwrap();
         let service_root = dir.0.with_extension("cp0566b-process-services");
         fs::create_dir_all(&service_root).unwrap();
@@ -5660,6 +5666,29 @@ mod tests {
         let accepted = noise.read_q6pa_response(&mut stream, 0x566B).unwrap();
         noise.write_q6pb_request(&mut stream, &frame).unwrap();
         let replayed = noise.read_q6pa_response(&mut stream, 0x566B).unwrap();
+
+        let transaction = q6ti_test_transaction();
+        let transaction_id = transaction_id_with_signature_limit(
+            &transaction,
+            QRUN_V06_MAX_NATIVE_TX_SIGNATURE_BYTES,
+        )
+        .unwrap();
+        let q6ti_frame = encode_q6ti_transaction_request(0x566D, &transaction).unwrap();
+        noise.write_record(&mut stream, &q6ti_frame).unwrap();
+        let q6ta_bytes = noise.read_record(&mut stream).unwrap();
+        let q6ta = decode_q6ta_response(&q6ta_bytes, 0x566D).unwrap();
+        assert_eq!(q6ta.status, QRunV06TransactionSubmitStatus::Accepted);
+        assert_eq!(q6ta.transaction_id, transaction_id);
+        assert_eq!(q6ta.mempool_count, 1);
+        assert_eq!(q6ta.canonical_height, 1);
+
+        let duplicate_frame = encode_q6ti_transaction_request(0x566E, &transaction).unwrap();
+        noise.write_record(&mut stream, &duplicate_frame).unwrap();
+        let duplicate_bytes = noise.read_record(&mut stream).unwrap();
+        let duplicate = decode_q6ta_response(&duplicate_bytes, 0x566E).unwrap();
+        assert_eq!(duplicate.status, QRunV06TransactionSubmitStatus::Duplicate);
+        assert_eq!(duplicate.transaction_id, transaction_id);
+        assert_eq!(duplicate.mempool_count, 1);
         drop(noise);
         drop(stream);
 
@@ -5695,10 +5724,19 @@ mod tests {
         let state_root = parse_hex32(&output_value("QFP6_QAP1_STATE_ROOT="));
         let expected_height = output_value("QFP6_QAP1_HEIGHT=");
         let expected_generation = output_value("QFP6_QAP1_GENERATION=");
+        let expected_journal_generation = output_value("QFP6_Q6MJ_GENERATION=");
+        assert_eq!(expected_journal_generation, "4");
+        assert_eq!(output_value("QFP6_Q6MJ_PENDING_COUNT="), "1");
+        let persisted_transaction_id = parse_hex32(&output_value("QFP6_Q6MJ_TXID="));
+        assert_eq!(persisted_transaction_id, transaction_id);
 
         // Reopen the child's durable archive only with the anchor returned by the child,
         // then independently check that exact local state against Provider and Q6EA.
-        let reopened_store = open_store_at(&node_directory, Some(manifest_anchor));
+        let reopened_store = open_store_at_with_genesis(
+            &node_directory,
+            Some(manifest_anchor),
+            q6ti_test_genesis_state(),
+        );
         let externally_checked_state =
             QRunV06ExternalAnchorState::from_store(&reopened_store, GENESIS_DIGEST).unwrap();
         assert_eq!(reopened_store.manifest_anchor().unwrap(), manifest_anchor);
@@ -5743,6 +5781,14 @@ mod tests {
             .env("QRUN_QFP6_QAP1_EXPECTED_HEIGHT", &expected_height)
             .env("QRUN_QFP6_QAP1_EXPECTED_GENERATION", &expected_generation)
             .env("QRUN_QFP6_QAP1_EXPECTED_STATE_ROOT", hex32(&state_root))
+            .env(
+                "QRUN_QFP6_QAP1_EXPECTED_JOURNAL_GENERATION",
+                &expected_journal_generation,
+            )
+            .env(
+                "QRUN_QFP6_QAP1_EXPECTED_TRANSACTION_ID",
+                hex32(&persisted_transaction_id),
+            )
             .env("QRUN_QFP6_QAP1_LISTEN_ADDR", peer_address.to_string())
             .env("QRUN_QFP6_QAP1_LISTENER_PRIVATE", hex32(&listener_private))
             .env("QRUN_QFP6_QAP1_PEER_PUBLIC", hex32(&peer_public))
@@ -5793,11 +5839,20 @@ mod tests {
             String::from_utf8_lossy(&restart_output.stdout),
             String::from_utf8_lossy(&restart_output.stderr)
         );
+        let restart_stdout = String::from_utf8_lossy(&restart_output.stdout);
         assert!(
-            String::from_utf8_lossy(&restart_output.stdout)
-                .contains("QFP6_QAP1_RESTART_SERVER=PASS"),
+            restart_stdout.contains("QFP6_QAP1_RESTART_SERVER=PASS"),
             "second QFP6 process did not report exact QAP1 recovery"
         );
+        assert!(restart_stdout.contains("QFP6_Q6MJ_RESTART=PASS"));
+        assert!(restart_stdout.contains("QFP6_Q6MJ_RESTART_PENDING_COUNT=1"));
+        let recovered_transaction_id = restart_stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("QFP6_Q6MJ_RESTART_TXID="))
+            .map(parse_hex32)
+            .expect("second QFP6 process must report the recovered Q6MJ TXID");
+        assert_eq!(recovered_transaction_id, persisted_transaction_id);
+        assert!(restart_stdout.contains("QFP6_Q6MJ_RESTART_GENERATION=5"));
 
         anchor_server.shutdown_and_join();
         provider_server.shutdown_and_join();
