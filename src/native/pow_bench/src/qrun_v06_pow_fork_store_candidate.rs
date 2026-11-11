@@ -6749,4 +6749,90 @@ mod tests {
             checkpoint_prepared_bytes
         );
     }
+
+    #[test]
+    fn permissionless_history_batch_import_is_bounded_contiguous_and_durable() {
+        let genesis = genesis_state();
+        let consensus = params();
+        let descriptor = *genesis.genesis_descriptor().unwrap();
+        let profile_bundle = QRunV06ProfilePinCandidate::new(
+            descriptor,
+            ExternalCasPin {
+                provider_id: [0x91; 32],
+                network_id: NETWORK,
+                genesis_digest: [0x92; 32],
+                receipt_key_id: [0x93; 32],
+                receipt_public_key: [0x94; ML_DSA_65_PUBLIC_KEY_BYTES],
+            },
+        )
+        .unwrap();
+        let profile_bytes = profile_bundle.encode().unwrap();
+        let profile_commitment = profile_bundle.commitment().unwrap();
+        let verified_pin =
+            crate::qrun_v06_profile_pin_candidate::QRunV06VerifiedProfilePin::decode(
+                &profile_bytes,
+                profile_commitment,
+            )
+            .unwrap();
+
+        let source_dir = TestDir::new();
+        let mut source = QRunV06DurableForkStore::open(
+            &source_dir.0,
+            genesis.clone(),
+            consensus.clone(),
+            &EmptyAuthenticator,
+            None,
+        )
+        .unwrap();
+        let mut envelopes = Vec::new();
+        for height in 1..=2u64 {
+            let graph = source.graph().unwrap();
+            let parent_state = graph.canonical_state().clone();
+            let parent_tip = graph.canonical_tip();
+            let target = graph.expected_next_target(&parent_tip.tip_hash).unwrap();
+            let (envelope, expected_tip) = candidate(
+                &parent_state,
+                parent_tip.tip_hash,
+                60 * height,
+                target,
+                &consensus,
+            );
+            source.submit(&envelope, &EmptyAuthenticator).unwrap();
+            assert_eq!(source.canonical_tip().unwrap(), expected_tip);
+            envelopes.push(envelope);
+        }
+
+        let receiver_dir = TestDir::new();
+        let mut receiver = crate::qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessNodeRuntime::open(
+            &receiver_dir.0,
+            genesis,
+            consensus,
+            &EmptyAuthenticator,
+            None,
+            &verified_pin,
+        )
+        .unwrap();
+
+        assert_eq!(
+            receiver.import_history_batch(&[], &EmptyAuthenticator),
+            Err(crate::qrun_v06_permissionless_runtime_candidate::QRunV06HistorySyncError::EmptyBatch)
+        );
+        assert_eq!(
+            receiver.import_history_batch(&[envelopes[1].clone(), envelopes[0].clone()], &EmptyAuthenticator),
+            Err(crate::qrun_v06_permissionless_runtime_candidate::QRunV06HistorySyncError::NonContiguous)
+        );
+        assert_eq!(receiver.status().unwrap().height, 0);
+
+        let report = receiver
+            .import_history_batch(&envelopes, &EmptyAuthenticator)
+            .unwrap();
+        assert_eq!(report.imported_blocks, 2);
+        assert_eq!(report.resulting_height, 2);
+        assert_eq!(report.resulting_tip, source.canonical_tip().unwrap());
+        assert_eq!(
+            report.resulting_state_root,
+            source.canonical_state_root().unwrap()
+        );
+        assert_eq!(receiver.status().unwrap().tip, report.resulting_tip);
+    }
 }
