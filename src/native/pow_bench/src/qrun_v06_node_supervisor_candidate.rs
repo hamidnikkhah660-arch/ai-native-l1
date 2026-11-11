@@ -21,7 +21,10 @@ use crate::{
     },
     qrun_v06_external_anchor_candidate::{QRunV06ExternalAnchorPin, QRunV06ExternalAnchorState},
     qrun_v06_history_sync_service_candidate::QRunV06HistorySyncResponder,
-    qrun_v06_history_sync_wire_candidate::{decode_q6hs_request, Q6HS_REQUEST_MAGIC},
+    qrun_v06_history_sync_wire_candidate::{
+        decode_q6hi_request, decode_q6hs_request, encode_q6hr_status, Q6HI_REQUEST_MAGIC,
+        Q6HS_REQUEST_MAGIC,
+    },
     qrun_v06_miner_candidate::QRUN_V06_MAX_NONCE_ATTEMPTS_PER_JOB,
     qrun_v06_node_runtime_candidate::{
         QRunV06NodeAnchorGate, QRunV06NodeRuntime, QRunV06PeerReplayGuard,
@@ -1172,7 +1175,21 @@ pub fn run_qfp6_permissionless_mining_supervisor<T: TransactionAuthenticator>(
                 round_config.max_sessions = round_config.max_sessions.min(remaining).min(1);
                 let mut on_application_frame =
                     |guard: &mut QRunV06PeerReplayGuard, frame: &[u8]| {
-                        if frame.get(..4) == Some(&Q6HS_REQUEST_MAGIC) {
+                        if frame.get(..4) == Some(&Q6HI_REQUEST_MAGIC) {
+                            let request =
+                                decode_q6hi_request(frame).map_err(|error| error.to_string())?;
+                            let snapshot = history_responder
+                                .pin_current_snapshot(runtime)
+                                .map_err(|error| error.to_string())?;
+                            let response = encode_q6hr_status(
+                                &request,
+                                snapshot.height,
+                                snapshot.consensus_tip,
+                                snapshot.execution_tip,
+                            )
+                            .map_err(|error| error.to_string())?;
+                            Ok(vec![response.to_vec()])
+                        } else if frame.get(..4) == Some(&Q6HS_REQUEST_MAGIC) {
                             let request =
                                 decode_q6hs_request(frame).map_err(|error| error.to_string())?;
                             history_responder

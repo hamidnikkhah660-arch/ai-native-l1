@@ -601,7 +601,8 @@ where
     F: FnMut(&mut QRunV06PeerReplayGuard, &[u8]) -> Result<Vec<Vec<u8>>, String>,
 {
     use crate::qrun_v06_history_sync_wire_candidate::{
-        decode_q6hs_request, validate_q6hc_response_sequence, Q6HS_REQUEST_MAGIC,
+        decode_q6hi_request, decode_q6hr_status, decode_q6hs_request,
+        validate_q6hc_response_sequence, Q6HI_REQUEST_MAGIC, Q6HS_REQUEST_MAGIC,
     };
     use crate::qrun_v06_noise_transport_candidate::MAX_QFP6_NOISE_RECORD_BYTES;
     use crate::qrun_v06_transaction_ingress_candidate::{
@@ -628,7 +629,7 @@ where
         .map_err(|error| QRunV06PeerListenerError::Io(error.to_string()))?;
 
     let mut stats = QRunV06PeerListenerStats::default();
-    const MAX_HISTORY_SESSION_EGRESS_BYTES: usize = 64 * 1024 * 1024;
+    const MAX_HISTORY_SESSION_EGRESS_BYTES: usize = 256 * 1024 * 1024;
     let stop_reason = loop {
         if shutdown.load(Ordering::Acquire) {
             break QRunV06PeerListenerStopReason::ShutdownRequested;
@@ -677,13 +678,26 @@ where
                 Ok(frame) => frame,
                 Err(_) => break,
             };
-            let (request_id, is_history) = if frame.get(..4) == Some(&Q6HS_REQUEST_MAGIC) {
+            let (request_id, is_history, is_info) = if frame.get(..4) == Some(&Q6HI_REQUEST_MAGIC) {
+                match decode_q6hi_request(&frame) {
+                    Ok(request)
+                        if request.network_id == *network_id
+                            && request.profile_id == *profile_id =>
+                    {
+                        (request.request_id, false, true)
+                    }
+                    _ => {
+                        stats.handler_failures += 1;
+                        break;
+                    }
+                }
+            } else if frame.get(..4) == Some(&Q6HS_REQUEST_MAGIC) {
                 match decode_q6hs_request(&frame) {
                     Ok(request)
                         if request.network_id == *network_id
                             && request.profile_id == *profile_id =>
                     {
-                        (request.request_id, true)
+                        (request.request_id, true, false)
                     }
                     _ => {
                         stats.handler_failures += 1;
@@ -692,7 +706,7 @@ where
                 }
             } else if frame.get(..4) == Some(&Q6TI_MAGIC) {
                 match decode_q6ti_transaction_request(&frame) {
-                    Ok(request) => (request.request_id, false),
+                    Ok(request) => (request.request_id, false, false),
                     Err(_) => {
                         stats.handler_failures += 1;
                         break;
@@ -700,7 +714,7 @@ where
                 }
             } else {
                 match decode_qrun_v06_peer_block_request(&frame) {
-                    Ok(request) => (request.request_id, false),
+                    Ok(request) => (request.request_id, false, false),
                     Err(_) => {
                         stats.handler_failures += 1;
                         break;
@@ -708,7 +722,7 @@ where
                 }
             };
             stats.requests_received += 1;
-            if is_history && replay_guard.accept(request_id).is_err() {
+            if (is_history || is_info) && replay_guard.accept(request_id).is_err() {
                 stats.handler_failures += 1;
                 break;
             }
@@ -729,6 +743,16 @@ where
                 )
                 .is_err()
                 {
+                    stats.malformed_responses += 1;
+                    break;
+                }
+            } else if is_info {
+                let valid_status = responses.len() == 1
+                    && decode_q6hi_request(&frame)
+                        .ok()
+                        .and_then(|request| decode_q6hr_status(&responses[0], &request).ok())
+                        .is_some();
+                if !valid_status {
                     stats.malformed_responses += 1;
                     break;
                 }
@@ -1284,7 +1308,8 @@ mod tests {
     #[test]
     fn qfp6_history_listener_transfers_q6hc_chunks_over_pinned_noise_session() {
         use crate::qrun_v06_history_sync_wire_candidate::{
-            decode_q6hs_request, encode_q6hp_page_chunks, QRunV06HistorySyncRequest,
+            decode_q6hi_request, decode_q6hs_request, encode_q6hp_page_chunks, encode_q6hr_status,
+            QRunV06HistoryInfoRequest, QRunV06HistorySyncRequest,
         };
         use crate::qrun_v06_noise_transport_candidate::QRunV06NoiseSession;
         use crate::qrun_v06_pow_fork_choice_candidate::QRunV06CanonicalHistoryPage;
@@ -1298,7 +1323,7 @@ mod tests {
         let server = thread::spawn(move || {
             let mut config = QRunV06PeerListenerConfig::default();
             config.max_sessions = 1;
-            config.max_requests_per_session = 2;
+            config.max_requests_per_session = 3;
             let report = serve_qfp6_noise_listener_with_history(
                 &listener,
                 config,
@@ -1308,16 +1333,27 @@ mod tests {
                 &PROFILE,
                 &server_shutdown,
                 |_guard, frame| {
-                    let request = decode_q6hs_request(frame).map_err(|error| error.to_string())?;
-                    let page = QRunV06CanonicalHistoryPage {
-                        start_height: 1,
-                        next_height: 1,
-                        snapshot_height: 0,
-                        snapshot_tip: request.snapshot_tip,
-                        complete: true,
-                        envelopes: Vec::new(),
-                    };
-                    encode_q6hp_page_chunks(&request, &page).map_err(|error| error.to_string())
+                    if frame.get(..4)
+                        == Some(&crate::qrun_v06_history_sync_wire_candidate::Q6HI_REQUEST_MAGIC)
+                    {
+                        let request =
+                            decode_q6hi_request(frame).map_err(|error| error.to_string())?;
+                        let status = encode_q6hr_status(&request, 0, [0x77; 32], [0x56; 32])
+                            .map_err(|error| error.to_string())?;
+                        Ok(vec![status.to_vec()])
+                    } else {
+                        let request =
+                            decode_q6hs_request(frame).map_err(|error| error.to_string())?;
+                        let page = QRunV06CanonicalHistoryPage {
+                            start_height: 1,
+                            next_height: 1,
+                            snapshot_height: 0,
+                            snapshot_tip: request.snapshot_tip,
+                            complete: true,
+                            envelopes: Vec::new(),
+                        };
+                        encode_q6hp_page_chunks(&request, &page).map_err(|error| error.to_string())
+                    }
                 },
             )
             .unwrap();
@@ -1334,6 +1370,24 @@ mod tests {
             &PROFILE,
         )
         .unwrap();
+        let info_request = QRunV06HistoryInfoRequest {
+            request_id: 9000,
+            network_id: NETWORK,
+            profile_id: PROFILE,
+        };
+        noise
+            .write_record(&mut stream, &info_request.encode().unwrap())
+            .unwrap();
+        let info_frame = noise.read_record(&mut stream).unwrap();
+        let info = crate::qrun_v06_history_sync_wire_candidate::decode_q6hr_status(
+            &info_frame,
+            &info_request,
+        )
+        .unwrap();
+        assert_eq!(info.height, 0);
+        assert_eq!(info.consensus_tip, [0x77; 32]);
+        assert_eq!(info.execution_tip, [0x56; 32]);
+
         let request = QRunV06HistorySyncRequest {
             request_id: 9001,
             network_id: NETWORK,
@@ -1366,9 +1420,9 @@ mod tests {
         shutdown.store(true, std::sync::atomic::Ordering::Release);
         let report = server.join().unwrap();
         assert_eq!(report.stats.authenticated_sessions, 1);
-        assert_eq!(report.stats.requests_received, 2);
+        assert_eq!(report.stats.requests_received, 3);
         assert_eq!(report.stats.handler_failures, 1);
-        assert_eq!(report.stats.responses_written, 1);
+        assert_eq!(report.stats.responses_written, 2);
     }
 
     #[test]

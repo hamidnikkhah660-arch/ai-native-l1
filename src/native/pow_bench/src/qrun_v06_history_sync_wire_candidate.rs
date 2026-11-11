@@ -12,6 +12,10 @@ use crate::{
 };
 use sha2::{Digest, Sha256};
 
+pub const Q6HI_REQUEST_MAGIC: [u8; 4] = *b"Q6HI";
+pub const Q6HR_STATUS_MAGIC: [u8; 4] = *b"Q6HR";
+pub const Q6HI_REQUEST_BYTES: usize = 80;
+pub const Q6HR_STATUS_BYTES: usize = 152;
 pub const Q6HS_REQUEST_MAGIC: [u8; 4] = *b"Q6HS";
 pub const Q6HP_PAGE_MAGIC: [u8; 4] = *b"Q6HP";
 pub const Q6HC_CHUNK_MAGIC: [u8; 4] = *b"Q6HC";
@@ -34,6 +38,8 @@ const Q6HC_FINAL_FLAG: u16 = 1;
 pub enum Q6HistorySyncWireError {
     InvalidRequest,
     MalformedRequest,
+    InvalidStatus,
+    MalformedStatus,
     WrongRequest,
     MalformedChunk,
     Oversized,
@@ -55,6 +61,119 @@ impl std::fmt::Display for Q6HistorySyncWireError {
     }
 }
 impl std::error::Error for Q6HistorySyncWireError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QRunV06HistoryInfoRequest {
+    pub request_id: u64,
+    pub network_id: [u8; 32],
+    pub profile_id: [u8; 32],
+}
+
+impl QRunV06HistoryInfoRequest {
+    pub fn encode(&self) -> Result<[u8; Q6HI_REQUEST_BYTES], Q6HistorySyncWireError> {
+        if self.request_id == 0 || is_zero(&self.network_id) || is_zero(&self.profile_id) {
+            return Err(Q6HistorySyncWireError::InvalidRequest);
+        }
+        let mut out = [0u8; Q6HI_REQUEST_BYTES];
+        out[..4].copy_from_slice(&Q6HI_REQUEST_MAGIC);
+        out[4..6].copy_from_slice(&Q6_HISTORY_SYNC_WIRE_VERSION.to_be_bytes());
+        out[6..8].copy_from_slice(&0u16.to_be_bytes());
+        out[8..16].copy_from_slice(&self.request_id.to_be_bytes());
+        out[16..48].copy_from_slice(&self.network_id);
+        out[48..80].copy_from_slice(&self.profile_id);
+        Ok(out)
+    }
+}
+
+pub fn decode_q6hi_request(
+    bytes: &[u8],
+) -> Result<QRunV06HistoryInfoRequest, Q6HistorySyncWireError> {
+    if bytes.len() != Q6HI_REQUEST_BYTES || bytes[..4] != Q6HI_REQUEST_MAGIC {
+        return Err(Q6HistorySyncWireError::MalformedRequest);
+    }
+    if u16_at(bytes, 4)? != Q6_HISTORY_SYNC_WIRE_VERSION || u16_at(bytes, 6)? != 0 {
+        return Err(Q6HistorySyncWireError::MalformedRequest);
+    }
+    let request = QRunV06HistoryInfoRequest {
+        request_id: u64_at(bytes, 8)?,
+        network_id: array_at(bytes, 16)?,
+        profile_id: array_at(bytes, 48)?,
+    };
+    if request.request_id == 0 || is_zero(&request.network_id) || is_zero(&request.profile_id) {
+        return Err(Q6HistorySyncWireError::InvalidRequest);
+    }
+    Ok(request)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QRunV06HistoryInfoResponse {
+    pub request_id: u64,
+    pub network_id: [u8; 32],
+    pub profile_id: [u8; 32],
+    pub height: u64,
+    pub consensus_tip: [u8; 32],
+    pub execution_tip: [u8; 32],
+}
+
+pub fn encode_q6hr_status(
+    request: &QRunV06HistoryInfoRequest,
+    height: u64,
+    consensus_tip: [u8; 32],
+    execution_tip: [u8; 32],
+) -> Result<[u8; Q6HR_STATUS_BYTES], Q6HistorySyncWireError> {
+    if request.request_id == 0
+        || is_zero(&request.network_id)
+        || is_zero(&request.profile_id)
+        || is_zero(&consensus_tip)
+        || is_zero(&execution_tip)
+    {
+        return Err(Q6HistorySyncWireError::InvalidStatus);
+    }
+    let mut out = [0u8; Q6HR_STATUS_BYTES];
+    out[..4].copy_from_slice(&Q6HR_STATUS_MAGIC);
+    out[4..6].copy_from_slice(&Q6_HISTORY_SYNC_WIRE_VERSION.to_be_bytes());
+    out[6..8].copy_from_slice(&0u16.to_be_bytes());
+    out[8..16].copy_from_slice(&request.request_id.to_be_bytes());
+    out[16..48].copy_from_slice(&request.network_id);
+    out[48..80].copy_from_slice(&request.profile_id);
+    out[80..88].copy_from_slice(&height.to_be_bytes());
+    out[88..120].copy_from_slice(&consensus_tip);
+    out[120..152].copy_from_slice(&execution_tip);
+    Ok(out)
+}
+
+pub fn decode_q6hr_status(
+    bytes: &[u8],
+    request: &QRunV06HistoryInfoRequest,
+) -> Result<QRunV06HistoryInfoResponse, Q6HistorySyncWireError> {
+    if bytes.len() != Q6HR_STATUS_BYTES || bytes[..4] != Q6HR_STATUS_MAGIC {
+        return Err(Q6HistorySyncWireError::MalformedStatus);
+    }
+    if u16_at(bytes, 4)? != Q6_HISTORY_SYNC_WIRE_VERSION || u16_at(bytes, 6)? != 0 {
+        return Err(Q6HistorySyncWireError::MalformedStatus);
+    }
+    let response = QRunV06HistoryInfoResponse {
+        request_id: u64_at(bytes, 8)?,
+        network_id: array_at(bytes, 16)?,
+        profile_id: array_at(bytes, 48)?,
+        height: u64_at(bytes, 80)?,
+        consensus_tip: array_at(bytes, 88)?,
+        execution_tip: array_at(bytes, 120)?,
+    };
+    if response.request_id != request.request_id {
+        return Err(Q6HistorySyncWireError::WrongRequest);
+    }
+    if response.network_id != request.network_id {
+        return Err(Q6HistorySyncWireError::WrongNetwork);
+    }
+    if response.profile_id != request.profile_id {
+        return Err(Q6HistorySyncWireError::WrongProfile);
+    }
+    if is_zero(&response.consensus_tip) || is_zero(&response.execution_tip) {
+        return Err(Q6HistorySyncWireError::InvalidStatus);
+    }
+    Ok(response)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QRunV06HistorySyncRequest {
@@ -633,6 +752,33 @@ mod tests {
             max_blocks: 64,
             max_bytes: 1024 * 1024,
         }
+    }
+
+    #[test]
+    fn q6hi_q6hr_status_roundtrips_and_binds_authenticated_peer_request() {
+        let request = QRunV06HistoryInfoRequest {
+            request_id: 41,
+            network_id: [0x31; 32],
+            profile_id: [0x42; 32],
+        };
+        let encoded_request = request.encode().unwrap();
+        assert_eq!(encoded_request.len(), Q6HI_REQUEST_BYTES);
+        let decoded_request = decode_q6hi_request(&encoded_request).unwrap();
+        assert_eq!(decoded_request, request);
+
+        let encoded_status = encode_q6hr_status(&request, 987, [0x53; 32], [0x64; 32]).unwrap();
+        assert_eq!(encoded_status.len(), Q6HR_STATUS_BYTES);
+        let decoded_status = decode_q6hr_status(&encoded_status, &request).unwrap();
+        assert_eq!(decoded_status.height, 987);
+        assert_eq!(decoded_status.consensus_tip, [0x53; 32]);
+        assert_eq!(decoded_status.execution_tip, [0x64; 32]);
+
+        let mut wrong_id = encoded_status;
+        wrong_id[15] ^= 1;
+        assert_eq!(
+            decode_q6hr_status(&wrong_id, &request),
+            Err(Q6HistorySyncWireError::WrongRequest)
+        );
     }
 
     #[test]
