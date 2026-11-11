@@ -60,7 +60,15 @@ function Get-ConnectedOverlayAddress {
     return $match.Groups[1].Value
 }
 
-function Invoke-Qfp6Worker([string]$Role, [string]$ExpectedAnchor, [string]$ExpectedHeight, [string]$ExpectedGeneration, [string]$ExpectedStateRoot) {
+function Invoke-Qfp6Worker(
+    [string]$Role,
+    [string]$ExpectedAnchor,
+    [string]$ExpectedHeight,
+    [string]$ExpectedGeneration,
+    [string]$ExpectedStateRoot,
+    [string]$ExpectedJournalGeneration = '',
+    [string]$ExpectedTransactionId = ''
+) {
     $env:QRUN_QFP6_QAP1_PROCESS_ROLE = $Role
     if ($Role -eq 'server') { $env:QRUN_QFP6_QAP1_INITIALIZE_FLOOR = '1' }
     else { Remove-Item Env:QRUN_QFP6_QAP1_INITIALIZE_FLOOR -ErrorAction SilentlyContinue }
@@ -70,6 +78,8 @@ function Invoke-Qfp6Worker([string]$Role, [string]$ExpectedAnchor, [string]$Expe
         $env:QRUN_QFP6_QAP1_EXPECTED_HEIGHT = $ExpectedHeight
         $env:QRUN_QFP6_QAP1_EXPECTED_GENERATION = $ExpectedGeneration
         $env:QRUN_QFP6_QAP1_EXPECTED_STATE_ROOT = $ExpectedStateRoot
+        $env:QRUN_QFP6_QAP1_EXPECTED_JOURNAL_GENERATION = $ExpectedJournalGeneration
+        $env:QRUN_QFP6_QAP1_EXPECTED_TRANSACTION_ID = $ExpectedTransactionId
     }
     $workerLog = Join-Path $env:TEMP ('qfp6-qap1-worker-' + $Role + '-' + [guid]::NewGuid().ToString('N') + '.log')
     $previousBacktrace = $env:RUST_BACKTRACE
@@ -260,7 +270,17 @@ try {
 
     $firstOutput = Invoke-Qfp6Worker -Role 'server' -ExpectedAnchor 'none' -ExpectedHeight '' -ExpectedGeneration '' -ExpectedStateRoot ''
     Write-Output $firstOutput
-    foreach ($marker in @('QFP6_QAP1_PROCESS_SERVER=PASS','QFP6_QAP1_MANIFEST_ANCHOR=','QFP6_QAP1_STATE_ROOT=','QFP6_QAP1_HEIGHT=','QFP6_QAP1_GENERATION=')) {
+    foreach ($marker in @(
+        'QFP6_QAP1_PROCESS_SERVER=PASS',
+        'QFP6_QAP1_MANIFEST_ANCHOR=',
+        'QFP6_QAP1_STATE_ROOT=',
+        'QFP6_QAP1_HEIGHT=',
+        'QFP6_QAP1_GENERATION=',
+        'QFP6_Q6MJ=PASS',
+        'QFP6_Q6MJ_GENERATION=',
+        'QFP6_Q6MJ_PENDING_COUNT=1',
+        'QFP6_Q6MJ_TXID='
+    )) {
         if ($firstOutput -notmatch [regex]::Escape($marker)) {
             throw "First QFP6 process omitted required evidence marker: $marker"
         }
@@ -269,24 +289,48 @@ try {
     $stateRoot = [regex]::Match($firstOutput, '(?m)^QFP6_QAP1_STATE_ROOT=([0-9a-fA-F]{64})\r?$').Groups[1].Value
     $height = [regex]::Match($firstOutput, '(?m)^QFP6_QAP1_HEIGHT=([0-9]+)\r?$').Groups[1].Value
     $generation = [regex]::Match($firstOutput, '(?m)^QFP6_QAP1_GENERATION=([0-9]+)\r?$').Groups[1].Value
+    $journalGeneration = [regex]::Match($firstOutput, '(?m)^QFP6_Q6MJ_GENERATION=([0-9]+)\r?$').Groups[1].Value
+    $transactionId = [regex]::Match($firstOutput, '(?m)^QFP6_Q6MJ_TXID=([0-9a-fA-F]{64})\r?$').Groups[1].Value
     Assert-Hex32 'Committed QFP6 manifest anchor' $anchor
+    Assert-Hex32 'Persisted Q6MJ transaction ID' $transactionId
+    if ($journalGeneration -ne '4') {
+        throw 'The Q6MJ ingress worker did not persist the expected four journal generations.'
+    }
     Assert-Hex32 'Committed QFP6 state root' $stateRoot
     if ($height -ne '1' -or $generation -ne '1') {
         throw 'The first QFP6 process did not commit exactly one test block and one manifest generation.'
     }
 
-    $restartOutput = Invoke-Qfp6Worker -Role 'restart' -ExpectedAnchor $anchor -ExpectedHeight $height -ExpectedGeneration $generation -ExpectedStateRoot $stateRoot
+    $restartOutput = Invoke-Qfp6Worker -Role 'restart' -ExpectedAnchor $anchor -ExpectedHeight $height -ExpectedGeneration $generation -ExpectedStateRoot $stateRoot -ExpectedJournalGeneration $journalGeneration -ExpectedTransactionId $transactionId
     Write-Output $restartOutput
-    if ($restartOutput -notmatch 'QFP6_QAP1_RESTART_SERVER=PASS') {
-        throw 'Second QFP6 process did not confirm exact QAP1 restart continuity.'
+    foreach ($marker in @(
+        'QFP6_QAP1_RESTART_SERVER=PASS',
+        'QFP6_Q6MJ_RESTART=PASS',
+        'QFP6_Q6MJ_RESTART_PENDING_COUNT=1'
+    )) {
+        if ($restartOutput -notmatch [regex]::Escape($marker)) {
+            throw "Second QFP6 process omitted required recovery evidence: $marker"
+        }
+    }
+    $restartTransactionId = [regex]::Match($restartOutput, '(?m)^QFP6_Q6MJ_RESTART_TXID=([0-9a-fA-F]{64})\r?$').Groups[1].Value
+    $restartJournalGeneration = [regex]::Match($restartOutput, '(?m)^QFP6_Q6MJ_RESTART_GENERATION=([0-9]+)\r?$').Groups[1].Value
+    Assert-Hex32 'Restored Q6MJ transaction ID' $restartTransactionId
+    if ($restartTransactionId -ne $transactionId) {
+        throw 'Q6MJ recovered transaction ID differs from the transaction acknowledged by Node A.'
+    }
+    if ([int64]$restartJournalGeneration -ne ([int64]$journalGeneration + 1)) {
+        throw 'Q6MJ journal generation did not advance exactly once during restart reconciliation.'
     }
 
     Write-Output "QFP6_QAP1_RESTART_ANCHOR=$anchor"
     Write-Output "QFP6_QAP1_RESTART_STATE_ROOT=$stateRoot"
     Write-Output "QFP6_QAP1_RESTART_HEIGHT=$height"
     Write-Output "QFP6_QAP1_RESTART_GENERATION=$generation"
+    Write-Output "QFP6_Q6MJ_CROSS_PROCESS_TXID=$transactionId"
+    Write-Output "QFP6_Q6MJ_CROSS_PROCESS_GENERATION=$journalGeneration->$restartJournalGeneration"
+    Write-Output 'QFP6_Q6MJ_CROSS_PROCESS_RECOVERY=PASS'
     Write-Output 'QFP6_QAP1_REMOTE_NODE_ADMISSION_AND_RESTART=PASS'
-    $callbackWriter.WriteLine(('DONE|' + $callbackNonce + '|' + $anchor + '|' + $stateRoot + '|' + $height + '|' + $generation + '|PASS'))
+    $callbackWriter.WriteLine(('DONE|' + $callbackNonce + '|' + $anchor + '|' + $stateRoot + '|' + $height + '|' + $generation + '|' + $restartJournalGeneration + '|' + $restartTransactionId + '|PASS'))
     Write-Output 'QFP6_QAP1_NODE_A_RESTART_CALLBACK_SENT=PASS'
 }
 finally {
@@ -304,6 +348,8 @@ finally {
         'QRUN_QFP6_QAP1_EXPECTED_HEIGHT',
         'QRUN_QFP6_QAP1_EXPECTED_GENERATION',
         'QRUN_QFP6_QAP1_EXPECTED_STATE_ROOT',
+        'QRUN_QFP6_QAP1_EXPECTED_JOURNAL_GENERATION',
+        'QRUN_QFP6_QAP1_EXPECTED_TRANSACTION_ID',
         'QRUN_QFP6_QAP1_LISTEN_ADDR',
         'QRUN_QFP6_QAP1_PROVIDER_ADDR',
         'QRUN_QFP6_QAP1_ANCHOR_ADDR',
