@@ -330,7 +330,7 @@ try {
     Write-Output "QFP6_Q6MJ_CROSS_PROCESS_GENERATION=$journalGeneration->$restartJournalGeneration"
     Write-Output 'QFP6_Q6MJ_CROSS_PROCESS_RECOVERY=PASS'
     Write-Output 'QFP6_QAP1_REMOTE_NODE_ADMISSION_AND_RESTART=PASS'
-    $callbackWriter.WriteLine(('DONE|' + $callbackNonce + '|' + $anchor + '|' + $stateRoot + '|' + $height + '|' + $generation + '|PASS'))
+    $callbackWriter.WriteLine(('DONE|' + $callbackNonce + '|' + $anchor + '|' + $stateRoot + '|' + $height + '|' + $generation + '|' + $restartJournalGeneration + '|' + $restartTransactionId + '|PASS'))
     Write-Output 'QFP6_QAP1_NODE_A_RESTART_CALLBACK_SENT=PASS'
 }
 finally {

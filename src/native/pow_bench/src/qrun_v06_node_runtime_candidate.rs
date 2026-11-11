@@ -1279,12 +1279,6 @@ mod tests {
 
     fn q6ti_test_transaction() -> Transaction {
         let signer = q6ti_test_signer();
-        let expires_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .checked_add(3_600)
-            .unwrap();
         let mut transaction = Transaction {
             network_id: NETWORK,
             sender: signer.account_id(),
@@ -1292,7 +1286,8 @@ mod tests {
             nonce: 1,
             amount: 10_000,
             fee: 10,
-            expires_at,
+            // Fixed future expiry keeps the signed TXID byte-identical across hosts.
+            expires_at: 4_000_000_000,
             signature: Vec::new(),
         };
         signer.sign_transaction(&mut transaction).unwrap();
@@ -1364,13 +1359,6 @@ mod tests {
         )
         .unwrap();
         (dir, store)
-    }
-
-    fn open_store_at(
-        directory: &Path,
-        trusted_manifest_anchor: Option<[u8; 32]>,
-    ) -> QRunV06DurableForkStore {
-        open_store_at_with_genesis(directory, trusted_manifest_anchor, genesis_state())
     }
 
     fn open_store_at_with_genesis(
@@ -5446,7 +5434,7 @@ mod tests {
         let mut done_line = String::new();
         std::io::BufRead::read_line(&mut callback_reader, &mut done_line).unwrap();
         let done = qap1_callback_fields(&done_line);
-        assert_eq!(done.len(), 7, "malformed Node B DONE callback");
+        assert_eq!(done.len(), 9, "malformed Node B DONE callback");
         assert_eq!(done[0], "DONE");
         assert_eq!(
             done[1], ready[1],
@@ -5479,7 +5467,17 @@ mod tests {
             reported_state_root, [0; 32],
             "Node B DONE state root must not be the zero digest"
         );
-        assert_eq!(done[6], "PASS");
+        assert_eq!(
+            done[6], "5",
+            "Node B must report the Q6MJ generation after restart reconciliation"
+        );
+        assert_eq!(
+            done[7],
+            hex32(&transaction_id),
+            "Node B's recovered Q6MJ TXID must equal Node A's submitted Q6TI TXID"
+        );
+        assert_eq!(done[8], "PASS");
+        println!("QFP6_QAP1_NODE_A_Q6MJ_TXID_MATCH=PASS");
         println!("QFP6_QAP1_NODE_A_CONFIRMED_REMOTE_RESTART=PASS");
 
         anchor_server.shutdown_and_join();

@@ -35,6 +35,18 @@ Node B after restart:
 - `QFP6_Q6MJ_RESTART_TXID=<same 64 hex>`
 - Journal generation advances from 4 to 5 after revalidation/persistence.
 
+## Local verification completed
+
+- cargo fmt --all -- --check ? passed.
+- cargo check --all-targets --locked --offline ? passed.
+- cargo test --lib --locked --offline q6ti_ -- --nocapture --test-threads=1 ? 6 passed.
+- cargo test --lib --locked --offline qrun_v06_node_runtime_candidate::tests::qap1_peer_ingress_qualifies_separate_qfp6_process -- --exact --nocapture --test-threads=1 ? 1 passed. This exercises Q6PB admission/replay, signed Q6TI Accepted/Duplicate, durable Q6MJ generation 4, and second-process QAP1 recovery plus exact TXID restoration at generation 5.
+- PowerShell parser validation for tools/qrun-v06-qfp6-qap1-runner.ps1 ? passed.
+- The local process test stores Q6MJ in a sibling directory to keep the strict QFP6 Store root free of unrecognized entries.
+- Node A's cross-host callback now includes Node B's recovered Q6MJ generation and TXID; Node A must compare that TXID to the one it submitted before reporting remote restart success.
+
+These are same-host multi-process/local CI checks only. The separate-host NetBird qualification has **not** yet been run on this CP-0587 head.
+
 ## Security and interpretation
 
 - Test-only deterministic Q6HA seeds and candidate testnet Genesis are used only as isolated qualification fixtures. They are not wallet credentials and do not create QZXB mainnet value.
