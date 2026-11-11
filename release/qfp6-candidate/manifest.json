@@ -1,0 +1,60 @@
+{
+  "schema": "qfp6-candidate-package/v1",
+  "network_name": "QZXB",
+  "protocol_family": "QFP6",
+  "release_channel": "candidate",
+  "production_authorized": false,
+  "mainnet_status": "NOT_AUTHORIZED",
+  "owner_genesis_account": null,
+  "components": {
+    "genesis_snapshot": {
+      "path": null,
+      "sha256": null,
+      "status": "MISSING"
+    },
+    "genesis_descriptor_q6gd": {
+      "path": null,
+      "sha256": null,
+      "status": "MISSING"
+    },
+    "consensus_profile_q6cp": {
+      "path": null,
+      "sha256": null,
+      "status": "MISSING"
+    },
+    "network_profile_q6pn": {
+      "path": null,
+      "sha256": null,
+      "status": "MISSING"
+    },
+    "trust_bundle_q6ts": {
+      "path": null,
+      "sha256": null,
+      "status": "MISSING"
+    },
+    "bootstrap_peers": {
+      "path": null,
+      "sha256": null,
+      "status": "MISSING"
+    }
+  },
+  "independent_review": {
+    "consensus": "PENDING",
+    "cryptography": "PENDING",
+    "economics": "PENDING"
+  },
+  "signing": {
+    "q6ts_signatures_present": false,
+    "trust_floor_provisioned": false
+  },
+  "runtime": {
+    "wired": false,
+    "full_history_replay_qualified": false,
+    "public_listener_qualified": false
+  },
+  "notes": [
+    "Candidate scaffold only. No Genesis, public keys, trust roots, signatures, or service endpoints are fabricated.",
+    "Do not promote this manifest to Mainnet. Replace each missing component only with independently reviewed canonical artifacts.",
+    "Q6CP candidate parameters and QFP6 SHA-256d easy-fixture targets are not Mainnet-approved."
+  ]
+}
