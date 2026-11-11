@@ -11,7 +11,8 @@
 //! routes Q6TI submissions into a bounded pool, persists accepted pending transactions in an
 //! immutable-generation journal, restores/revalidates them against recovered QAP1 state, and
 //! selects them for QAP1 mining. This remains a candidate service seam, not a standalone
-//! production launcher, RPC server, peer-discovery service, full-history sync daemon or Mainnet.
+//! production launcher, RPC server, peer-discovery service or Mainnet. A separate permissionless
+//! startup wrapper can complete bounded history sync from operator-pinned peers before mining.
 
 use crate::{
     external_cas_anchor_candidate::{ExternalCasPin, ExternalCasProviderTransport},
@@ -20,7 +21,10 @@ use crate::{
         QRunV06BlockOperation, QRunV06CanonicalExecutionState, MAX_QRUN_V06_BLOCK_OPERATIONS,
     },
     qrun_v06_external_anchor_candidate::{QRunV06ExternalAnchorPin, QRunV06ExternalAnchorState},
-    qrun_v06_history_sync_service_candidate::QRunV06HistorySyncResponder,
+    qrun_v06_history_sync_service_candidate::{
+        sync_history_from_pinned_peer_until_complete, QRunV06HistorySyncClientConfig,
+        QRunV06HistorySyncClientReport, QRunV06HistorySyncResponder,
+    },
     qrun_v06_history_sync_wire_candidate::{
         decode_q6hi_request, decode_q6hs_request, encode_q6hr_status, Q6HI_REQUEST_MAGIC,
         Q6HS_REQUEST_MAGIC,
@@ -56,7 +60,8 @@ use crate::{
     v4_fat1_trust_candidate::MlDsa65Verifier,
 };
 use std::{
-    net::TcpListener,
+    collections::HashSet,
+    net::{SocketAddr, TcpListener},
     sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -197,6 +202,18 @@ pub struct QRunV06PermissionlessMiningSupervisorReport {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QRunV06PinnedBootstrapPeer {
+    pub address: SocketAddr,
+    pub noise_static_public_key: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QRunV06PermissionlessLaunchReport {
+    pub bootstrap_sync: QRunV06HistorySyncClientReport,
+    pub supervisor: QRunV06PermissionlessMiningSupervisorReport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QRunV06MiningSupervisorReport {
     pub listener_rounds: u64,
     pub mining_rounds: u64,
@@ -232,6 +249,8 @@ pub enum QRunV06NodeSupervisorError {
     Mempool(String),
     Journal(String),
     Mining(String),
+    InvalidBootstrapPeers,
+    BootstrapSync(String),
 }
 
 impl std::fmt::Display for QRunV06NodeSupervisorError {
@@ -1319,6 +1338,104 @@ pub fn run_qfp6_permissionless_mining_supervisor<T: TransactionAuthenticator>(
     }
 }
 
+/// Validate a static set of outbound bootstrap peers and return their Noise static-key pins.
+pub fn validate_qfp6_pinned_bootstrap_peers(
+    peers: &[QRunV06PinnedBootstrapPeer],
+) -> Result<Vec<[u8; 32]>, QRunV06NodeSupervisorError> {
+    if peers.is_empty() || peers.len() > 64 {
+        return Err(QRunV06NodeSupervisorError::InvalidBootstrapPeers);
+    }
+    let mut addresses = HashSet::new();
+    let mut keys = HashSet::new();
+    let mut trusted_keys = Vec::with_capacity(peers.len());
+    for peer in peers {
+        if peer.address.port() == 0
+            || peer.address.ip().is_unspecified()
+            || peer.address.ip().is_multicast()
+            || peer.noise_static_public_key == [0; 32]
+            || !addresses.insert(peer.address)
+            || !keys.insert(peer.noise_static_public_key)
+        {
+            return Err(QRunV06NodeSupervisorError::InvalidBootstrapPeers);
+        }
+        trusted_keys.push(peer.noise_static_public_key);
+    }
+    Ok(trusted_keys)
+}
+
+/// Startup path that refuses to begin mining until one of the configured statically pinned
+/// peers has completed Q6HI/Q6HR discovery and full bounded canonical-history synchronization.
+/// The same peer key set is then used by the permissionless inbound Noise listener.
+#[allow(clippy::too_many_arguments)]
+pub fn run_qfp6_permissionless_mining_supervisor_with_bootstrap<T: TransactionAuthenticator>(
+    listener: &TcpListener,
+    config: QRunV06PermissionlessMiningSupervisorConfig,
+    local_static_private_key: &[u8; 32],
+    bootstrap_peers: &[QRunV06PinnedBootstrapPeer],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    shutdown_requested: &AtomicBool,
+    runtime: &mut QRunV06PermissionlessNodeRuntime,
+    authenticator: &T,
+    producer: [u8; 32],
+    mempool: &mut QRunV06PermissionlessMempool,
+    sync_config: QRunV06HistorySyncClientConfig,
+) -> Result<QRunV06PermissionlessLaunchReport, QRunV06NodeSupervisorError> {
+    validate_identity_material(local_static_private_key, network_id, profile_id)?;
+    let trusted_keys = validate_qfp6_pinned_bootstrap_peers(bootstrap_peers)?;
+    let startup = runtime
+        .status()
+        .map_err(|error| QRunV06NodeSupervisorError::Runtime(error.to_string()))?;
+    if startup.network_id != *network_id {
+        return Err(QRunV06NodeSupervisorError::NetworkMismatch);
+    }
+    if startup.profile_id != *profile_id {
+        return Err(QRunV06NodeSupervisorError::ProfileMismatch);
+    }
+
+    let mut bootstrap_report = None;
+    let mut peer_errors = Vec::new();
+    for peer in bootstrap_peers {
+        match sync_history_from_pinned_peer_until_complete(
+            peer.address,
+            local_static_private_key,
+            &peer.noise_static_public_key,
+            runtime,
+            authenticator,
+            sync_config,
+        ) {
+            Ok(report) if report.complete => {
+                bootstrap_report = Some(report);
+                break;
+            }
+            Ok(_) => peer_errors.push(format!(
+                "{} returned without reaching the pinned source tip",
+                peer.address
+            )),
+            Err(error) => peer_errors.push(format!("{}: {error}", peer.address)),
+        }
+    }
+    let bootstrap_sync = bootstrap_report
+        .ok_or_else(|| QRunV06NodeSupervisorError::BootstrapSync(peer_errors.join("; ")))?;
+    let supervisor = run_qfp6_permissionless_mining_supervisor(
+        listener,
+        config,
+        local_static_private_key,
+        &trusted_keys,
+        network_id,
+        profile_id,
+        shutdown_requested,
+        runtime,
+        authenticator,
+        producer,
+        mempool,
+    )?;
+    Ok(QRunV06PermissionlessLaunchReport {
+        bootstrap_sync,
+        supervisor,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1583,6 +1700,34 @@ mod tests {
             QRUN_V06_SUPERVISOR_MAX_TOTAL_SESSIONS
         );
         assert!(config.install_os_signal_handler);
+    }
+
+    #[test]
+    fn pinned_bootstrap_peer_validation_rejects_empty_duplicate_and_zero_keys() {
+        assert_eq!(
+            validate_qfp6_pinned_bootstrap_peers(&[]),
+            Err(QRunV06NodeSupervisorError::InvalidBootstrapPeers)
+        );
+        let first = QRunV06PinnedBootstrapPeer {
+            address: "127.0.0.1:30333".parse().unwrap(),
+            noise_static_public_key: [0x31; 32],
+        };
+        assert_eq!(
+            validate_qfp6_pinned_bootstrap_peers(&[first]),
+            Ok(vec![[0x31; 32]])
+        );
+        assert_eq!(
+            validate_qfp6_pinned_bootstrap_peers(&[first, first]),
+            Err(QRunV06NodeSupervisorError::InvalidBootstrapPeers)
+        );
+        let zero_key = QRunV06PinnedBootstrapPeer {
+            noise_static_public_key: [0; 32],
+            ..first
+        };
+        assert_eq!(
+            validate_qfp6_pinned_bootstrap_peers(&[zero_key]),
+            Err(QRunV06NodeSupervisorError::InvalidBootstrapPeers)
+        );
     }
 
     #[test]
