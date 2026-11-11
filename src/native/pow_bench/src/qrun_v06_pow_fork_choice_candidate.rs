@@ -63,6 +63,7 @@ pub enum QRunV06ForkChoiceError {
     BranchHeightExceeded,
     ChainworkOverflow,
     RetargetHistoryUnavailable,
+    TimestampNotAboveMedian { median: u64, actual: u64 },
     ReplayIncomplete,
     ArchiveExportLimitExceeded,
     Checkpoint(QRunV06CheckpointError),
@@ -147,6 +148,10 @@ impl std::fmt::Display for QRunV06ForkChoiceError {
             Self::RetargetHistoryUnavailable => {
                 f.write_str("QFP6 branch does not retain the timestamps required for retarget")
             }
+            Self::TimestampNotAboveMedian { median, actual } => write!(
+                f,
+                "QFP6 timestamp {actual} is not above branch median-time-past {median}"
+            ),
             Self::ReplayIncomplete => {
                 f.write_str("QFP6 archive replay did not restore every accepted block")
             }
@@ -185,11 +190,6 @@ struct TargetHistoryNode {
 }
 
 impl TargetHistoryNode {
-    #[cfg(test)]
-    fn genesis(params: &ConsensusParameters) -> Arc<Self> {
-        Self::genesis_with_timestamp(params, None)
-    }
-
     fn genesis_at(params: &ConsensusParameters, timestamp: u64) -> Arc<Self> {
         Self::genesis_with_timestamp(params, Some(timestamp))
     }
@@ -203,6 +203,27 @@ impl TargetHistoryNode {
         })
     }
 
+    fn validate_mtp(parent: &Arc<Self>, timestamp: u64) -> Result<(), QRunV06ForkChoiceError> {
+        let mut ancestors = Vec::with_capacity(
+            crate::qrun_v06_time_consensus_candidate::QFP6_MEDIAN_TIME_PAST_WINDOW,
+        );
+        let mut cursor = Some(Arc::clone(parent));
+        while ancestors.len()
+            < crate::qrun_v06_time_consensus_candidate::QFP6_MEDIAN_TIME_PAST_WINDOW
+        {
+            let Some(node) = cursor else { break };
+            let value = node
+                .timestamp
+                .ok_or(QRunV06ForkChoiceError::RetargetHistoryUnavailable)?;
+            ancestors.push(value);
+            cursor = node.parent.as_ref().map(Arc::clone);
+        }
+        crate::qrun_v06_time_consensus_candidate::validate_candidate_timestamp(&ancestors, timestamp)
+            .map_err(|error| match error {
+                crate::qrun_v06_time_consensus_candidate::QRunV06TimeConsensusError::TimestampNotAboveMedian { median, actual } => QRunV06ForkChoiceError::TimestampNotAboveMedian { median, actual },
+                crate::qrun_v06_time_consensus_candidate::QRunV06TimeConsensusError::EmptyHistory => QRunV06ForkChoiceError::RetargetHistoryUnavailable,
+            })
+    }
     fn expected_next_target(
         parent: &Arc<Self>,
         next_height: u64,
@@ -282,6 +303,7 @@ impl TargetHistoryNode {
         {
             return Err(QRunV06ForkChoiceError::RetargetHistoryUnavailable);
         }
+        Self::validate_mtp(parent, timestamp)?;
         let expected_target = Self::expected_next_target(parent, height, params)?;
         if target != expected_target {
             return Err(QRunV06ForkChoiceError::ExpectedTargetMismatch {
@@ -320,7 +342,11 @@ impl TargetHistoryNode {
             .and_then(|first| first.checked_add(1))
             .ok_or(QRunV06ForkChoiceError::RetargetHistoryUnavailable)?;
 
-        let mut previous: Option<Arc<Self>> = None;
+        let mut previous: Option<Arc<Self>> = if expected_first_height == 1 {
+            Some(Self::genesis_at(params, genesis_timestamp))
+        } else {
+            None
+        };
         let mut previous_height = expected_first_height.saturating_sub(1);
         let mut previous_timestamp = genesis_timestamp;
         for entry in entries {
@@ -657,8 +683,12 @@ impl QRunV06PowForkChoice {
                     .target_history,
             )
         };
-        let entries =
-            export_target_history_tail(&history, self.params.difficulty_window_blocks as usize);
+        let entries = export_target_history_tail(
+            &history,
+            self.params.difficulty_window_blocks.max(
+                (crate::qrun_v06_time_consensus_candidate::QFP6_MEDIAN_TIME_PAST_WINDOW + 1) as u64,
+            ) as usize,
+        );
         Ok(QRunV06CheckpointCandidate::from_validated_branch(
             state.clone(),
             *tip,
@@ -1508,6 +1538,32 @@ mod tests {
     }
 
     #[test]
+    fn qfp6_mtp_is_computed_from_the_exact_parent_branch() {
+        let params = params(2);
+        let build = |start: u64| {
+            let mut parent = TargetHistoryNode::genesis_at(&params, 1);
+            for offset in 0..11u64 {
+                parent = Arc::new(TargetHistoryNode {
+                    height: parent.height + 1,
+                    target: params.initial_target,
+                    timestamp: Some(start + offset * 10),
+                    parent: Some(parent),
+                });
+            }
+            parent
+        };
+        let branch_a = build(10);
+        let branch_b = build(20);
+        assert_eq!(TargetHistoryNode::validate_mtp(&branch_a, 65), Ok(()));
+        assert_eq!(
+            TargetHistoryNode::validate_mtp(&branch_b, 65),
+            Err(QRunV06ForkChoiceError::TimestampNotAboveMedian {
+                median: 70,
+                actual: 65
+            })
+        );
+    }
+    #[test]
     fn qfp6_difficulty_retarget_remains_branch_local_across_siblings() {
         let mut params = params(2);
         params.initial_target = Uint256::from_be_bytes([0x1F; 32]);
@@ -1535,10 +1591,18 @@ mod tests {
         assert!(slow_target > params.initial_target);
         assert_ne!(fast_target, slow_target);
 
-        let fast_checkpoint_tail =
-            export_target_history_tail(&fast_parent, params.difficulty_window_blocks as usize);
-        let slow_checkpoint_tail =
-            export_target_history_tail(&slow_parent, params.difficulty_window_blocks as usize);
+        let fast_checkpoint_tail = export_target_history_tail(
+            &fast_parent,
+            params.difficulty_window_blocks.max(
+                (crate::qrun_v06_time_consensus_candidate::QFP6_MEDIAN_TIME_PAST_WINDOW + 1) as u64,
+            ) as usize,
+        );
+        let slow_checkpoint_tail = export_target_history_tail(
+            &slow_parent,
+            params.difficulty_window_blocks.max(
+                (crate::qrun_v06_time_consensus_candidate::QFP6_MEDIAN_TIME_PAST_WINDOW + 1) as u64,
+            ) as usize,
+        );
         let fast_restored =
             TargetHistoryNode::from_checkpoint_entries(&fast_checkpoint_tail, 2, &params, 1_000)
                 .unwrap();
@@ -1573,7 +1637,7 @@ mod tests {
         // This directly preserves the unanchored-history reproducer. Production QFP6
         // constructors now reject a missing Genesis descriptor; this fixture models the
         // former legacy history shape to prove why that route must remain inadmissible.
-        let mut history = TargetHistoryNode::genesis(&params);
+        let mut history = TargetHistoryNode::genesis_at(&params, 0);
         let timestamps = [1, 2, 3, 4, 5, 6, 7, 1_000_330];
         for (index, timestamp) in timestamps.into_iter().enumerate() {
             history = TargetHistoryNode::append(
@@ -1653,7 +1717,7 @@ mod tests {
 
         // The candidate history API has no trusted-time input. Genesis itself has no
         // timestamp, so this first admitted block can be arbitrarily old.
-        let mut history = TargetHistoryNode::genesis(&params);
+        let mut history = TargetHistoryNode::genesis_at(&params, 0);
         for height in 1..=PRODUCTION_WINDOW {
             let timestamp = if height == PRODUCTION_WINDOW {
                 1_000_330
@@ -1781,7 +1845,7 @@ mod tests {
         let state4 = uninterrupted.state_for_tip(&tip4).unwrap().clone();
         let work4 = uninterrupted.branch_work(&tip4).unwrap();
 
-        // A second checkpoint trims history to the last full target window (heights 3 and 4).
+        // A second checkpoint retains the difficulty window and the MTP ancestry tail.
         let checkpoint2 = uninterrupted.checkpoint_at_tip(&tip4).unwrap();
         assert_eq!(
             checkpoint2
@@ -1789,7 +1853,7 @@ mod tests {
                 .iter()
                 .map(|entry| entry.height)
                 .collect::<Vec<_>>(),
-            vec![3, 4]
+            vec![1, 2, 3, 4]
         );
         let checkpoint2_bytes = checkpoint2.encode_snapshot().unwrap();
         let checkpoint2_anchor = checkpoint2.commitment().unwrap();
