@@ -30,7 +30,7 @@ GitHub Actions run [43017541194](https://github.com/hamidnikkhah660-arch/ai-nati
 - Markers included `QFP6_QAP1_REMOTE_NODE_ADMISSION_AND_RESTART=PASS`, `QFP6_Q6MJ_CROSS_PROCESS_RECOVERY=PASS`, `QFP6_QAP1_NODE_A_Q6MJ_TXID_MATCH=PASS`, and `QFP6_QAP1_NODE_A_RESTART_CALLBACK_SENT=PASS`.
 - The ephemeral Node B peer was disconnected successfully after qualification.
 
-The workflow ran on code commit `7578bae719700860ecccb8539a7f79c3d023bbed`. The PR head was subsequently advanced to `dd59e768ef6d50c2c7bec033a9315a3456ab93d5` by a documentation-only commit; no protocol or workflow code changed after the qualified code commit. This distinction is recorded rather than claiming the workflow ran on the later documentation commit.
+The cross-host workflow run reports head SHA `dd59e768ef6d50c2c7bec033a9315a3456ab93d5`, which was the PR head at dispatch time and contains the CP-0587 protocol/workflow code. The current PR head was subsequently advanced to `d827087b934cd1098eec9669f2a67648849ed48d` by a documentation-only commit; no protocol or workflow code changed after the qualified head. Latest-head Rust validation is running separately as run `43018636352`.
 
 ## Local verification
 
