@@ -20,12 +20,18 @@ use crate::{
         QRunV06BlockOperation, QRunV06CanonicalExecutionState, MAX_QRUN_V06_BLOCK_OPERATIONS,
     },
     qrun_v06_external_anchor_candidate::{QRunV06ExternalAnchorPin, QRunV06ExternalAnchorState},
+    qrun_v06_miner_candidate::QRUN_V06_MAX_NONCE_ATTEMPTS_PER_JOB,
     qrun_v06_node_runtime_candidate::{
         QRunV06NodeAnchorGate, QRunV06NodeRuntime, QRunV06PeerReplayGuard,
     },
     qrun_v06_peer_listener_candidate::{
-        process_qfp6_peer_frame_with_qap1, serve_qfp6_noise_listener, QRunV06PeerListenerConfig,
-        QRunV06PeerListenerError, QRunV06PeerListenerStats, QRunV06PeerListenerStopReason,
+        process_qfp6_peer_frame_with_permissionless_runtime, process_qfp6_peer_frame_with_qap1,
+        serve_qfp6_noise_listener, QRunV06PeerListenerConfig, QRunV06PeerListenerError,
+        QRunV06PeerListenerStats, QRunV06PeerListenerStopReason,
+    },
+    qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessNodeRuntime,
+    qrun_v06_permissionless_service_candidate::{
+        QRunV06PermissionlessMempool, QRunV06PermissionlessServiceError,
     },
     qrun_v06_pow_fork_choice_candidate::QRunV06QuoteAssetAuthorizationProvider,
     qrun_v06_qap1_coordinator_candidate::{
@@ -136,6 +142,52 @@ impl QRunV06MiningSupervisorConfig {
             .map_err(|error| QRunV06NodeSupervisorError::Mining(error.to_string()))?;
         Ok(())
     }
+}
+
+/// Settings for the permissionless Genesis-rooted peer-ingress and PoW-mining lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QRunV06PermissionlessMiningSupervisorConfig {
+    pub peer: QRunV06NodeSupervisorConfig,
+    pub listener_round_timeout: Duration,
+    pub max_nonce_attempts_per_block: u64,
+}
+
+impl Default for QRunV06PermissionlessMiningSupervisorConfig {
+    fn default() -> Self {
+        Self {
+            peer: QRunV06NodeSupervisorConfig::default(),
+            listener_round_timeout: Duration::from_millis(250),
+            max_nonce_attempts_per_block: QRUN_V06_MAX_NONCE_ATTEMPTS_PER_JOB,
+        }
+    }
+}
+
+impl QRunV06PermissionlessMiningSupervisorConfig {
+    pub fn validate(&self) -> Result<(), QRunV06NodeSupervisorError> {
+        self.peer.validate()?;
+        if !(Duration::from_millis(20)..=Duration::from_secs(30))
+            .contains(&self.listener_round_timeout)
+            || self.max_nonce_attempts_per_block == 0
+            || self.max_nonce_attempts_per_block > QRUN_V06_MAX_NONCE_ATTEMPTS_PER_JOB
+        {
+            return Err(QRunV06NodeSupervisorError::InvalidConfiguration);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QRunV06PermissionlessMiningSupervisorReport {
+    pub listener_rounds: u64,
+    pub mining_rounds: u64,
+    pub blocks_durably_committed: u64,
+    pub blocks_became_canonical: u64,
+    pub ending_height: u64,
+    pub pending_mempool_transactions: usize,
+    pub pending_mempool_bytes: usize,
+    pub mempool_journal_generation: u64,
+    pub stats: QRunV06PeerListenerStats,
+    pub stop_reason: QRunV06NodeSupervisorStopReason,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -919,6 +971,265 @@ where
     }
 }
 
+/// Dispatch Q6TI or Q6PB inside an already authenticated Noise session for the permissionless
+/// runtime. Q6TA Accepted means the transaction is validated and durably journaled as pending;
+/// Q6PA Accepted means a local durable block commit. Neither response means global finality.
+#[allow(clippy::too_many_arguments)]
+pub fn process_qfp6_application_frame_with_permissionless_runtime<T: TransactionAuthenticator>(
+    runtime: &mut QRunV06PermissionlessNodeRuntime,
+    replay_guard: &mut QRunV06PeerReplayGuard,
+    mempool: &mut QRunV06PermissionlessMempool,
+    frame: &[u8],
+    authenticator: &T,
+    producer: [u8; 32],
+) -> Result<
+    [u8; crate::qrun_v06_node_runtime_candidate::QRUN_V06_PEER_ADMISSION_RESPONSE_BYTES],
+    String,
+> {
+    if frame.get(..4) == Some(&Q6TI_MAGIC) {
+        let graph = runtime
+            .fork_choice_snapshot()
+            .map_err(|error| format!("cannot snapshot permissionless state for Q6TI: {error}"))?;
+        let candidate_timestamp = current_candidate_timestamp(graph.canonical_state())?;
+        let response = mempool
+            .submit_q6ti(
+                runtime,
+                replay_guard,
+                frame,
+                authenticator,
+                producer,
+                candidate_timestamp,
+            )
+            .map_err(|error: QRunV06PermissionlessServiceError| error.to_string())?;
+        return response
+            .try_into()
+            .map_err(|_| "Q6TA response did not have the fixed 128-byte wire length".to_string());
+    }
+
+    let response = process_qfp6_peer_frame_with_permissionless_runtime(
+        runtime,
+        replay_guard,
+        frame,
+        authenticator,
+    )?;
+    let graph = runtime.fork_choice_snapshot().map_err(|error| {
+        format!("cannot refresh permissionless canonical state after Q6PB: {error}")
+    })?;
+    let candidate_timestamp = current_candidate_timestamp(graph.canonical_state())?;
+    mempool
+        .reconcile_after_canonical_change(runtime, authenticator, producer, candidate_timestamp)
+        .map_err(|error| error.to_string())?;
+    Ok(response)
+}
+
+/// Run the authenticated QFP6 Noise listener and permissionless durable miner in alternating,
+/// bounded windows. The runtime must already be opened from complete Genesis-rooted history with
+/// an independently verified profile pin. This does not perform peer discovery or history sync.
+#[allow(clippy::too_many_arguments)]
+pub fn run_qfp6_permissionless_mining_supervisor<T: TransactionAuthenticator>(
+    listener: &TcpListener,
+    config: QRunV06PermissionlessMiningSupervisorConfig,
+    local_static_private_key: &[u8; 32],
+    trusted_remote_static_public_keys: &[[u8; 32]],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    shutdown_requested: &AtomicBool,
+    runtime: &mut QRunV06PermissionlessNodeRuntime,
+    authenticator: &T,
+    producer: [u8; 32],
+    mempool: &mut QRunV06PermissionlessMempool,
+) -> Result<QRunV06PermissionlessMiningSupervisorReport, QRunV06NodeSupervisorError> {
+    config.validate()?;
+    validate_identity_material(local_static_private_key, network_id, profile_id)?;
+    if producer == [0; 32] {
+        return Err(QRunV06NodeSupervisorError::InvalidIdentity);
+    }
+    let startup = runtime
+        .status()
+        .map_err(|error| QRunV06NodeSupervisorError::Runtime(error.to_string()))?;
+    if startup.network_id != *network_id {
+        return Err(QRunV06NodeSupervisorError::NetworkMismatch);
+    }
+    if startup.profile_id != *profile_id {
+        return Err(QRunV06NodeSupervisorError::ProfileMismatch);
+    }
+    let startup_graph = runtime
+        .fork_choice_snapshot()
+        .map_err(|error| QRunV06NodeSupervisorError::Runtime(error.to_string()))?;
+    let startup_timestamp = current_candidate_timestamp(startup_graph.canonical_state())
+        .map_err(QRunV06NodeSupervisorError::Journal)?;
+    mempool
+        .restore(runtime, authenticator, producer, startup_timestamp)
+        .map_err(|error| QRunV06NodeSupervisorError::Journal(error.to_string()))?;
+
+    let signal = if config.peer.install_os_signal_handler {
+        Some(
+            QRunNodeShutdownSignalCandidate::install()
+                .map_err(|error| QRunV06NodeSupervisorError::ShutdownSignal(error.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let signal_ref = signal.as_ref();
+    let watcher_stop = AtomicBool::new(false);
+    let run_result = thread::scope(|scope| {
+        let watcher = scope.spawn(|| {
+            while !watcher_stop.load(Ordering::Acquire) {
+                if signal_ref.is_some_and(|signal| signal.is_shutdown_requested()) {
+                    shutdown_requested.store(true, Ordering::Release);
+                    break;
+                }
+                thread::sleep(SHUTDOWN_WATCH_INTERVAL);
+            }
+        });
+
+        let service_result = (|| {
+            let mut aggregate = QRunV06PeerListenerStats::default();
+            let mut listener_rounds = 0u64;
+            let mut mining_rounds = 0u64;
+            let mut blocks_durably_committed = 0u64;
+            let mut blocks_became_canonical = 0u64;
+            let stop_reason;
+
+            loop {
+                if shutdown_requested.load(Ordering::Acquire) {
+                    stop_reason = QRunV06NodeSupervisorStopReason::ShutdownRequested;
+                    break;
+                }
+                if aggregate.accepted_connections >= config.peer.max_total_sessions {
+                    stop_reason = QRunV06NodeSupervisorStopReason::SessionBudgetReached;
+                    break;
+                }
+                let remaining = config
+                    .peer
+                    .max_total_sessions
+                    .checked_sub(aggregate.accepted_connections)
+                    .ok_or(QRunV06NodeSupervisorError::StatisticsOverflow)?;
+                let mut round_config = config.peer.listener;
+                round_config.max_sessions = round_config.max_sessions.min(remaining).min(1);
+                let mut on_application_frame =
+                    |guard: &mut QRunV06PeerReplayGuard, frame: &[u8]| {
+                        process_qfp6_application_frame_with_permissionless_runtime(
+                            runtime,
+                            guard,
+                            mempool,
+                            frame,
+                            authenticator,
+                            producer,
+                        )
+                    };
+                let (listener_report, process_stopped) = serve_qfp6_listener_round(
+                    listener,
+                    round_config,
+                    local_static_private_key,
+                    trusted_remote_static_public_keys,
+                    network_id,
+                    profile_id,
+                    shutdown_requested,
+                    config.listener_round_timeout,
+                    &mut on_application_frame,
+                )?;
+                listener_rounds = listener_rounds
+                    .checked_add(1)
+                    .ok_or(QRunV06NodeSupervisorError::StatisticsOverflow)?;
+                add_stats(&mut aggregate, listener_report.stats)?;
+                if listener_report.stop_reason
+                    == QRunV06PeerListenerStopReason::FailedHandshakeLimitReached
+                {
+                    return Err(QRunV06NodeSupervisorError::HandshakeBudgetExceeded);
+                }
+                if listener_report.stats.handler_failures > 0
+                    || listener_report.stats.malformed_responses > 0
+                {
+                    return Err(QRunV06NodeSupervisorError::Listener(
+                        "permissionless application handler failed; supervisor stops before mining"
+                            .into(),
+                    ));
+                }
+                if process_stopped || shutdown_requested.load(Ordering::Acquire) {
+                    stop_reason = QRunV06NodeSupervisorStopReason::ShutdownRequested;
+                    break;
+                }
+
+                let graph = runtime
+                    .fork_choice_snapshot()
+                    .map_err(|error| QRunV06NodeSupervisorError::Runtime(error.to_string()))?;
+                let candidate_timestamp = current_candidate_timestamp(graph.canonical_state())
+                    .map_err(QRunV06NodeSupervisorError::Mining)?;
+                let mined = match mempool.mine_one_batch(
+                    runtime,
+                    authenticator,
+                    producer,
+                    candidate_timestamp,
+                    config.max_nonce_attempts_per_block,
+                    shutdown_requested,
+                ) {
+                    Ok(mined) => mined,
+                    Err(QRunV06PermissionlessServiceError::MiningCancelled)
+                        if shutdown_requested.load(Ordering::Acquire) =>
+                    {
+                        stop_reason = QRunV06NodeSupervisorStopReason::ShutdownRequested;
+                        break;
+                    }
+                    Err(error) => {
+                        return Err(QRunV06NodeSupervisorError::Mining(error.to_string()))
+                    }
+                };
+                mining_rounds = mining_rounds
+                    .checked_add(1)
+                    .ok_or(QRunV06NodeSupervisorError::StatisticsOverflow)?;
+                if let Some(mined) = mined {
+                    blocks_durably_committed = blocks_durably_committed
+                        .checked_add(1)
+                        .ok_or(QRunV06NodeSupervisorError::StatisticsOverflow)?;
+                    if mined.became_canonical {
+                        blocks_became_canonical = blocks_became_canonical
+                            .checked_add(1)
+                            .ok_or(QRunV06NodeSupervisorError::StatisticsOverflow)?;
+                    }
+                }
+                if shutdown_requested.load(Ordering::Acquire) {
+                    stop_reason = QRunV06NodeSupervisorStopReason::ShutdownRequested;
+                    break;
+                }
+            }
+
+            let ending = runtime
+                .status()
+                .map_err(|error| QRunV06NodeSupervisorError::Runtime(error.to_string()))?;
+            Ok(QRunV06PermissionlessMiningSupervisorReport {
+                listener_rounds,
+                mining_rounds,
+                blocks_durably_committed,
+                blocks_became_canonical,
+                ending_height: ending.height,
+                pending_mempool_transactions: mempool.pending_count(),
+                pending_mempool_bytes: mempool.pending_bytes(),
+                mempool_journal_generation: mempool.journal_generation(),
+                stats: aggregate,
+                stop_reason,
+            })
+        })();
+        watcher_stop.store(true, Ordering::Release);
+        if watcher.join().is_err() {
+            return Err(QRunV06NodeSupervisorError::ShutdownWatcherPanicked);
+        }
+        service_result
+    });
+
+    let uninstall_result = match signal {
+        Some(signal) => signal
+            .uninstall()
+            .map_err(|error| QRunV06NodeSupervisorError::ShutdownSignal(error.to_string())),
+        None => Ok(()),
+    };
+    match (run_result, uninstall_result) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(report), Ok(())) => Ok(report),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -934,6 +1245,29 @@ mod tests {
         v4_fat1_mldsa65_candidate::LibcruxMlDsa65VerifierCandidate,
         v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES,
     };
+
+    #[test]
+    fn permissionless_mining_supervisor_config_is_finite_and_bounded() {
+        let mut config = QRunV06PermissionlessMiningSupervisorConfig::default();
+        assert!(config.validate().is_ok());
+        config.max_nonce_attempts_per_block = 0;
+        assert_eq!(
+            config.validate(),
+            Err(QRunV06NodeSupervisorError::InvalidConfiguration)
+        );
+        config = QRunV06PermissionlessMiningSupervisorConfig::default();
+        config.max_nonce_attempts_per_block = QRUN_V06_MAX_NONCE_ATTEMPTS_PER_JOB + 1;
+        assert_eq!(
+            config.validate(),
+            Err(QRunV06NodeSupervisorError::InvalidConfiguration)
+        );
+        config = QRunV06PermissionlessMiningSupervisorConfig::default();
+        config.listener_round_timeout = Duration::from_secs(31);
+        assert_eq!(
+            config.validate(),
+            Err(QRunV06NodeSupervisorError::InvalidConfiguration)
+        );
+    }
 
     #[test]
     fn q6ti_pending_transfers_are_selected_for_mining_and_pruned_after_canonical_execution() {
