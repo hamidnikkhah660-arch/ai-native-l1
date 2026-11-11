@@ -538,3 +538,6 @@ pub mod qrun_v06_founder_treasury_policy_candidate;
 pub mod qrun_v06_permissionless_runtime_candidate;
 /// CP-0592 permissionless Q6TI journal, native mempool and bounded PoW-to-durable-commit service adapter.
 pub mod qrun_v06_permissionless_service_candidate;
+
+/// CP-0604 versioned 7B founder Genesis / 3B mining-only supply policy candidate; not yet canonical-runtime wired.
+pub mod qrun_v06_cp0604_supply_candidate;
