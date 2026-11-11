@@ -6,7 +6,10 @@
 //! the complete local archive. It is a base-node admission API, not yet a socket listener,
 //! peer-discovery/sync daemon, miner supervisor, RPC server, or public Mainnet launcher.
 
-use crate::consensus::ConsensusParameters;
+use crate::consensus::{pow_digest, ConsensusParameters};
+use crate::qrun_v06_pow_wire_candidate::{
+    decode_qrun_v06_pow_block, MAX_QRUN_V06_POW_ENVELOPE_BYTES,
+};
 use crate::{
     qrun_v06_canonical_execution_candidate::QRunV06CanonicalExecutionState,
     qrun_v06_pow_fork_choice_candidate::QRunV06PowForkChoice,
@@ -54,6 +57,41 @@ pub struct QRunV06PermissionlessRuntimeStatus {
     pub consensus_fingerprint: [u8; 32],
 }
 
+pub const QRUN_V06_HISTORY_SYNC_MAX_BATCH_BLOCKS: usize = 128;
+pub const QRUN_V06_HISTORY_SYNC_MAX_BATCH_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QRunV06HistorySyncError {
+    EmptyBatch,
+    BatchTooLarge,
+    WrongNetwork,
+    WrongProfile,
+    InvalidEnvelope(String),
+    NonContiguous,
+    ApplyFailed {
+        index: usize,
+        committed_blocks: usize,
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for QRunV06HistorySyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "QFP6 permissionless history sync rejected batch: {self:?}"
+        )
+    }
+}
+impl std::error::Error for QRunV06HistorySyncError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QRunV06HistorySyncReport {
+    pub imported_blocks: usize,
+    pub resulting_height: u64,
+    pub resulting_tip: [u8; 32],
+    pub resulting_state_root: [u8; 32],
+}
 /// Permissionless base admission with no mandatory external-anchor dependency.
 pub struct QRunV06PermissionlessNodeRuntime {
     store: QRunV06DurableForkStore,
@@ -106,6 +144,105 @@ impl QRunV06PermissionlessNodeRuntime {
         Ok(self.store.submit(envelope, authenticator)?)
     }
 
+    /// Import one bounded, parent-first canonical history batch from an authenticated peer.
+    /// The batch must continue exactly from this node's current canonical tip. Every QFP6
+    /// envelope is decoded and checked for network/profile and contiguous height/parent links
+    /// before any block is committed. Consensus, PoW, execution and durable replay checks remain
+    /// authoritative in the durable fork store. If a later commit fails, the error reports the
+    /// durable prefix already imported; the caller resumes from the returned local status.
+    pub fn import_history_batch<A: TransactionAuthenticator>(
+        &mut self,
+        envelopes: &[Vec<u8>],
+        authenticator: &A,
+    ) -> Result<QRunV06HistorySyncReport, QRunV06HistorySyncError> {
+        if envelopes.is_empty() {
+            return Err(QRunV06HistorySyncError::EmptyBatch);
+        }
+        if envelopes.len() > QRUN_V06_HISTORY_SYNC_MAX_BATCH_BLOCKS {
+            return Err(QRunV06HistorySyncError::BatchTooLarge);
+        }
+        let initial = self
+            .status()
+            .map_err(|error| QRunV06HistorySyncError::InvalidEnvelope(error.to_string()))?;
+        let mut expected_consensus_parent = initial.tip;
+        let expected_execution_parent = self
+            .store
+            .graph()
+            .map_err(|error| QRunV06HistorySyncError::InvalidEnvelope(error.to_string()))?
+            .canonical_state()
+            .tip_hash();
+        let mut expected_height = initial
+            .height
+            .checked_add(1)
+            .ok_or(QRunV06HistorySyncError::BatchTooLarge)?;
+        let params = self
+            .store
+            .graph()
+            .map_err(|error| QRunV06HistorySyncError::InvalidEnvelope(error.to_string()))?
+            .consensus_parameters()
+            .clone();
+        let mut total_bytes = 0usize;
+
+        for (index, envelope) in envelopes.iter().enumerate() {
+            if envelope.is_empty() || envelope.len() > MAX_QRUN_V06_POW_ENVELOPE_BYTES {
+                return Err(QRunV06HistorySyncError::BatchTooLarge);
+            }
+            total_bytes = total_bytes
+                .checked_add(envelope.len())
+                .ok_or(QRunV06HistorySyncError::BatchTooLarge)?;
+            if total_bytes > QRUN_V06_HISTORY_SYNC_MAX_BATCH_BYTES {
+                return Err(QRunV06HistorySyncError::BatchTooLarge);
+            }
+            let decoded = decode_qrun_v06_pow_block(envelope)
+                .map_err(|error| QRunV06HistorySyncError::InvalidEnvelope(error.to_string()))?;
+            if decoded.header.network_id != self.network_id
+                || decoded.block.network_id != self.network_id
+            {
+                return Err(QRunV06HistorySyncError::WrongNetwork);
+            }
+            if decoded.block.profile_id != self.profile_id {
+                return Err(QRunV06HistorySyncError::WrongProfile);
+            }
+            if decoded.header.height != expected_height
+                || decoded.block.height != expected_height
+                || decoded.header.previous_consensus_hash != expected_consensus_parent
+                || decoded.header.parent_hash != decoded.block.parent_hash
+                || (index == 0 && decoded.block.parent_hash != expected_execution_parent)
+            {
+                return Err(QRunV06HistorySyncError::NonContiguous);
+            }
+            expected_consensus_parent = pow_digest(&decoded.header, params.pow)
+                .map_err(|error| QRunV06HistorySyncError::InvalidEnvelope(error.to_string()))?;
+            expected_height = expected_height
+                .checked_add(1)
+                .ok_or(QRunV06HistorySyncError::BatchTooLarge)?;
+        }
+
+        let mut imported = 0usize;
+        for (index, envelope) in envelopes.iter().enumerate() {
+            if let Err(error) = self.submit_envelope(envelope, authenticator) {
+                return Err(QRunV06HistorySyncError::ApplyFailed {
+                    index,
+                    committed_blocks: imported,
+                    reason: error.to_string(),
+                });
+            }
+            imported += 1;
+        }
+        let status = self
+            .status()
+            .map_err(|error| QRunV06HistorySyncError::ApplyFailed {
+                index: imported,
+                committed_blocks: imported,
+                reason: error.to_string(),
+            })?;
+        Ok(QRunV06HistorySyncReport {
+            imported_blocks: imported,
+            resulting_height: status.height,
+            resulting_tip: status.tip,
+            resulting_state_root: status.state_root,
+        })
+    }
     /// Return an immutable branch-graph snapshot for mempool validation and mining-template
     /// construction. The durable store remains the sole authority for subsequent commits.
     pub fn fork_choice_snapshot(
