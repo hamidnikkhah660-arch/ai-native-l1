@@ -10,6 +10,7 @@ use crate::{
     qrun_v06_external_anchor_candidate::{
         QRunV06ExternalAnchorCoordinator, QRunV06ExternalAnchorError, QRunV06ExternalAnchorState,
     },
+    qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessNodeRuntime,
     qrun_v06_pow_fork_choice_candidate::{
         QRunV06PowForkChoice, QRunV06QuoteAssetAuthorizationProvider,
     },
@@ -970,6 +971,50 @@ where
         status,
         commit,
     })
+}
+
+/// Shared Q6PB frame decoding, session replay enforcement, and commit-to-Q6PA mapping.
+/// The admission closure is invoked only after a valid, fresh session request identifier.
+fn process_qrun_v06_permissionless_peer_block_frame_with_admission<F, E>(
+    replay_guard: &mut QRunV06PeerReplayGuard,
+    frame: &[u8],
+    admit: F,
+) -> Result<QRunV06PeerAdmissionResponse, QRunV06PeerIngressError>
+where
+    F: FnOnce(&[u8]) -> Result<QRunV06DurableCommit, E>,
+{
+    let request = decode_qrun_v06_peer_block_request(frame)?;
+    let (status, commit) = if replay_guard.accept(request.request_id).is_err() {
+        (QRunV06PeerAdmissionStatus::Rejected, None)
+    } else {
+        match admit(&request.envelope) {
+            Ok(commit) => (QRunV06PeerAdmissionStatus::Accepted, Some(commit)),
+            Err(_) => (QRunV06PeerAdmissionStatus::Rejected, None),
+        }
+    };
+    Ok(QRunV06PeerAdmissionResponse {
+        request_id: request.request_id,
+        status,
+        commit,
+    })
+}
+
+/// Process one Q6PB frame through the permissionless Genesis-rooted base runtime.
+/// The session replay guard is consumed before validation. Accepted means the envelope
+/// was validated and committed to this node's durable canonical store; it does not mean
+/// network-wide finality or external-anchor confirmation. This base path intentionally
+/// admits native-only blocks; quote-asset authorization remains an explicit extension.
+pub fn process_qrun_v06_permissionless_peer_block_frame<T: TransactionAuthenticator>(
+    runtime: &mut QRunV06PermissionlessNodeRuntime,
+    replay_guard: &mut QRunV06PeerReplayGuard,
+    frame: &[u8],
+    authenticator: &T,
+) -> Result<QRunV06PeerAdmissionResponse, QRunV06PeerIngressError> {
+    process_qrun_v06_permissionless_peer_block_frame_with_admission(
+        replay_guard,
+        frame,
+        |envelope| runtime.submit_envelope(envelope, authenticator),
+    )
 }
 
 /// Read exactly one bounded Q6PB frame from a byte stream.
@@ -5855,5 +5900,82 @@ mod tests {
         anchor_server.shutdown_and_join();
         provider_server.shutdown_and_join();
         fs::remove_dir_all(&service_root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod permissionless_peer_ingress_tests {
+    use super::*;
+
+    #[test]
+    fn rejected_admission_consumes_request_id_and_duplicate_never_reaches_runtime() {
+        let frame = encode_qrun_v06_peer_block_request(55, &[1, 2, 3]).unwrap();
+        let mut replay_guard = QRunV06PeerReplayGuard::new();
+
+        let rejected = process_qrun_v06_permissionless_peer_block_frame_with_admission(
+            &mut replay_guard,
+            &frame,
+            |_| Err::<QRunV06DurableCommit, _>(()),
+        )
+        .unwrap();
+        assert_eq!(rejected.request_id(), 55);
+        assert_eq!(rejected.status(), QRunV06PeerAdmissionStatus::Rejected);
+        assert!(!rejected.is_positive_ack());
+        assert!(rejected.durable_commit().is_none());
+        assert_eq!(replay_guard.last_request_id(), Some(55));
+
+        let duplicate = process_qrun_v06_permissionless_peer_block_frame_with_admission(
+            &mut replay_guard,
+            &frame,
+            |_| -> Result<QRunV06DurableCommit, ()> {
+                panic!("replayed request must be rejected before runtime admission")
+            },
+        )
+        .unwrap();
+        assert_eq!(duplicate.status(), QRunV06PeerAdmissionStatus::Rejected);
+        assert!(!duplicate.is_positive_ack());
+        assert!(duplicate.durable_commit().is_none());
+        assert_eq!(replay_guard.last_request_id(), Some(55));
+    }
+
+    #[test]
+    fn accepted_status_requires_a_durable_commit_value() {
+        let frame = encode_qrun_v06_peer_block_request(77, &[9, 8, 7]).unwrap();
+        let mut replay_guard = QRunV06PeerReplayGuard::new();
+        let commit = QRunV06DurableCommit {
+            outcome: crate::qrun_v06_pow_fork_choice_candidate::QRunV06ForkChoiceOutcome {
+                block_digest: [1; 32],
+                previous_canonical_tip: [2; 32],
+                canonical_tip: [3; 32],
+                previous_height: 0,
+                canonical_height: 1,
+                canonical_changed: true,
+                reorg_count: 0,
+            },
+            generation: 1,
+            manifest_anchor: [4; 32],
+        };
+        let response = process_qrun_v06_permissionless_peer_block_frame_with_admission(
+            &mut replay_guard,
+            &frame,
+            |_| Ok::<_, ()>(commit),
+        )
+        .unwrap();
+        assert_eq!(response.request_id(), 77);
+        assert_eq!(response.status(), QRunV06PeerAdmissionStatus::Accepted);
+        assert!(response.is_positive_ack());
+        assert_eq!(response.durable_commit(), Some(commit));
+    }
+
+    #[test]
+    fn malformed_frame_does_not_consume_session_request_id() {
+        let mut replay_guard = QRunV06PeerReplayGuard::new();
+        let result = process_qrun_v06_permissionless_peer_block_frame_with_admission(
+            &mut replay_guard,
+            &[0, 1, 2],
+            |_| Err::<QRunV06DurableCommit, _>(()),
+        );
+        assert!(result.is_err());
+        assert_eq!(replay_guard.last_request_id(), None);
     }
 }
