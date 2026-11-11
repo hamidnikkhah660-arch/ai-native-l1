@@ -16,6 +16,7 @@ use ai_native_l1_pow_bench::{
     qrun_v06_consensus_profile_candidate::{
         QRunV06ConsensusProfile, QRUN_V06_CONSENSUS_PROFILE_MAX_BYTES,
     },
+    qrun_v06_cp0604_supply_candidate::CP0604_FOUNDER_GENESIS_ATOMS,
     qrun_v06_external_anchor_candidate::{QRunV06ExternalAnchorPin, QRunV06ExternalAnchorState},
     qrun_v06_profile_pin_candidate::QRunV06VerifiedProfilePin,
     qrun_v06_profile_trust_candidate::{
@@ -385,31 +386,38 @@ fn verify_genesis_snapshot(
     {
         return Err("full Q6GD descriptor/timestamp differs from the independently pinned Q6PN profile identity".into());
     }
-    let tokenomics = state
-        .tokenomics()
-        .ok_or_else(|| "full Genesis snapshot is missing CP-0528 tokenomics state".to_string())?;
-    if tokenomics.founder_account() != *founder_account
-        || tokenomics.policy_fingerprint() != *tokenomics_policy_fingerprint
-    {
-        return Err(
-            "full Genesis CP-0528 policy or Founder binding differs from the pinned identity"
-                .into(),
-        );
-    }
     let founder_balance = state
         .unified()
         .ledger()
         .account(founder_account)
         .map_or(0u128, |account| account.balance as u128);
-    if founder_balance != QRUN_V06_FOUNDER_GENESIS_ATOMS {
-        return Err(format!(
-            "Genesis Founder allocation must be exactly {} atoms; found {founder_balance}",
-            QRUN_V06_FOUNDER_GENESIS_ATOMS
-        ));
+    if let Some(supply) = state.cp0604_supply() {
+        if supply.founder_account() != *founder_account
+            || supply.policy_fingerprint() != *tokenomics_policy_fingerprint
+            || supply.mining_issued_atoms() != 0
+            || founder_balance != CP0604_FOUNDER_GENESIS_ATOMS
+        {
+            return Err(
+                "full Genesis CP-0604 policy, Founder binding, zero pre-mining issuance, or 7B allocation differs from the pinned identity".into(),
+            );
+        }
+        supply
+            .validate_ledger_supply(founder_balance)
+            .map_err(|error| format!("CP-0604 Genesis supply invariant failed: {error:?}"))?;
+    } else {
+        let tokenomics = state.tokenomics().ok_or_else(|| {
+            "full Genesis snapshot is missing CP-0528/CP-0604 supply state".to_string()
+        })?;
+        if tokenomics.founder_account() != *founder_account
+            || tokenomics.policy_fingerprint() != *tokenomics_policy_fingerprint
+            || founder_balance != QRUN_V06_FOUNDER_GENESIS_ATOMS
+        {
+            return Err(
+                "full Genesis CP-0528 policy or Founder allocation differs from the pinned identity".into(),
+            );
+        }
     }
-    // verify_invariants binds Ledger total value to the CP-0528 live-supply counters. Since the
-    // only live Genesis issuance is the exact Founder allocation checked above, there is no
-    // remaining spendable supply available to another account.
+    // verify_invariants binds the complete Ledger to the selected versioned issuance policy.
     let state_root = state
         .state_root()
         .map_err(|error| format!("QFP6 Genesis state-root verification failed: {error:?}"))?;
@@ -1249,6 +1257,41 @@ mod tests {
         .unwrap();
         assert_eq!(root, state.state_root().unwrap());
         assert_eq!(founder_balance, QRUN_V06_FOUNDER_GENESIS_ATOMS);
+
+        let cp0604_schedule =
+            QRunV06MiningScheduleCandidate::new(35_673_515_981, 4_204_800).unwrap();
+        let cp0604_policy = ai_native_l1_pow_bench::qrun_v06_cp0604_supply_candidate::Cp0604FounderControlledSupply::genesis(
+            TEST_NETWORK, [0xA3; 32], cp0604_schedule,
+        ).unwrap();
+        let cp0604_fingerprint = cp0604_policy.policy_fingerprint();
+        let cp0604_descriptor = QRunV06GenesisDescriptor::new(
+            TEST_NETWORK,
+            TEST_PROFILE,
+            [0xA3; 32],
+            1_800_000_000,
+            [0xA4; 32],
+            cp0604_fingerprint,
+        )
+        .unwrap();
+        let cp0604_state =
+            QRunV06CanonicalExecutionState::cp0604_genesis_candidate_with_descriptor(
+                cp0604_descriptor.clone(),
+                cp0604_schedule,
+            )
+            .unwrap();
+        let cp0604_bytes = cp0604_state.encode_snapshot().unwrap();
+        let (cp0604_root, cp0604_founder_balance) = verify_genesis_snapshot(
+            &cp0604_bytes,
+            &TEST_NETWORK,
+            &TEST_PROFILE,
+            &[0xA3; 32],
+            &[0xA4; 32],
+            &cp0604_fingerprint,
+            &cp0604_descriptor,
+        )
+        .unwrap();
+        assert_eq!(cp0604_root, cp0604_state.state_root().unwrap());
+        assert_eq!(cp0604_founder_balance, CP0604_FOUNDER_GENESIS_ATOMS);
 
         let mut corrupted = bytes.clone();
         let last_byte = corrupted.len() - 1;

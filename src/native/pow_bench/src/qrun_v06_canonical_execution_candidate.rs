@@ -746,7 +746,7 @@ impl QRunV06CanonicalExecutionState {
                     return Err(QRunV06ExecutionError::InvalidTimestamp);
                 }
             }
-        } else if self.genesis_descriptor.is_some() {
+        } else if self.genesis_descriptor.is_some() && self.cp0604_supply.is_none() {
             return Err(QRunV06ExecutionError::TokenomicsConsensusMismatch);
         }
         if let Some(policy) = &self.cp0604_supply {
