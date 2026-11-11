@@ -411,6 +411,18 @@ struct StoredQRunV06Branch {
     cumulative_work: Uint256,
 }
 
+/// One bounded parent-first page from a pinned canonical fork-choice snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QRunV06CanonicalHistoryPage {
+    pub start_height: u64,
+    /// The next height the caller should request; unchanged only for an empty completed page.
+    pub next_height: u64,
+    pub snapshot_height: u64,
+    pub snapshot_tip: [u8; 32],
+    pub complete: bool,
+    pub envelopes: Vec<Vec<u8>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QRunV06PowForkChoice {
     network_id: [u8; 32],
@@ -753,6 +765,111 @@ impl QRunV06PowForkChoice {
         }
         reverse.reverse();
         Ok(reverse)
+    }
+
+    /// Export a bounded parent-first page from an immutable fork-choice snapshot.
+    ///
+    /// Pass a clone returned by the permissionless runtime's fork_choice_snapshot and keep
+    /// it for the whole sync. This pins one canonical tip while the live node continues
+    /// mining or accepting peers. The method retains at most max_blocks envelopes and
+    /// never exports side branches.
+    pub fn canonical_history_page(
+        &self,
+        start_height: u64,
+        max_blocks: usize,
+        max_bytes: usize,
+    ) -> Result<QRunV06CanonicalHistoryPage, QRunV06ForkChoiceError> {
+        const MAX_PAGE_BLOCKS: usize = 128;
+        const MAX_PAGE_BYTES: usize = 16 * 1024 * 1024;
+
+        if max_blocks == 0
+            || max_blocks > MAX_PAGE_BLOCKS
+            || max_bytes == 0
+            || max_bytes > MAX_PAGE_BYTES
+        {
+            return Err(QRunV06ForkChoiceError::ArchiveExportLimitExceeded);
+        }
+
+        let snapshot_tip = self.canonical_tip();
+        let first_height = self
+            .base_state
+            .height()
+            .checked_add(1)
+            .ok_or(QRunV06ForkChoiceError::ArchiveExportLimitExceeded)?;
+        let after_tip = snapshot_tip
+            .height
+            .checked_add(1)
+            .ok_or(QRunV06ForkChoiceError::ArchiveExportLimitExceeded)?;
+        if start_height < first_height || start_height > after_tip {
+            return Err(QRunV06ForkChoiceError::ArchiveExportLimitExceeded);
+        }
+
+        let mut selected_reverse: Vec<(u64, usize, Vec<u8>)> = Vec::with_capacity(max_blocks);
+        let mut selected_bytes = 0usize;
+        let mut tip = self.canonical_tip;
+        while tip != self.base_tip {
+            if selected_reverse.len() >= MAX_QRUN_V06_FORK_BRANCH_HEIGHT as usize {
+                return Err(QRunV06ForkChoiceError::ReplayIncomplete);
+            }
+            let branch = self
+                .branches
+                .get(&tip)
+                .ok_or(QRunV06ForkChoiceError::UnknownParent)?;
+            let decoded = decode_qrun_v06_pow_block(&branch.envelope)?;
+            let digest = pow_digest(&decoded.header, self.params.pow)?;
+            if digest != tip {
+                return Err(QRunV06ForkChoiceError::ReplayIncomplete);
+            }
+            let height = decoded.header.height;
+            if height < start_height {
+                break;
+            }
+            let encoded_len = branch.envelope.len();
+            if encoded_len > max_bytes {
+                return Err(QRunV06ForkChoiceError::ArchiveExportLimitExceeded);
+            }
+            while selected_reverse.len() >= max_blocks
+                || selected_bytes
+                    .checked_add(encoded_len)
+                    .is_none_or(|total| total > max_bytes)
+            {
+                if selected_reverse.is_empty() {
+                    return Err(QRunV06ForkChoiceError::ArchiveExportLimitExceeded);
+                }
+                let (_, removed_len, _) = selected_reverse.remove(0);
+                selected_bytes = selected_bytes
+                    .checked_sub(removed_len)
+                    .ok_or(QRunV06ForkChoiceError::ArchiveExportLimitExceeded)?;
+            }
+            selected_bytes = selected_bytes
+                .checked_add(encoded_len)
+                .ok_or(QRunV06ForkChoiceError::ArchiveExportLimitExceeded)?;
+            selected_reverse.push((height, encoded_len, branch.envelope.clone()));
+            tip = decoded.header.previous_consensus_hash;
+        }
+
+        selected_reverse.reverse();
+        let mut envelopes = Vec::with_capacity(selected_reverse.len());
+        for (_, _, envelope) in selected_reverse {
+            envelopes.push(envelope);
+        }
+        let next_height = if let Some(last) = envelopes.last() {
+            decode_qrun_v06_pow_block(last)?
+                .header
+                .height
+                .checked_add(1)
+                .ok_or(QRunV06ForkChoiceError::ArchiveExportLimitExceeded)?
+        } else {
+            start_height
+        };
+        Ok(QRunV06CanonicalHistoryPage {
+            start_height,
+            next_height,
+            snapshot_height: snapshot_tip.height,
+            snapshot_tip: snapshot_tip.tip_hash,
+            complete: next_height > snapshot_tip.height,
+            envelopes,
+        })
     }
 
     /// Validate and import one QFP6 block on its exact parent branch.
@@ -2188,6 +2305,88 @@ mod tests {
         assert_eq!(
             rebuilt.canonical_envelopes().unwrap(),
             graph.canonical_envelopes().unwrap()
+        );
+    }
+
+    #[test]
+    fn qfp6_canonical_history_pages_are_bounded_parent_first_and_snapshot_pinned() {
+        let params = params(2);
+        let genesis = genesis_state(&params);
+        let mut graph = QRunV06PowForkChoice::new(genesis, params.clone()).unwrap();
+
+        for height in 1..=5u64 {
+            let parent = graph.canonical_state().clone();
+            let parent_tip = graph.canonical_tip().tip_hash;
+            let target = graph.expected_next_target(&parent_tip).unwrap();
+            let (envelope, _) = make_candidate(
+                &parent,
+                parent_tip,
+                100 + height * 30,
+                target,
+                Vec::new(),
+                &params,
+            );
+            graph
+                .insert_encoded(&envelope, &DigestAuthenticator)
+                .unwrap();
+        }
+
+        let snapshot = graph.clone();
+        let pinned_tip = snapshot.canonical_tip().tip_hash;
+        let first = snapshot.canonical_history_page(1, 2, 1024 * 1024).unwrap();
+        assert_eq!(first.start_height, 1);
+        assert_eq!(first.next_height, 3);
+        assert_eq!(first.snapshot_height, 5);
+        assert_eq!(first.snapshot_tip, pinned_tip);
+        assert!(!first.complete);
+        assert_eq!(
+            first
+                .envelopes
+                .iter()
+                .map(|bytes| decode_qrun_v06_pow_block(bytes).unwrap().header.height)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let second = snapshot
+            .canonical_history_page(first.next_height, 2, 1024 * 1024)
+            .unwrap();
+        assert_eq!(second.next_height, 5);
+        assert!(!second.complete);
+        assert_eq!(
+            second
+                .envelopes
+                .iter()
+                .map(|bytes| decode_qrun_v06_pow_block(bytes).unwrap().header.height)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+
+        let third = snapshot
+            .canonical_history_page(second.next_height, 2, 1024 * 1024)
+            .unwrap();
+        assert_eq!(third.next_height, 6);
+        assert!(third.complete);
+        assert_eq!(
+            third
+                .envelopes
+                .iter()
+                .map(|bytes| decode_qrun_v06_pow_block(bytes).unwrap().header.height)
+                .collect::<Vec<_>>(),
+            vec![5]
+        );
+
+        assert_eq!(
+            snapshot.canonical_history_page(1, 129, 1024 * 1024),
+            Err(QRunV06ForkChoiceError::ArchiveExportLimitExceeded)
+        );
+        assert_eq!(
+            snapshot.canonical_history_page(1, 2, 16 * 1024 * 1024 + 1),
+            Err(QRunV06ForkChoiceError::ArchiveExportLimitExceeded)
+        );
+        assert_eq!(
+            snapshot.canonical_history_page(0, 2, 1024 * 1024),
+            Err(QRunV06ForkChoiceError::ArchiveExportLimitExceeded)
         );
     }
 
