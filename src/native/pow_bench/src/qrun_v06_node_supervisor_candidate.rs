@@ -1297,6 +1297,12 @@ pub fn run_qfp6_permissionless_mining_supervisor<T: TransactionAuthenticator>(
                     shutdown_requested,
                 ) {
                     Ok(mined) => mined,
+                    // A bounded nonce window is one mining slice, not a fatal node error.
+                    // The mempool service has advanced its nonce cursor; return to the listener
+                    // so peers/transactions are serviced before the next mining slice.
+                    Err(QRunV06PermissionlessServiceError::MiningNonceBudgetExhausted {
+                        next_nonce: _,
+                    }) => None,
                     Err(QRunV06PermissionlessServiceError::MiningCancelled)
                         if shutdown_requested.load(Ordering::Acquire) =>
                     {

@@ -8,7 +8,9 @@
 
 use crate::{
     qrun_v06_canonical_execution_candidate::QRunV06BlockOperation,
-    qrun_v06_miner_candidate::{mine_qfp6_block_on_tip, QRunV06MinedBlock, QRunV06MiningError},
+    qrun_v06_miner_candidate::{
+        mine_qfp6_block_on_tip_from_nonce, QRunV06MinedBlock, QRunV06MiningError,
+    },
     qrun_v06_node_runtime_candidate::QRunV06PeerReplayGuard,
     qrun_v06_permissionless_runtime_candidate::{
         QRunV06PermissionlessNodeRuntime, QRunV06PermissionlessRuntimeError,
@@ -35,6 +37,7 @@ pub enum QRunV06PermissionlessServiceError {
     Ingress(String),
     Journal(String),
     Mining(String),
+    MiningNonceBudgetExhausted { next_nonce: u64 },
     MiningCancelled,
 }
 
@@ -59,6 +62,8 @@ impl From<QRunV06TransactionJournalError> for QRunV06PermissionlessServiceError 
 pub struct QRunV06PermissionlessMempool {
     pool: QRunV06NativeTransactionMempool,
     journal: QRunV06TransactionJournal,
+    /// In-memory continuation cursor for bounded PoW batches; resets on process restart.
+    next_pow_nonce: u64,
 }
 
 impl QRunV06PermissionlessMempool {
@@ -72,7 +77,11 @@ impl QRunV06PermissionlessMempool {
             QRunV06PermissionlessServiceError::Journal(format!("invalid mempool limits: {error:?}"))
         })?;
         let journal = QRunV06TransactionJournal::open(directory, limits)?;
-        Ok(Self { pool, journal })
+        Ok(Self {
+            pool,
+            journal,
+            next_pow_nonce: 0,
+        })
     }
 
     pub fn pending_count(&self) -> usize {
@@ -83,6 +92,9 @@ impl QRunV06PermissionlessMempool {
     }
     pub fn journal_generation(&self) -> u64 {
         self.journal.generation()
+    }
+    pub fn next_pow_nonce(&self) -> u64 {
+        self.next_pow_nonce
     }
 
     /// Revalidate pending native transfers after a peer-admitted canonical block/reorg and
@@ -187,24 +199,42 @@ impl QRunV06PermissionlessMempool {
             .cloned()
             .map(QRunV06BlockOperation::NativeTransfer)
             .collect();
-        let mined = mine_qfp6_block_on_tip(
+        let mined = match mine_qfp6_block_on_tip_from_nonce(
             &graph,
             &parent_tip,
             candidate_timestamp,
             producer,
             operations,
             authenticator,
+            self.next_pow_nonce,
             max_nonce_attempts,
             cancellation,
-        )
-        .map_err(|error| match error {
-            QRunV06MiningError::Cancelled => QRunV06PermissionlessServiceError::MiningCancelled,
-            other => QRunV06PermissionlessServiceError::Mining(other.to_string()),
-        })?;
+        ) {
+            Ok(mined) => mined,
+            Err(QRunV06MiningError::NonceBudgetExhausted { next_nonce }) => {
+                return Err(record_nonce_budget_exhaustion(
+                    &mut self.next_pow_nonce,
+                    next_nonce,
+                ));
+            }
+            Err(QRunV06MiningError::Cancelled) => {
+                return Err(QRunV06PermissionlessServiceError::MiningCancelled);
+            }
+            Err(error) => {
+                return Err(QRunV06PermissionlessServiceError::Mining(error.to_string()));
+            }
+        };
         let durable_commit = runtime.submit_envelope(&mined.envelope, authenticator)?;
         let updated_graph = runtime.fork_choice_snapshot()?;
         let became_canonical =
             exact_mined_block_became_canonical(&durable_commit, mined.block_digest);
+        // A canonical block changes the parent/template, so its successor may start at nonce 0.
+        // A side-branch commit leaves the same canonical template eligible and advances instead.
+        self.next_pow_nonce = if became_canonical {
+            0
+        } else {
+            mined.nonce.checked_add(1).unwrap_or(0)
+        };
         let removed_transactions = if became_canonical {
             self.pool.remove_included(&transactions)
         } else {
@@ -245,6 +275,14 @@ pub struct QRunV06PermissionlessMiningCommit {
     pub removed_transactions: usize,
     pub journal_generation: u64,
     pub became_canonical: bool,
+}
+
+fn record_nonce_budget_exhaustion(
+    cursor: &mut u64,
+    next_nonce: u64,
+) -> QRunV06PermissionlessServiceError {
+    *cursor = next_nonce;
+    QRunV06PermissionlessServiceError::MiningNonceBudgetExhausted { next_nonce }
 }
 
 fn exact_mined_block_became_canonical(
@@ -289,6 +327,25 @@ mod tests {
             &commit(true, [9; 32]),
             [7; 32]
         ));
+    }
+
+    #[test]
+    fn exhausted_nonce_batches_advance_the_in_memory_cursor_across_listener_rounds() {
+        let mut cursor = 0u64;
+        assert_eq!(
+            record_nonce_budget_exhaustion(&mut cursor, 1_000_000),
+            QRunV06PermissionlessServiceError::MiningNonceBudgetExhausted {
+                next_nonce: 1_000_000,
+            }
+        );
+        assert_eq!(cursor, 1_000_000);
+        assert_eq!(
+            record_nonce_budget_exhaustion(&mut cursor, 2_000_000),
+            QRunV06PermissionlessServiceError::MiningNonceBudgetExhausted {
+                next_nonce: 2_000_000,
+            }
+        );
+        assert_eq!(cursor, 2_000_000);
     }
 
     #[test]
