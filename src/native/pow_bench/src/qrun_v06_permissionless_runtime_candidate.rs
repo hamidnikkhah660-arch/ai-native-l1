@@ -11,13 +11,22 @@ use crate::qrun_v06_pow_wire_candidate::{
     decode_qrun_v06_pow_block, MAX_QRUN_V06_POW_ENVELOPE_BYTES,
 };
 use crate::{
+    external_cas_anchor_candidate::ExternalCasProviderTransport,
     qrun_v06_canonical_execution_candidate::QRunV06CanonicalExecutionState,
+    qrun_v06_node_runtime_candidate::{
+        QRunV06NodeAnchorGate, QRunV06NodeRuntime, QRunV06NodeRuntimeError,
+    },
     qrun_v06_pow_fork_choice_candidate::QRunV06PowForkChoice,
+    qrun_v06_pow_fork_choice_candidate::QRunV06QuoteAssetAuthorizationProvider,
     qrun_v06_pow_fork_store_candidate::{
         QRunV06DurableCommit, QRunV06DurableForkStore, QRunV06ForkStoreError,
     },
     qrun_v06_profile_pin_candidate::QRunV06VerifiedProfilePin,
+    qrun_v06_qap1_coordinator_candidate::{
+        QRunV06Qap1AnchorTransport, QRunV06Qap1ExternalCoordinator,
+    },
     state_machine::TransactionAuthenticator,
+    v4_fat1_trust_candidate::MlDsa65Verifier,
 };
 use std::path::Path;
 
@@ -25,12 +34,14 @@ use std::path::Path;
 pub enum QRunV06PermissionlessRuntimeError {
     Store(String),
     UnresolvedQap1Intent,
+    Qap1Recovery(String),
 }
 
 impl std::fmt::Display for QRunV06PermissionlessRuntimeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Store(error) => write!(f, "QFP6 permissionless base runtime failed: {error}"),
+            Self::Qap1Recovery(error) => write!(f, "QFP6 QAP1 recovery failed: {error}"),
             Self::UnresolvedQap1Intent => f.write_str(
                 "QFP6 permissionless base runtime refuses a store with unresolved QAP1 intent; recover through the anchored runtime first",
             ),
@@ -100,6 +111,68 @@ pub struct QRunV06PermissionlessNodeRuntime {
 }
 
 impl QRunV06PermissionlessNodeRuntime {
+    /// Open a verified-Genesis durable store directly into the QAP1-required node runtime.
+    /// Unlike `open`, this constructor allows a saved QAP1 intent to reach the recovery
+    /// constructor, which must reconcile it against independently pinned Provider and Q6EA
+    /// authorities before exposing an admission-capable runtime.
+    ///
+    /// All trust inputs (manifest anchor, Genesis digest, profile pin, Provider/Q6EA pins and
+    /// verifier keys) must come from independent provisioning channels. Local manifest values
+    /// are never promoted into trust anchors here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_qap1<A, P, PV, AV, Q, T>(
+        directory: impl AsRef<Path>,
+        genesis_state: QRunV06CanonicalExecutionState,
+        params: ConsensusParameters,
+        authenticator: &T,
+        trusted_manifest_anchor: Option<[u8; 32]>,
+        verified_profile_pin: &QRunV06VerifiedProfilePin,
+        anchor_gate: A,
+        coordinator: QRunV06Qap1ExternalCoordinator<P, PV, AV, Q>,
+        genesis_digest: [u8; 32],
+        quote_authorizer: &mut QRunV06QuoteAssetAuthorizationProvider<'_>,
+    ) -> Result<QRunV06NodeRuntime<A>, QRunV06PermissionlessRuntimeError>
+    where
+        A: QRunV06NodeAnchorGate,
+        P: ExternalCasProviderTransport,
+        PV: MlDsa65Verifier + Clone,
+        AV: MlDsa65Verifier,
+        Q: QRunV06Qap1AnchorTransport,
+        T: TransactionAuthenticator,
+    {
+        let descriptor = verified_profile_pin.descriptor();
+        let provider_pin = coordinator.provider_pin();
+        let qfp6_pin = coordinator.qfp6_pin();
+        if provider_pin != verified_profile_pin.bundle().external_cas_pin()
+            || qfp6_pin.external_cas_pin() != provider_pin
+            || qfp6_pin.genesis_descriptor_commitment() != descriptor.commitment()
+            || provider_pin.network_id != descriptor.network_id()
+            || provider_pin.genesis_digest != genesis_digest
+        {
+            return Err(QRunV06PermissionlessRuntimeError::Qap1Recovery(
+                "Q6PN, Provider, Q6EA, Genesis digest and descriptor commitments are not the same independently pinned domain".into(),
+            ));
+        }
+        let store = QRunV06DurableForkStore::open_with_verified_profile_pin(
+            directory,
+            genesis_state,
+            params,
+            authenticator,
+            trusted_manifest_anchor,
+            verified_profile_pin,
+        )?;
+        QRunV06NodeRuntime::recover_qap1_after_process_restart(
+            store,
+            anchor_gate,
+            coordinator,
+            genesis_digest,
+            authenticator,
+            quote_authorizer,
+        )
+        .map_err(|error: QRunV06NodeRuntimeError| {
+            QRunV06PermissionlessRuntimeError::Qap1Recovery(error.to_string())
+        })
+    }
     /// Open from the complete Genesis-rooted history. The verified profile pin must have been
     /// authenticated out of band; this constructor does not invent or fetch trust material.
     pub fn open<A: TransactionAuthenticator>(
