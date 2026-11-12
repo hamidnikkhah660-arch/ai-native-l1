@@ -56,6 +56,8 @@ pub struct QRunV06NoiseSession {
     transport: TransportState,
     remote_static_public_key: [u8; 32],
     remote_static_key_pinned: bool,
+    network_id: [u8; 32],
+    profile_id: [u8; 32],
 }
 
 impl std::fmt::Debug for QRunV06NoiseSession {
@@ -76,6 +78,14 @@ impl QRunV06NoiseSession {
     /// verified peer identity.
     pub fn remote_static_key_pinned(&self) -> bool {
         self.remote_static_key_pinned
+    }
+
+    /// Network and profile bound into this Noise handshake's authenticated prologue.
+    pub fn network_id(&self) -> &[u8; 32] {
+        &self.network_id
+    }
+    pub fn profile_id(&self) -> &[u8; 32] {
+        &self.profile_id
     }
 
     /// Initiator verifies the responder static key before exposing the session.
@@ -129,6 +139,8 @@ impl QRunV06NoiseSession {
             transport,
             remote_static_public_key,
             remote_static_key_pinned: true,
+            network_id: *network_id,
+            profile_id: *profile_id,
         })
     }
 
@@ -188,6 +200,8 @@ impl QRunV06NoiseSession {
             transport,
             remote_static_public_key,
             remote_static_key_pinned: true,
+            network_id: *network_id,
+            profile_id: *profile_id,
         })
     }
 
@@ -244,6 +258,8 @@ impl QRunV06NoiseSession {
             transport,
             remote_static_public_key,
             remote_static_key_pinned: false,
+            network_id: *network_id,
+            profile_id: *profile_id,
         })
     }
     /// Encrypt one bounded QFP6 application record with a five-second absolute deadline.
@@ -765,6 +781,111 @@ mod tests {
             client.read_record(&mut stream).unwrap(),
             b"validated-domain-response"
         );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn q6ar_relay_from_pinned_session_is_authenticated_and_profile_bound() {
+        use crate::qrun_v06_peer_address_relay_candidate::{
+            decode_q6ar_from_pinned_session, decode_q6ar_from_session, encode_q6ar, Q6arAddress,
+            Q6arAdvertisement,
+        };
+        let wire = encode_q6ar(&Q6arAdvertisement {
+            network_id: NETWORK,
+            profile_id: PROFILE,
+            issued_at_secs: 1_000,
+            ttl_secs: 600,
+            addresses: vec![Q6arAddress {
+                endpoint: "8.8.8.8:8333".parse().unwrap(),
+                noise_static_public_key: [0x44; 32],
+            }],
+        })
+        .unwrap();
+        let (server_private, server_public) = keypair();
+        let (client_private, client_public) = keypair();
+        let (listener, address) = listener();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut session = QRunV06NoiseSession::accept(
+                &mut stream,
+                &server_private,
+                &[client_public],
+                &NETWORK,
+                &PROFILE,
+            )
+            .unwrap();
+            let frame = session.read_record(&mut stream).unwrap();
+            let received = decode_q6ar_from_session(&frame, &session, 1_100).unwrap();
+            assert!(received.relay_origin.relay_static_key_pinned);
+            assert_eq!(received.relay_origin.relay_static_public_key, client_public);
+            assert_eq!(
+                decode_q6ar_from_pinned_session(&frame, &session, 1_100).unwrap(),
+                received.advertisement
+            );
+            assert_eq!(session.network_id(), &NETWORK);
+            assert_eq!(session.profile_id(), &PROFILE);
+        });
+        let mut stream = TcpStream::connect(address).unwrap();
+        let mut client = QRunV06NoiseSession::connect(
+            &mut stream,
+            &client_private,
+            &server_public,
+            &NETWORK,
+            &PROFILE,
+        )
+        .unwrap();
+        client.write_record(&mut stream, &wire).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn q6ar_relay_from_unpinned_session_is_only_an_untrusted_candidate() {
+        use crate::qrun_v06_peer_address_relay_candidate::{
+            decode_q6ar_from_pinned_session, decode_q6ar_from_session, encode_q6ar, Q6arAddress,
+            Q6arAdvertisement, Q6arError,
+        };
+        let wire = encode_q6ar(&Q6arAdvertisement {
+            network_id: NETWORK,
+            profile_id: PROFILE,
+            issued_at_secs: 1_000,
+            ttl_secs: 600,
+            addresses: vec![Q6arAddress {
+                endpoint: "1.1.1.1:8333".parse().unwrap(),
+                noise_static_public_key: [0x45; 32],
+            }],
+        })
+        .unwrap();
+        let (server_private, server_public) = keypair();
+        let (client_private, client_public) = keypair();
+        let (listener, address) = listener();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut session = QRunV06NoiseSession::accept_unpinned(
+                &mut stream,
+                &server_private,
+                &NETWORK,
+                &PROFILE,
+            )
+            .unwrap();
+            let frame = session.read_record(&mut stream).unwrap();
+            let received = decode_q6ar_from_session(&frame, &session, 1_100).unwrap();
+            assert!(!received.relay_origin.relay_static_key_pinned);
+            assert_eq!(received.relay_origin.relay_static_public_key, client_public);
+            assert_eq!(
+                decode_q6ar_from_pinned_session(&frame, &session, 1_100),
+                Err(Q6arError::UnauthenticatedSession),
+            );
+        });
+        let mut stream = TcpStream::connect(address).unwrap();
+        let mut client = QRunV06NoiseSession::connect(
+            &mut stream,
+            &client_private,
+            &server_public,
+            &NETWORK,
+            &PROFILE,
+        )
+        .unwrap();
+        client.write_record(&mut stream, &wire).unwrap();
         server.join().unwrap();
     }
 }

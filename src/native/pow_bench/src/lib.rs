@@ -546,3 +546,6 @@ pub mod qrun_v06_cp0604_supply_candidate;
 
 /// Candidate-only bounded, profile-bound durable peer address book; not runtime-wired.
 pub mod qrun_v06_peer_address_manager_candidate;
+
+/// Candidate-only Q6AR network/profile-bound address relay codec; not runtime-wired.
+pub mod qrun_v06_peer_address_relay_candidate;
