@@ -17,12 +17,14 @@ use crate::{
     qrun_v06_pow_fork_store_candidate::{
         QRunV06DurableCommit, QRunV06DurableForkStore, QRunV06ForkStoreError,
     },
+    qrun_v06_pow_wire_candidate::decode_qrun_v06_pow_block,
     qrun_v06_qap1_coordinator_candidate::{
         QRunV06Qap1AnchorTransport, QRunV06Qap1ExternalCoordinator,
     },
     state_machine::TransactionAuthenticator,
     v4_fat1_trust_candidate::MlDsa65Verifier,
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QRunV06NodeRuntimeError {
@@ -1013,7 +1015,32 @@ pub fn process_qrun_v06_permissionless_peer_block_frame<T: TransactionAuthentica
     process_qrun_v06_permissionless_peer_block_frame_with_admission(
         replay_guard,
         frame,
-        |envelope| runtime.submit_envelope(envelope, authenticator),
+        |envelope| {
+            // This is the live Q6PB peer-ingress boundary. Keep the wall-clock future
+            // guard here, outside deterministic fork-choice/replay, so old archive
+            // blocks remain importable while peers cannot relay far-future timestamps.
+            let decoded = decode_qrun_v06_pow_block(envelope).map_err(|error| {
+                crate::qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessRuntimeError::Store(error.to_string())
+            })?;
+            let reference_time = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| {
+                    crate::qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessRuntimeError::Store(
+                        format!("local reference clock is before Unix epoch: {error}"),
+                    )
+                })?
+                .as_secs();
+            crate::qrun_v06_live_timestamp_policy_candidate::validate_live_block_timestamp(
+                decoded.header.timestamp,
+                reference_time,
+            )
+            .map_err(|error| {
+                crate::qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessRuntimeError::Store(
+                    format!("live QFP6 timestamp policy rejected peer block: {error:?}"),
+                )
+            })?;
+            runtime.submit_envelope(envelope, authenticator)
+        },
     )
 }
 

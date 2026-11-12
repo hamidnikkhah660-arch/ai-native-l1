@@ -148,6 +148,8 @@ pub mod qrun_v06_history_sync_service_candidate;
 pub mod qrun_v06_history_sync_wire_candidate;
 /// CP-0580 candidate QFP6 self-contained Ed25519 + ML-DSA-65 transaction authentication; not runtime activated.
 pub mod qrun_v06_hybrid_auth_candidate;
+/// Bitcoin-inspired local two-hour future-time guard for live peer admission only; never for replay.
+pub mod qrun_v06_live_timestamp_policy_candidate;
 /// CP-0569 branch-local QFP6 block-template construction and bounded Argon2id nonce search; caller performs durable QAP1 admission.
 pub mod qrun_v06_miner_candidate;
 /// CP-0547/0550/0551 QFP6 admission, bounded peer ingress/ACK and per-session replay guard; no production listener wiring yet.
