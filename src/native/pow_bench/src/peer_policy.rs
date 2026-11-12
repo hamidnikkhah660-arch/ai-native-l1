@@ -55,11 +55,34 @@ impl Default for Policy {
     }
 }
 
+fn can_select_peer(
+    peer: &PeerRecord,
+    policy: Policy,
+    prefixes: &std::collections::HashMap<u32, usize>,
+    sources: &std::collections::HashMap<u32, usize>,
+) -> bool {
+    prefixes.get(&peer.prefix).copied().unwrap_or(0) < policy.max_per_prefix
+        && sources.get(&peer.source).copied().unwrap_or(0) < policy.max_per_source
+}
+
+fn record_selected_peer(
+    peer: &PeerRecord,
+    prefixes: &mut std::collections::HashMap<u32, usize>,
+    sources: &mut std::collections::HashMap<u32, usize>,
+) {
+    *prefixes.entry(peer.prefix).or_default() += 1;
+    *sources.entry(peer.source).or_default() += 1;
+}
+
 pub fn select_peers(peers: &[PeerRecord], policy: Policy, now_ms: u64) -> Vec<PeerRecord> {
+    if policy.slots == 0 || policy.max_per_prefix == 0 || policy.max_per_source == 0 {
+        return Vec::new();
+    }
+
     let mut pool = peers.to_vec();
     let mut selected = Vec::new();
-    let mut prefixes = std::collections::HashSet::new();
-    let mut sources = std::collections::HashSet::new();
+    let mut prefixes = std::collections::HashMap::new();
+    let mut sources = std::collections::HashMap::new();
 
     let mut established: Vec<PeerRecord> = pool
         .iter()
@@ -73,11 +96,10 @@ pub fn select_peers(peers: &[PeerRecord], policy: Policy, now_ms: u64) -> Vec<Pe
         if selected.len() >= policy.protected_established.min(policy.slots) {
             break;
         }
-        if prefixes.contains(&peer.prefix) || sources.contains(&peer.source) {
+        if !can_select_peer(&peer, policy, &prefixes, &sources) {
             continue;
         }
-        prefixes.insert(peer.prefix);
-        sources.insert(peer.source);
+        record_selected_peer(&peer, &mut prefixes, &mut sources);
         selected.push(peer.clone());
         pool.retain(|p| p.peer_id != peer.peer_id);
     }
@@ -94,16 +116,16 @@ pub fn select_peers(peers: &[PeerRecord], policy: Policy, now_ms: u64) -> Vec<Pe
         if selected.len() >= policy.slots {
             break;
         }
-        if prefixes.contains(&peer.prefix) || sources.contains(&peer.source) {
+        if !can_select_peer(&peer, policy, &prefixes, &sources) {
             continue;
         }
-        prefixes.insert(peer.prefix);
-        sources.insert(peer.source);
+        record_selected_peer(&peer, &mut prefixes, &mut sources);
         selected.push(peer);
     }
 
     selected
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +193,42 @@ mod tests {
 
         assert!(established_count >= 4);
         assert_eq!(selected.len(), 8);
+    }
+
+    #[test]
+    fn configured_prefix_and_source_caps_are_respected() {
+        let peers = vec![
+            honest(1, 10, 100),
+            honest(2, 10, 200),
+            honest(3, 20, 100),
+            honest(4, 20, 200),
+            honest(5, 30, 300),
+        ];
+        let policy = Policy {
+            slots: 8,
+            protected_established: 8,
+            minimum_tenure_ms: 1,
+            max_per_prefix: 2,
+            max_per_source: 2,
+        };
+
+        let selected = select_peers(&peers, policy, 3_600_000 + 1_000);
+        assert_eq!(selected.len(), 5);
+        for prefix in [10, 20, 30] {
+            assert!(selected.iter().filter(|p| p.prefix == prefix).count() <= 2);
+        }
+        for source in [100, 200, 300] {
+            assert!(selected.iter().filter(|p| p.source == source).count() <= 2);
+        }
+    }
+
+    #[test]
+    fn zero_diversity_capacity_fails_closed() {
+        let policy = Policy {
+            max_per_prefix: 0,
+            ..Policy::default()
+        };
+        assert!(select_peers(&[honest(1, 1, 1)], policy, 10_000).is_empty());
     }
 
     #[test]
