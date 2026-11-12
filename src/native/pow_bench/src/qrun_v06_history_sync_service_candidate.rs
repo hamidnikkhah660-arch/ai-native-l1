@@ -10,18 +10,28 @@ use crate::qrun_v06_peer_listener_candidate::{
 };
 use crate::{
     consensus::pow_digest,
+    external_cas_anchor_candidate::ExternalCasProviderTransport,
     qrun_v06_history_sync_wire_candidate::{
         decode_q6hr_status, encode_q6hp_page_chunks, Q6HistorySyncWireError,
         QRunV06HistoryInfoRequest, QRunV06HistoryPageChunkAssembler, QRunV06HistorySyncRequest,
+    },
+    qrun_v06_node_runtime_candidate::{
+        QRunV06NodeAdmission, QRunV06NodeRuntime, QRunV06NodeRuntimeError,
     },
     qrun_v06_noise_transport_candidate::{QRunV06NoiseError, QRunV06NoiseSession},
     qrun_v06_permissionless_runtime_candidate::{
         QRunV06HistorySyncError, QRunV06HistorySyncReport, QRunV06PermissionlessNodeRuntime,
         QRunV06PermissionlessRuntimeError,
     },
-    qrun_v06_pow_fork_choice_candidate::QRunV06CanonicalHistoryPage,
+    qrun_v06_pow_fork_choice_candidate::{
+        QRunV06CanonicalHistoryPage, QRunV06QuoteAssetAuthorizationProvider,
+    },
     qrun_v06_pow_wire_candidate::decode_qrun_v06_pow_block,
+    qrun_v06_qap1_coordinator_candidate::{
+        QRunV06Qap1AnchorTransport, QRunV06Qap1ExternalCoordinator,
+    },
     state_machine::TransactionAuthenticator,
+    v4_fat1_trust_candidate::MlDsa65Verifier,
 };
 use std::{
     net::{SocketAddr, TcpListener, TcpStream},
@@ -294,6 +304,104 @@ pub fn import_history_page<A: TransactionAuthenticator>(
     Ok(report)
 }
 
+/// Import a verified Q6HS page through QAP1. Every block is committed and acknowledged by
+/// Provider/Q6EA before the next block is attempted. A partial failure leaves the exact
+/// acknowledged prefix durable and requires restart recovery before more admission.
+#[allow(clippy::too_many_arguments)]
+pub fn import_history_page_with_qap1<A, P, PV, AV, Q, T>(
+    runtime: &mut QRunV06NodeRuntime<A>,
+    page: &QRunV06CanonicalHistoryPage,
+    authenticator: &T,
+    quote_authorizer: &mut QRunV06QuoteAssetAuthorizationProvider<'_>,
+    coordinator: &mut QRunV06Qap1ExternalCoordinator<P, PV, AV, Q>,
+) -> Result<QRunV06HistorySyncReport, QRunV06HistorySyncServiceError>
+where
+    A: crate::qrun_v06_node_runtime_candidate::QRunV06NodeAnchorGate,
+    P: ExternalCasProviderTransport,
+    PV: MlDsa65Verifier + Clone,
+    AV: MlDsa65Verifier,
+    Q: QRunV06Qap1AnchorTransport,
+    T: TransactionAuthenticator,
+{
+    if !runtime.requires_qap1()
+        || !runtime.qap1_recovery_verified()
+        || runtime.requires_reopen()
+        || runtime.has_pending_external_anchor()
+    {
+        return Err(QRunV06HistorySyncServiceError::Runtime(
+            "QAP1 recovery/anchor gate is not in an admission-ready state".into(),
+        ));
+    }
+    if page.envelopes.is_empty() {
+        return Err(QRunV06HistorySyncServiceError::EmptyPage);
+    }
+    let before = runtime.committed_anchor_state();
+    if page.start_height != before.canonical_height.saturating_add(1) {
+        return Err(QRunV06HistorySyncServiceError::PageDoesNotContinueLocalTip);
+    }
+    let expected_next = page
+        .start_height
+        .checked_add(page.envelopes.len() as u64)
+        .ok_or(QRunV06HistorySyncServiceError::PageDoesNotMatchSnapshot)?;
+    let after_snapshot = page
+        .snapshot_height
+        .checked_add(1)
+        .ok_or(QRunV06HistorySyncServiceError::PageDoesNotMatchSnapshot)?;
+    if page.next_height != expected_next
+        || page.complete != (page.next_height > page.snapshot_height)
+        || (page.complete && page.next_height != after_snapshot)
+        || (!page.complete && page.next_height > page.snapshot_height)
+    {
+        return Err(QRunV06HistorySyncServiceError::PageDoesNotMatchSnapshot);
+    }
+    let graph = runtime
+        .fork_choice_snapshot()
+        .map_err(|error: QRunV06NodeRuntimeError| {
+            QRunV06HistorySyncServiceError::Runtime(error.to_string())
+        })?;
+    if before.canonical_tip != graph.canonical_tip().tip_hash {
+        return Err(QRunV06HistorySyncServiceError::SnapshotMismatch);
+    }
+    if page.complete {
+        let last = decode_qrun_v06_pow_block(page.envelopes.last().unwrap())
+            .map_err(|error| QRunV06HistorySyncServiceError::Wire(error.to_string()))?;
+        let final_digest = pow_digest(&last.header, graph.consensus_parameters().pow)
+            .map_err(|error| QRunV06HistorySyncServiceError::Wire(error.to_string()))?;
+        if final_digest != page.snapshot_tip || page.snapshot_height != expected_next - 1 {
+            return Err(QRunV06HistorySyncServiceError::PageDoesNotMatchSnapshot);
+        }
+    }
+    for envelope in &page.envelopes {
+        match runtime.submit_envelope_with_qap1(
+            envelope,
+            authenticator,
+            quote_authorizer,
+            coordinator,
+        ) {
+            Ok(QRunV06NodeAdmission::Acknowledged(_)) => {}
+            Ok(QRunV06NodeAdmission::ExternalAnchorPending(_)) => {
+                return Err(QRunV06HistorySyncServiceError::Runtime(
+                    "QAP1 page import stopped: external anchor pending; no further block admitted"
+                        .into(),
+                ));
+            }
+            Err(error) => return Err(QRunV06HistorySyncServiceError::Runtime(error.to_string())),
+        }
+    }
+    let after = runtime.committed_anchor_state();
+    if page.complete
+        && (after.canonical_height != page.snapshot_height
+            || after.canonical_tip != page.snapshot_tip)
+    {
+        return Err(QRunV06HistorySyncServiceError::PageDoesNotMatchSnapshot);
+    }
+    Ok(QRunV06HistorySyncReport {
+        imported_blocks: page.envelopes.len(),
+        resulting_height: after.canonical_height,
+        resulting_tip: after.canonical_tip,
+        resulting_state_root: after.canonical_state_root,
+    })
+}
 /// Bounds for one statically pinned peer bootstrap/synchronization attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QRunV06HistorySyncClientConfig {
