@@ -1584,6 +1584,162 @@ mod tests {
     }
 
     #[test]
+    fn cp0604_permissionless_supervisor_mines_and_recovers_durable_genesis_state() {
+        use crate::{
+            consensus::{ConsensusParameters, Uint256},
+            external_cas_anchor_candidate::ExternalCasPin,
+            qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint,
+            qrun_v06_cp0604_supply_candidate::Cp0604FounderControlledSupply,
+            qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
+            qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessNodeRuntime,
+            qrun_v06_permissionless_service_candidate::QRunV06PermissionlessMempool,
+            qrun_v06_profile_pin_candidate::{
+                QRunV06ProfilePinCandidate, QRunV06VerifiedProfilePin,
+            },
+            qrun_v06_tokenomics_candidate::QRunV06MiningScheduleCandidate,
+            qrun_v06_transaction_mempool_candidate::QRunV06MempoolLimits,
+            v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES,
+        };
+        use std::sync::Arc;
+
+        const NETWORK: [u8; 32] = [0xB1; 32];
+        const PROFILE: [u8; 32] = [0xB2; 32];
+        const FOUNDER: [u8; 32] = [0xB3; 32];
+        let mut params = ConsensusParameters::qrun_v06_sha256d_candidate().unwrap();
+        params.target_block_time_secs = 30;
+        params.difficulty_window_blocks = 2;
+        params.difficulty_min_ratio_divisor = 4;
+        params.difficulty_max_ratio = 4;
+        params.initial_target = Uint256::from_be_bytes([0x7F; 32]);
+        params.pow_limit = Uint256::MAX;
+        params.validate().unwrap();
+
+        let schedule = QRunV06MiningScheduleCandidate::cp0422_research_candidate();
+        let supply = Cp0604FounderControlledSupply::genesis(NETWORK, FOUNDER, schedule).unwrap();
+        let descriptor = QRunV06GenesisDescriptor::new(
+            NETWORK,
+            PROFILE,
+            FOUNDER,
+            1,
+            qrun_v06_consensus_fingerprint(&params).unwrap(),
+            supply.policy_fingerprint(),
+        )
+        .unwrap();
+        let genesis = crate::qrun_v06_canonical_execution_candidate::QRunV06CanonicalExecutionState::
+            cp0604_genesis_candidate_with_descriptor(descriptor.clone(), schedule).unwrap();
+        let bundle = QRunV06ProfilePinCandidate::new(
+            descriptor,
+            ExternalCasPin {
+                provider_id: [0xC1; 32],
+                network_id: NETWORK,
+                genesis_digest: [0xC2; 32],
+                receipt_key_id: [0xC3; 32],
+                receipt_public_key: [0xC4; ML_DSA_65_PUBLIC_KEY_BYTES],
+            },
+        )
+        .unwrap();
+        let pin_bytes = bundle.encode().unwrap();
+        let pin_commitment = bundle.commitment().unwrap();
+        let verified_pin = QRunV06VerifiedProfilePin::decode(&pin_bytes, pin_commitment).unwrap();
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "qfp6-cp0604-supervisor-store-{}",
+            std::process::id()
+        ));
+        let mempool_dir = store_dir.with_extension("mempool");
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let _ = std::fs::remove_dir_all(&mempool_dir);
+        let authenticator =
+            QRunV06HybridTransactionAuthenticator::new(LibcruxMlDsa65VerifierCandidate);
+        let mut runtime = QRunV06PermissionlessNodeRuntime::open(
+            &store_dir,
+            genesis.clone(),
+            params.clone(),
+            &authenticator,
+            None,
+            &verified_pin,
+        )
+        .unwrap();
+        let mut mempool =
+            QRunV06PermissionlessMempool::open(&mempool_dir, QRunV06MempoolLimits::default())
+                .unwrap();
+
+        let noise_params = "Noise_XX_25519_ChaChaPoly_SHA256".parse().unwrap();
+        let local_pair = snow::Builder::new(noise_params).generate_keypair().unwrap();
+        let remote_pair = snow::Builder::new("Noise_XX_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let mut local_private = [0u8; 32];
+        let mut remote_public = [0u8; 32];
+        local_private.copy_from_slice(&local_pair.private);
+        remote_public.copy_from_slice(&remote_pair.public);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let signal = shutdown.clone();
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(180));
+            signal.store(true, Ordering::Release);
+        });
+        let mut config = QRunV06PermissionlessMiningSupervisorConfig::default();
+        config.peer.install_os_signal_handler = false;
+        config.peer.max_total_sessions = 8;
+        config.listener_round_timeout = Duration::from_millis(20);
+        config.max_nonce_attempts_per_block = QRUN_V06_MAX_NONCE_ATTEMPTS_PER_JOB;
+
+        let report = run_qfp6_permissionless_mining_supervisor(
+            &listener,
+            config,
+            &local_private,
+            &[remote_public],
+            &NETWORK,
+            &PROFILE,
+            shutdown.as_ref(),
+            &mut runtime,
+            &authenticator,
+            FOUNDER,
+            &mut mempool,
+        )
+        .unwrap();
+        stopper.join().unwrap();
+        local_private.fill(0);
+        let committed = runtime.status().unwrap();
+        assert_eq!(
+            report.stop_reason,
+            QRunV06NodeSupervisorStopReason::ShutdownRequested
+        );
+        assert!(report.blocks_durably_committed >= 1);
+        assert!(report.blocks_became_canonical >= 1);
+        assert!(report.ending_height >= 1);
+        assert_eq!(committed.height, report.ending_height);
+        assert_eq!(committed.network_id, NETWORK);
+        assert_eq!(committed.profile_id, PROFILE);
+        let trusted_manifest_anchor = committed.manifest_anchor;
+        let committed_root = committed.state_root;
+        drop(runtime);
+        drop(mempool);
+
+        let recovered = QRunV06PermissionlessNodeRuntime::open(
+            &store_dir,
+            genesis,
+            params,
+            &authenticator,
+            Some(trusted_manifest_anchor),
+            &verified_pin,
+        )
+        .unwrap();
+        let recovered_status = recovered.status().unwrap();
+        assert_eq!(recovered_status.height, committed.height);
+        assert_eq!(recovered_status.tip, committed.tip);
+        assert_eq!(recovered_status.state_root, committed_root);
+        assert_eq!(
+            recovered_status.manifest_generation,
+            committed.manifest_generation
+        );
+        drop(recovered);
+        std::fs::remove_dir_all(store_dir).unwrap();
+        std::fs::remove_dir_all(mempool_dir).unwrap();
+    }
+    #[test]
     fn supervisor_requires_the_recovery_coordinator_provider_and_genesis_pins_to_match() {
         let state = QRunV06ExternalAnchorState {
             network_id: [3; 32],
