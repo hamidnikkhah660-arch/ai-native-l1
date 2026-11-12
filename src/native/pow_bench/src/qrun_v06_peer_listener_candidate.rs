@@ -108,6 +108,8 @@ pub enum QRunV06PeerListenerStopReason {
 pub struct QRunV06PeerListenerStats {
     pub accepted_connections: usize,
     pub authenticated_sessions: usize,
+    /// Established Noise sessions without an operator-pinned remote static key.
+    pub unverified_peer_sessions: usize,
     pub rejected_handshakes: usize,
     pub requests_received: usize,
     pub responses_written: usize,
@@ -610,7 +612,9 @@ where
     };
 
     config.validate()?;
-    validate_peer_pins(trusted_remote_static_public_keys)?;
+    if !trusted_remote_static_public_keys.is_empty() {
+        validate_peer_pins(trusted_remote_static_public_keys)?;
+    }
     if local_static_private_key.iter().all(|byte| *byte == 0)
         || network_id.iter().all(|byte| *byte == 0)
         || profile_id.iter().all(|byte| *byte == 0)
@@ -621,7 +625,11 @@ where
         .local_addr()
         .map_err(|error| QRunV06PeerListenerError::Io(error.to_string()))?
         .ip();
-    if !is_safe_private_or_overlay_ip(bind_ip) {
+    if trusted_remote_static_public_keys.is_empty() {
+        if bind_ip.is_multicast() {
+            return Err(QRunV06PeerListenerError::UnsafeBindAddress(bind_ip));
+        }
+    } else if !is_safe_private_or_overlay_ip(bind_ip) {
         return Err(QRunV06PeerListenerError::UnsafeBindAddress(bind_ip));
     }
     listener
@@ -654,20 +662,34 @@ where
             stats.handler_failures += 1;
             continue;
         }
-        let mut noise = match QRunV06NoiseSession::accept(
-            &mut stream,
-            local_static_private_key,
-            trusted_remote_static_public_keys,
-            network_id,
-            profile_id,
-        ) {
+        let session = if trusted_remote_static_public_keys.is_empty() {
+            QRunV06NoiseSession::accept_unpinned(
+                &mut stream,
+                local_static_private_key,
+                network_id,
+                profile_id,
+            )
+        } else {
+            QRunV06NoiseSession::accept(
+                &mut stream,
+                local_static_private_key,
+                trusted_remote_static_public_keys,
+                network_id,
+                profile_id,
+            )
+        };
+        let mut noise = match session {
             Ok(session) => session,
             Err(_) => {
                 stats.rejected_handshakes += 1;
                 continue;
             }
         };
-        stats.authenticated_sessions += 1;
+        if noise.remote_static_key_pinned() {
+            stats.authenticated_sessions += 1;
+        } else {
+            stats.unverified_peer_sessions += 1;
+        }
         let mut replay_guard = QRunV06PeerReplayGuard::new();
         let mut session_history_egress = 0usize;
         for _ in 0..config.max_requests_per_session {
@@ -797,6 +819,32 @@ where
     Ok(QRunV06PeerListenerReport { stats, stop_reason })
 }
 
+/// Public-network ingress variant. Noise XX is anonymous here: it provides transport
+/// confidentiality and network/profile domain separation only. Consensus validation remains
+/// authoritative; the remote static key is not treated as an authenticated identity.
+pub fn serve_qfp6_noise_listener_with_history_open<F>(
+    listener: &TcpListener,
+    config: QRunV06PeerListenerConfig,
+    local_static_private_key: &[u8; 32],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    shutdown: &AtomicBool,
+    on_application_frame: F,
+) -> Result<QRunV06PeerListenerReport, QRunV06PeerListenerError>
+where
+    F: FnMut(&mut QRunV06PeerReplayGuard, &[u8]) -> Result<Vec<Vec<u8>>, String>,
+{
+    serve_qfp6_noise_listener_with_history(
+        listener,
+        config,
+        local_static_private_key,
+        &[],
+        network_id,
+        profile_id,
+        shutdown,
+        on_application_frame,
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1511,5 +1559,68 @@ mod tests {
         let report = server.join().unwrap();
         assert_eq!(report.stats.requests_received, 1);
         assert_eq!(report.stats.responses_written, 3);
+    }
+    #[test]
+    fn qfp6_open_history_listener_accepts_anonymous_peer_on_wildcard_candidate_bind() {
+        let (server_private, server_public) = keypair();
+        let (client_private, _client_public) = keypair();
+        let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = AtomicBool::new(false);
+        let server = thread::spawn(move || {
+            serve_qfp6_noise_listener_with_history_open(
+                &listener,
+                QRunV06PeerListenerConfig {
+                    max_sessions: 1,
+                    max_requests_per_session: 1,
+                    max_failed_handshakes: 2,
+                    accept_poll_interval: Duration::from_millis(10),
+                },
+                &server_private,
+                &NETWORK,
+                &PROFILE,
+                &shutdown,
+                |_guard, frame| {
+                    let request = decode_qrun_v06_peer_block_request(frame)
+                        .map_err(|error| error.to_string())?;
+                    Ok(vec![make_response(
+                        request.request_id,
+                        crate::qrun_v06_node_runtime_candidate::QRunV06PeerAdmissionStatus::Accepted
+                            as u16,
+                    )
+                    .to_vec()])
+                },
+            )
+            .unwrap()
+        });
+
+        let mut stream = connect_until(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            address.port(),
+        ));
+        let mut client = QRunV06NoiseSession::connect(
+            &mut stream,
+            &client_private,
+            &server_public,
+            &NETWORK,
+            &PROFILE,
+        )
+        .unwrap();
+        let frame = encode_qrun_v06_peer_block_request(0xA016, b"candidate-open-peer").unwrap();
+        client.write_q6pb_request(&mut stream, &frame).unwrap();
+        let ack = client.read_q6pa_response(&mut stream, 0xA016).unwrap();
+        assert_eq!(
+            u16::from_be_bytes([ack[6], ack[7]]),
+            crate::qrun_v06_node_runtime_candidate::QRunV06PeerAdmissionStatus::Accepted as u16,
+        );
+        let report = server.join().unwrap();
+        assert_eq!(report.stats.accepted_connections, 1);
+        assert_eq!(report.stats.authenticated_sessions, 0);
+        assert_eq!(report.stats.unverified_peer_sessions, 1);
+        assert_eq!(report.stats.requests_received, 1);
+        assert_eq!(
+            report.stop_reason,
+            QRunV06PeerListenerStopReason::SessionLimitReached
+        );
     }
 }

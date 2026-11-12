@@ -52,13 +52,21 @@
     "anchored_qap1_candidate_wired": true,
     "permissionless_base_runtime_wired": true,
     "permissionless_base_runtime_candidate_only": true,
-    "peer_admission_pinned_only": true,
+    "peer_admission_pinned_only": false,
+    "open_peer_listener_candidate_wired": true,
+    "long_running_session_rotation_wired": true,
+    "outbound_bootstrap_pins_required_for_sync": true,
+    "inbound_peer_identity_authenticated": false,
+    "public_peer_discovery_qualified": false,
+    "public_listener_opt_in_required": true,
     "full_history_replay_qualified": false,
     "public_listener_qualified": false
   },
   "notes": [
     "Candidate scaffold only. No Genesis, public keys, trust roots, signatures, or service endpoints are fabricated.",
     "Do not promote this manifest to Mainnet. Replace each missing component only with independently reviewed canonical artifacts.",
+    "Open inbound Noise XX is unauthenticated: remote peer identity is unpinned and an active MITM can terminate/re-encrypt the transport.",
+    "Wildcard/public candidate binds require allow_public_listener opt-in; public peer discovery remains unimplemented.",
     "Q6CP candidate parameters and QFP6 SHA-256d easy-fixture targets are not Mainnet-approved."
   ],
   "founder_identity": {

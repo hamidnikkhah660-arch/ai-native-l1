@@ -55,12 +55,14 @@ impl std::error::Error for QRunV06NoiseError {}
 pub struct QRunV06NoiseSession {
     transport: TransportState,
     remote_static_public_key: [u8; 32],
+    remote_static_key_pinned: bool,
 }
 
 impl std::fmt::Debug for QRunV06NoiseSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QRunV06NoiseSession")
-            .field("remote_static_public_key", &"<pinned-key>")
+            .field("remote_static_public_key", &"<redacted>")
+            .field("remote_static_key_pinned", &self.remote_static_key_pinned)
             .finish_non_exhaustive()
     }
 }
@@ -68,6 +70,12 @@ impl std::fmt::Debug for QRunV06NoiseSession {
 impl QRunV06NoiseSession {
     pub fn remote_static_public_key(&self) -> &[u8; 32] {
         &self.remote_static_public_key
+    }
+    /// True only when the remote static key was checked against an operator-supplied pin.
+    /// An unpinned session provides transport confidentiality and domain binding, not a
+    /// verified peer identity.
+    pub fn remote_static_key_pinned(&self) -> bool {
+        self.remote_static_key_pinned
     }
 
     /// Initiator verifies the responder static key before exposing the session.
@@ -120,6 +128,7 @@ impl QRunV06NoiseSession {
         Ok(Self {
             transport,
             remote_static_public_key,
+            remote_static_key_pinned: true,
         })
     }
 
@@ -178,9 +187,65 @@ impl QRunV06NoiseSession {
         Ok(Self {
             transport,
             remote_static_public_key,
+            remote_static_key_pinned: true,
         })
     }
 
+    /// Responder accepts an anonymous Noise XX peer without treating its self-asserted static
+    /// key as an identity or trust anchor. The prologue still binds the exact QFP6 network and
+    /// profile. Consensus, signatures, replay guards, and bounded admission remain mandatory.
+    /// This is unauthenticated Noise XX. The remote identity is unverified and an active MITM can
+    /// terminate/re-encrypt the session; at best this protects against passive eavesdropping.
+    /// It is not an authenticated transport or a post-quantum transport.
+    pub fn accept_unpinned(
+        stream: &mut TcpStream,
+        local_static_private_key: &[u8; 32],
+        network_id: &[u8; 32],
+        profile_id: &[u8; 32],
+    ) -> Result<Self, QRunV06NoiseError> {
+        validate_context(local_static_private_key, network_id, profile_id)?;
+        let deadline = Instant::now() + HANDSHAKE_BUDGET;
+        let mut handshake = Builder::new(noise_params()?)
+            .prologue(&prologue(network_id, profile_id))
+            .local_private_key(local_static_private_key)
+            .build_responder()
+            .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
+        let mut payload = [0u8; MAX_HANDSHAKE_MESSAGE];
+        let mut message = [0u8; MAX_HANDSHAKE_MESSAGE];
+
+        let first = read_handshake(stream, deadline)?;
+        let read = handshake
+            .read_message(&first, &mut payload)
+            .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
+        if read != 0 {
+            return Err(QRunV06NoiseError::MalformedHandshake);
+        }
+        let written = handshake
+            .write_message(&[], &mut message)
+            .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
+        write_handshake(stream, &message[..written], deadline)?;
+
+        let third = read_handshake(stream, deadline)?;
+        let read = handshake
+            .read_message(&third, &mut payload)
+            .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
+        if read != 0 {
+            return Err(QRunV06NoiseError::MalformedHandshake);
+        }
+        let remote = handshake
+            .get_remote_static()
+            .ok_or(QRunV06NoiseError::MalformedHandshake)?;
+        let mut remote_static_public_key = [0u8; 32];
+        remote_static_public_key.copy_from_slice(remote);
+        let transport = handshake
+            .into_transport_mode()
+            .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
+        Ok(Self {
+            transport,
+            remote_static_public_key,
+            remote_static_key_pinned: false,
+        })
+    }
     /// Encrypt one bounded QFP6 application record with a five-second absolute deadline.
     pub fn write_record(
         &mut self,
@@ -657,5 +722,49 @@ mod tests {
             server.join().unwrap(),
             Err(QRunV06NoiseError::MalformedRecord)
         ));
+    }
+    #[test]
+    fn qfp6_noise_unpinned_mode_encrypts_without_claiming_peer_identity() {
+        let (server_private, server_public) = keypair();
+        let (client_private, client_public) = keypair();
+        let (listener, address) = listener();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut session = QRunV06NoiseSession::accept_unpinned(
+                &mut stream,
+                &server_private,
+                &NETWORK,
+                &PROFILE,
+            )
+            .unwrap();
+            assert!(!session.remote_static_key_pinned());
+            assert_eq!(session.remote_static_public_key(), &client_public);
+            assert_eq!(
+                session.read_record(&mut stream).unwrap(),
+                b"anonymous-peer-frame"
+            );
+            session
+                .write_record(&mut stream, b"validated-domain-response")
+                .unwrap();
+        });
+
+        let mut stream = TcpStream::connect(address).unwrap();
+        let mut client = QRunV06NoiseSession::connect(
+            &mut stream,
+            &client_private,
+            &server_public,
+            &NETWORK,
+            &PROFILE,
+        )
+        .unwrap();
+        assert!(client.remote_static_key_pinned());
+        client
+            .write_record(&mut stream, b"anonymous-peer-frame")
+            .unwrap();
+        assert_eq!(
+            client.read_record(&mut stream).unwrap(),
+            b"validated-domain-response"
+        );
+        server.join().unwrap();
     }
 }

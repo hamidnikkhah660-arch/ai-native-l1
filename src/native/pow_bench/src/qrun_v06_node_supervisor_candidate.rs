@@ -37,8 +37,8 @@ use crate::{
     qrun_v06_peer_listener_candidate::{
         process_qfp6_peer_frame_with_permissionless_runtime, process_qfp6_peer_frame_with_qap1,
         serve_qfp6_noise_listener, serve_qfp6_noise_listener_with_history,
-        QRunV06PeerListenerConfig, QRunV06PeerListenerError, QRunV06PeerListenerStats,
-        QRunV06PeerListenerStopReason,
+        serve_qfp6_noise_listener_with_history_open, QRunV06PeerListenerConfig,
+        QRunV06PeerListenerError, QRunV06PeerListenerStats, QRunV06PeerListenerStopReason,
     },
     qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessNodeRuntime,
     qrun_v06_permissionless_service_candidate::{
@@ -281,6 +281,10 @@ fn add_stats(
     add_counter(
         &mut total.authenticated_sessions,
         next.authenticated_sessions,
+    )?;
+    add_counter(
+        &mut total.unverified_peer_sessions,
+        next.unverified_peer_sessions,
     )?;
     add_counter(&mut total.rejected_handshakes, next.rejected_handshakes)?;
     add_counter(&mut total.requests_received, next.requests_received)?;
@@ -749,16 +753,28 @@ where
             }
         });
 
-        let report = serve_qfp6_noise_listener_with_history(
-            listener,
-            config,
-            local_static_private_key,
-            trusted_remote_static_public_keys,
-            network_id,
-            profile_id,
-            &round_shutdown,
-            on_application_frame,
-        );
+        let report = if trusted_remote_static_public_keys.is_empty() {
+            serve_qfp6_noise_listener_with_history_open(
+                listener,
+                config,
+                local_static_private_key,
+                network_id,
+                profile_id,
+                &round_shutdown,
+                on_application_frame,
+            )
+        } else {
+            serve_qfp6_noise_listener_with_history(
+                listener,
+                config,
+                local_static_private_key,
+                trusted_remote_static_public_keys,
+                network_id,
+                profile_id,
+                &round_shutdown,
+                on_application_frame,
+            )
+        };
         watcher_stop.store(true, Ordering::Release);
         if watcher.join().is_err() {
             return Err(QRunV06NodeSupervisorError::ShutdownWatcherPanicked);
@@ -947,6 +963,7 @@ where
                 }
                 if listener_report.stop_reason
                     == QRunV06PeerListenerStopReason::FailedHandshakeLimitReached
+                    && !trusted_remote_static_public_keys.is_empty()
                 {
                     return Err(QRunV06NodeSupervisorError::HandshakeBudgetExceeded);
                 }
@@ -1249,6 +1266,7 @@ pub fn run_qfp6_permissionless_mining_supervisor<T: TransactionAuthenticator>(
                 add_stats(&mut aggregate, listener_report.stats)?;
                 if listener_report.stop_reason
                     == QRunV06PeerListenerStopReason::FailedHandshakeLimitReached
+                    && !trusted_remote_static_public_keys.is_empty()
                 {
                     return Err(QRunV06NodeSupervisorError::HandshakeBudgetExceeded);
                 }
@@ -1344,6 +1362,83 @@ pub fn run_qfp6_permissionless_mining_supervisor<T: TransactionAuthenticator>(
     }
 }
 
+/// Permissionless inbound variant: peers may establish anonymous QFP6 Noise sessions.
+/// Transport does not authenticate peer identity; consensus and transaction validation do.
+/// Long-running open inbound supervisor. Each inner run has a finite accepted-connection
+/// budget; when that window fills, it rolls the listener window without closing the TCP socket,
+/// clearing the durable runtime, or losing Q6MJ. Ctrl-C/SIGTERM still exits the outer loop.
+#[allow(clippy::too_many_arguments)]
+pub fn run_qfp6_permissionless_mining_supervisor_open<T: TransactionAuthenticator>(
+    listener: &TcpListener,
+    config: QRunV06PermissionlessMiningSupervisorConfig,
+    local_static_private_key: &[u8; 32],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    shutdown_requested: &AtomicBool,
+    runtime: &mut QRunV06PermissionlessNodeRuntime,
+    authenticator: &T,
+    producer: [u8; 32],
+    mempool: &mut QRunV06PermissionlessMempool,
+) -> Result<QRunV06PermissionlessMiningSupervisorReport, QRunV06NodeSupervisorError> {
+    let mut total = QRunV06PermissionlessMiningSupervisorReport {
+        listener_rounds: 0,
+        mining_rounds: 0,
+        blocks_durably_committed: 0,
+        blocks_became_canonical: 0,
+        ending_height: 0,
+        pending_mempool_transactions: 0,
+        pending_mempool_bytes: 0,
+        mempool_journal_generation: 0,
+        stats: QRunV06PeerListenerStats::default(),
+        stop_reason: QRunV06NodeSupervisorStopReason::ShutdownRequested,
+    };
+    loop {
+        if shutdown_requested.load(Ordering::Acquire) {
+            total.stop_reason = QRunV06NodeSupervisorStopReason::ShutdownRequested;
+            return Ok(total);
+        }
+        let report = run_qfp6_permissionless_mining_supervisor(
+            listener,
+            config,
+            local_static_private_key,
+            &[],
+            network_id,
+            profile_id,
+            shutdown_requested,
+            runtime,
+            authenticator,
+            producer,
+            mempool,
+        )?;
+        total.listener_rounds = total
+            .listener_rounds
+            .checked_add(report.listener_rounds)
+            .ok_or(QRunV06NodeSupervisorError::StatisticsOverflow)?;
+        total.mining_rounds = total
+            .mining_rounds
+            .checked_add(report.mining_rounds)
+            .ok_or(QRunV06NodeSupervisorError::StatisticsOverflow)?;
+        total.blocks_durably_committed = total
+            .blocks_durably_committed
+            .checked_add(report.blocks_durably_committed)
+            .ok_or(QRunV06NodeSupervisorError::StatisticsOverflow)?;
+        total.blocks_became_canonical = total
+            .blocks_became_canonical
+            .checked_add(report.blocks_became_canonical)
+            .ok_or(QRunV06NodeSupervisorError::StatisticsOverflow)?;
+        add_stats(&mut total.stats, report.stats)?;
+        total.ending_height = report.ending_height;
+        total.pending_mempool_transactions = report.pending_mempool_transactions;
+        total.pending_mempool_bytes = report.pending_mempool_bytes;
+        total.mempool_journal_generation = report.mempool_journal_generation;
+        total.stop_reason = report.stop_reason;
+        if report.stop_reason == QRunV06NodeSupervisorStopReason::ShutdownRequested {
+            return Ok(total);
+        }
+        // SessionBudgetReached is a window rotation, not a node shutdown.
+        thread::sleep(Duration::from_millis(100));
+    }
+}
 /// Validate a static set of outbound bootstrap peers and return their Noise static-key pins.
 pub fn validate_qfp6_pinned_bootstrap_peers(
     peers: &[QRunV06PinnedBootstrapPeer],
@@ -1502,7 +1597,7 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_bootstrap<T: TransactionAu
         .validate()
         .map_err(|error| QRunV06NodeSupervisorError::BootstrapSync(error.to_string()))?;
     validate_identity_material(local_static_private_key, network_id, profile_id)?;
-    let trusted_keys = validate_qfp6_pinned_bootstrap_peers(bootstrap_peers)?;
+    validate_qfp6_pinned_bootstrap_peers(bootstrap_peers)?;
     let startup = runtime
         .status()
         .map_err(|error| QRunV06NodeSupervisorError::Runtime(error.to_string()))?;
@@ -1537,11 +1632,10 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_bootstrap<T: TransactionAu
     }
     let bootstrap_sync = bootstrap_report
         .ok_or_else(|| QRunV06NodeSupervisorError::BootstrapSync(peer_errors.join("; ")))?;
-    let supervisor = run_qfp6_permissionless_mining_supervisor(
+    let supervisor = run_qfp6_permissionless_mining_supervisor_open(
         listener,
         config,
         local_static_private_key,
-        &trusted_keys,
         network_id,
         profile_id,
         shutdown_requested,
@@ -2067,5 +2161,23 @@ mod tests {
             Err(QRunV06NodeSupervisorError::InvalidIdentity)
         );
         assert!(validate_identity_material(&[1; 32], &[2; 32], &[3; 32]).is_ok());
+    }
+
+    #[test]
+    fn supervisor_statistics_keep_pinned_and_unverified_peer_counts_separate() {
+        let mut total = QRunV06PeerListenerStats::default();
+        add_stats(
+            &mut total,
+            QRunV06PeerListenerStats {
+                authenticated_sessions: 2,
+                unverified_peer_sessions: 3,
+                accepted_connections: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(total.authenticated_sessions, 2);
+        assert_eq!(total.unverified_peer_sessions, 3);
+        assert_eq!(total.accepted_connections, 5);
     }
 }

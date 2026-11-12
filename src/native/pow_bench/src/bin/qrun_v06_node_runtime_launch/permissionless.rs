@@ -10,6 +10,7 @@ use ai_native_l1_pow_bench::{
     qrun_v06_history_sync_service_candidate::QRunV06HistorySyncClientConfig,
     qrun_v06_hybrid_auth_candidate::QRunV06HybridTransactionAuthenticator,
     qrun_v06_node_supervisor_candidate::{
+        run_qfp6_permissionless_mining_supervisor_open,
         run_qfp6_permissionless_mining_supervisor_with_bootstrap,
         validate_qfp6_pinned_bootstrap_peers, QRunV06PermissionlessMiningSupervisorConfig,
         QRunV06PinnedBootstrapPeer,
@@ -57,6 +58,37 @@ fn endpoint(name: &str, text: &str, allow_unspecified: bool) -> Result<SocketAdd
     }
     Ok(a)
 }
+fn requires_public_listener_opt_in(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(address) => {
+            let octets = address.octets();
+            let shared = octets[0] == 100 && (64..=127).contains(&octets[1]);
+            address.is_unspecified()
+                || !(address.is_loopback()
+                    || address.is_private()
+                    || address.is_link_local()
+                    || shared)
+        }
+        std::net::IpAddr::V6(address) => {
+            let octets = address.octets();
+            let unique_local = octets[0] & 0xfe == 0xfc;
+            let link_local = octets[0] == 0xfe && octets[1] & 0xc0 == 0x80;
+            address.is_unspecified() || !(address.is_loopback() || unique_local || link_local)
+        }
+    }
+}
+
+fn validate_public_listener_opt_in(runtime: &Value, listen: SocketAddr) -> Result<(), String> {
+    if requires_public_listener_opt_in(listen.ip())
+        && runtime
+            .get("allow_public_listener")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return Err("wildcard/public listen_address requires permissionless_runtime.allow_public_listener=true".into());
+    }
+    Ok(())
+}
 fn load_peers(
     path: &Path,
     expected_sha: [u8; 32],
@@ -73,8 +105,8 @@ fn load_peers(
     let rows = value
         .as_array()
         .ok_or("bootstrap peer set must be a JSON array")?;
-    if rows.is_empty() || rows.len() > 64 {
-        return Err("bootstrap peer set must contain 1..=64 peers".into());
+    if rows.len() > 64 {
+        return Err("bootstrap peer set must contain at most 64 peers".into());
     }
     let mut peers = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
@@ -94,8 +126,10 @@ fn load_peers(
             noise_static_public_key: parse_hex32("bootstrap peer Noise key", key)?,
         });
     }
-    validate_qfp6_pinned_bootstrap_peers(&peers)
-        .map_err(|e| format!("invalid bootstrap peer pins: {e:?}"))?;
+    if !peers.is_empty() {
+        validate_qfp6_pinned_bootstrap_peers(&peers)
+            .map_err(|e| format!("invalid bootstrap peer pins: {e:?}"))?;
+    }
     Ok(peers)
 }
 
@@ -210,6 +244,7 @@ pub fn run_permissionless_node(
         req(cfg, "listen_address")?,
         true,
     )?;
+    validate_public_listener_opt_in(cfg, listen)?;
     if peers.iter().any(|p| p.address == listen) {
         return Err("P2P listener cannot alias a bootstrap peer".into());
     }
@@ -268,34 +303,54 @@ pub fn run_permissionless_node(
     println!("listener={listen}");
     println!("bootstrap_peer_count={}", peers.len());
     println!("Q6TS=NOT_REQUIRED; Provider=NOT_REQUIRED; Q6EA=NOT_REQUIRED; QAP1=NOT_REQUIRED");
-    let result = run_qfp6_permissionless_mining_supervisor_with_bootstrap(
-        &listener,
-        supervisor_config,
-        &local_key,
-        &peers,
-        &descriptor.network_id(),
-        &descriptor.profile_id(),
-        &shutdown,
-        &mut runtime,
-        &authenticator,
-        producer,
-        &mut mempool,
-        QRunV06HistorySyncClientConfig::default(),
-    );
-    let report = result.map_err(|e| format!("permissionless bootstrap/supervisor stopped: {e}"))?;
-    println!(
-        "permissionless_bootstrap_complete={}",
-        report.bootstrap_sync.complete
-    );
-    println!("bootstrap_height={}", report.bootstrap_sync.final_height);
+    let supervisor_report = if peers.is_empty() {
+        println!("bootstrap_mode=GENESIS_ROOTED_NO_SEED_PEERS");
+        run_qfp6_permissionless_mining_supervisor_open(
+            &listener,
+            supervisor_config,
+            &local_key,
+            &descriptor.network_id(),
+            &descriptor.profile_id(),
+            &shutdown,
+            &mut runtime,
+            &authenticator,
+            producer,
+            &mut mempool,
+        )
+        .map_err(|e| format!("permissionless open-network supervisor stopped: {e}"))?
+    } else {
+        let report = run_qfp6_permissionless_mining_supervisor_with_bootstrap(
+            &listener,
+            supervisor_config,
+            &local_key,
+            &peers,
+            &descriptor.network_id(),
+            &descriptor.profile_id(),
+            &shutdown,
+            &mut runtime,
+            &authenticator,
+            producer,
+            &mut mempool,
+            QRunV06HistorySyncClientConfig::default(),
+        )
+        .map_err(|e| format!("permissionless bootstrap/supervisor stopped: {e}"))?;
+        println!(
+            "permissionless_bootstrap_complete={}",
+            report.bootstrap_sync.complete
+        );
+        println!("bootstrap_height={}", report.bootstrap_sync.final_height);
+        report.supervisor
+    };
+    println!("permissionless_inbound_peer_policy=ANONYMOUS_UNAUTHENTICATED_NOISE_XX");
+    println!("bootstrap_peer_authentication=PINNED_OUTBOUND_ONLY");
     println!(
         "blocks_committed={}",
-        report.supervisor.blocks_durably_committed
+        supervisor_report.blocks_durably_committed
     );
-    println!("ending_height={}", report.supervisor.ending_height);
+    println!("ending_height={}", supervisor_report.ending_height);
     println!(
         "pending_mempool_transactions={}",
-        report.supervisor.pending_mempool_transactions
+        supervisor_report.pending_mempool_transactions
     );
     println!("runtime_status=STOPPED");
     println!("production_authorized=false");
@@ -304,7 +359,7 @@ pub fn run_permissionless_node(
 
 #[cfg(test)]
 mod tests {
-    use super::endpoint;
+    use super::{endpoint, load_peers, validate_public_listener_opt_in};
 
     #[test]
     fn permissionless_listener_accepts_wildcard_bind_but_peer_endpoints_must_be_specific() {
@@ -316,6 +371,38 @@ mod tests {
         assert!(endpoint("peer", "239.1.1.1:30333", false).is_err());
         assert!(endpoint("peer", "127.0.0.1:30333", false).is_ok());
         assert!(endpoint("listen", "0.0.0.0:0", true).is_err());
+    }
+
+    #[test]
+    fn public_listener_bind_requires_explicit_candidate_opt_in() {
+        use serde_json::json;
+        use std::net::SocketAddr;
+        let wildcard: SocketAddr = "0.0.0.0:30333".parse().unwrap();
+        assert!(validate_public_listener_opt_in(&json!({}), wildcard).is_err());
+        assert!(validate_public_listener_opt_in(
+            &json!({"allow_public_listener": false}),
+            wildcard
+        )
+        .is_err());
+        assert!(
+            validate_public_listener_opt_in(&json!({"allow_public_listener": true}), wildcard)
+                .is_ok()
+        );
+        let private: SocketAddr = "10.0.0.2:30333".parse().unwrap();
+        assert!(validate_public_listener_opt_in(&json!({}), private).is_ok());
+    }
+
+    #[test]
+    fn empty_bootstrap_seed_set_is_accepted_only_as_a_hash_pinned_array() {
+        use sha2::{Digest, Sha256};
+        use std::{fs, path::PathBuf};
+        let path: PathBuf =
+            std::env::temp_dir().join(format!("qfp6-empty-seeds-{}.json", std::process::id()));
+        fs::write(&path, b"[]").unwrap();
+        let digest: [u8; 32] = Sha256::digest(b"[]").into();
+        assert!(load_peers(&path, digest).unwrap().is_empty());
+        assert!(load_peers(&path, [0xA5; 32]).is_err());
+        fs::remove_file(path).unwrap();
     }
 }
 
