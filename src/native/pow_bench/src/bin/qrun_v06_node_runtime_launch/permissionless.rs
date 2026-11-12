@@ -34,6 +34,46 @@ use zeroize::Zeroizing;
 
 const MAX_PEERS_BYTES: u64 = 16 * 1024;
 
+/// Permissionless QFP6 must use the current CP-0604 7B/3B policy, never the
+/// historical CP-0528 founder-allocation path. This is stricter than the
+/// shared snapshot verifier, which retains legacy decoding for compatibility.
+fn validate_permissionless_cp0604_genesis(
+    genesis: &QRunV06CanonicalExecutionState,
+    founder_account: &[u8; 32],
+    policy_fingerprint: &[u8; 32],
+) -> Result<(), String> {
+    let supply = genesis.cp0604_supply().ok_or_else(|| {
+        "permissionless QFP6 requires CP-0604 7B founder / 3B mining policy; legacy CP-0528 Genesis is forbidden".to_string()
+    })?;
+    if genesis.tokenomics().is_some()
+        || supply.founder_account() != *founder_account
+        || supply.policy_fingerprint() != *policy_fingerprint
+        || supply.mining_issued_atoms() != 0
+    {
+        return Err("permissionless Genesis CP-0604 founder/policy identity or zero pre-mining issuance mismatch".into());
+    }
+    let founder_balance = genesis
+        .unified()
+        .ledger()
+        .account(founder_account)
+        .map_or(0u128, |account| account.balance as u128);
+    if founder_balance != supply.founder_genesis_atoms() {
+        return Err(
+            "permissionless Genesis must credit exactly the CP-0604 7B founder allocation".into(),
+        );
+    }
+    let ledger_total = genesis
+        .unified()
+        .ledger()
+        .total_value()
+        .map_err(|error| format!("permissionless Genesis Ledger total failed: {error:?}"))?;
+    supply
+        .validate_ledger_supply(ledger_total)
+        .map_err(|error| {
+            format!("permissionless Genesis CP-0604 issuance invariant failed: {error:?}")
+        })
+}
+
 fn req<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
     v.get(key)
         .and_then(Value::as_str)
@@ -226,6 +266,11 @@ pub fn run_permissionless_node(
     // Bind decoded Genesis economics to the exact Q6CP parameters before opening
     // any durable store or network listener. CP-0604 enforces the 7B founder
     // Genesis and 3B mining issuance ceiling/schedule.
+    validate_permissionless_cp0604_genesis(
+        &genesis,
+        &descriptor.founder_account(),
+        &descriptor.tokenomics_policy_fingerprint(),
+    )?;
     genesis
         .validate_consensus_parameters(&params)
         .map_err(|e| format!("Genesis CP-0604/Q6CP monetary-policy binding failed: {e:?}"))?;
@@ -365,7 +410,42 @@ pub fn run_permissionless_node(
 
 #[cfg(test)]
 mod tests {
-    use super::{endpoint, load_peers, validate_public_listener_opt_in};
+    use super::{
+        endpoint, load_peers, validate_permissionless_cp0604_genesis,
+        validate_public_listener_opt_in,
+    };
+
+    #[test]
+    fn permissionless_genesis_rejects_legacy_cp0528_and_accepts_only_cp0604_7b3b() {
+        use ai_native_l1_pow_bench::{
+            qrun_v06_canonical_execution_candidate::QRunV06CanonicalExecutionState,
+            qrun_v06_tokenomics_candidate::QRunV06MiningScheduleCandidate,
+        };
+        const NETWORK: [u8; 32] = [0x61; 32];
+        const PROFILE: [u8; 32] = [0x62; 32];
+        const FOUNDER: [u8; 32] = [0x63; 32];
+        let schedule = QRunV06MiningScheduleCandidate::cp0422_research_candidate();
+
+        let legacy = QRunV06CanonicalExecutionState::cp0528_genesis_candidate(
+            NETWORK, PROFILE, FOUNDER, schedule,
+        )
+        .unwrap();
+        assert!(validate_permissionless_cp0604_genesis(&legacy, &FOUNDER, &[0x64; 32]).is_err());
+
+        let current = QRunV06CanonicalExecutionState::cp0604_genesis_candidate(
+            NETWORK, PROFILE, FOUNDER, schedule,
+        )
+        .unwrap();
+        let policy_fingerprint = current.cp0604_supply().unwrap().policy_fingerprint();
+        assert!(
+            validate_permissionless_cp0604_genesis(&current, &FOUNDER, &policy_fingerprint).is_ok()
+        );
+        assert!(
+            validate_permissionless_cp0604_genesis(&current, &[0x65; 32], &policy_fingerprint)
+                .is_err()
+        );
+        assert!(validate_permissionless_cp0604_genesis(&current, &FOUNDER, &[0x66; 32]).is_err());
+    }
 
     #[test]
     fn permissionless_listener_accepts_wildcard_bind_but_peer_endpoints_must_be_specific() {

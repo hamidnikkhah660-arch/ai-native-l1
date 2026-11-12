@@ -64,7 +64,9 @@
     "resumable_nonce_batches_candidate_wired": true,
     "nonce_cursor_scope": "IN_MEMORY_ONLY_RESET_ON_PROCESS_RESTART",
     "nonce_budget_exhaustion_is_fatal": false,
-    "public_mining_authorized": false
+    "public_mining_authorized": false,
+    "permissionless_requires_cp0604_genesis": true,
+    "permissionless_legacy_cp0528_genesis_allowed": false
   },
   "notes": [
     "Candidate scaffold only. No Genesis, public keys, trust roots, signatures, or service endpoints are fabricated.",
