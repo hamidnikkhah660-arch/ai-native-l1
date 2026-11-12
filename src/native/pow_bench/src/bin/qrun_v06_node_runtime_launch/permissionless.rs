@@ -223,6 +223,12 @@ pub fn run_permissionless_node(
         &descriptor.profile_id(),
     )
     .map_err(|e| format!("Genesis snapshot decode failed: {e:?}"))?;
+    // Bind decoded Genesis economics to the exact Q6CP parameters before opening
+    // any durable store or network listener. CP-0604 enforces the 7B founder
+    // Genesis and 3B mining issuance ceiling/schedule.
+    genesis
+        .validate_consensus_parameters(&params)
+        .map_err(|e| format!("Genesis CP-0604/Q6CP monetary-policy binding failed: {e:?}"))?;
     let data_dir = path(base, cfg, "data_directory")?;
     let mempool_dir = path(base, cfg, "mempool_directory")?;
     if data_dir == mempool_dir
