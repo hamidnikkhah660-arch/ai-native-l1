@@ -558,6 +558,21 @@ impl QRunV06CanonicalExecutionState {
         self.tokenomics.as_ref()
     }
 
+    /// Return the founder and policy commitment for whichever versioned Genesis
+    /// economics policy is active. This keeps profile-pin validation independent
+    /// of the legacy CP-0528 representation.
+    pub fn genesis_economic_policy_identity(&self) -> Option<(AccountId, [u8; 32])> {
+        if let Some(tokenomics) = self.tokenomics.as_ref() {
+            return Some((
+                tokenomics.founder_account(),
+                tokenomics.policy_fingerprint(),
+            ));
+        }
+        self.cp0604_supply
+            .as_ref()
+            .map(|policy| (policy.founder_account(), policy.policy_fingerprint()))
+    }
+
     /// Verify and atomically apply a Founder-authorized, recipient-accepted CP-0528 release.
     /// This path cannot release Mining, Founder, or ProtocolBurnReserve buckets.
     fn apply_signed_category_release<A: TransactionAuthenticator>(
@@ -2261,6 +2276,35 @@ mod tests {
         let amm = QzxbAmmStateCandidate::new(NETWORK, 32, 64, 512).unwrap();
         let unified = QRunV06UnifiedAssetState::new(ledger, amm).unwrap();
         QRunV06CanonicalExecutionState::new(unified, PROFILE).unwrap()
+    }
+
+    #[test]
+    fn genesis_economic_policy_identity_supports_cp0528_and_cp0604() {
+        let legacy = QRunV06CanonicalExecutionState::cp0528_genesis_candidate(
+            NETWORK,
+            PROFILE,
+            ALICE,
+            QRunV06MiningScheduleCandidate::cp0422_research_candidate(),
+        )
+        .unwrap();
+        let legacy_policy = legacy.tokenomics().unwrap();
+        assert_eq!(
+            legacy.genesis_economic_policy_identity(),
+            Some((ALICE, legacy_policy.policy_fingerprint()))
+        );
+
+        let current = QRunV06CanonicalExecutionState::cp0604_genesis_candidate(
+            NETWORK,
+            PROFILE,
+            ALICE,
+            QRunV06MiningScheduleCandidate::cp0422_research_candidate(),
+        )
+        .unwrap();
+        let current_policy = current.cp0604_supply().unwrap();
+        assert_eq!(
+            current.genesis_economic_policy_identity(),
+            Some((ALICE, current_policy.policy_fingerprint()))
+        );
     }
 
     fn transfer(
