@@ -580,6 +580,245 @@ pub fn sync_history_from_pinned_peer<A: TransactionAuthenticator>(
     })
 }
 
+/// Synchronize history from one statically pinned Noise peer using the QAP1 runtime only.
+/// Each received Q6HS page is imported through `import_history_page_with_qap1`; this function
+/// never opens or falls back to the non-QAP1 runtime/import path.
+#[allow(clippy::too_many_arguments)]
+pub fn sync_history_from_pinned_peer_with_qap1<A, P, PV, AV, Q, T>(
+    address: SocketAddr,
+    local_static_private_key: &[u8; 32],
+    remote_static_public_key: &[u8; 32],
+    runtime: &mut QRunV06NodeRuntime<A>,
+    authenticator: &T,
+    quote_authorizer: &mut QRunV06QuoteAssetAuthorizationProvider<'_>,
+    coordinator: &mut QRunV06Qap1ExternalCoordinator<P, PV, AV, Q>,
+    config: QRunV06HistorySyncClientConfig,
+) -> Result<QRunV06HistorySyncClientReport, QRunV06HistorySyncServiceError>
+where
+    A: crate::qrun_v06_node_runtime_candidate::QRunV06NodeAnchorGate,
+    P: ExternalCasProviderTransport,
+    PV: MlDsa65Verifier + Clone,
+    AV: MlDsa65Verifier,
+    Q: QRunV06Qap1AnchorTransport,
+    T: TransactionAuthenticator,
+{
+    config.validate()?;
+    if !runtime.requires_qap1()
+        || !runtime.qap1_recovery_verified()
+        || runtime.requires_reopen()
+        || runtime.has_pending_external_anchor()
+        || local_static_private_key.iter().all(|byte| *byte == 0)
+        || remote_static_public_key.iter().all(|byte| *byte == 0)
+    {
+        return Err(QRunV06HistorySyncServiceError::InvalidClientConfig);
+    }
+    let anchor = runtime.committed_anchor_state();
+    let network_id = anchor.network_id;
+    let profile_id = anchor.profile_id;
+    let local_height = anchor.canonical_height;
+    let local_tip = anchor.canonical_tip;
+    let local_graph = runtime
+        .fork_choice_snapshot()
+        .map_err(|error| QRunV06HistorySyncServiceError::Runtime(error.to_string()))?;
+    if local_graph.canonical_tip().tip_hash != local_tip
+        || local_graph
+            .canonical_state()
+            .state_root()
+            .map_err(|error| QRunV06HistorySyncServiceError::Runtime(format!("{error:?}")))?
+            != anchor.canonical_state_root
+    {
+        return Err(QRunV06HistorySyncServiceError::SnapshotMismatch);
+    }
+    let mut stream = TcpStream::connect_timeout(&address, config.connect_timeout)
+        .map_err(|error| QRunV06HistorySyncServiceError::Noise(error.to_string()))?;
+    stream
+        .set_read_timeout(Some(config.io_timeout))
+        .map_err(|error| QRunV06HistorySyncServiceError::Noise(error.to_string()))?;
+    stream
+        .set_write_timeout(Some(config.io_timeout))
+        .map_err(|error| QRunV06HistorySyncServiceError::Noise(error.to_string()))?;
+    stream
+        .set_nodelay(true)
+        .map_err(|error| QRunV06HistorySyncServiceError::Noise(error.to_string()))?;
+    let mut noise = QRunV06NoiseSession::connect(
+        &mut stream,
+        local_static_private_key,
+        remote_static_public_key,
+        &network_id,
+        &profile_id,
+    )?;
+    let info_request = QRunV06HistoryInfoRequest {
+        request_id: 1,
+        network_id,
+        profile_id,
+    };
+    noise.write_record(&mut stream, &info_request.encode()?)?;
+    let info_frame = noise.read_record(&mut stream)?;
+    let source = decode_q6hr_status(&info_frame, &info_request)?;
+    if source.height < local_height {
+        return Err(QRunV06HistorySyncServiceError::SourceBehind);
+    }
+    if source.height == local_height
+        && (source.consensus_tip != local_tip
+            || source.execution_tip != local_graph.canonical_state().tip_hash())
+    {
+        return Err(QRunV06HistorySyncServiceError::SnapshotMismatch);
+    }
+
+    let mut pages_imported = 0u32;
+    let mut blocks_imported = 0u64;
+    let mut request_id = 2u64;
+    while runtime.committed_anchor_state().canonical_height < source.height {
+        if pages_imported >= config.max_pages {
+            return Err(QRunV06HistorySyncServiceError::PageBudgetExceeded);
+        }
+        if runtime.requires_reopen() || runtime.has_pending_external_anchor() {
+            return Err(QRunV06HistorySyncServiceError::Runtime(
+                "QAP1 anchor transition requires restart recovery before history sync continues"
+                    .into(),
+            ));
+        }
+        let anchor = runtime.committed_anchor_state();
+        let graph = runtime
+            .fork_choice_snapshot()
+            .map_err(|error| QRunV06HistorySyncServiceError::Runtime(error.to_string()))?;
+        if graph.canonical_tip().tip_hash != anchor.canonical_tip
+            || graph
+                .canonical_state()
+                .state_root()
+                .map_err(|error| QRunV06HistorySyncServiceError::Runtime(format!("{error:?}")))?
+                != anchor.canonical_state_root
+        {
+            return Err(QRunV06HistorySyncServiceError::SnapshotMismatch);
+        }
+        let request = QRunV06HistorySyncRequest {
+            request_id,
+            network_id: anchor.network_id,
+            profile_id: anchor.profile_id,
+            snapshot_tip: source.consensus_tip,
+            expected_parent_consensus_hash: anchor.canonical_tip,
+            expected_parent_execution_hash: graph.canonical_state().tip_hash(),
+            start_height: anchor.canonical_height.checked_add(1).ok_or_else(|| {
+                QRunV06HistorySyncServiceError::Runtime("local height overflow".into())
+            })?,
+            max_blocks: config.max_blocks_per_page,
+            max_bytes: config.max_bytes_per_page,
+        };
+        request.validate()?;
+        let page = request_history_page_over_noise(
+            &mut noise,
+            &mut stream,
+            request,
+            graph.consensus_parameters().clone(),
+        )?;
+        if page.snapshot_height != source.height || page.snapshot_tip != source.consensus_tip {
+            return Err(QRunV06HistorySyncServiceError::SnapshotMismatch);
+        }
+        if page.envelopes.is_empty() {
+            return Err(QRunV06HistorySyncServiceError::NoProgress);
+        }
+        let imported_count = page.envelopes.len() as u64;
+        import_history_page_with_qap1(
+            runtime,
+            &page,
+            authenticator,
+            quote_authorizer,
+            coordinator,
+        )?;
+        pages_imported = pages_imported
+            .checked_add(1)
+            .ok_or(QRunV06HistorySyncServiceError::PageBudgetExceeded)?;
+        blocks_imported = blocks_imported
+            .checked_add(imported_count)
+            .ok_or(QRunV06HistorySyncServiceError::PageBudgetExceeded)?;
+        request_id = request_id
+            .checked_add(1)
+            .ok_or(QRunV06HistorySyncServiceError::PageBudgetExceeded)?;
+        if page.complete {
+            break;
+        }
+    }
+    let final_anchor = runtime.committed_anchor_state();
+    if final_anchor.canonical_height > source.height {
+        return Err(QRunV06HistorySyncServiceError::SnapshotMismatch);
+    }
+    let complete = final_anchor.canonical_height == source.height;
+    if complete {
+        let final_graph = runtime
+            .fork_choice_snapshot()
+            .map_err(|error| QRunV06HistorySyncServiceError::Runtime(error.to_string()))?;
+        if final_anchor.canonical_tip != source.consensus_tip
+            || final_graph.canonical_state().tip_hash() != source.execution_tip
+            || final_graph
+                .canonical_state()
+                .state_root()
+                .map_err(|error| QRunV06HistorySyncServiceError::Runtime(format!("{error:?}")))?
+                != final_anchor.canonical_state_root
+        {
+            return Err(QRunV06HistorySyncServiceError::SnapshotMismatch);
+        }
+    } else if pages_imported != config.max_pages {
+        return Err(QRunV06HistorySyncServiceError::NoProgress);
+    }
+    Ok(QRunV06HistorySyncClientReport {
+        source_height: source.height,
+        final_height: final_anchor.canonical_height,
+        pages_imported,
+        blocks_imported,
+        source_tip: source.consensus_tip,
+        complete,
+    })
+}
+
+/// Repeat bounded QAP1-gated Q6HS sessions until the peer's canonical height and tips match.
+/// A failed anchor transition must be reconciled by reopening the QAP1 runtime before retry.
+#[allow(clippy::too_many_arguments)]
+pub fn sync_history_from_pinned_peer_until_complete_with_qap1<A, P, PV, AV, Q, T>(
+    address: SocketAddr,
+    local_static_private_key: &[u8; 32],
+    remote_static_public_key: &[u8; 32],
+    runtime: &mut QRunV06NodeRuntime<A>,
+    authenticator: &T,
+    quote_authorizer: &mut QRunV06QuoteAssetAuthorizationProvider<'_>,
+    coordinator: &mut QRunV06Qap1ExternalCoordinator<P, PV, AV, Q>,
+    config: QRunV06HistorySyncClientConfig,
+) -> Result<QRunV06HistorySyncClientReport, QRunV06HistorySyncServiceError>
+where
+    A: crate::qrun_v06_node_runtime_candidate::QRunV06NodeAnchorGate,
+    P: ExternalCasProviderTransport,
+    PV: MlDsa65Verifier + Clone,
+    AV: MlDsa65Verifier,
+    Q: QRunV06Qap1AnchorTransport,
+    T: TransactionAuthenticator,
+{
+    config.validate()?;
+    let mut total_pages = 0u32;
+    let mut total_blocks = 0u64;
+    for _ in 0..config.max_rounds {
+        let mut report = sync_history_from_pinned_peer_with_qap1(
+            address,
+            local_static_private_key,
+            remote_static_public_key,
+            runtime,
+            authenticator,
+            quote_authorizer,
+            coordinator,
+            config,
+        )?;
+        total_pages = total_pages
+            .checked_add(report.pages_imported)
+            .ok_or(QRunV06HistorySyncServiceError::PageBudgetExceeded)?;
+        total_blocks = total_blocks
+            .checked_add(report.blocks_imported)
+            .ok_or(QRunV06HistorySyncServiceError::PageBudgetExceeded)?;
+        if report.complete {
+            report.pages_imported = total_pages;
+            report.blocks_imported = total_blocks;
+            return Ok(report);
+        }
+    }
+    Err(QRunV06HistorySyncServiceError::PageBudgetExceeded)
+}
 /// Repeat bounded Q6HI/Q6HR + page sessions until the peer's canonical height/tips match
 /// the local durable runtime. Each round is independently authenticated and pins a fresh
 /// source snapshot; CP-0594 validates every imported page. A reorg below the imported prefix

@@ -22,7 +22,8 @@ use crate::{
     },
     qrun_v06_external_anchor_candidate::{QRunV06ExternalAnchorPin, QRunV06ExternalAnchorState},
     qrun_v06_history_sync_service_candidate::{
-        sync_history_from_pinned_peer_until_complete, QRunV06HistorySyncClientConfig,
+        sync_history_from_pinned_peer_until_complete,
+        sync_history_from_pinned_peer_until_complete_with_qap1, QRunV06HistorySyncClientConfig,
         QRunV06HistorySyncClientReport, QRunV06HistorySyncResponder,
     },
     qrun_v06_history_sync_wire_candidate::{
@@ -207,6 +208,11 @@ pub struct QRunV06PinnedBootstrapPeer {
     pub noise_static_public_key: [u8; 32],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QRunV06Qap1LaunchReport {
+    pub bootstrap_sync: QRunV06HistorySyncClientReport,
+    pub supervisor: QRunV06MiningSupervisorReport,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QRunV06PermissionlessLaunchReport {
     pub bootstrap_sync: QRunV06HistorySyncClientReport,
@@ -1363,6 +1369,116 @@ pub fn validate_qfp6_pinned_bootstrap_peers(
     Ok(trusted_keys)
 }
 
+/// QAP1-only startup: authenticate and synchronize from an operator-pinned peer set, then
+/// enter the QAP1 mining supervisor. No non-QAP1 runtime or bulk-import fallback is available.
+#[allow(clippy::too_many_arguments)]
+pub fn run_qfp6_mining_supervisor_with_qap1_bootstrap<A, T, P, PV, AV, Q, F>(
+    listener: &TcpListener,
+    config: QRunV06MiningSupervisorConfig,
+    local_static_private_key: &[u8; 32],
+    bootstrap_peers: &[QRunV06PinnedBootstrapPeer],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    shutdown_requested: &AtomicBool,
+    runtime: &mut QRunV06NodeRuntime<A>,
+    authenticator: &T,
+    quote_authorizer: &mut QRunV06QuoteAssetAuthorizationProvider<'_>,
+    coordinator: &mut QRunV06Qap1ExternalCoordinator<P, PV, AV, Q>,
+    producer: [u8; 32],
+    transaction_journal: &mut QRunV06TransactionJournal,
+    next_template: F,
+    sync_config: QRunV06HistorySyncClientConfig,
+) -> Result<QRunV06Qap1LaunchReport, QRunV06NodeSupervisorError>
+where
+    A: QRunV06NodeAnchorGate,
+    T: TransactionAuthenticator,
+    P: ExternalCasProviderTransport,
+    PV: MlDsa65Verifier + Clone,
+    AV: MlDsa65Verifier,
+    Q: QRunV06Qap1AnchorTransport,
+    F: FnMut(&QRunV06CanonicalExecutionState) -> Result<(u64, Vec<QRunV06BlockOperation>), String>,
+{
+    config.validate()?;
+    sync_config
+        .validate()
+        .map_err(|error| QRunV06NodeSupervisorError::BootstrapSync(error.to_string()))?;
+    validate_identity_material(local_static_private_key, network_id, profile_id)?;
+    if producer == [0; 32] {
+        return Err(QRunV06NodeSupervisorError::InvalidIdentity);
+    }
+    let trusted_keys = validate_qfp6_pinned_bootstrap_peers(bootstrap_peers)?;
+    if !runtime.requires_qap1() || !runtime.qap1_recovery_verified() {
+        return Err(QRunV06NodeSupervisorError::RuntimeNotQap1Recovered);
+    }
+    if runtime.requires_reopen() {
+        return Err(QRunV06NodeSupervisorError::RuntimeRequiresRecovery);
+    }
+    if runtime.has_pending_external_anchor() {
+        return Err(QRunV06NodeSupervisorError::PendingAnchorTransition);
+    }
+    let anchor = runtime.committed_anchor_state();
+    if anchor.network_id != *network_id {
+        return Err(QRunV06NodeSupervisorError::NetworkMismatch);
+    }
+    if anchor.profile_id != *profile_id {
+        return Err(QRunV06NodeSupervisorError::ProfileMismatch);
+    }
+    validate_qap1_pin_bindings(anchor, coordinator.provider_pin(), coordinator.qfp6_pin())?;
+    let mut bootstrap_sync = None;
+    let mut peer_errors = Vec::new();
+    for peer in bootstrap_peers {
+        match sync_history_from_pinned_peer_until_complete_with_qap1(
+            peer.address,
+            local_static_private_key,
+            &peer.noise_static_public_key,
+            runtime,
+            authenticator,
+            quote_authorizer,
+            coordinator,
+            sync_config,
+        ) {
+            Ok(report) if report.complete => {
+                bootstrap_sync = Some(report);
+                break;
+            }
+            Ok(_) => peer_errors.push(format!(
+                "{}: bounded QAP1 sync did not reach the pinned snapshot",
+                peer.address
+            )),
+            Err(error) => {
+                peer_errors.push(format!("{}: {error}", peer.address));
+                if runtime.requires_reopen() {
+                    return Err(QRunV06NodeSupervisorError::RuntimeRequiresRecovery);
+                }
+                if runtime.has_pending_external_anchor() {
+                    return Err(QRunV06NodeSupervisorError::PendingAnchorTransition);
+                }
+            }
+        }
+    }
+    let bootstrap_sync = bootstrap_sync
+        .ok_or_else(|| QRunV06NodeSupervisorError::BootstrapSync(peer_errors.join("; ")))?;
+    let supervisor = run_qfp6_mining_supervisor(
+        listener,
+        config,
+        local_static_private_key,
+        &trusted_keys,
+        network_id,
+        profile_id,
+        shutdown_requested,
+        runtime,
+        authenticator,
+        quote_authorizer,
+        coordinator,
+        producer,
+        transaction_journal,
+        next_template,
+    )?;
+    Ok(QRunV06Qap1LaunchReport {
+        bootstrap_sync,
+        supervisor,
+    })
+}
 /// Startup path that refuses to begin mining until one of the configured statically pinned
 /// peers has completed Q6HI/Q6HR discovery and full bounded canonical-history synchronization.
 /// The same peer key set is then used by the permissionless inbound Noise listener.
@@ -1381,6 +1497,10 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_bootstrap<T: TransactionAu
     mempool: &mut QRunV06PermissionlessMempool,
     sync_config: QRunV06HistorySyncClientConfig,
 ) -> Result<QRunV06PermissionlessLaunchReport, QRunV06NodeSupervisorError> {
+    config.validate()?;
+    sync_config
+        .validate()
+        .map_err(|error| QRunV06NodeSupervisorError::BootstrapSync(error.to_string()))?;
     validate_identity_material(local_static_private_key, network_id, profile_id)?;
     let trusted_keys = validate_qfp6_pinned_bootstrap_peers(bootstrap_peers)?;
     let startup = runtime
