@@ -3,8 +3,10 @@
 from __future__ import annotations
 import argparse, hashlib, json, pathlib
 
-SCHEMA = "qfp6-candidate-package/v1"
-COMPONENTS = ("genesis_snapshot", "genesis_descriptor_q6gd", "consensus_profile_q6cp", "network_profile_q6pn", "trust_bundle_q6ts", "bootstrap_peers")
+SCHEMA = "qfp6-candidate-package/v2"
+BASE_COMPONENTS = ("genesis_snapshot", "genesis_descriptor_q6gd", "consensus_profile_q6cp", "network_profile_q6pn", "bootstrap_peers")
+ANCHORED_COMPONENTS = BASE_COMPONENTS + ("trust_bundle_q6ts",)
+RELEASE_PROFILES = {"permissionless_full_history": BASE_COMPONENTS, "anchored_checkpoint": ANCHORED_COMPONENTS}
 ACCOUNT_DOMAIN = b"AIN1-QFP6-ACCOUNT-ID-HYBRID-V1\0"
 ED25519_PUBLIC_KEY_BYTES = 32
 MLDSA65_PUBLIC_KEY_BYTES = 1952
@@ -32,13 +34,14 @@ def init_package(root: pathlib.Path) -> None:
         "network_name": "QZXB",
         "protocol_family": "QFP6",
         "release_channel": "candidate",
+        "release_profile": "permissionless_full_history",
         "production_authorized": False,
         "mainnet_status": "NOT_AUTHORIZED",
         "owner_genesis_account": None,
         "founder_identity": None,
-        "components": {name: {"path": None, "sha256": None, "status": "MISSING"} for name in COMPONENTS},
+        "components": {name: {"path": None, "sha256": None, "status": "MISSING"} for name in ANCHORED_COMPONENTS},
         "independent_review": {"consensus": "PENDING", "cryptography": "PENDING", "economics": "PENDING"},
-        "signing": {"q6ts_signatures_present": False, "trust_floor_provisioned": False},
+        "signing": {"q6ts_signatures_present": False, "trust_floor_provisioned": False, "q6ts_runtime_enforced": False},
         "runtime": {"wired": False, "full_history_replay_qualified": False, "public_listener_qualified": False},
         "notes": [
             "Candidate scaffold only. No Genesis, trust roots, signatures, or service endpoints are fabricated.",
@@ -132,11 +135,29 @@ def validate_package(root: pathlib.Path) -> int:
             errors.append(f"founder identity invalid: {exc}")
     elif data.get("owner_genesis_account") is not None:
         errors.append("owner_genesis_account is set without a validated founder_identity")
+    profile = data.get("release_profile")
+    required_components = RELEASE_PROFILES.get(profile)
+    if required_components is None:
+        errors.append("release_profile must be permissionless_full_history or anchored_checkpoint")
+        required_components = ()
+    signing = data.get("signing") if isinstance(data.get("signing"), dict) else {}
+    if profile == "permissionless_full_history":
+        if signing.get("q6ts_runtime_enforced") is True:
+            errors.append("base profile cannot claim Q6TS runtime enforcement")
+        print("q6ts_required=false")
+        print("q6ts_runtime_enforced=false")
+    elif profile == "anchored_checkpoint":
+        if signing.get("q6ts_runtime_enforced") is not True:
+            errors.append("anchored profile requires an explicitly enforced Q6TS verifier")
+        if signing.get("q6ts_signatures_present") is not True or signing.get("trust_floor_provisioned") is not True:
+            errors.append("anchored profile requires Q6TS signatures and an independently provisioned trust floor")
+        print("q6ts_required=true")
+        print("q6ts_runtime_enforced=" + str(signing.get("q6ts_runtime_enforced") is True).lower())
     components = data.get("components")
     if not isinstance(components, dict):
         errors.append("components object is missing")
         components = {}
-    for name in COMPONENTS:
+    for name in required_components:
         item = components.get(name)
         if not isinstance(item, dict):
             missing.append(name)
@@ -165,7 +186,11 @@ def validate_package(root: pathlib.Path) -> int:
     if errors:
         print("INVALID: " + "; ".join(errors))
         return 2
+    if errors:
+        print("INVALID: " + "; ".join(errors))
+        return 2
     print(f"package_schema={SCHEMA}")
+    print("release_profile=" + str(profile))
     print(f"artifacts_hash_verified={len(checked)}")
     print(f"artifacts_missing={len(missing)}" + (":" + ",".join(missing) if missing else ""))
     print("founder_identity_status=" + ("PUBLIC_KEYS_BOUND_CANDIDATE_ONLY" if founder else "NOT_BOUND"))
@@ -188,6 +213,32 @@ def self_test() -> int:
         if validate_package(root) != 2:
             print("SELF-TEST FAILED: incomplete scaffold must fail closed")
             return 1
+        m = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+        if m.get("release_profile") != "permissionless_full_history":
+            print("SELF-TEST FAILED: default profile must be permissionless full-history")
+            return 1
+        m["signing"]["q6ts_runtime_enforced"] = True
+        (root / "manifest.json").write_text(json.dumps(m), encoding="utf-8")
+        if validate_package(root) != 2:
+            print("SELF-TEST FAILED: base profile must reject false Q6TS enforcement claim")
+            return 1
+        m["release_profile"] = "anchored_checkpoint"
+        (root / "manifest.json").write_text(json.dumps(m), encoding="utf-8")
+        if validate_package(root) != 2:
+            print("SELF-TEST FAILED: anchored profile must fail without trust floor/signatures")
+            return 1
+        m["signing"] = {"q6ts_runtime_enforced": True, "q6ts_signatures_present": True, "trust_floor_provisioned": True}
+        (root / "manifest.json").write_text(json.dumps(m), encoding="utf-8")
+        if validate_package(root) != 2:
+            print("SELF-TEST FAILED: anchored profile must still require all anchored artifacts")
+            return 1
+        m["release_profile"] = "unknown_profile"
+        (root / "manifest.json").write_text(json.dumps(m), encoding="utf-8")
+        if validate_package(root) != 2:
+            print("SELF-TEST FAILED: unknown release profile must fail closed")
+            return 1
+        m["release_profile"] = "permissionless_full_history"
+        m["signing"]["q6ts_runtime_enforced"] = False
         ed, pq = bytes(range(32)), bytes((i % 251 for i in range(MLDSA65_PUBLIC_KEY_BYTES)))
         account = founder_account_id(ed, pq)
         manifest_path = root / "manifest.json"
@@ -211,7 +262,7 @@ def self_test() -> int:
         if validate_package(root) != 2:
             print("SELF-TEST FAILED: mismatched founder account must fail closed")
             return 1
-    print("SELF-TEST PASSED: founder identity binding is verified; incomplete package remains non-production")
+    print("SELF-TEST PASSED: release profiles are separated; Q6TS claims fail closed; founder binding is verified; incomplete package remains non-production")
     return 0
 
 
