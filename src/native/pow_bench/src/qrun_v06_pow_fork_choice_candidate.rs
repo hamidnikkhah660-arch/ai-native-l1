@@ -449,7 +449,7 @@ impl QRunV06PowForkChoice {
         if params.protocol_version != 6 {
             return Err(QRunV06ForkChoiceError::InvalidConsensusProfile);
         }
-        if genesis_state.tokenomics().is_none()
+        if genesis_state.genesis_economic_policy_identity().is_none()
             || genesis_state
                 .validate_consensus_parameters(&params)
                 .is_err()
@@ -530,7 +530,7 @@ impl QRunV06PowForkChoice {
         }
         checkpoint.validate(&params)?;
         let base_state = checkpoint.execution_state().clone();
-        if base_state.tokenomics().is_none() {
+        if base_state.genesis_economic_policy_identity().is_none() {
             return Err(QRunV06ForkChoiceError::InvalidConsensusProfile);
         }
         let descriptor = base_state

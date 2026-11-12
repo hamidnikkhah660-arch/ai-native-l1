@@ -271,6 +271,166 @@ impl QRunV06PermissionlessNodeRuntime {
 mod tests {
     use super::*;
 
+    struct RejectAllTransactions;
+
+    impl crate::state_machine::TransactionAuthenticator for RejectAllTransactions {
+        fn verify(
+            &self,
+            _account: &crate::state_machine::AccountId,
+            _digest: &[u8; 32],
+            _signature: &[u8],
+        ) -> Result<(), ()> {
+            Err(())
+        }
+    }
+
+    #[test]
+    fn cp0604_permissionless_runtime_bootstraps_and_recovers_verified_genesis_store() {
+        use crate::{
+            consensus::{ConsensusParameters, Uint256},
+            external_cas_anchor_candidate::ExternalCasPin,
+            qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint,
+            qrun_v06_cp0604_supply_candidate::Cp0604FounderControlledSupply,
+            qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
+            qrun_v06_profile_pin_candidate::{
+                QRunV06ProfilePinCandidate, QRunV06VerifiedProfilePin,
+            },
+            qrun_v06_tokenomics_candidate::QRunV06MiningScheduleCandidate,
+            v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES,
+        };
+
+        const NETWORK: [u8; 32] = [0xA1; 32];
+        const PROFILE: [u8; 32] = [0xB2; 32];
+        const FOUNDER: [u8; 32] = [0xC3; 32];
+        let mut params = ConsensusParameters::qrun_v06_sha256d_candidate().unwrap();
+        params.target_block_time_secs = 30;
+        params.difficulty_window_blocks = 2;
+        params.difficulty_min_ratio_divisor = 4;
+        params.difficulty_max_ratio = 4;
+        params.initial_target = Uint256::from_be_bytes([0x7F; 32]);
+        params.pow_limit = Uint256::MAX;
+        params.validate().unwrap();
+
+        let schedule = QRunV06MiningScheduleCandidate::cp0422_research_candidate();
+        let policy = Cp0604FounderControlledSupply::genesis(NETWORK, FOUNDER, schedule).unwrap();
+        let descriptor = QRunV06GenesisDescriptor::new(
+            NETWORK,
+            PROFILE,
+            FOUNDER,
+            1,
+            qrun_v06_consensus_fingerprint(&params).unwrap(),
+            policy.policy_fingerprint(),
+        )
+        .unwrap();
+        let genesis = QRunV06CanonicalExecutionState::cp0604_genesis_candidate_with_descriptor(
+            descriptor, schedule,
+        )
+        .unwrap();
+        assert_eq!(
+            genesis
+                .unified()
+                .ledger()
+                .account(&FOUNDER)
+                .unwrap()
+                .balance as u128,
+            crate::qrun_v06_cp0604_supply_candidate::CP0604_FOUNDER_GENESIS_ATOMS
+        );
+
+        let bundle = QRunV06ProfilePinCandidate::new(
+            descriptor,
+            ExternalCasPin {
+                provider_id: [0xD1; 32],
+                network_id: NETWORK,
+                genesis_digest: [0xD2; 32],
+                receipt_key_id: [0xD3; 32],
+                receipt_public_key: [0xD4; ML_DSA_65_PUBLIC_KEY_BYTES],
+            },
+        )
+        .unwrap();
+        let pin_bytes = bundle.encode().unwrap();
+        let independent_commitment = bundle.commitment().unwrap();
+        let verified_pin =
+            QRunV06VerifiedProfilePin::decode(&pin_bytes, independent_commitment).unwrap();
+
+        let directory = std::env::temp_dir().join(format!(
+            "qfp6-permissionless-cp0604-runtime-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let authenticator = RejectAllTransactions;
+        let first = QRunV06PermissionlessNodeRuntime::open(
+            &directory,
+            genesis.clone(),
+            params.clone(),
+            &authenticator,
+            None,
+            &verified_pin,
+        )
+        .unwrap();
+        let first_status = first.status().unwrap();
+        assert_eq!(first_status.network_id, NETWORK);
+        assert_eq!(first_status.profile_id, PROFILE);
+        assert_eq!(first_status.height, 0);
+        assert_ne!(first_status.state_root, [0; 32]);
+        assert_eq!(first_status.manifest_generation, 0);
+        drop(first);
+
+        // The checkpoint restore path must accept the same CP-0604 policy identity.
+        let checkpoint_source_dir = directory.with_extension("checkpoint-source");
+        let checkpoint_restore_dir = directory.with_extension("checkpoint-restore");
+        let checkpoint_source = QRunV06DurableForkStore::open_with_verified_profile_pin(
+            &checkpoint_source_dir,
+            genesis.clone(),
+            params.clone(),
+            &authenticator,
+            None,
+            &verified_pin,
+        )
+        .unwrap();
+        let (checkpoint_bytes, checkpoint_anchor) =
+            checkpoint_source.export_canonical_checkpoint().unwrap();
+        drop(checkpoint_source);
+        let checkpoint_restored =
+            QRunV06DurableForkStore::open_from_checkpoint_with_verified_profile_pin(
+                &checkpoint_restore_dir,
+                &checkpoint_bytes,
+                params.clone(),
+                checkpoint_anchor,
+                &verified_pin,
+                &authenticator,
+                None,
+            )
+            .unwrap();
+        assert_eq!(checkpoint_restored.canonical_height().unwrap(), 0);
+        assert_eq!(
+            checkpoint_restored.canonical_state_root().unwrap(),
+            first_status.state_root
+        );
+        drop(checkpoint_restored);
+
+        let recovered = QRunV06PermissionlessNodeRuntime::open(
+            &directory,
+            genesis,
+            params,
+            &authenticator,
+            Some(first_status.manifest_anchor),
+            &verified_pin,
+        )
+        .unwrap();
+        let recovered_status = recovered.status().unwrap();
+        assert_eq!(recovered_status.height, first_status.height);
+        assert_eq!(recovered_status.tip, first_status.tip);
+        assert_eq!(recovered_status.state_root, first_status.state_root);
+        assert_eq!(
+            recovered_status.manifest_generation,
+            first_status.manifest_generation
+        );
+        drop(recovered);
+        std::fs::remove_dir_all(directory).unwrap();
+        std::fs::remove_dir_all(checkpoint_source_dir).unwrap();
+        std::fs::remove_dir_all(checkpoint_restore_dir).unwrap();
+    }
+
     #[test]
     fn unresolved_anchor_intent_fails_closed_with_recovery_direction() {
         let error = QRunV06PermissionlessRuntimeError::UnresolvedQap1Intent;

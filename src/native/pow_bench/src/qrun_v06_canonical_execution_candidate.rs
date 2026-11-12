@@ -680,13 +680,19 @@ impl QRunV06CanonicalExecutionState {
         Ok(())
     }
 
-    /// The active QFP6 consensus profile must use the same subsidy schedule as Q6TM.
+    /// The active QFP6 consensus profile must match the active versioned Genesis economics policy.
     pub fn validate_consensus_parameters(
         &self,
         params: &ConsensusParameters,
     ) -> Result<(), QRunV06ExecutionError> {
-        if let Some(policy) = &self.cp0604_supply {
-            let schedule = policy.mining_schedule();
+        let schedule = if let Some(policy) = &self.cp0604_supply {
+            Some(policy.mining_schedule())
+        } else {
+            self.tokenomics
+                .as_ref()
+                .map(|tokenomics| tokenomics.mining_schedule())
+        };
+        if let Some(schedule) = schedule {
             if params.issuance.maximum_supply()
                 != crate::qrun_v06_tokenomics_candidate::QRUN_V06_MAX_GROSS_ISSUANCE_ATOMS
                 || params.issuance.initial_subsidy() != schedule.initial_subsidy_atoms
@@ -694,29 +700,23 @@ impl QRunV06CanonicalExecutionState {
             {
                 return Err(QRunV06ExecutionError::TokenomicsConsensusMismatch);
             }
-        }
-        if let Some(tokenomics) = &self.tokenomics {
-            let schedule = tokenomics.mining_schedule();
-            if params.issuance.maximum_supply()
-                != crate::qrun_v06_tokenomics_candidate::QRUN_V06_MAX_GROSS_ISSUANCE_ATOMS
-                || params.issuance.initial_subsidy() != schedule.initial_subsidy_atoms
-                || params.issuance.blocks_per_halving() != schedule.blocks_per_halving
-            {
-                return Err(QRunV06ExecutionError::TokenomicsConsensusMismatch);
-            }
-            if let Some(descriptor) = &self.genesis_descriptor {
-                let consensus_fingerprint =
-                    crate::qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint(params)
+            if let Some((founder, policy_fingerprint)) = self.genesis_economic_policy_identity() {
+                if let Some(descriptor) = &self.genesis_descriptor {
+                    let consensus_fingerprint =
+                        crate::qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint(
+                            params,
+                        )
                         .map_err(|_| QRunV06ExecutionError::TokenomicsConsensusMismatch)?;
-                descriptor.validate_binding(
-                    &self.network_id(),
-                    &self.profile_id,
-                    &tokenomics.founder_account(),
-                    &consensus_fingerprint,
-                    &tokenomics.policy_fingerprint(),
-                )?;
+                    descriptor.validate_binding(
+                        &self.network_id(),
+                        &self.profile_id,
+                        &founder,
+                        &consensus_fingerprint,
+                        &policy_fingerprint,
+                    )?;
+                }
             }
-        } else if self.genesis_descriptor.is_some() && self.cp0604_supply.is_none() {
+        } else if self.genesis_descriptor.is_some() {
             return Err(QRunV06ExecutionError::TokenomicsConsensusMismatch);
         }
         Ok(())
