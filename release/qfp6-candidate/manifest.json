@@ -48,7 +48,7 @@
     "trust_floor_provisioned": false
   },
   "runtime": {
-    "wired": false,
+    "wired": true,
     "full_history_replay_qualified": false,
     "public_listener_qualified": false
   },

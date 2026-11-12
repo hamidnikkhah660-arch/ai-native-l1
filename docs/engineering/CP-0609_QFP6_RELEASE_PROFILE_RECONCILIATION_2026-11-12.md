@@ -1,4 +1,4 @@
-﻿# CP-0609 - QFP6 release-profile reconciliation and Mainnet artifact gate
+# CP-0609 - QFP6 release-profile reconciliation and Mainnet artifact gate
 
 Date: 2026-11-12
 Status: audit/documentation reconciliation only; no Mainnet identity, Genesis, signing, or activation.
@@ -16,7 +16,7 @@ CP-0575's original draft described Q6CP v1/Argon2id and a 1B Founder Genesis inv
 
 ## Exact release-package status
 
-The candidate package validator was run after the public identity binding. It reports `CANDIDATE_SCAFFOLD_ONLY`, `mainnet_authorized=false`, `runtime_wired=false`, and `public_mining_authorized=false`. Six canonical artifacts are absent:
+The candidate package validator was run after the public identity binding. It reports `CANDIDATE_SCAFFOLD_ONLY`, `mainnet_authorized=false`, `runtime_wired=false` at the time of the CP-0609 audit, and `public_mining_authorized=false`. CP-0613 subsequently wires the private-candidate executable path; it does not change the six-artifact gap or production authorization. Six canonical artifacts are absent:
 
 1. Canonical Genesis snapshot.
 2. Q6GD Genesis descriptor.
@@ -33,7 +33,7 @@ The absence is intentional. These values cannot be safely generated from test fi
 - Calibrate SHA-256d target and difficulty parameters from reproducible benchmarks and independent implementation vectors; current easy/candidate fixtures are not Mainnet values.
 - Generate canonical Q6GD/Q6CP/Q6PN and the Genesis snapshot only after the final network identity, profile, Genesis timestamp, founder account and CP-0604 policy are fixed. Independently pin the resulting digests.
 - Provision independently administered Q6TS/trust-floor authority and authenticated bootstrap peers. Do not invent signatures, public endpoints, keys or peer identities.
-- Wire the ordinary executable to the permissionless base runtime and qualify full-history sync, transaction admission, mining, fork choice/reorg, persistent restart and anti-rollback across independently operated hosts. `qrun_v06_node --run` remains disabled.
+- CP-0613 wires the executable to the QAP1 bootstrap and QAP1 mining supervisor in private-candidate mode. Still qualify full-history sync, transaction admission, mining, fork choice/reorg, persistent restart and anti-rollback across independently operated hosts. Public/Mainnet execution remains disabled.
 - Complete independent security/cryptographic/economic review and explicit release authorization.
 
 ## Validation record

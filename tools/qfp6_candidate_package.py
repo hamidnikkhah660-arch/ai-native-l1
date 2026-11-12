@@ -171,7 +171,8 @@ def validate_package(root: pathlib.Path) -> int:
     print("founder_identity_status=" + ("PUBLIC_KEYS_BOUND_CANDIDATE_ONLY" if founder else "NOT_BOUND"))
     print("qfp6_package_status=CANDIDATE_SCAFFOLD_ONLY")
     print("mainnet_authorized=false")
-    print("runtime_wired=false")
+    runtime = data.get("runtime") if isinstance(data.get("runtime"), dict) else {}
+    print("runtime_wired=" + str(runtime.get("wired") is True).lower())
     print("public_mining_authorized=false")
     print("exit_status=" + ("INCOMPLETE" if missing else "HASHES_VALID_CANDIDATE_ONLY"))
     return 2 if missing else 0

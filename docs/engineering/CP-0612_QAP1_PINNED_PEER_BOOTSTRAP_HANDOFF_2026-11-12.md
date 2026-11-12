@@ -1,7 +1,7 @@
 # CP-0612 - QAP1-gated pinned-peer history bootstrap and mining handoff
 
 Date: 2026-11-12
-Status: QAP1 history client and library-level mining bootstrap handoff implemented; executable wiring and independent end-to-end peer qualification remain open.
+Status: QAP1 history client and library-level handoff implemented; CP-0613 adds private-candidate executable wiring. Independent end-to-end peer qualification remains open.
 
 ## Implemented
 
@@ -23,7 +23,7 @@ Status: QAP1 history client and library-level mining bootstrap handoff implement
 
 ## Remaining boundaries
 
-- `qrun_v06_node` executable is still not wired to construct/provision these dependencies or invoke the new QAP1 bootstrap wrapper; its fail-closed `--run` guard remains in place.
+- CP-0613 wires `qrun_v06_node --run` to the QAP1 bootstrap wrapper in private-candidate mode only. It remains fail-closed and requires independently provisioned configuration, Genesis/profile/trust inputs, protected Noise keys, and pinned peers. Public Mainnet execution remains disabled.
 - No actual external peer endpoints/Noise keys, Provider/Q6EA transports/verifiers, local protected Noise key, Genesis/profile artifacts or independently authenticated trust pins are provisioned by this code change.
 - No public listener, Mainnet activation, public mining, issuance, or exchange trading is enabled.
 - Required next qualification: two independently provisioned hosts with real pinned peer keys and Provider/Q6EA test services; interrupt after an acknowledged prefix, restart via `open_qap1`, resume from exact next height, then verify matching snapshot and bounded QAP1 mining handoff.
