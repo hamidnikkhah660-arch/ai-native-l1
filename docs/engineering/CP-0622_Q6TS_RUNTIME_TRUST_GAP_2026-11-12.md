@@ -1,39 +1,28 @@
-# CP-0622 — Q6TS release/runtime trust-boundary gap
+﻿# CP-0622 — Q6TS release/runtime trust-boundary finding (clarified)
 
-Status: engineering finding; candidate-only. This note does not authorize Mainnet, public mining, Genesis signing, or network exposure.
+Status: candidate-only engineering finding. No Mainnet, public mining, Genesis signing, or public network exposure is authorized.
 
-## Finding
+## Clarification
 
-The CP-0620 release artifact gate requires a Q6TS trust bundle, independent trust authorities, and threshold signatures. The candidate package validator also requires the Q6TS artifact as one of six package components.
+The permissionless full-history base-node architecture intentionally does not require Q6TS, Provider, Q6EA, or QAP1. CP-0588 and CP-0590 explicitly establish this boundary: ordinary nodes validate and replay the complete chain from an independently pinned immutable Genesis/manifest identity. Q6TS remains an optional trust extension for anchored, pruned, or checkpoint operation.
 
-The permissionless QFP6 launcher inspected for this checkpoint explicitly states that it does not load Q6TS (nor Provider, Q6EA, or QAP1 services). Therefore the current release gate and runtime have different trust boundaries: a Q6TS file may be present and externally checked by a release operator, while the running node itself does not consume or enforce that trust bundle.
+The permissionless launcher therefore not loading Q6TS is not, by itself, a runtime security defect. The actual defect is that CP-0620 and the generic candidate-package validator currently describe a single six-artifact package and do not distinguish the base-chain release from the optional anchored/checkpoint extension. This conflates two different trust models.
 
-This is not evidence that Q6TS is unnecessary. It is an unresolved production-security gap.
+## Required resolution — split release profiles
 
-## Required resolution — fail closed
+1. **Permissionless full-history Base Mainnet:** require independently pinned network/profile/consensus/Genesis commitments; full-history replay from Genesis; canonical timestamp/MTP and retarget rules; valid PoW and fork choice; anti-rollback protection for retained local history; authenticated/qualified peer admission and public network protections. Q6TS is not a mandatory artifact for this mode.
+2. **Anchored/pruned/checkpoint extension:** require Q6TS dual signatures, independently provisioned authority keyset and monotonic trust floor, exact Q6PN/Q6GD/Q6CP/Genesis bindings, expiry/revocation and rollback handling, plus the Q6EA/Provider dependencies required by that mode. This mode must remain separately selected and fail closed.
 
-Before any production authorization, choose and implement one reviewed architecture:
+Do not add Q6TS as a universal base-protocol dependency merely to satisfy a package counter. Do not remove Q6TS from the anchored/checkpoint release requirements. Do not describe a local candidate validator as an independent trust authority.
 
-1. **Runtime-enforced Q6TS (preferred):** define a versioned Q6TS encoding; load it from the permissionless runtime configuration; verify authority keys, threshold signatures, network/profile/Genesis commitments, expiry/revocation policy, and anti-rollback anchor before opening listeners, importing history, or mining. Add negative tests for missing, malformed, wrong-network, insufficient-threshold, revoked, expired, and rollback bundles.
-2. **Explicit external trust-verifier architecture:** only acceptable after an independent security review defines a cryptographically verifiable handoff from the release verifier to every node, including how nodes authenticate the verifier result and prevent substitution/rollback. A local “operator checked it” statement is not sufficient.
+## Required code/documentation follow-up
 
-Do not silently remove Q6TS from the six-artifact release gate, mark it runtime-loaded when it is not, or promote a package merely because all six files exist.
-
-## Additional release blockers remain
-
-- Inbound Noise XX currently does not authenticate remote peer identity.
-- Public peer discovery and authenticated peer advertisements are not qualified.
-- Existing-history replay needs an independently pinned trusted manifest anchor.
-- Public listener qualification and public mining authorization remain false.
-- Production Q6CP parameters, canonical Genesis/Q6GD/Q6PN commitments, independent reviews, and independently operated bootstrap peers remain required.
-
-## Acceptance criteria
-
-- Manifest distinguishes `release_trust_bundle_required` from `runtime_q6ts_enforced`; the latter must remain false until actual runtime enforcement and tests land.
-- The production release gate rejects any configuration that claims Q6TS enforcement without a runtime verifier implementation and passing tests.
-- Documentation names the exact trust boundary and never describes the candidate launcher as Q6TS-authenticated.
-- All existing candidate checks remain fail-closed; no fabricated trust roots, signatures, endpoints, or Genesis artifacts.
+- Split candidate/release manifest profiles into `permissionless_full_history` and `anchored_checkpoint` (or an equivalently explicit versioned discriminator).
+- Require Q6TS artifacts and trust-floor state only for the anchored/checkpoint profile; reject attempts to claim anchored operation without them.
+- For the permissionless profile, require externally pinned immutable Genesis/profile commitments and full-history replay qualification instead of Q6TS.
+- Keep `production_authorized=false`, `mainnet_status=NOT_AUTHORIZED`, and `public_mining_authorized=false` until all mode-specific checks and independent reviews pass.
+- Add validator tests proving that a base profile does not falsely claim Q6TS enforcement, while an anchored profile cannot pass without valid Q6TS material.
 
 ## Current decision
 
-**NO-GO for production.** Preserve `production_authorized=false`, `mainnet_status=NOT_AUTHORIZED`, and `public_mining_authorized=false`. This checkpoint records the gap; it does not pretend to close it.
+**NO-GO for production.** This clarification corrects the trust-boundary interpretation; it does not qualify either release profile or authorize Mainnet.
