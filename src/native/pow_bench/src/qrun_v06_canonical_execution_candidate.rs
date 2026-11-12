@@ -1,7 +1,8 @@
 //! Isolated QFP6 canonical block codec and deterministic execution candidate.
 //!
-//! QFP5/QFB5 encodings are untouched. QFB6 v5 commits CP-0528 issuance counters, signed category releases,
-//! the Founder Genesis policy and the mining-security reward schedule in the execution root.
+//! QFP5/QFB5 encodings are untouched. QFB6 v5 commits legacy CP-0528 state where present;
+//! permissionless QFP6 uses the mutually exclusive CP-0604 founder-controlled supply policy,
+//! and commits its issuance state and mining-security reward schedule in the execution root.
 //! The candidate also executes native TXN2 transfers, signed AMM operations, signed asset
 //! registrations and issuer-admin operations in the canonical order carried by QFB6. The root is computed
 //! after per-block fee settlement and header advancement, then the tip is committed from
@@ -296,8 +297,8 @@ pub struct QRunV06CanonicalExecutionState {
     unified: QRunV06UnifiedAssetState,
     orderbook: OrderBook,
     profile_id: [u8; 32],
-    /// None identifies a legacy/market-only QFB6 research fixture. CP-0528-aware
-    /// candidate Genesis and subsequent state transitions must carry Some(policy).
+    /// None identifies a legacy/market-only QFB6 research fixture. Legacy CP-0528
+    /// state is retained for compatibility; permissionless QFP6 separately requires CP-0604.
     tokenomics: Option<QRunV06TokenomicsState>,
     /// CP-0604 founder-controlled issuance policy; mutually exclusive with legacy CP-0528.
     cp0604_supply: Option<Cp0604FounderControlledSupply>,

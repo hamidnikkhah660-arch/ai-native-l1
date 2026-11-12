@@ -138,7 +138,7 @@ pub mod qrun_v06_checkpoint_candidate;
 pub mod qrun_v06_consensus_profile_candidate;
 /// CP-0527 QFP6 bridge from durable segment state to signed external monotonic CAS anchors.
 pub mod qrun_v06_external_anchor_candidate;
-/// Immutable QFP6 Genesis descriptor binding timestamp, profile, consensus and CP-0528 policy.
+/// Immutable QFP6 Genesis descriptor binding timestamp, profile, consensus and versioned policy (CP-0604 for permissionless QFP6).
 pub mod qrun_v06_genesis_descriptor_candidate;
 /// CP-0546 append-only historical Q6TS/Q6PN/Q6QA trust-history and pinned checkpoint verifier candidate.
 pub mod qrun_v06_historical_trust_candidate;

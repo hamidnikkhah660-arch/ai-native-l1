@@ -1,8 +1,9 @@
 //! Immutable QFP6 Genesis descriptor candidate.
 //!
 //! It binds Genesis time, Network/Profile, Founder, consensus parameters and the
-//! CP-0528 tokenomics policy. A selected network profile must pin this commitment
-//! out-of-band; the encoding itself is not anti-rollback authority.
+//! active versioned tokenomics policy fingerprint (CP-0604 for permissionless QFP6).
+//! A selected network profile must pin this commitment out-of-band; the encoding
+//! itself is not anti-rollback authority.
 
 use sha2::{Digest, Sha256};
 
