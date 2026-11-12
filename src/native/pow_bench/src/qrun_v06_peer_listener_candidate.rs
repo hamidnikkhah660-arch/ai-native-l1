@@ -597,16 +597,51 @@ pub fn serve_qfp6_noise_listener_with_history<F>(
     network_id: &[u8; 32],
     profile_id: &[u8; 32],
     shutdown: &AtomicBool,
+    on_application_frame: F,
+) -> Result<QRunV06PeerListenerReport, QRunV06PeerListenerError>
+where
+    F: FnMut(&mut QRunV06PeerReplayGuard, &[u8]) -> Result<Vec<Vec<u8>>, String>,
+{
+    serve_qfp6_noise_listener_with_history_and_q6ar(
+        listener,
+        config,
+        local_static_private_key,
+        trusted_remote_static_public_keys,
+        network_id,
+        profile_id,
+        shutdown,
+        |_| Ok(()),
+        on_application_frame,
+    )
+}
+
+/// Q6AR-aware candidate listener. Advertisements are delivered with their session provenance;
+/// the application must persist only pinned relays and must not treat advertised keys as pins.
+pub fn serve_qfp6_noise_listener_with_history_and_q6ar<F, G>(
+    listener: &TcpListener,
+    config: QRunV06PeerListenerConfig,
+    local_static_private_key: &[u8; 32],
+    trusted_remote_static_public_keys: &[[u8; 32]],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    shutdown: &AtomicBool,
+    mut on_q6ar: G,
     mut on_application_frame: F,
 ) -> Result<QRunV06PeerListenerReport, QRunV06PeerListenerError>
 where
     F: FnMut(&mut QRunV06PeerReplayGuard, &[u8]) -> Result<Vec<Vec<u8>>, String>,
+    G: FnMut(
+        crate::qrun_v06_peer_address_relay_candidate::Q6arReceivedAdvertisement,
+    ) -> Result<(), String>,
 {
     use crate::qrun_v06_history_sync_wire_candidate::{
         decode_q6hi_request, decode_q6hr_status, decode_q6hs_request,
         validate_q6hc_response_sequence, Q6HI_REQUEST_MAGIC, Q6HS_REQUEST_MAGIC,
     };
     use crate::qrun_v06_noise_transport_candidate::MAX_QFP6_NOISE_RECORD_BYTES;
+    use crate::qrun_v06_peer_address_relay_candidate::{
+        decode_q6ar_from_session, Q6AR_MAGIC, Q6AR_MAX_FRAME_BYTES,
+    };
     use crate::qrun_v06_transaction_ingress_candidate::{
         decode_q6ti_transaction_request, Q6TI_MAGIC,
     };
@@ -692,6 +727,7 @@ where
         }
         let mut replay_guard = QRunV06PeerReplayGuard::new();
         let mut session_history_egress = 0usize;
+        let mut q6ar_seen = false;
         for _ in 0..config.max_requests_per_session {
             if shutdown.load(Ordering::Acquire) {
                 break;
@@ -700,6 +736,35 @@ where
                 Ok(frame) => frame,
                 Err(_) => break,
             };
+            if frame.get(..4) == Some(&Q6AR_MAGIC) {
+                if q6ar_seen || frame.len() > Q6AR_MAX_FRAME_BYTES {
+                    stats.handler_failures += 1;
+                    break;
+                }
+                q6ar_seen = true;
+                let now_secs =
+                    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                        Ok(duration) => duration.as_secs(),
+                        Err(_) => {
+                            stats.handler_failures += 1;
+                            break;
+                        }
+                    };
+                match decode_q6ar_from_session(&frame, &noise, now_secs) {
+                    Ok(advertisement) => {
+                        stats.requests_received += 1;
+                        if on_q6ar(advertisement).is_err() {
+                            stats.handler_failures += 1;
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(_) => {
+                        stats.handler_failures += 1;
+                        break;
+                    }
+                }
+            }
             let (request_id, is_history, is_info) = if frame.get(..4) == Some(&Q6HI_REQUEST_MAGIC) {
                 match decode_q6hi_request(&frame) {
                     Ok(request)
@@ -1471,6 +1536,90 @@ mod tests {
         assert_eq!(report.stats.requests_received, 3);
         assert_eq!(report.stats.handler_failures, 1);
         assert_eq!(report.stats.responses_written, 2);
+    }
+
+    #[test]
+    fn qfp6_listener_dispatches_one_q6ar_from_pinned_noise_session() {
+        use crate::qrun_v06_noise_transport_candidate::QRunV06NoiseSession;
+        use crate::qrun_v06_peer_address_relay_candidate::{
+            encode_q6ar, Q6arAddress, Q6arAdvertisement,
+        };
+        let (server_private, server_public) = keypair();
+        let (client_private, client_public) = keypair();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_received = received.clone();
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = thread::spawn(move || {
+            let mut config = QRunV06PeerListenerConfig::default();
+            config.max_sessions = 1;
+            config.max_requests_per_session = 2;
+            serve_qfp6_noise_listener_with_history_and_q6ar(
+                &listener,
+                config,
+                &server_private,
+                &[client_public],
+                &NETWORK,
+                &PROFILE,
+                &server_shutdown,
+                move |advertisement| {
+                    server_received.lock().unwrap().push(advertisement);
+                    Ok(())
+                },
+                |_guard, _frame| {
+                    Err("Q6AR must not reach the application transaction handler".into())
+                },
+            )
+            .unwrap()
+        });
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream.set_nodelay(true).unwrap();
+        let mut noise = QRunV06NoiseSession::connect(
+            &mut stream,
+            &client_private,
+            &server_public,
+            &NETWORK,
+            &PROFILE,
+        )
+        .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let frame = encode_q6ar(&Q6arAdvertisement {
+            network_id: NETWORK,
+            profile_id: PROFILE,
+            issued_at_secs: now,
+            ttl_secs: 300,
+            addresses: vec![Q6arAddress {
+                endpoint: "8.8.8.8:8333".parse().unwrap(),
+                noise_static_public_key: [0x44; 32],
+            }],
+        })
+        .unwrap();
+        noise.write_record(&mut stream, &frame).unwrap();
+        for _ in 0..200 {
+            if !received.lock().unwrap().is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(received.lock().unwrap().len(), 1);
+        noise.write_record(&mut stream, &frame).unwrap();
+        drop(stream);
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        let report = server.join().unwrap();
+        let records = received.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].relay_origin.relay_static_key_pinned);
+        assert_eq!(
+            records[0].advertisement.addresses[0].noise_static_public_key,
+            [0x44; 32]
+        );
+        assert_eq!(report.stats.requests_received, 1);
+        assert_eq!(report.stats.handler_failures, 1);
     }
 
     #[test]

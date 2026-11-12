@@ -13,8 +13,9 @@ use std::{
 pub const MAX_PEERS: usize = 256;
 pub const MAX_STORE_BYTES: usize = 256 * 1024;
 const MAGIC: &str = "Q6PA-ADDRESS-BOOK";
-const VERSION: u64 = 1;
-const DOMAIN: &[u8] = b"QFP6-PEER-ADDRESS-BOOK-V1\0";
+const VERSION: u64 = 2;
+const DOMAIN_V1: &[u8] = b"QFP6-PEER-ADDRESS-BOOK-V1\0";
+const DOMAIN_V2: &[u8] = b"QFP6-PEER-ADDRESS-BOOK-V2\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
@@ -42,6 +43,12 @@ pub struct PeerAddressRecord {
     pub failures: u32,
     pub retry_after_ms: u64,
     pub banned_until_ms: u64,
+    /// Advertised key is a candidate only; it is not trusted until a later pinned handshake.
+    pub advertised_noise_static_key: Option<[u8; 32]>,
+    pub relay_static_public_key: Option<[u8; 32]>,
+    pub relay_static_key_pinned: bool,
+    pub advertisement_expires_at_ms: u64,
+    pub advertisement_fingerprint: Option<[u8; 32]>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerAddressBookError {
@@ -54,6 +61,8 @@ pub enum PeerAddressBookError {
     InvalidAddress,
     LockHeld,
     StoreTooLarge,
+    UnauthenticatedRelay,
+    Replay,
 }
 impl std::fmt::Display for PeerAddressBookError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -64,6 +73,26 @@ impl std::error::Error for PeerAddressBookError {}
 impl From<std::io::Error> for PeerAddressBookError {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e.to_string())
+    }
+}
+
+fn parse_optional_key(value: Option<&Value>) -> Result<Option<[u8; 32]>, PeerAddressBookError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if value.len() == 64 => {
+            let mut key = [0u8; 32];
+            for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+                let text =
+                    std::str::from_utf8(chunk).map_err(|_| PeerAddressBookError::Malformed)?;
+                key[index] =
+                    u8::from_str_radix(text, 16).map_err(|_| PeerAddressBookError::Malformed)?;
+            }
+            if key == [0; 32] {
+                return Err(PeerAddressBookError::Malformed);
+            }
+            Ok(Some(key))
+        }
+        _ => Err(PeerAddressBookError::Malformed),
     }
 }
 
@@ -144,6 +173,11 @@ impl QRunV06PeerAddressBookCandidate {
                 failures: 0,
                 retry_after_ms: 0,
                 banned_until_ms: 0,
+                advertised_noise_static_key: None,
+                relay_static_public_key: None,
+                relay_static_key_pinned: false,
+                advertisement_expires_at_ms: 0,
+                advertisement_fingerprint: None,
             });
         self.persist()
     }
@@ -177,15 +211,103 @@ impl QRunV06PeerAddressBookCandidate {
         r.banned_until_ms = r.banned_until_ms.max(until_ms);
         self.persist()
     }
+    /// Persist only advertisements relayed over an operator-pinned Noise session.
+    /// Advertised endpoint keys remain candidates and are never promoted to trust pins here.
+    pub fn ingest_pinned_q6ar(
+        &mut self,
+        received: &crate::qrun_v06_peer_address_relay_candidate::Q6arReceivedAdvertisement,
+        now_ms: u64,
+    ) -> Result<usize, PeerAddressBookError> {
+        if !received.relay_origin.relay_static_key_pinned
+            || received.relay_origin.relay_static_public_key == [0; 32]
+        {
+            return Err(PeerAddressBookError::UnauthenticatedRelay);
+        }
+        if received.advertisement.network_id != self.network {
+            return Err(PeerAddressBookError::WrongNetwork);
+        }
+        if received.advertisement.profile_id != self.profile {
+            return Err(PeerAddressBookError::WrongProfile);
+        }
+        if received.advertisement.issued_at_secs
+            > now_ms / 1000
+                + crate::qrun_v06_peer_address_relay_candidate::Q6AR_MAX_FUTURE_SKEW_SECS
+        {
+            return Err(PeerAddressBookError::Malformed);
+        }
+        let expires = received
+            .advertisement
+            .issued_at_secs
+            .saturating_add(received.advertisement.ttl_secs as u64)
+            .saturating_mul(1000);
+        if expires <= now_ms {
+            return Err(PeerAddressBookError::Malformed);
+        }
+        let encoded =
+            crate::qrun_v06_peer_address_relay_candidate::encode_q6ar(&received.advertisement)
+                .map_err(|_| PeerAddressBookError::Malformed)?;
+        let mut fingerprint_hash = Sha256::new();
+        fingerprint_hash.update(b"QFP6-Q6AR-REPLAY-V1\0");
+        fingerprint_hash.update(&encoded);
+        let fingerprint: [u8; 32] = fingerprint_hash.finalize().into();
+        if self
+            .records
+            .values()
+            .any(|record| record.advertisement_fingerprint == Some(fingerprint))
+        {
+            return Err(PeerAddressBookError::Replay);
+        }
+        let before = self.records.clone();
+        for advertised in &received.advertisement.addresses {
+            let address = advertised.endpoint.to_string();
+            if !self.records.contains_key(&address) && self.records.len() >= MAX_PEERS {
+                self.records = before;
+                return Err(PeerAddressBookError::Capacity);
+            }
+            let record = self
+                .records
+                .entry(address.clone())
+                .or_insert(PeerAddressRecord {
+                    address,
+                    source: PeerAddressSource::Gossip,
+                    first_seen_ms: now_ms,
+                    last_seen_ms: now_ms,
+                    failures: 0,
+                    retry_after_ms: 0,
+                    banned_until_ms: 0,
+                    advertised_noise_static_key: None,
+                    relay_static_public_key: None,
+                    relay_static_key_pinned: false,
+                    advertisement_expires_at_ms: 0,
+                    advertisement_fingerprint: None,
+                });
+            record.last_seen_ms = record.last_seen_ms.max(now_ms);
+            record.advertised_noise_static_key = Some(advertised.noise_static_public_key);
+            record.relay_static_public_key = Some(received.relay_origin.relay_static_public_key);
+            record.relay_static_key_pinned = true;
+            record.advertisement_expires_at_ms = record.advertisement_expires_at_ms.max(expires);
+            record.advertisement_fingerprint = Some(fingerprint);
+            if record.source != PeerAddressSource::Manual
+                && record.source != PeerAddressSource::Bootstrap
+            {
+                record.source = PeerAddressSource::Gossip;
+            }
+        }
+        if let Err(error) = self.persist() {
+            self.records = before;
+            return Err(error);
+        }
+        Ok(received.advertisement.addresses.len())
+    }
     fn payload(&self) -> Value {
-        let rows:Vec<Value>=self.records.values().map(|r|json!({"address":r.address,"source":r.source as u64,"first_seen_ms":r.first_seen_ms,"last_seen_ms":r.last_seen_ms,"failures":r.failures,"retry_after_ms":r.retry_after_ms,"banned_until_ms":r.banned_until_ms})).collect();
+        let rows:Vec<Value>=self.records.values().map(|r|json!({"address":r.address,"source":r.source as u64,"first_seen_ms":r.first_seen_ms,"last_seen_ms":r.last_seen_ms,"failures":r.failures,"retry_after_ms":r.retry_after_ms,"banned_until_ms":r.banned_until_ms,"advertised_noise_static_key":r.advertised_noise_static_key.map(|v|hex(&v)),"relay_static_public_key":r.relay_static_public_key.map(|v|hex(&v)),"relay_static_key_pinned":r.relay_static_key_pinned,"advertisement_expires_at_ms":r.advertisement_expires_at_ms,"advertisement_fingerprint":r.advertisement_fingerprint.map(|v|hex(&v))})).collect();
         json!({"magic":MAGIC,"version":VERSION,"network":hex(&self.network),"profile":hex(&self.profile),"records":rows})
     }
     fn persist(&self) -> Result<(), PeerAddressBookError> {
         let payload = self.payload();
         let body = serde_json::to_vec(&payload).map_err(|_| PeerAddressBookError::Malformed)?;
         let mut h = Sha256::new();
-        h.update(DOMAIN);
+        h.update(DOMAIN_V2);
         h.update(&body);
         let checksum = hex(&h.finalize());
         let bytes = serde_json::to_vec(&json!({"payload":payload,"checksum":checksum}))
@@ -223,14 +345,22 @@ impl QRunV06PeerAddressBookCandidate {
             serde_json::from_slice(&bytes).map_err(|_| PeerAddressBookError::Malformed)?;
         let payload = root.get("payload").ok_or(PeerAddressBookError::Malformed)?;
         let body = serde_json::to_vec(payload).map_err(|_| PeerAddressBookError::Malformed)?;
+        let version = payload
+            .get("version")
+            .and_then(Value::as_u64)
+            .ok_or(PeerAddressBookError::Malformed)?;
+        let domain = match version {
+            1 => DOMAIN_V1,
+            2 => DOMAIN_V2,
+            _ => return Err(PeerAddressBookError::Malformed),
+        };
         let mut h = Sha256::new();
-        h.update(DOMAIN);
+        h.update(domain);
         h.update(&body);
         if root.get("checksum").and_then(Value::as_str) != Some(hex(&h.finalize()).as_str()) {
             return Err(PeerAddressBookError::ChecksumMismatch);
         }
-        if payload.get("magic").and_then(Value::as_str) != Some(MAGIC)
-            || payload.get("version").and_then(Value::as_u64) != Some(VERSION)
+        if payload.get("magic").and_then(Value::as_str) != Some(MAGIC) || !matches!(version, 1 | 2)
         {
             return Err(PeerAddressBookError::Malformed);
         }
@@ -281,12 +411,56 @@ impl QRunV06PeerAddressBookCandidate {
                 failures,
                 retry_after_ms: s("retry_after_ms")?,
                 banned_until_ms: s("banned_until_ms")?,
+                advertised_noise_static_key: if version >= 2 {
+                    parse_optional_key(v.get("advertised_noise_static_key"))?
+                } else {
+                    None
+                },
+                relay_static_public_key: if version >= 2 {
+                    parse_optional_key(v.get("relay_static_public_key"))?
+                } else {
+                    None
+                },
+                relay_static_key_pinned: if version >= 2 {
+                    v.get("relay_static_key_pinned")
+                        .and_then(Value::as_bool)
+                        .ok_or(PeerAddressBookError::Malformed)?
+                } else {
+                    false
+                },
+                advertisement_expires_at_ms: if version >= 2 {
+                    s("advertisement_expires_at_ms")?
+                } else {
+                    0
+                },
+                advertisement_fingerprint: if version >= 2 {
+                    parse_optional_key(v.get("advertisement_fingerprint"))?
+                } else {
+                    None
+                },
             };
-            if rec.last_seen_ms < rec.first_seen_ms || loaded.insert(address, rec).is_some() {
+            let metadata_consistent = match (
+                rec.advertised_noise_static_key,
+                rec.relay_static_public_key,
+                rec.relay_static_key_pinned,
+                rec.advertisement_expires_at_ms,
+                rec.advertisement_fingerprint,
+            ) {
+                (None, None, false, 0, None) => true,
+                (Some(_), Some(_), true, expiry, Some(_)) if expiry > 0 => true,
+                _ => false,
+            };
+            if rec.last_seen_ms < rec.first_seen_ms
+                || !metadata_consistent
+                || loaded.insert(address, rec).is_some()
+            {
                 return Err(PeerAddressBookError::Malformed);
             }
         }
         self.records = loaded;
+        if version == 1 {
+            self.persist()?;
+        }
         Ok(())
     }
 }
@@ -378,6 +552,111 @@ mod tests {
             Err(PeerAddressBookError::WrongNetwork)
         ));
     }
+    #[test]
+    fn migrates_v1_store_to_v2_without_losing_records() {
+        let t = Temp::new();
+        let p = t.0.join("peers.q6pa");
+        let payload = json!({
+            "magic": MAGIC, "version": 1, "network": hex(&[1; 32]), "profile": hex(&[2; 32]),
+            "records": [{"address":"127.0.0.1:8333","source":1,"first_seen_ms":10,"last_seen_ms":20,"failures":2,"retry_after_ms":30,"banned_until_ms":0}]
+        });
+        let body = serde_json::to_vec(&payload).unwrap();
+        let mut hash = Sha256::new();
+        hash.update(DOMAIN_V1);
+        hash.update(&body);
+        fs::write(
+            &p,
+            serde_json::to_vec(&json!({"payload":payload,"checksum":hex(&hash.finalize())}))
+                .unwrap(),
+        )
+        .unwrap();
+        let book = QRunV06PeerAddressBookCandidate::open(&p, [1; 32], [2; 32]).unwrap();
+        let record = book.records().next().unwrap();
+        assert_eq!(record.address, "127.0.0.1:8333");
+        assert_eq!(record.failures, 2);
+        assert_eq!(record.advertised_noise_static_key, None);
+        drop(book);
+        let migrated: Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
+        assert_eq!(migrated["payload"]["version"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn stores_only_pinned_q6ar_relay_metadata_and_recovers_it() {
+        let t = Temp::new();
+        let p = t.0.join("peers.q6pa");
+        let received = crate::qrun_v06_peer_address_relay_candidate::Q6arReceivedAdvertisement {
+            advertisement: crate::qrun_v06_peer_address_relay_candidate::Q6arAdvertisement {
+                network_id: [1; 32],
+                profile_id: [2; 32],
+                issued_at_secs: 100,
+                ttl_secs: 60,
+                addresses: vec![crate::qrun_v06_peer_address_relay_candidate::Q6arAddress {
+                    endpoint: "8.8.8.8:8333".parse().unwrap(),
+                    noise_static_public_key: [7; 32],
+                }],
+            },
+            relay_origin: crate::qrun_v06_peer_address_relay_candidate::Q6arRelayOrigin {
+                relay_static_public_key: [9; 32],
+                relay_static_key_pinned: true,
+            },
+        };
+        {
+            let mut book = QRunV06PeerAddressBookCandidate::open(&p, [1; 32], [2; 32]).unwrap();
+            assert_eq!(book.ingest_pinned_q6ar(&received, 100_000).unwrap(), 1);
+            let record = book.records().next().unwrap();
+            assert_eq!(record.advertised_noise_static_key, Some([7; 32]));
+            assert_eq!(record.relay_static_public_key, Some([9; 32]));
+            assert!(record.relay_static_key_pinned);
+            assert_eq!(record.advertisement_expires_at_ms, 160_000);
+        }
+        let mut book = QRunV06PeerAddressBookCandidate::open(&p, [1; 32], [2; 32]).unwrap();
+        assert_eq!(
+            book.ingest_pinned_q6ar(&received, 100_000),
+            Err(PeerAddressBookError::Replay)
+        );
+        drop(book);
+        let book = QRunV06PeerAddressBookCandidate::open(&p, [1; 32], [2; 32]).unwrap();
+        assert_eq!(
+            book.records().next().unwrap().advertised_noise_static_key,
+            Some([7; 32])
+        );
+    }
+
+    #[test]
+    fn refuses_unpinned_q6ar_relay_and_wrong_profile() {
+        let t = Temp::new();
+        let p = t.0.join("peers.q6pa");
+        let mut book = QRunV06PeerAddressBookCandidate::open(&p, [1; 32], [2; 32]).unwrap();
+        let mut received =
+            crate::qrun_v06_peer_address_relay_candidate::Q6arReceivedAdvertisement {
+                advertisement: crate::qrun_v06_peer_address_relay_candidate::Q6arAdvertisement {
+                    network_id: [1; 32],
+                    profile_id: [2; 32],
+                    issued_at_secs: 100,
+                    ttl_secs: 60,
+                    addresses: vec![crate::qrun_v06_peer_address_relay_candidate::Q6arAddress {
+                        endpoint: "1.1.1.1:8333".parse().unwrap(),
+                        noise_static_public_key: [7; 32],
+                    }],
+                },
+                relay_origin: crate::qrun_v06_peer_address_relay_candidate::Q6arRelayOrigin {
+                    relay_static_public_key: [9; 32],
+                    relay_static_key_pinned: false,
+                },
+            };
+        assert_eq!(
+            book.ingest_pinned_q6ar(&received, 100_000),
+            Err(PeerAddressBookError::UnauthenticatedRelay)
+        );
+        received.relay_origin.relay_static_key_pinned = true;
+        received.advertisement.profile_id = [3; 32];
+        assert_eq!(
+            book.ingest_pinned_q6ar(&received, 100_000),
+            Err(PeerAddressBookError::WrongProfile)
+        );
+        assert_eq!(book.records().count(), 0);
+    }
+
     #[test]
     fn rejects_checksum_corruption() {
         let t = Temp::new();
