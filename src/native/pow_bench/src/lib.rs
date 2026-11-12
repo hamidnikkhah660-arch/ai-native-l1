@@ -543,3 +543,6 @@ pub mod qrun_v06_permissionless_service_candidate;
 
 /// CP-0604 versioned 7B founder Genesis / 3B mining-only supply policy candidate; not yet canonical-runtime wired.
 pub mod qrun_v06_cp0604_supply_candidate;
+
+/// Candidate-only bounded, profile-bound durable peer address book; not runtime-wired.
+pub mod qrun_v06_peer_address_manager_candidate;
