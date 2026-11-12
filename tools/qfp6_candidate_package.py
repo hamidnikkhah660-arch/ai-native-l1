@@ -173,6 +173,8 @@ def validate_package(root: pathlib.Path) -> int:
     print("mainnet_authorized=false")
     runtime = data.get("runtime") if isinstance(data.get("runtime"), dict) else {}
     print("runtime_wired=" + str(runtime.get("wired") is True).lower())
+    print("anchored_qap1_candidate_wired=" + str(runtime.get("anchored_qap1_candidate_wired") is True).lower())
+    print("permissionless_base_runtime_wired=" + str(runtime.get("permissionless_base_runtime_wired") is True).lower())
     print("public_mining_authorized=false")
     print("exit_status=" + ("INCOMPLETE" if missing else "HASHES_VALID_CANDIDATE_ONLY"))
     return 2 if missing else 0
