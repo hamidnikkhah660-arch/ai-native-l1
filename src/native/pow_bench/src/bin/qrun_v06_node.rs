@@ -5,6 +5,8 @@
 //! starting consensus/mining services. The read-only AWS CLI floor lookup uses network access.
 //! It is intentionally preflight-only until the production QAP1/Provider/Anchor/runtime wiring
 //! and independent deployment qualifications are complete.
+mod qrun_v06_node_runtime_launch;
+
 use ai_native_l1_pow_bench::{
     external_cas_anchor_candidate::ExternalCasPin,
     external_cas_floor_store_candidate::ExternalCasFloorStore,
@@ -851,11 +853,12 @@ fn print_help() {
          Usage:\n\
            qrun_v06_node --preflight --config <path> --config-sha256 <64-hex>\n\
            qrun_v06_node --probe-qap1 --config <path> --config-sha256 <64-hex>\n\
+           qrun_v06_node --run --config <path> --config-sha256 <64-hex>\n\
            qrun_v06_node --help\n\
          \n\
          --preflight verifies the pinned Genesis/Q6CP/Q6PN/Q6TS/Q6EA bootstrap package.\n\
          --probe-qap1 additionally performs read-only signed Provider and Q6EA Anchor reads over pinned Noise endpoints.\n\
-         Neither command starts a node, mutates a store/floor, admits transactions, or mines."
+         --run is private-candidate only and requires runtime.mode=private-candidate plus runtime.allow_candidate_runtime=true; public binding and Mainnet are disabled."
     );
 }
 
@@ -864,17 +867,21 @@ fn run(args: &[String]) -> Result<(), String> {
         print_help();
         return Ok(());
     }
-    if args.iter().any(|arg| arg == "--run") {
-        return Err("node runtime is not enabled in this build: QAP1/Provider/Anchor, node-key custody, durable-store recovery and independent production qualification must be wired and verified first".into());
-    }
     if args.len() != 5
-        || !matches!(args[0].as_str(), "--preflight" | "--probe-qap1")
+        || !matches!(args[0].as_str(), "--preflight" | "--probe-qap1" | "--run")
         || args[1] != "--config"
         || args[3] != "--config-sha256"
     {
-        return Err("expected '--preflight|--probe-qap1 --config <path> --config-sha256 <64-hex>' (or '--help')".into());
+        return Err("expected '--preflight|--probe-qap1|--run --config <path> --config-sha256 <64-hex>' (or '--help')".into());
     }
     let expected_config_digest = parse_hex32("config_sha256", &args[4])?;
+    if args[0] == "--run" {
+        qrun_v06_node_runtime_launch::run_candidate_node(
+            Path::new(&args[2]),
+            &expected_config_digest,
+        )?;
+        return Ok(());
+    }
     let (summary, q6ea_state) = if args[0] == "--probe-qap1" {
         let (summary, state) = probe_qap1_services(Path::new(&args[2]), &expected_config_digest)?;
         (summary, Some(state))
@@ -1444,9 +1451,10 @@ mod tests {
     }
 
     #[test]
-    fn runtime_mode_is_explicitly_fail_closed() {
+    fn runtime_mode_requires_the_complete_candidate_config_envelope() {
         let error = run(&["--run".into()]).unwrap_err();
-        assert!(error.contains("node runtime is not enabled"));
+        assert!(error.contains("--config <path>"));
+        assert!(error.contains("--config-sha256"));
     }
 
     #[test]
