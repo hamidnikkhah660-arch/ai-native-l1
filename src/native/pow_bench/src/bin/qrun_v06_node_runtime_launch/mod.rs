@@ -950,3 +950,6 @@ mod tests {
         fs::remove_dir_all(&data_directory).expect("remove test manifests directory");
     }
 }
+
+mod permissionless;
+pub(super) use permissionless::run_permissionless_node;

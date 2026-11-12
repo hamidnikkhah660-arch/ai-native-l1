@@ -848,33 +848,40 @@ fn hex(bytes: &[u8]) -> String {
 
 fn print_help() {
     println!(
-        "QRun QFP6 bootstrap preflight\n\
-         \n\
-         Usage:\n\
-           qrun_v06_node --preflight --config <path> --config-sha256 <64-hex>\n\
-           qrun_v06_node --probe-qap1 --config <path> --config-sha256 <64-hex>\n\
-           qrun_v06_node --run --config <path> --config-sha256 <64-hex>\n\
-           qrun_v06_node --help\n\
-         \n\
-         --preflight verifies the pinned Genesis/Q6CP/Q6PN/Q6TS/Q6EA bootstrap package.\n\
-         --probe-qap1 additionally performs read-only signed Provider and Q6EA Anchor reads over pinned Noise endpoints.\n\
-         --run is private-candidate only and requires runtime.mode=private-candidate plus runtime.allow_candidate_runtime=true; public binding and Mainnet are disabled."
+        r#"QRun QFP6 node launcher
+Usage:
+  qrun_v06_node --preflight --config <path> --config-sha256 <64-hex>
+  qrun_v06_node --probe-qap1 --config <path> --config-sha256 <64-hex>
+  qrun_v06_node --run --config <path> --config-sha256 <64-hex>
+  qrun_v06_node --permissionless-run --config <path> --config-sha256 <64-hex>
+  qrun_v06_node --help
+--run: private-candidate QAP1 mode.
+--permissionless-run: Genesis-rooted base runtime candidate; not production/Mainnet authorization."#
     );
 }
-
 fn run(args: &[String]) -> Result<(), String> {
     if args == ["--help"] {
         print_help();
         return Ok(());
     }
     if args.len() != 5
-        || !matches!(args[0].as_str(), "--preflight" | "--probe-qap1" | "--run")
+        || !matches!(
+            args[0].as_str(),
+            "--preflight" | "--probe-qap1" | "--run" | "--permissionless-run"
+        )
         || args[1] != "--config"
         || args[3] != "--config-sha256"
     {
-        return Err("expected '--preflight|--probe-qap1|--run --config <path> --config-sha256 <64-hex>' (or '--help')".into());
+        return Err("expected '--preflight|--probe-qap1|--run|--permissionless-run --config <path> --config-sha256 <64-hex>' (or '--help')".into());
     }
     let expected_config_digest = parse_hex32("config_sha256", &args[4])?;
+    if args[0] == "--permissionless-run" {
+        qrun_v06_node_runtime_launch::run_permissionless_node(
+            Path::new(&args[2]),
+            &expected_config_digest,
+        )?;
+        return Ok(());
+    }
     if args[0] == "--run" {
         qrun_v06_node_runtime_launch::run_candidate_node(
             Path::new(&args[2]),

@@ -50,7 +50,9 @@
   "runtime": {
     "wired": true,
     "anchored_qap1_candidate_wired": true,
-    "permissionless_base_runtime_wired": false,
+    "permissionless_base_runtime_wired": true,
+    "permissionless_base_runtime_candidate_only": true,
+    "peer_admission_pinned_only": true,
     "full_history_replay_qualified": false,
     "public_listener_qualified": false
   },
