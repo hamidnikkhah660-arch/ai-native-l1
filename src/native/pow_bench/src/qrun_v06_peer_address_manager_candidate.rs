@@ -1,4 +1,5 @@
-//! Candidate-only bounded QFP6 peer-address book. Not connected to discovery or runtime.
+//! Bounded QFP6 peer candidate/trust address book. Q6AR candidates and operator-approved pins are
+//! stored separately; runtime use is opt-in and never auto-trusts or auto-connects candidates.
 //! Local checksums provide corruption detection, not freshness or peer authentication.
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -13,9 +14,10 @@ use std::{
 pub const MAX_PEERS: usize = 256;
 pub const MAX_STORE_BYTES: usize = 256 * 1024;
 const MAGIC: &str = "Q6PA-ADDRESS-BOOK";
-const VERSION: u64 = 2;
+const VERSION: u64 = 3;
 const DOMAIN_V1: &[u8] = b"QFP6-PEER-ADDRESS-BOOK-V1\0";
 const DOMAIN_V2: &[u8] = b"QFP6-PEER-ADDRESS-BOOK-V2\0";
+const DOMAIN_V3: &[u8] = b"QFP6-PEER-ADDRESS-BOOK-V3\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
@@ -49,6 +51,9 @@ pub struct PeerAddressRecord {
     pub relay_static_key_pinned: bool,
     pub advertisement_expires_at_ms: u64,
     pub advertisement_fingerprint: Option<[u8; 32]>,
+    /// Explicit operator-approved outbound pin. Never populated by Q6AR ingestion.
+    pub operator_approved_noise_static_key: Option<[u8; 32]>,
+    pub operator_approved_at_ms: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerAddressBookError {
@@ -63,6 +68,8 @@ pub enum PeerAddressBookError {
     StoreTooLarge,
     UnauthenticatedRelay,
     Replay,
+    ApprovalKeyConflict,
+    NotAnApprovedCandidate,
 }
 impl std::fmt::Display for PeerAddressBookError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -178,6 +185,8 @@ impl QRunV06PeerAddressBookCandidate {
                 relay_static_key_pinned: false,
                 advertisement_expires_at_ms: 0,
                 advertisement_fingerprint: None,
+                operator_approved_noise_static_key: None,
+                operator_approved_at_ms: 0,
             });
         self.persist()
     }
@@ -280,6 +289,8 @@ impl QRunV06PeerAddressBookCandidate {
                     relay_static_key_pinned: false,
                     advertisement_expires_at_ms: 0,
                     advertisement_fingerprint: None,
+                    operator_approved_noise_static_key: None,
+                    operator_approved_at_ms: 0,
                 });
             record.last_seen_ms = record.last_seen_ms.max(now_ms);
             record.advertised_noise_static_key = Some(advertised.noise_static_public_key);
@@ -299,15 +310,179 @@ impl QRunV06PeerAddressBookCandidate {
         }
         Ok(received.advertisement.addresses.len())
     }
+    /// Explicitly trust an endpoint/key pair supplied by the node operator. If the endpoint
+    /// came from Q6AR, the key must exactly match the recorded, still-fresh advertised key.
+    /// Changing an existing approval requires a separate revoke operation first.
+    pub fn pin_manual_peer(
+        &mut self,
+        address: &str,
+        noise_static_public_key: [u8; 32],
+        now_ms: u64,
+    ) -> Result<(), PeerAddressBookError> {
+        let parsed: SocketAddr = address
+            .parse()
+            .map_err(|_| PeerAddressBookError::InvalidAddress)?;
+        if parsed.port() == 0
+            || parsed.ip().is_unspecified()
+            || parsed.ip().is_multicast()
+            || noise_static_public_key == [0; 32]
+        {
+            return Err(PeerAddressBookError::InvalidAddress);
+        }
+        let canonical = parsed.to_string();
+        if !self.records.contains_key(&canonical) && self.records.len() >= MAX_PEERS {
+            return Err(PeerAddressBookError::Capacity);
+        }
+        if let Some(record) = self.records.get(&canonical) {
+            if record
+                .advertised_noise_static_key
+                .is_some_and(|key| key != noise_static_public_key)
+            {
+                return Err(PeerAddressBookError::ApprovalKeyConflict);
+            }
+            if record
+                .operator_approved_noise_static_key
+                .is_some_and(|key| key != noise_static_public_key)
+            {
+                return Err(PeerAddressBookError::ApprovalKeyConflict);
+            }
+            if record.advertisement_expires_at_ms != 0
+                && record.advertisement_expires_at_ms <= now_ms
+                && record.operator_approved_noise_static_key.is_none()
+            {
+                return Err(PeerAddressBookError::NotAnApprovedCandidate);
+            }
+        }
+        let before = self.records.clone();
+        self.records
+            .entry(canonical.clone())
+            .and_modify(|record| {
+                record.source = PeerAddressSource::Manual;
+                record.last_seen_ms = record.last_seen_ms.max(now_ms);
+                record.operator_approved_noise_static_key = Some(noise_static_public_key);
+                record.operator_approved_at_ms = now_ms.max(1);
+                record.failures = 0;
+                record.retry_after_ms = 0;
+                record.banned_until_ms = 0;
+            })
+            .or_insert(PeerAddressRecord {
+                address: canonical,
+                source: PeerAddressSource::Manual,
+                first_seen_ms: now_ms,
+                last_seen_ms: now_ms,
+                failures: 0,
+                retry_after_ms: 0,
+                banned_until_ms: 0,
+                advertised_noise_static_key: None,
+                relay_static_public_key: None,
+                relay_static_key_pinned: false,
+                advertisement_expires_at_ms: 0,
+                advertisement_fingerprint: None,
+                operator_approved_noise_static_key: Some(noise_static_public_key),
+                operator_approved_at_ms: now_ms.max(1),
+            });
+        if let Err(error) = self.persist() {
+            self.records = before;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Explicitly approve a Q6AR candidate only after independently checking its endpoint/key.
+    pub fn approve_advertised_candidate(
+        &mut self,
+        address: &str,
+        independently_verified_noise_static_public_key: [u8; 32],
+        now_ms: u64,
+    ) -> Result<(), PeerAddressBookError> {
+        let record = self
+            .records
+            .get(address)
+            .ok_or(PeerAddressBookError::NotAnApprovedCandidate)?;
+        if record.advertised_noise_static_key
+            != Some(independently_verified_noise_static_public_key)
+            || record.advertisement_expires_at_ms <= now_ms
+            || !record.relay_static_key_pinned
+        {
+            return Err(PeerAddressBookError::NotAnApprovedCandidate);
+        }
+        self.pin_manual_peer(
+            address,
+            independently_verified_noise_static_public_key,
+            now_ms,
+        )
+    }
+
+    /// Remove the operator's explicit outbound trust pin. Candidate metadata is retained.
+    pub fn revoke_operator_approval(&mut self, address: &str) -> Result<(), PeerAddressBookError> {
+        if self.records.get(address).is_none() {
+            return Err(PeerAddressBookError::InvalidAddress);
+        }
+        if self
+            .records
+            .get(address)
+            .is_some_and(|record| record.operator_approved_noise_static_key.is_none())
+        {
+            return Err(PeerAddressBookError::NotAnApprovedCandidate);
+        }
+        let before = self.records.clone();
+        let record = self
+            .records
+            .get_mut(address)
+            .ok_or(PeerAddressBookError::InvalidAddress)?;
+        record.operator_approved_noise_static_key = None;
+        record.operator_approved_at_ms = 0;
+        if let Err(error) = self.persist() {
+            self.records = before;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Return only explicit operator-approved endpoint/key pins, bounded by the caller's budget.
+    pub fn approved_peer_pins(&self, now_ms: u64, limit: usize) -> Vec<(SocketAddr, [u8; 32])> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        self.records
+            .values()
+            .filter(|record| self.is_eligible(&record.address, now_ms))
+            .filter_map(|record| {
+                let key = record.operator_approved_noise_static_key?;
+                let address = record.address.parse().ok()?;
+                Some((address, key))
+            })
+            .take(limit.min(8))
+            .collect()
+    }
+
+    pub fn record_success(&mut self, address: &str) -> Result<(), PeerAddressBookError> {
+        if !self.records.contains_key(address) {
+            return Err(PeerAddressBookError::InvalidAddress);
+        }
+        let before = self.records.clone();
+        let record = self
+            .records
+            .get_mut(address)
+            .ok_or(PeerAddressBookError::InvalidAddress)?;
+        record.failures = 0;
+        record.retry_after_ms = 0;
+        if let Err(error) = self.persist() {
+            self.records = before;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn payload(&self) -> Value {
-        let rows:Vec<Value>=self.records.values().map(|r|json!({"address":r.address,"source":r.source as u64,"first_seen_ms":r.first_seen_ms,"last_seen_ms":r.last_seen_ms,"failures":r.failures,"retry_after_ms":r.retry_after_ms,"banned_until_ms":r.banned_until_ms,"advertised_noise_static_key":r.advertised_noise_static_key.map(|v|hex(&v)),"relay_static_public_key":r.relay_static_public_key.map(|v|hex(&v)),"relay_static_key_pinned":r.relay_static_key_pinned,"advertisement_expires_at_ms":r.advertisement_expires_at_ms,"advertisement_fingerprint":r.advertisement_fingerprint.map(|v|hex(&v))})).collect();
+        let rows:Vec<Value>=self.records.values().map(|r|json!({"address":r.address,"source":r.source as u64,"first_seen_ms":r.first_seen_ms,"last_seen_ms":r.last_seen_ms,"failures":r.failures,"retry_after_ms":r.retry_after_ms,"banned_until_ms":r.banned_until_ms,"advertised_noise_static_key":r.advertised_noise_static_key.map(|v|hex(&v)),"relay_static_public_key":r.relay_static_public_key.map(|v|hex(&v)),"relay_static_key_pinned":r.relay_static_key_pinned,"advertisement_expires_at_ms":r.advertisement_expires_at_ms,"advertisement_fingerprint":r.advertisement_fingerprint.map(|v|hex(&v)),"operator_approved_noise_static_key":r.operator_approved_noise_static_key.map(|v|hex(&v)),"operator_approved_at_ms":r.operator_approved_at_ms})).collect();
         json!({"magic":MAGIC,"version":VERSION,"network":hex(&self.network),"profile":hex(&self.profile),"records":rows})
     }
     fn persist(&self) -> Result<(), PeerAddressBookError> {
         let payload = self.payload();
         let body = serde_json::to_vec(&payload).map_err(|_| PeerAddressBookError::Malformed)?;
         let mut h = Sha256::new();
-        h.update(DOMAIN_V2);
+        h.update(DOMAIN_V3);
         h.update(&body);
         let checksum = hex(&h.finalize());
         let bytes = serde_json::to_vec(&json!({"payload":payload,"checksum":checksum}))
@@ -352,6 +527,7 @@ impl QRunV06PeerAddressBookCandidate {
         let domain = match version {
             1 => DOMAIN_V1,
             2 => DOMAIN_V2,
+            3 => DOMAIN_V3,
             _ => return Err(PeerAddressBookError::Malformed),
         };
         let mut h = Sha256::new();
@@ -360,7 +536,8 @@ impl QRunV06PeerAddressBookCandidate {
         if root.get("checksum").and_then(Value::as_str) != Some(hex(&h.finalize()).as_str()) {
             return Err(PeerAddressBookError::ChecksumMismatch);
         }
-        if payload.get("magic").and_then(Value::as_str) != Some(MAGIC) || !matches!(version, 1 | 2)
+        if payload.get("magic").and_then(Value::as_str) != Some(MAGIC)
+            || !matches!(version, 1 | 2 | 3)
         {
             return Err(PeerAddressBookError::Malformed);
         }
@@ -438,6 +615,16 @@ impl QRunV06PeerAddressBookCandidate {
                 } else {
                     None
                 },
+                operator_approved_noise_static_key: if version >= 3 {
+                    parse_optional_key(v.get("operator_approved_noise_static_key"))?
+                } else {
+                    None
+                },
+                operator_approved_at_ms: if version >= 3 {
+                    s("operator_approved_at_ms")?
+                } else {
+                    0
+                },
             };
             let metadata_consistent = match (
                 rec.advertised_noise_static_key,
@@ -450,15 +637,31 @@ impl QRunV06PeerAddressBookCandidate {
                 (Some(_), Some(_), true, expiry, Some(_)) if expiry > 0 => true,
                 _ => false,
             };
+            let approval_consistent = match (
+                rec.operator_approved_noise_static_key,
+                rec.operator_approved_at_ms,
+            ) {
+                (None, 0) => true,
+                (Some(key), approved_at)
+                    if approved_at > 0
+                        && rec
+                            .advertised_noise_static_key
+                            .is_none_or(|advertised| advertised == key) =>
+                {
+                    true
+                }
+                _ => false,
+            };
             if rec.last_seen_ms < rec.first_seen_ms
                 || !metadata_consistent
+                || !approval_consistent
                 || loaded.insert(address, rec).is_some()
             {
                 return Err(PeerAddressBookError::Malformed);
             }
         }
         self.records = loaded;
-        if version == 1 {
+        if version < VERSION {
             self.persist()?;
         }
         Ok(())
@@ -553,7 +756,7 @@ mod tests {
         ));
     }
     #[test]
-    fn migrates_v1_store_to_v2_without_losing_records() {
+    fn migrates_v1_store_to_v3_without_losing_records() {
         let t = Temp::new();
         let p = t.0.join("peers.q6pa");
         let payload = json!({
@@ -577,7 +780,7 @@ mod tests {
         assert_eq!(record.advertised_noise_static_key, None);
         drop(book);
         let migrated: Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
-        assert_eq!(migrated["payload"]["version"].as_u64(), Some(2));
+        assert_eq!(migrated["payload"]["version"].as_u64(), Some(3));
     }
 
     #[test]
@@ -655,6 +858,71 @@ mod tests {
             Err(PeerAddressBookError::WrongProfile)
         );
         assert_eq!(book.records().count(), 0);
+    }
+
+    #[test]
+    fn only_explicit_operator_approval_enters_bounded_outbound_peer_set() {
+        let t = Temp::new();
+        let p = t.0.join("peers.q6pa");
+        let mut book = QRunV06PeerAddressBookCandidate::open(&p, [1; 32], [2; 32]).unwrap();
+        book.upsert("8.8.8.8:8333", PeerAddressSource::Gossip, 10)
+            .unwrap();
+        book.upsert("1.1.1.1:8333", PeerAddressSource::Manual, 10)
+            .unwrap();
+        assert!(book.approved_peer_pins(20, 8).is_empty());
+        book.pin_manual_peer("8.8.8.8:8333", [7; 32], 30).unwrap();
+        assert_eq!(
+            book.approved_peer_pins(31, 8),
+            vec![("8.8.8.8:8333".parse().unwrap(), [7; 32])]
+        );
+        assert!(book.approved_peer_pins(31, 1).len() <= 1);
+        book.revoke_operator_approval("8.8.8.8:8333").unwrap();
+        assert!(book.approved_peer_pins(32, 8).is_empty());
+    }
+
+    #[test]
+    fn advertised_candidate_requires_exact_fresh_key_and_survives_operator_approval_restart() {
+        let t = Temp::new();
+        let p = t.0.join("peers.q6pa");
+        let received = crate::qrun_v06_peer_address_relay_candidate::Q6arReceivedAdvertisement {
+            advertisement: crate::qrun_v06_peer_address_relay_candidate::Q6arAdvertisement {
+                network_id: [1; 32],
+                profile_id: [2; 32],
+                issued_at_secs: 100,
+                ttl_secs: 60,
+                addresses: vec![crate::qrun_v06_peer_address_relay_candidate::Q6arAddress {
+                    endpoint: "8.8.8.8:8333".parse().unwrap(),
+                    noise_static_public_key: [7; 32],
+                }],
+            },
+            relay_origin: crate::qrun_v06_peer_address_relay_candidate::Q6arRelayOrigin {
+                relay_static_public_key: [9; 32],
+                relay_static_key_pinned: true,
+            },
+        };
+        {
+            let mut book = QRunV06PeerAddressBookCandidate::open(&p, [1; 32], [2; 32]).unwrap();
+            book.ingest_pinned_q6ar(&received, 100_000).unwrap();
+            assert_eq!(
+                book.approve_advertised_candidate("8.8.8.8:8333", [8; 32], 110_000),
+                Err(PeerAddressBookError::NotAnApprovedCandidate)
+            );
+            assert_eq!(
+                book.approve_advertised_candidate("8.8.8.8:8333", [7; 32], 160_000),
+                Err(PeerAddressBookError::NotAnApprovedCandidate)
+            );
+            book.approve_advertised_candidate("8.8.8.8:8333", [7; 32], 110_000)
+                .unwrap();
+            assert_eq!(
+                book.approved_peer_pins(111_000, 1),
+                vec![("8.8.8.8:8333".parse().unwrap(), [7; 32])]
+            );
+        }
+        let book = QRunV06PeerAddressBookCandidate::open(&p, [1; 32], [2; 32]).unwrap();
+        assert_eq!(
+            book.approved_peer_pins(200_000, 1),
+            vec![("8.8.8.8:8333".parse().unwrap(), [7; 32])]
+        );
     }
 
     #[test]

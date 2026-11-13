@@ -17,7 +17,7 @@ use ai_native_l1_pow_bench::{
         validate_qfp6_pinned_bootstrap_peers, QRunV06PermissionlessMiningSupervisorConfig,
         QRunV06PinnedBootstrapPeer,
     },
-    qrun_v06_peer_address_manager_candidate::{PeerAddressSource, QRunV06PeerAddressBookCandidate},
+    qrun_v06_peer_address_manager_candidate::QRunV06PeerAddressBookCandidate,
     qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessNodeRuntime,
     qrun_v06_permissionless_service_candidate::QRunV06PermissionlessMempool,
     qrun_v06_profile_pin_candidate::QRunV06VerifiedProfilePin,
@@ -186,6 +186,33 @@ fn q6ar_candidate_address_book_enabled(cfg: &Value) -> Result<bool, String> {
     }
 }
 
+fn approved_peer_outbound_sync_enabled(cfg: &Value) -> Result<bool, String> {
+    match cfg.get("enable_approved_peer_outbound_sync") {
+        None => Ok(false),
+        Some(Value::Bool(enabled)) => Ok(*enabled),
+        Some(_) => Err(
+            "permissionless_runtime.enable_approved_peer_outbound_sync must be a boolean".into(),
+        ),
+    }
+}
+
+fn max_approved_peer_sync_attempts(cfg: &Value) -> Result<usize, String> {
+    let value = match cfg.get("max_approved_peer_sync_attempts") {
+        None => 1,
+        Some(value) => value.as_u64().ok_or(
+            "permissionless_runtime.max_approved_peer_sync_attempts must be an unsigned integer",
+        )?,
+    };
+    let value =
+        usize::try_from(value).map_err(|_| "max_approved_peer_sync_attempts is out of range")?;
+    if !(1..=4).contains(&value) {
+        return Err(
+            "permissionless_runtime.max_approved_peer_sync_attempts must be between 1 and 4".into(),
+        );
+    }
+    Ok(value)
+}
+
 fn trusted_manifest_anchor(cfg: &Value, data_dir: &Path) -> Result<Option<[u8; 32]>, String> {
     let manifests = data_dir.join("manifests");
     let entries = match fs::symlink_metadata(&manifests) {
@@ -304,6 +331,20 @@ pub fn run_permissionless_node(
     )?;
     let peers = load_peers(&peer_path, peer_sha)?;
     let enable_q6ar_candidate = q6ar_candidate_address_book_enabled(cfg)?;
+    let enable_approved_peer_sync = approved_peer_outbound_sync_enabled(cfg)?;
+    let max_approved_attempts = max_approved_peer_sync_attempts(cfg)?;
+    if enable_approved_peer_sync && !enable_q6ar_candidate {
+        return Err(
+            "enable_approved_peer_outbound_sync requires enable_q6ar_candidate_address_book=true"
+                .into(),
+        );
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("system clock invalid for Q6AR address book: {error}"))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| "system clock exceeds Q6AR millisecond range".to_string())?;
     let mut q6ar_address_book = if enable_q6ar_candidate {
         let address_book_path = path(base, cfg, "q6ar_candidate_address_book_path")?;
         if address_book_path == data_dir
@@ -321,16 +362,10 @@ pub fn run_permissionless_node(
             descriptor.profile_id(),
         )
         .map_err(|error| format!("Q6AR candidate address-book open failed: {error}"))?;
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| format!("system clock invalid for Q6AR address book: {error}"))?
-            .as_millis()
-            .try_into()
-            .map_err(|_| "system clock exceeds Q6AR millisecond range".to_string())?;
         for peer in &peers {
-            book.upsert(
+            book.pin_manual_peer(
                 &peer.address.to_string(),
-                PeerAddressSource::Bootstrap,
+                peer.noise_static_public_key,
                 now_ms,
             )
             .map_err(|error| {
@@ -341,8 +376,29 @@ pub fn run_permissionless_node(
     } else {
         None
     };
+    let mut supervisor_peers = peers.clone();
+    if enable_approved_peer_sync {
+        let book = q6ar_address_book
+            .as_ref()
+            .ok_or("approved peer sync has no address book")?;
+        supervisor_peers = book
+            .approved_peer_pins(now_ms, max_approved_attempts)
+            .into_iter()
+            .map(
+                |(address, noise_static_public_key)| QRunV06PinnedBootstrapPeer {
+                    address,
+                    noise_static_public_key,
+                },
+            )
+            .collect();
+        if supervisor_peers.is_empty() {
+            return Err("approved peer outbound sync is enabled, but no operator-approved peer is currently eligible (check persistent backoff or add a peer pin)".into());
+        }
+        validate_qfp6_pinned_bootstrap_peers(&supervisor_peers)
+            .map_err(|error| format!("operator-approved peer pins invalid: {error:?}"))?;
+    }
     let q6ar_relay_pins: Vec<[u8; 32]> = if enable_q6ar_candidate {
-        peers
+        supervisor_peers
             .iter()
             .map(|peer| peer.noise_static_public_key)
             .collect()
@@ -355,8 +411,8 @@ pub fn run_permissionless_node(
         true,
     )?;
     validate_public_listener_opt_in(cfg, listen)?;
-    if peers.iter().any(|p| p.address == listen) {
-        return Err("P2P listener cannot alias a bootstrap peer".into());
+    if supervisor_peers.iter().any(|peer| peer.address == listen) {
+        return Err("P2P listener cannot alias a pinned outbound peer".into());
     }
     let listener = TcpListener::bind(listen)
         .map_err(|e| format!("permissionless P2P listener bind failed: {e}"))?;
@@ -419,10 +475,13 @@ pub fn run_permissionless_node(
         println!("q6ar_pinned_relay_count={}", q6ar_relay_pins.len());
         println!("q6ar_advertised_keys_auto_trusted=false");
         println!("q6ar_discovered_peers_auto_connected=false");
+        println!("approved_peer_outbound_sync_enabled={enable_approved_peer_sync}");
+        println!("approved_peer_sync_attempt_limit={max_approved_attempts}");
+        println!("pinned_outbound_peer_count={}", supervisor_peers.len());
     } else {
         println!("q6ar_candidate_address_book=DISABLED_DEFAULT");
     }
-    let supervisor_report = if peers.is_empty() {
+    let supervisor_report = if supervisor_peers.is_empty() {
         println!("bootstrap_mode=GENESIS_ROOTED_NO_SEED_PEERS");
         if let Some(book) = q6ar_address_book.as_mut() {
             run_qfp6_permissionless_mining_supervisor_open_with_q6ar_candidate(
@@ -457,11 +516,16 @@ pub fn run_permissionless_node(
         }
     } else {
         let report = if let Some(book) = q6ar_address_book.as_mut() {
+            let peer_attempt_limit = if enable_approved_peer_sync {
+                max_approved_attempts
+            } else {
+                supervisor_peers.len().min(64)
+            };
             run_qfp6_permissionless_mining_supervisor_with_bootstrap_and_q6ar_candidate(
                 &listener,
                 supervisor_config,
                 &local_key,
-                &peers,
+                &supervisor_peers,
                 &descriptor.network_id(),
                 &descriptor.profile_id(),
                 &shutdown,
@@ -470,6 +534,7 @@ pub fn run_permissionless_node(
                 producer,
                 &mut mempool,
                 QRunV06HistorySyncClientConfig::default(),
+                peer_attempt_limit,
                 book,
             )
             .map_err(|e| format!("permissionless bootstrap/Q6AR supervisor stopped: {e}"))?
@@ -478,7 +543,7 @@ pub fn run_permissionless_node(
                 &listener,
                 supervisor_config,
                 &local_key,
-                &peers,
+                &supervisor_peers,
                 &descriptor.network_id(),
                 &descriptor.profile_id(),
                 &shutdown,
@@ -516,9 +581,34 @@ pub fn run_permissionless_node(
 #[cfg(test)]
 mod tests {
     use super::{
-        endpoint, load_peers, q6ar_candidate_address_book_enabled,
-        validate_permissionless_cp0604_genesis, validate_public_listener_opt_in,
+        approved_peer_outbound_sync_enabled, endpoint, load_peers, max_approved_peer_sync_attempts,
+        q6ar_candidate_address_book_enabled, validate_permissionless_cp0604_genesis,
+        validate_public_listener_opt_in,
     };
+
+    #[test]
+    fn approved_peer_outbound_sync_is_disabled_by_default_and_bounded() {
+        assert!(!approved_peer_outbound_sync_enabled(&serde_json::json!({})).unwrap());
+        assert!(approved_peer_outbound_sync_enabled(
+            &serde_json::json!({"enable_approved_peer_outbound_sync": true})
+        )
+        .unwrap());
+        assert_eq!(
+            max_approved_peer_sync_attempts(&serde_json::json!({})).unwrap(),
+            1
+        );
+        assert_eq!(
+            max_approved_peer_sync_attempts(
+                &serde_json::json!({"max_approved_peer_sync_attempts": 4})
+            )
+            .unwrap(),
+            4
+        );
+        assert!(max_approved_peer_sync_attempts(
+            &serde_json::json!({"max_approved_peer_sync_attempts": 5})
+        )
+        .is_err());
+    }
 
     #[test]
     fn q6ar_address_book_is_opt_in_and_rejects_non_boolean_flags() {

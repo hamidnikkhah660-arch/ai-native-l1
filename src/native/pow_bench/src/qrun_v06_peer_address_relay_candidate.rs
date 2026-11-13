@@ -2,8 +2,9 @@
 //!
 //! Q6AR advertisements are network/profile bound and time-limited. A Noise source may be
 //! pinned or anonymous; anonymous origins are explicitly marked low-trust. Each advertised
-//! endpoint remains untrusted until a later handshake verifies its static key. This codec
-//! is not wired into the listener, address book, peer discovery or public runtime.
+//! endpoint remains untrusted until an operator explicitly approves its independently verified key.
+//! An opt-in listener callback can persist candidate metadata from pinned relays, but candidates
+//! are never automatically trusted, selected, or connected.
 use crate::qrun_v06_noise_transport_candidate::QRunV06NoiseSession;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 

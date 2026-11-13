@@ -296,6 +296,19 @@ fn add_stats(
     Ok(())
 }
 
+fn system_now_ms() -> Result<u64, QRunV06NodeSupervisorError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            QRunV06NodeSupervisorError::Runtime(format!("system clock invalid: {error}"))
+        })?
+        .as_millis()
+        .try_into()
+        .map_err(|_| {
+            QRunV06NodeSupervisorError::Runtime("system clock exceeds millisecond range".into())
+        })
+}
+
 fn validate_identity_material(
     local_static_private_key: &[u8; 32],
     network_id: &[u8; 32],
@@ -1126,8 +1139,8 @@ pub fn process_qfp6_application_frame_with_permissionless_runtime<T: Transaction
 /// Run the authenticated QFP6 Noise listener and permissionless durable miner in alternating,
 /// bounded windows. The runtime must already be opened from complete Genesis-rooted history with
 /// an independently verified profile pin. The same pinned Noise listener serves bounded
-/// Q6HS/Q6HC canonical-history export requests; outbound peer discovery and automatic remote
-/// history import remain separate work.
+/// Q6HS/Q6HC canonical-history export requests. This base supervisor does not discover or
+/// auto-connect peers; the separate startup wrapper syncs only from operator-approved pins.
 #[allow(clippy::too_many_arguments)]
 pub fn run_qfp6_permissionless_mining_supervisor<T: TransactionAuthenticator>(
     listener: &TcpListener,
@@ -1763,6 +1776,7 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_bootstrap_and_q6ar_candida
     producer: [u8; 32],
     mempool: &mut QRunV06PermissionlessMempool,
     sync_config: QRunV06HistorySyncClientConfig,
+    max_peer_attempts: usize,
     address_book: &mut crate::qrun_v06_peer_address_manager_candidate::QRunV06PeerAddressBookCandidate,
 ) -> Result<QRunV06PermissionlessLaunchReport, QRunV06NodeSupervisorError> {
     config.validate()?;
@@ -1770,6 +1784,9 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_bootstrap_and_q6ar_candida
         .validate()
         .map_err(|error| QRunV06NodeSupervisorError::BootstrapSync(error.to_string()))?;
     validate_identity_material(local_static_private_key, network_id, profile_id)?;
+    if !(1..=64).contains(&max_peer_attempts) {
+        return Err(QRunV06NodeSupervisorError::InvalidConfiguration);
+    }
     validate_qfp6_pinned_bootstrap_peers(bootstrap_peers)?;
     let startup = runtime
         .status()
@@ -1782,7 +1799,8 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_bootstrap_and_q6ar_candida
     }
     let mut bootstrap_report = None;
     let mut peer_errors = Vec::new();
-    for peer in bootstrap_peers {
+    for peer in bootstrap_peers.iter().take(max_peer_attempts) {
+        let address_key = peer.address.to_string();
         match sync_history_from_pinned_peer_until_complete(
             peer.address,
             local_static_private_key,
@@ -1792,14 +1810,37 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_bootstrap_and_q6ar_candida
             sync_config,
         ) {
             Ok(report) if report.complete => {
+                address_book.record_success(&address_key).map_err(|error| {
+                    QRunV06NodeSupervisorError::BootstrapSync(format!(
+                        "cannot persist peer success state: {error}"
+                    ))
+                })?;
                 bootstrap_report = Some(report);
                 break;
             }
-            Ok(_) => peer_errors.push(format!(
-                "{} returned without reaching the pinned source tip",
-                peer.address
-            )),
-            Err(error) => peer_errors.push(format!("{}: {error}", peer.address)),
+            Ok(_) => {
+                address_book
+                    .record_failure(&address_key, system_now_ms()?)
+                    .map_err(|error| {
+                        QRunV06NodeSupervisorError::BootstrapSync(format!(
+                            "cannot persist peer backoff: {error}"
+                        ))
+                    })?;
+                peer_errors.push(format!(
+                    "{} returned without reaching the pinned source tip",
+                    peer.address
+                ));
+            }
+            Err(error) => {
+                address_book
+                    .record_failure(&address_key, system_now_ms()?)
+                    .map_err(|store_error| {
+                        QRunV06NodeSupervisorError::BootstrapSync(format!(
+                            "{error}; additionally failed to persist peer backoff: {store_error}"
+                        ))
+                    })?;
+                peer_errors.push(format!("{}: {error}", peer.address));
+            }
         }
     }
     let bootstrap_sync = bootstrap_report
