@@ -36,7 +36,8 @@ pub enum QRunV06MiningError {
     InvalidTarget,
     HeightOverflow,
     Cancelled,
-    NonceBudgetExhausted,
+    NonceBudgetExhausted { next_nonce: u64 },
+    NonceSpaceExhausted,
     MissingQuoteAssetAuthorization,
     QuoteAssetAuthorizationProvider(String),
     Execution(QRunV06ExecutionError),
@@ -91,13 +92,14 @@ pub struct QRunV06MinedBlock {
 /// instance. A caller cannot pass a different target/profile alongside the same branch graph.
 /// After success, the caller must submit the envelope to the durable runtime; this function
 /// never updates the canonical tip or publishes a Q6PA acknowledgement.
-pub fn mine_qfp6_block_on_tip<A: TransactionAuthenticator>(
+pub fn mine_qfp6_block_on_tip_from_nonce<A: TransactionAuthenticator>(
     fork_choice: &QRunV06PowForkChoice,
     parent_consensus_tip: &[u8; 32],
     timestamp: u64,
     producer: [u8; 32],
     operations: Vec<QRunV06BlockOperation>,
     authenticator: &A,
+    nonce_start: u64,
     max_nonce_attempts: u64,
     cancellation: &AtomicBool,
 ) -> Result<QRunV06MinedBlock, QRunV06MiningError> {
@@ -108,9 +110,34 @@ pub fn mine_qfp6_block_on_tip<A: TransactionAuthenticator>(
         producer,
         operations,
         authenticator,
+        nonce_start,
         max_nonce_attempts,
         cancellation,
         None,
+    )
+}
+
+/// Mine one bounded batch from nonce zero. This compatibility wrapper preserves the original API.
+pub fn mine_qfp6_block_on_tip<A: TransactionAuthenticator>(
+    fork_choice: &QRunV06PowForkChoice,
+    parent_consensus_tip: &[u8; 32],
+    timestamp: u64,
+    producer: [u8; 32],
+    operations: Vec<QRunV06BlockOperation>,
+    authenticator: &A,
+    max_nonce_attempts: u64,
+    cancellation: &AtomicBool,
+) -> Result<QRunV06MinedBlock, QRunV06MiningError> {
+    mine_qfp6_block_on_tip_from_nonce(
+        fork_choice,
+        parent_consensus_tip,
+        timestamp,
+        producer,
+        operations,
+        authenticator,
+        0,
+        max_nonce_attempts,
+        cancellation,
     )
 }
 
@@ -136,6 +163,7 @@ pub fn mine_qfp6_block_on_tip_with_quote_asset_authorization<A: TransactionAuthe
         producer,
         operations,
         authenticator,
+        0,
         max_nonce_attempts,
         cancellation,
         Some(quote_authorizer),
@@ -149,6 +177,7 @@ fn mine_qfp6_block_on_tip_inner<A: TransactionAuthenticator>(
     producer: [u8; 32],
     operations: Vec<QRunV06BlockOperation>,
     authenticator: &A,
+    nonce_start: u64,
     max_nonce_attempts: u64,
     cancellation: &AtomicBool,
     mut quote_authorizer: Option<&mut QRunV06QuoteAssetAuthorizationProvider<'_>>,
@@ -156,6 +185,9 @@ fn mine_qfp6_block_on_tip_inner<A: TransactionAuthenticator>(
     if max_nonce_attempts == 0 || max_nonce_attempts > QRUN_V06_MAX_NONCE_ATTEMPTS_PER_JOB {
         return Err(QRunV06MiningError::InvalidNonceBudget);
     }
+    let nonce_end = nonce_start
+        .checked_add(max_nonce_attempts)
+        .ok_or(QRunV06MiningError::NonceSpaceExhausted)?;
     if producer == [0; 32] {
         return Err(QRunV06MiningError::InvalidProducer);
     }
@@ -223,10 +255,10 @@ fn mine_qfp6_block_on_tip_inner<A: TransactionAuthenticator>(
         previous_consensus_hash: *parent_consensus_tip,
         state_root: qrun_v06_pow_state_commitment(&block)?,
         target,
-        nonce: 0,
+        nonce: nonce_start,
     };
 
-    for nonce in 0..max_nonce_attempts {
+    for nonce in nonce_start..nonce_end {
         if cancellation.load(Ordering::Acquire) {
             return Err(QRunV06MiningError::Cancelled);
         }
@@ -252,7 +284,9 @@ fn mine_qfp6_block_on_tip_inner<A: TransactionAuthenticator>(
         }
     }
 
-    Err(QRunV06MiningError::NonceBudgetExhausted)
+    Err(QRunV06MiningError::NonceBudgetExhausted {
+        next_nonce: nonce_end,
+    })
 }
 
 #[cfg(test)]
@@ -491,9 +525,50 @@ mod tests {
                 1,
                 &not_cancelled,
             ),
-            Err(QRunV06MiningError::NonceBudgetExhausted)
+            Err(QRunV06MiningError::NonceBudgetExhausted { next_nonce: 1 })
         );
         assert_eq!(graph.canonical_state().height(), 0);
+    }
+
+    #[test]
+    fn miner_fails_closed_instead_of_wrapping_the_nonce_space() {
+        let (_params, _genesis, graph) = setup(Uint256::MAX);
+        let parent_tip = graph.canonical_tip().tip_hash;
+        let cancellation = AtomicBool::new(false);
+        assert_eq!(
+            mine_qfp6_block_on_tip_from_nonce(
+                &graph,
+                &parent_tip,
+                31,
+                PRODUCER,
+                Vec::new(),
+                &EmptyAuthenticator,
+                u64::MAX,
+                1,
+                &cancellation,
+            ),
+            Err(QRunV06MiningError::NonceSpaceExhausted)
+        );
+    }
+
+    #[test]
+    fn miner_starts_at_the_requested_nonce_instead_of_restarting_at_zero() {
+        let (_params, _genesis, graph) = setup(Uint256::MAX);
+        let parent_tip = graph.canonical_tip().tip_hash;
+        let cancellation = AtomicBool::new(false);
+        let mined = mine_qfp6_block_on_tip_from_nonce(
+            &graph,
+            &parent_tip,
+            31,
+            PRODUCER,
+            Vec::new(),
+            &EmptyAuthenticator,
+            123,
+            1,
+            &cancellation,
+        )
+        .unwrap();
+        assert_eq!(mined.nonce, 123);
     }
 
     #[test]

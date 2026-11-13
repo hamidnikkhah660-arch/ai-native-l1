@@ -1,23 +1,23 @@
-# CP-0575 — Q6CP canonical consensus-parameter profile binding
+# CP-0575 - Q6CP canonical consensus-parameter profile binding
 
-**Status:** candidate implementation; no Mainnet authorization.
+**Status:** candidate implementation; no Mainnet authorization.  **Current wire version:** Q6CP v2 (294 bytes), SHA-256d only. This supersedes the original v1/Argon2id draft description.
 **Branch:** feat/cp0575-q6cp-consensus-profile-pinning-20261109
 **Base:** CP-0574 / f2cca64a564bdfad2a6b21c8ddde7bbf85efe2ca.
 
 ## Purpose
 
-Prior preflight compared the supplied consensus fingerprint with Q6GD/Q6PN but did not load the underlying consensus parameter set. CP-0575 adds a canonical, fixed-width **Q6CP v1** artifact and requires every node preflight to decode it, validate all consensus parameters, recompute the fingerprint, and match the exact Q6GD descriptor already bound by Q6PN.
+Prior preflight compared the supplied consensus fingerprint with Q6GD/Q6PN but did not load the underlying consensus parameter set. CP-0575 adds a canonical, fixed-width **Q6CP v2** artifact and requires every node preflight to decode it, validate all consensus parameters, recompute the fingerprint, and match the exact Q6GD descriptor already bound by Q6PN.
 
 A Q6CP artifact is a parameter container, **not** a signature, not a security review, and not a Mainnet authorization. Its raw file SHA-256 must be pinned independently in the externally digested deployment config. Q6TS/Q6PN continue to provide the separate trust-authority and network-profile binding.
 
-## Q6CP v1 wire layout
+## Q6CP v2 wire layout
 
-Q6CP v1 is exactly **294 bytes**. It has no variable-length fields or permitted trailing bytes.
+Q6CP v2 is exactly **294 bytes**. It has no variable-length fields or permitted trailing bytes.
 
 | Field | Encoding |
 |---|---|
 | Magic | ASCII `Q6CP` |
-| Version | u16 big-endian, currently 1 |
+| Version | u16 big-endian, currently 2 |
 | Header reserved | 2 zero bytes |
 | Network ID | 32 bytes |
 | Profile ID | 32 bytes |
@@ -29,11 +29,11 @@ Q6CP v1 is exactly **294 bytes**. It has no variable-length fields or permitted 
 | Maximum retarget ratio | u64 big-endian |
 | PoW limit | 32-byte big-endian Uint256 |
 | Initial target | 32-byte big-endian Uint256 |
-| PoW algorithm | one byte; 1 = Argon2id |
+| PoW algorithm | one byte; 2 = SHA-256d (the v2 validator rejects Argon2id) |
 | PoW reserved | 3 zero bytes |
-| Argon2 memory KiB | u32 big-endian |
-| Argon2 iterations | u32 big-endian |
-| Argon2 lanes | u32 big-endian |
+| PoW memory KiB | u32 big-endian; zero for SHA-256d |
+| PoW iterations | u32 big-endian; zero for SHA-256d |
+| PoW lanes | u32 big-endian; zero for SHA-256d |
 | PoW output bytes | u8 |
 | PoW reserved | 3 zero bytes |
 | Maximum supply | u128 big-endian atoms |
@@ -47,12 +47,12 @@ The fingerprint is recomputed from all encoded consensus fields using the existi
 
 ## Monetary execution constraints
 
-The Q6CP artifact must pass `ConsensusParameters::validate_monetary_execution_compatibility()`. In the current code this requires an exact match to the native execution constants:
+The Q6CP v2 artifact must pass `ConsensusParameters::validate_monetary_execution_compatibility()` and `validate_parameters()`; the current v2 validator accepts SHA-256d only. In the current code this requires an exact match to the native execution constants:
 
 - Maximum supply: 10,000,000,000 QZXB.
 - Initial mining subsidy: 35,673,515,981 atoms per block before the remaining-supply cap.
 - Halving interval: 4,204,800 blocks.
-- Genesis Founder allocation remains independently checked from the full QFB6 Genesis snapshot at exactly 1,000,000,000 QZXB.
+- Genesis allocation is not encoded in Q6CP. CP-0604 separately defines a 7,000,000,000 QZXB founder Genesis credit and a 3,000,000,000 QZXB mining cap; descriptor/policy fingerprint and full Genesis snapshot are checked separately.
 
 These values are a **candidate protocol configuration** until they are independently reviewed and explicitly approved. Q6CP does not silently adopt v0.5 fee-only issuance, nor does a matching fingerprint make the current candidate PoW target, memory cost, block interval, or mining economics Mainnet-approved.
 
@@ -73,7 +73,7 @@ Both `--preflight` and `--probe-qap1` require this Q6CP pair. They fail closed w
 
 ## Preflight output
 
-On success, the binary reports the Q6CP raw digest and consensus fingerprint, protocol version, target block interval, difficulty window, target/limit, Argon2 profile, supply cap, initial subsidy and halving interval. It explicitly reports:
+On success, the binary reports the Q6CP raw digest and consensus fingerprint, protocol version, target block interval, difficulty window, target/limit, PoW algorithm (SHA-256d), supply cap, initial subsidy and halving interval. It explicitly reports:
 
 ```
 q6cp_qualification=CANDIDATE_ONLY_NOT_MAINNET_APPROVED

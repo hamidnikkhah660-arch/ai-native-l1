@@ -5,6 +5,8 @@
 //! starting consensus/mining services. The read-only AWS CLI floor lookup uses network access.
 //! It is intentionally preflight-only until the production QAP1/Provider/Anchor/runtime wiring
 //! and independent deployment qualifications are complete.
+mod qrun_v06_node_runtime_launch;
+
 use ai_native_l1_pow_bench::{
     external_cas_anchor_candidate::ExternalCasPin,
     external_cas_floor_store_candidate::ExternalCasFloorStore,
@@ -16,6 +18,7 @@ use ai_native_l1_pow_bench::{
     qrun_v06_consensus_profile_candidate::{
         QRunV06ConsensusProfile, QRUN_V06_CONSENSUS_PROFILE_MAX_BYTES,
     },
+    qrun_v06_cp0604_supply_candidate::CP0604_FOUNDER_GENESIS_ATOMS,
     qrun_v06_external_anchor_candidate::{QRunV06ExternalAnchorPin, QRunV06ExternalAnchorState},
     qrun_v06_profile_pin_candidate::QRunV06VerifiedProfilePin,
     qrun_v06_profile_trust_candidate::{
@@ -385,31 +388,38 @@ fn verify_genesis_snapshot(
     {
         return Err("full Q6GD descriptor/timestamp differs from the independently pinned Q6PN profile identity".into());
     }
-    let tokenomics = state
-        .tokenomics()
-        .ok_or_else(|| "full Genesis snapshot is missing CP-0528 tokenomics state".to_string())?;
-    if tokenomics.founder_account() != *founder_account
-        || tokenomics.policy_fingerprint() != *tokenomics_policy_fingerprint
-    {
-        return Err(
-            "full Genesis CP-0528 policy or Founder binding differs from the pinned identity"
-                .into(),
-        );
-    }
     let founder_balance = state
         .unified()
         .ledger()
         .account(founder_account)
         .map_or(0u128, |account| account.balance as u128);
-    if founder_balance != QRUN_V06_FOUNDER_GENESIS_ATOMS {
-        return Err(format!(
-            "Genesis Founder allocation must be exactly {} atoms; found {founder_balance}",
-            QRUN_V06_FOUNDER_GENESIS_ATOMS
-        ));
+    if let Some(supply) = state.cp0604_supply() {
+        if supply.founder_account() != *founder_account
+            || supply.policy_fingerprint() != *tokenomics_policy_fingerprint
+            || supply.mining_issued_atoms() != 0
+            || founder_balance != CP0604_FOUNDER_GENESIS_ATOMS
+        {
+            return Err(
+                "full Genesis CP-0604 policy, Founder binding, zero pre-mining issuance, or 7B allocation differs from the pinned identity".into(),
+            );
+        }
+        supply
+            .validate_ledger_supply(founder_balance)
+            .map_err(|error| format!("CP-0604 Genesis supply invariant failed: {error:?}"))?;
+    } else {
+        let tokenomics = state.tokenomics().ok_or_else(|| {
+            "full Genesis snapshot is missing CP-0528/CP-0604 supply state".to_string()
+        })?;
+        if tokenomics.founder_account() != *founder_account
+            || tokenomics.policy_fingerprint() != *tokenomics_policy_fingerprint
+            || founder_balance != QRUN_V06_FOUNDER_GENESIS_ATOMS
+        {
+            return Err(
+                "full Genesis CP-0528 policy or Founder allocation differs from the pinned identity".into(),
+            );
+        }
     }
-    // verify_invariants binds Ledger total value to the CP-0528 live-supply counters. Since the
-    // only live Genesis issuance is the exact Founder allocation checked above, there is no
-    // remaining spendable supply available to another account.
+    // verify_invariants binds the complete Ledger to the selected versioned issuance policy.
     let state_root = state
         .state_root()
         .map_err(|error| format!("QFP6 Genesis state-root verification failed: {error:?}"))?;
@@ -838,35 +848,47 @@ fn hex(bytes: &[u8]) -> String {
 
 fn print_help() {
     println!(
-        "QRun QFP6 bootstrap preflight\n\
-         \n\
-         Usage:\n\
-           qrun_v06_node --preflight --config <path> --config-sha256 <64-hex>\n\
-           qrun_v06_node --probe-qap1 --config <path> --config-sha256 <64-hex>\n\
-           qrun_v06_node --help\n\
-         \n\
-         --preflight verifies the pinned Genesis/Q6CP/Q6PN/Q6TS/Q6EA bootstrap package.\n\
-         --probe-qap1 additionally performs read-only signed Provider and Q6EA Anchor reads over pinned Noise endpoints.\n\
-         Neither command starts a node, mutates a store/floor, admits transactions, or mines."
+        r#"QRun QFP6 node launcher
+Usage:
+  qrun_v06_node --preflight --config <path> --config-sha256 <64-hex>
+  qrun_v06_node --probe-qap1 --config <path> --config-sha256 <64-hex>
+  qrun_v06_node --run --config <path> --config-sha256 <64-hex>
+  qrun_v06_node --permissionless-run --config <path> --config-sha256 <64-hex>
+  qrun_v06_node --help
+--run: private-candidate QAP1 mode.
+--permissionless-run: Genesis-rooted base runtime candidate; not production/Mainnet authorization."#
     );
 }
-
 fn run(args: &[String]) -> Result<(), String> {
     if args == ["--help"] {
         print_help();
         return Ok(());
     }
-    if args.iter().any(|arg| arg == "--run") {
-        return Err("node runtime is not enabled in this build: QAP1/Provider/Anchor, node-key custody, durable-store recovery and independent production qualification must be wired and verified first".into());
-    }
     if args.len() != 5
-        || !matches!(args[0].as_str(), "--preflight" | "--probe-qap1")
+        || !matches!(
+            args[0].as_str(),
+            "--preflight" | "--probe-qap1" | "--run" | "--permissionless-run"
+        )
         || args[1] != "--config"
         || args[3] != "--config-sha256"
     {
-        return Err("expected '--preflight|--probe-qap1 --config <path> --config-sha256 <64-hex>' (or '--help')".into());
+        return Err("expected '--preflight|--probe-qap1|--run|--permissionless-run --config <path> --config-sha256 <64-hex>' (or '--help')".into());
     }
     let expected_config_digest = parse_hex32("config_sha256", &args[4])?;
+    if args[0] == "--permissionless-run" {
+        qrun_v06_node_runtime_launch::run_permissionless_node(
+            Path::new(&args[2]),
+            &expected_config_digest,
+        )?;
+        return Ok(());
+    }
+    if args[0] == "--run" {
+        qrun_v06_node_runtime_launch::run_candidate_node(
+            Path::new(&args[2]),
+            &expected_config_digest,
+        )?;
+        return Ok(());
+    }
     let (summary, q6ea_state) = if args[0] == "--probe-qap1" {
         let (summary, state) = probe_qap1_services(Path::new(&args[2]), &expected_config_digest)?;
         (summary, Some(state))
@@ -1250,6 +1272,41 @@ mod tests {
         assert_eq!(root, state.state_root().unwrap());
         assert_eq!(founder_balance, QRUN_V06_FOUNDER_GENESIS_ATOMS);
 
+        let cp0604_schedule =
+            QRunV06MiningScheduleCandidate::new(35_673_515_981, 4_204_800).unwrap();
+        let cp0604_policy = ai_native_l1_pow_bench::qrun_v06_cp0604_supply_candidate::Cp0604FounderControlledSupply::genesis(
+            TEST_NETWORK, [0xA3; 32], cp0604_schedule,
+        ).unwrap();
+        let cp0604_fingerprint = cp0604_policy.policy_fingerprint();
+        let cp0604_descriptor = QRunV06GenesisDescriptor::new(
+            TEST_NETWORK,
+            TEST_PROFILE,
+            [0xA3; 32],
+            1_800_000_000,
+            [0xA4; 32],
+            cp0604_fingerprint,
+        )
+        .unwrap();
+        let cp0604_state =
+            QRunV06CanonicalExecutionState::cp0604_genesis_candidate_with_descriptor(
+                cp0604_descriptor.clone(),
+                cp0604_schedule,
+            )
+            .unwrap();
+        let cp0604_bytes = cp0604_state.encode_snapshot().unwrap();
+        let (cp0604_root, cp0604_founder_balance) = verify_genesis_snapshot(
+            &cp0604_bytes,
+            &TEST_NETWORK,
+            &TEST_PROFILE,
+            &[0xA3; 32],
+            &[0xA4; 32],
+            &cp0604_fingerprint,
+            &cp0604_descriptor,
+        )
+        .unwrap();
+        assert_eq!(cp0604_root, cp0604_state.state_root().unwrap());
+        assert_eq!(cp0604_founder_balance, CP0604_FOUNDER_GENESIS_ATOMS);
+
         let mut corrupted = bytes.clone();
         let last_byte = corrupted.len() - 1;
         corrupted[last_byte] ^= 1;
@@ -1401,9 +1458,10 @@ mod tests {
     }
 
     #[test]
-    fn runtime_mode_is_explicitly_fail_closed() {
+    fn runtime_mode_requires_the_complete_candidate_config_envelope() {
         let error = run(&["--run".into()]).unwrap_err();
-        assert!(error.contains("node runtime is not enabled"));
+        assert!(error.contains("--config <path>"));
+        assert!(error.contains("--config-sha256"));
     }
 
     #[test]

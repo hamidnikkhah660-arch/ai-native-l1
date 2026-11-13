@@ -1,7 +1,8 @@
 //! Isolated QFP6 canonical block codec and deterministic execution candidate.
 //!
-//! QFP5/QFB5 encodings are untouched. QFB6 v5 commits CP-0528 issuance counters, signed category releases,
-//! the Founder Genesis policy and the mining-security reward schedule in the execution root.
+//! QFP5/QFB5 encodings are untouched. QFB6 v5 commits legacy CP-0528 state where present;
+//! permissionless QFP6 uses the mutually exclusive CP-0604 founder-controlled supply policy,
+//! and commits its issuance state and mining-security reward schedule in the execution root.
 //! The candidate also executes native TXN2 transfers, signed AMM operations, signed asset
 //! registrations and issuer-admin operations in the canonical order carried by QFB6. The root is computed
 //! after per-block fee settlement and header advancement, then the tip is committed from
@@ -10,6 +11,9 @@ use crate::consensus::ConsensusParameters;
 use crate::qrun_v06_asset_registry_candidate::{
     AssetAdminAction, AssetRegistration, AssetRegistryError, AssetSupplyPolicy, AssetTrustPolicy,
     QRunV06AssetRegistryCandidate, SignedAssetAdminOperation, MAX_QRUN_V06_REGISTRY_SNAPSHOT_BYTES,
+};
+use crate::qrun_v06_cp0604_supply_candidate::{
+    Cp0604Error, Cp0604FounderControlledSupply, CP0604_FOUNDER_GENESIS_ATOMS, CP0604_SNAPSHOT_BYTES,
 };
 use crate::qrun_v06_genesis_descriptor_candidate::{
     QRunV06GenesisDescriptor, QRunV06GenesisDescriptorError,
@@ -48,7 +52,8 @@ pub const MAX_QRUN_V06_ASSET_SIGNATURE_BYTES: usize = 4 * 1024;
 const BLOCK_ID_DOMAIN: &[u8] = b"QRUN-V06-CANONICAL-BLOCK-ID-V5\0";
 const EXECUTION_ROOT_DOMAIN: &[u8] = b"QRUN-V06-CANONICAL-EXECUTION-ROOT-V5\0";
 const EXECUTION_SNAPSHOT_MAGIC: [u8; 4] = *b"Q6SN";
-const EXECUTION_SNAPSHOT_VERSION: u16 = 5;
+const EXECUTION_SNAPSHOT_VERSION: u16 = 6;
+const EXECUTION_SNAPSHOT_VERSION_V5: u16 = 5;
 const EXECUTION_SNAPSHOT_VERSION_LEGACY: u16 = 4;
 const EXECUTION_SNAPSHOT_CHECKSUM_DOMAIN: &[u8] =
     b"QRUN-V06-CANONICAL-EXECUTION-SNAPSHOT-CHECKSUM-V1\0";
@@ -109,6 +114,9 @@ pub enum QRunV06ExecutionError {
     Tokenomics(QRunV06TokenomicsError),
     TokenomicsGenesisRequiresEmptyLedger,
     TokenomicsConsensusMismatch,
+    Cp0604(Cp0604Error),
+    Cp0604GenesisRequiresEmptyLedger,
+    Cp0604LegacyOperationForbidden,
     GenesisDescriptor(QRunV06GenesisDescriptorError),
     MissingQuoteAssetAuthorization,
     QuoteAssetAuthorizationMismatch,
@@ -148,6 +156,11 @@ impl From<AssetRegistryError> for QRunV06ExecutionError {
 impl From<UnifiedAssetError> for QRunV06ExecutionError {
     fn from(value: UnifiedAssetError) -> Self {
         Self::Unified(value)
+    }
+}
+impl From<Cp0604Error> for QRunV06ExecutionError {
+    fn from(value: Cp0604Error) -> Self {
+        Self::Cp0604(value)
     }
 }
 impl From<QRunV06TokenomicsError> for QRunV06ExecutionError {
@@ -284,9 +297,11 @@ pub struct QRunV06CanonicalExecutionState {
     unified: QRunV06UnifiedAssetState,
     orderbook: OrderBook,
     profile_id: [u8; 32],
-    /// None identifies a legacy/market-only QFB6 research fixture. CP-0528-aware
-    /// candidate Genesis and subsequent state transitions must carry Some(policy).
+    /// None identifies a legacy/market-only QFB6 research fixture. Legacy CP-0528
+    /// state is retained for compatibility; permissionless QFP6 separately requires CP-0604.
     tokenomics: Option<QRunV06TokenomicsState>,
+    /// CP-0604 founder-controlled issuance policy; mutually exclusive with legacy CP-0528.
+    cp0604_supply: Option<Cp0604FounderControlledSupply>,
     /// Immutable Genesis descriptor. Production QFP6 admission must reject None.
     genesis_descriptor: Option<QRunV06GenesisDescriptor>,
     quote_asset_authorization: Option<QRunV06PersistedQuoteAssetAuthorization>,
@@ -327,6 +342,7 @@ impl QRunV06CanonicalExecutionState {
             orderbook,
             profile_id,
             tokenomics: None,
+            cp0604_supply: None,
             genesis_descriptor: None,
             quote_asset_authorization: None,
         })
@@ -363,6 +379,55 @@ impl QRunV06CanonicalExecutionState {
         state.tokenomics = Some(tokenomics);
         state.verify_invariants()?;
         Ok(state)
+    }
+
+    /// Construct a CP-0604 state whose Genesis Ledger credits exactly 7B to the founder.
+    /// The separate CP-0604 policy accounts for the remaining 3B as a mining-only cap.
+    pub fn cp0604_genesis_candidate(
+        network_id: [u8; 32],
+        profile_id: [u8; 32],
+        founder_account: [u8; 32],
+        schedule: QRunV06MiningScheduleCandidate,
+    ) -> Result<Self, QRunV06ExecutionError> {
+        let policy = Cp0604FounderControlledSupply::genesis(network_id, founder_account, schedule)?;
+        let ledger = LedgerState::genesis(
+            network_id,
+            vec![(founder_account, CP0604_FOUNDER_GENESIS_ATOMS as u64)],
+        )?;
+        let amm = QzxbAmmStateCandidate::new(network_id, 32, 64, 512)?;
+        let unified = QRunV06UnifiedAssetState::new(ledger, amm)?;
+        Self::new_with_cp0604_supply(unified, profile_id, policy)
+    }
+
+    pub fn new_with_cp0604_supply(
+        unified: QRunV06UnifiedAssetState,
+        profile_id: [u8; 32],
+        policy: Cp0604FounderControlledSupply,
+    ) -> Result<Self, QRunV06ExecutionError> {
+        if unified.block_height() != 0
+            || unified.last_block_timestamp() != 0
+            || policy.network_id() != unified.network_id()
+            || unified
+                .ledger()
+                .account(&policy.founder_account())
+                .map_or(0u128, |a| a.balance as u128)
+                != CP0604_FOUNDER_GENESIS_ATOMS
+            || unified
+                .ledger()
+                .account_entries()
+                .iter()
+                .any(|(a, v)| *a != policy.founder_account() && v.balance != 0)
+        {
+            return Err(QRunV06ExecutionError::Cp0604GenesisRequiresEmptyLedger);
+        }
+        let mut state = Self::new(unified, profile_id)?;
+        state.cp0604_supply = Some(policy);
+        state.verify_invariants()?;
+        Ok(state)
+    }
+
+    pub fn cp0604_supply(&self) -> Option<&Cp0604FounderControlledSupply> {
+        self.cp0604_supply.as_ref()
     }
 
     /// Build an isolated CP-0528 Genesis candidate without changing QFP5 or Mainnet identity.
@@ -446,6 +511,34 @@ impl QRunV06CanonicalExecutionState {
         Self::new_with_genesis_descriptor(unified, descriptor.profile_id(), tokenomics, descriptor)
     }
 
+    pub fn cp0604_genesis_candidate_with_descriptor(
+        descriptor: QRunV06GenesisDescriptor,
+        schedule: QRunV06MiningScheduleCandidate,
+    ) -> Result<Self, QRunV06ExecutionError> {
+        let network = descriptor.network_id();
+        let founder = descriptor.founder_account();
+        let policy = Cp0604FounderControlledSupply::genesis(network, founder, schedule)?;
+        let ledger = LedgerState::genesis_at(
+            network,
+            vec![(founder, CP0604_FOUNDER_GENESIS_ATOMS as u64)],
+            descriptor.genesis_timestamp(),
+        )?;
+        let amm = QzxbAmmStateCandidate::new(network, 32, 64, 512)?;
+        let unified = QRunV06UnifiedAssetState::new(ledger, amm)?;
+        let mut state = Self::new(unified, descriptor.profile_id())?;
+        state.cp0604_supply = Some(policy.clone());
+        descriptor.validate_binding(
+            &network,
+            &state.profile_id,
+            &founder,
+            &descriptor.consensus_fingerprint(),
+            &policy.policy_fingerprint(),
+        )?;
+        state.genesis_descriptor = Some(descriptor);
+        state.verify_invariants()?;
+        Ok(state)
+    }
+
     pub fn genesis_descriptor(&self) -> Option<&QRunV06GenesisDescriptor> {
         self.genesis_descriptor.as_ref()
     }
@@ -466,6 +559,21 @@ impl QRunV06CanonicalExecutionState {
         self.tokenomics.as_ref()
     }
 
+    /// Return the founder and policy commitment for whichever versioned Genesis
+    /// economics policy is active. This keeps profile-pin validation independent
+    /// of the legacy CP-0528 representation.
+    pub fn genesis_economic_policy_identity(&self) -> Option<(AccountId, [u8; 32])> {
+        if let Some(tokenomics) = self.tokenomics.as_ref() {
+            return Some((
+                tokenomics.founder_account(),
+                tokenomics.policy_fingerprint(),
+            ));
+        }
+        self.cp0604_supply
+            .as_ref()
+            .map(|policy| (policy.founder_account(), policy.policy_fingerprint()))
+    }
+
     /// Verify and atomically apply a Founder-authorized, recipient-accepted CP-0528 release.
     /// This path cannot release Mining, Founder, or ProtocolBurnReserve buckets.
     fn apply_signed_category_release<A: TransactionAuthenticator>(
@@ -474,6 +582,9 @@ impl QRunV06CanonicalExecutionState {
         inclusion_timestamp: u64,
         authenticator: &A,
     ) -> Result<(), QRunV06ExecutionError> {
+        if self.cp0604_supply.is_some() {
+            return Err(QRunV06ExecutionError::Cp0604LegacyOperationForbidden);
+        }
         if inclusion_timestamp == 0 || release.network_id != self.network_id() {
             return Err(QRunV06ExecutionError::InvalidCategoryRelease);
         }
@@ -525,6 +636,9 @@ impl QRunV06CanonicalExecutionState {
         inclusion_timestamp: u64,
         authenticator: &A,
     ) -> Result<(), QRunV06ExecutionError> {
+        if self.cp0604_supply.is_some() {
+            return Err(QRunV06ExecutionError::Cp0604LegacyOperationForbidden);
+        }
         if inclusion_timestamp == 0
             || retirement.network_id != self.network_id()
             || retirement.valid_until_timestamp < inclusion_timestamp
@@ -567,13 +681,19 @@ impl QRunV06CanonicalExecutionState {
         Ok(())
     }
 
-    /// The active QFP6 consensus profile must use the same subsidy schedule as Q6TM.
+    /// The active QFP6 consensus profile must match the active versioned Genesis economics policy.
     pub fn validate_consensus_parameters(
         &self,
         params: &ConsensusParameters,
     ) -> Result<(), QRunV06ExecutionError> {
-        if let Some(tokenomics) = &self.tokenomics {
-            let schedule = tokenomics.mining_schedule();
+        let schedule = if let Some(policy) = &self.cp0604_supply {
+            Some(policy.mining_schedule())
+        } else {
+            self.tokenomics
+                .as_ref()
+                .map(|tokenomics| tokenomics.mining_schedule())
+        };
+        if let Some(schedule) = schedule {
             if params.issuance.maximum_supply()
                 != crate::qrun_v06_tokenomics_candidate::QRUN_V06_MAX_GROSS_ISSUANCE_ATOMS
                 || params.issuance.initial_subsidy() != schedule.initial_subsidy_atoms
@@ -581,17 +701,21 @@ impl QRunV06CanonicalExecutionState {
             {
                 return Err(QRunV06ExecutionError::TokenomicsConsensusMismatch);
             }
-            if let Some(descriptor) = &self.genesis_descriptor {
-                let consensus_fingerprint =
-                    crate::qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint(params)
+            if let Some((founder, policy_fingerprint)) = self.genesis_economic_policy_identity() {
+                if let Some(descriptor) = &self.genesis_descriptor {
+                    let consensus_fingerprint =
+                        crate::qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint(
+                            params,
+                        )
                         .map_err(|_| QRunV06ExecutionError::TokenomicsConsensusMismatch)?;
-                descriptor.validate_binding(
-                    &self.network_id(),
-                    &self.profile_id,
-                    &tokenomics.founder_account(),
-                    &consensus_fingerprint,
-                    &tokenomics.policy_fingerprint(),
-                )?;
+                    descriptor.validate_binding(
+                        &self.network_id(),
+                        &self.profile_id,
+                        &founder,
+                        &consensus_fingerprint,
+                        &policy_fingerprint,
+                    )?;
+                }
             }
         } else if self.genesis_descriptor.is_some() {
             return Err(QRunV06ExecutionError::TokenomicsConsensusMismatch);
@@ -638,8 +762,29 @@ impl QRunV06CanonicalExecutionState {
                     return Err(QRunV06ExecutionError::InvalidTimestamp);
                 }
             }
-        } else if self.genesis_descriptor.is_some() {
+        } else if self.genesis_descriptor.is_some() && self.cp0604_supply.is_none() {
             return Err(QRunV06ExecutionError::TokenomicsConsensusMismatch);
+        }
+        if let Some(policy) = &self.cp0604_supply {
+            if self.tokenomics.is_some() || policy.network_id() != self.network_id() {
+                return Err(QRunV06ExecutionError::TokenomicsConsensusMismatch);
+            }
+            policy.validate_ledger_supply(self.unified.ledger().total_value()?)?;
+            if let Some(descriptor) = &self.genesis_descriptor {
+                descriptor.validate_binding(
+                    &self.network_id(),
+                    &self.profile_id,
+                    &policy.founder_account(),
+                    &descriptor.consensus_fingerprint(),
+                    &policy.policy_fingerprint(),
+                )?;
+                if self.height() == 0 && self.last_timestamp() != descriptor.genesis_timestamp() {
+                    return Err(QRunV06ExecutionError::InvalidTimestamp);
+                }
+                if self.height() > 0 && self.last_timestamp() <= descriptor.genesis_timestamp() {
+                    return Err(QRunV06ExecutionError::InvalidTimestamp);
+                }
+            }
         }
         if let Some(quote_authorization) = &self.quote_asset_authorization {
             quote_authorization.validate()?;
@@ -839,6 +984,10 @@ impl QRunV06CanonicalExecutionState {
             }
             None => hash.update([0u8]),
         }
+        if let Some(policy) = &self.cp0604_supply {
+            hash.update([2u8]);
+            hash.update(policy.state_root());
+        }
         match &self.genesis_descriptor {
             Some(descriptor) => {
                 hash.update([1u8]);
@@ -893,6 +1042,13 @@ impl QRunV06CanonicalExecutionState {
             Some(snapshot) => {
                 out.push(1);
                 execution_snapshot_put_component(&mut out, &snapshot)?;
+            }
+            None => out.push(0),
+        }
+        match &self.cp0604_supply {
+            Some(policy) => {
+                out.push(1);
+                execution_snapshot_put_component(&mut out, &policy.encode_snapshot())?;
             }
             None => out.push(0),
         }
@@ -952,7 +1108,10 @@ impl QRunV06CanonicalExecutionState {
             return Err(QRunV06ExecutionError::SnapshotMalformed);
         }
         let version = execution_snapshot_u16(&mut cursor)?;
-        if version != EXECUTION_SNAPSHOT_VERSION && version != EXECUTION_SNAPSHOT_VERSION_LEGACY {
+        if version != EXECUTION_SNAPSHOT_VERSION
+            && version != EXECUTION_SNAPSHOT_VERSION_V5
+            && version != EXECUTION_SNAPSHOT_VERSION_LEGACY
+        {
             return Err(QRunV06ExecutionError::SnapshotNonCanonical);
         }
         let network_id = execution_snapshot_read::<32>(&mut cursor)?;
@@ -986,6 +1145,18 @@ impl QRunV06CanonicalExecutionState {
             )?),
             _ => return Err(QRunV06ExecutionError::SnapshotNonCanonical),
         };
+        let cp0604_supply = if version >= EXECUTION_SNAPSHOT_VERSION {
+            match execution_snapshot_read::<1>(&mut cursor)?[0] {
+                0 => None,
+                1 => Some(Cp0604FounderControlledSupply::decode_snapshot(
+                    &execution_snapshot_read_component(&mut cursor, CP0604_SNAPSHOT_BYTES)?,
+                    expected_network_id,
+                )?),
+                _ => return Err(QRunV06ExecutionError::SnapshotNonCanonical),
+            }
+        } else {
+            None
+        };
         let genesis_descriptor = match execution_snapshot_read::<1>(&mut cursor)?[0] {
             0 => None,
             1 => Some(QRunV06GenesisDescriptor::decode(
@@ -996,7 +1167,7 @@ impl QRunV06CanonicalExecutionState {
             )?),
             _ => return Err(QRunV06ExecutionError::SnapshotNonCanonical),
         };
-        let quote_asset_authorization = if version >= EXECUTION_SNAPSHOT_VERSION {
+        let quote_asset_authorization = if version >= EXECUTION_SNAPSHOT_VERSION_V5 {
             match execution_snapshot_read::<1>(&mut cursor)?[0] {
                 0 => None,
                 1 => Some(QRunV06PersistedQuoteAssetAuthorization::decode(
@@ -1029,6 +1200,7 @@ impl QRunV06CanonicalExecutionState {
             .map_err(QRunV06ExecutionError::Unified)?;
         let mut restored = Self::new_with_orderbook(unified, profile_id, orderbook)?;
         restored.tokenomics = tokenomics;
+        restored.cp0604_supply = cp0604_supply;
         restored.genesis_descriptor = genesis_descriptor;
         restored.quote_asset_authorization = quote_asset_authorization;
         restored.verify_invariants()?;
@@ -1441,7 +1613,22 @@ impl QRunV06CanonicalExecutionState {
         self.validate_quote_asset_decimals_for_block(block, quote_authorization)?;
         self.verify_invariants()?;
         let fees_paid_to_producer = self.unified.settle_v06_block_fees(block.producer)?;
-        let mining_reward_atoms = if let Some(tokenomics) = &self.tokenomics {
+        let mining_reward_atoms = if let Some(policy) = &self.cp0604_supply {
+            let reward = policy.expected_mining_reward_atoms(block.height)?;
+            if reward > 0 {
+                let mut next_policy = policy.clone();
+                next_policy.record_mining_reward(block.height, reward)?;
+                self.unified
+                    .apply_v06_mining_reward(block.producer, reward)?;
+                self.cp0604_supply = Some(next_policy);
+            } else {
+                self.cp0604_supply
+                    .as_mut()
+                    .ok_or(QRunV06ExecutionError::Cp0604GenesisRequiresEmptyLedger)?
+                    .record_mining_reward(block.height, 0)?;
+            }
+            reward
+        } else if let Some(tokenomics) = &self.tokenomics {
             let reward = tokenomics.expected_mining_reward_atoms(block.height)?;
             if reward > 0 {
                 self.unified
@@ -2090,6 +2277,35 @@ mod tests {
         let amm = QzxbAmmStateCandidate::new(NETWORK, 32, 64, 512).unwrap();
         let unified = QRunV06UnifiedAssetState::new(ledger, amm).unwrap();
         QRunV06CanonicalExecutionState::new(unified, PROFILE).unwrap()
+    }
+
+    #[test]
+    fn genesis_economic_policy_identity_supports_cp0528_and_cp0604() {
+        let legacy = QRunV06CanonicalExecutionState::cp0528_genesis_candidate(
+            NETWORK,
+            PROFILE,
+            ALICE,
+            QRunV06MiningScheduleCandidate::cp0422_research_candidate(),
+        )
+        .unwrap();
+        let legacy_policy = legacy.tokenomics().unwrap();
+        assert_eq!(
+            legacy.genesis_economic_policy_identity(),
+            Some((ALICE, legacy_policy.policy_fingerprint()))
+        );
+
+        let current = QRunV06CanonicalExecutionState::cp0604_genesis_candidate(
+            NETWORK,
+            PROFILE,
+            ALICE,
+            QRunV06MiningScheduleCandidate::cp0422_research_candidate(),
+        )
+        .unwrap();
+        let current_policy = current.cp0604_supply().unwrap();
+        assert_eq!(
+            current.genesis_economic_policy_identity(),
+            Some((ALICE, current_policy.policy_fingerprint()))
+        );
     }
 
     fn transfer(
@@ -3321,10 +3537,10 @@ mod tests {
         );
         assert_eq!(state.quote_asset_authorization_epoch(), Some(3));
 
-        // Q6SN v5 persists the Q6QA/Q6PN trust identity and keeps it in the
+        // Q6SN v6 persists the Q6QA/Q6PN trust identity and keeps it in the
         // canonical execution root after restart.
         let snapshot = state.encode_snapshot().unwrap();
-        assert_eq!(u16::from_be_bytes([snapshot[4], snapshot[5]]), 5);
+        assert_eq!(u16::from_be_bytes([snapshot[4], snapshot[5]]), 6);
         let restored =
             QRunV06CanonicalExecutionState::decode_snapshot(&snapshot, &NETWORK, &PROFILE).unwrap();
         assert_eq!(restored.state_root().unwrap(), state.state_root().unwrap());
@@ -3366,7 +3582,7 @@ mod tests {
         let quote_commitment_offset = tampered_snapshot
             .windows(32)
             .position(|window| window == [0xD7; 32])
-            .expect("Q6QA commitment must be present in Q6SN v5");
+            .expect("Q6QA commitment must be present in Q6SN v6");
         tampered_snapshot[quote_commitment_offset] ^= 1;
         let payload_len = tampered_snapshot.len() - 32;
         let mut checksum = Sha256::new();
@@ -3379,14 +3595,27 @@ mod tests {
             Err(QRunV06ExecutionError::StateRootMismatch)
         );
 
-        // Q6SN v4 snapshots have no quote-pin flag. They remain readable and retain
-        // their old no-quote-pin state root after being decoded by the v5 reader.
+        // Q6SN v4 snapshots have no quote-pin or CP-0604 flag. They remain readable
+        // and retain their old no-quote-pin state root after decoding.
         let legacy_state = fixture();
         let mut legacy_v4 = legacy_state.encode_snapshot().unwrap();
-        assert_eq!(u16::from_be_bytes([legacy_v4[4], legacy_v4[5]]), 5);
+        assert_eq!(u16::from_be_bytes([legacy_v4[4], legacy_v4[5]]), 6);
         let legacy_payload_len = legacy_v4.len() - 32;
         assert_eq!(legacy_v4[legacy_payload_len - 1], 0);
-        legacy_v4.remove(legacy_payload_len - 1);
+        legacy_v4.remove(legacy_payload_len - 1); // remove v5+ quote authorization flag
+                                                  // Remove the v6 CP-0604 component flag to reconstruct the v4 layout.
+        let mut component_cursor = 150usize;
+        for _ in 0..4 {
+            let component_len = u32::from_be_bytes(
+                legacy_v4[component_cursor..component_cursor + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            component_cursor += 4 + component_len;
+        }
+        component_cursor += 1; // legacy tokenomics presence flag
+        assert_eq!(legacy_v4[component_cursor], 0);
+        legacy_v4.remove(component_cursor);
         let legacy_payload_len = legacy_v4.len() - 32;
         legacy_v4[4..6].copy_from_slice(&4u16.to_be_bytes());
         let mut legacy_checksum = Sha256::new();
@@ -4264,6 +4493,142 @@ mod tests {
         assert_eq!(restored, state);
         assert_eq!(restored.state_root().unwrap(), state.state_root().unwrap());
         assert!(restored.tokenomics().is_some());
+    }
+
+    #[test]
+    fn cp0604_canonical_genesis_transfer_mining_and_snapshot_replay() {
+        let mut state = QRunV06CanonicalExecutionState::cp0604_genesis_candidate(
+            NETWORK,
+            PROFILE,
+            ALICE,
+            QRunV06MiningScheduleCandidate::cp0422_research_candidate(),
+        )
+        .unwrap();
+        assert_eq!(
+            state.unified().ledger().account(&ALICE).unwrap().balance as u128,
+            CP0604_FOUNDER_GENESIS_ATOMS
+        );
+        assert_eq!(
+            state.unified().ledger().total_value().unwrap(),
+            CP0604_FOUNDER_GENESIS_ATOMS
+        );
+        assert!(state.tokenomics().is_none());
+        assert_eq!(state.cp0604_supply().unwrap().mining_issued_atoms(), 0);
+
+        let transfer_block = block_for(
+            &state,
+            vec![QRunV06BlockOperation::NativeTransfer(transfer(
+                ALICE, BOB, 1, 1_000, 1,
+            ))],
+        );
+        let mut transfer_block = transfer_block;
+        transfer_block.state_root = state
+            .preview_state_root_after(&transfer_block, &DigestAuthenticator)
+            .unwrap();
+        let summary = state
+            .apply_block(&transfer_block, &DigestAuthenticator)
+            .unwrap();
+        assert!(summary.mining_reward_atoms > 0);
+        assert_eq!(
+            state.unified().ledger().account(&BOB).unwrap().balance,
+            1_000
+        );
+        assert_eq!(
+            state.unified().ledger().total_value().unwrap(),
+            CP0604_FOUNDER_GENESIS_ATOMS + summary.mining_reward_atoms
+        );
+        assert_eq!(
+            state.cp0604_supply().unwrap().mining_issued_atoms(),
+            summary.mining_reward_atoms
+        );
+        assert_eq!(state.cp0604_supply().unwrap().last_mining_height(), 1);
+
+        let snapshot = state.encode_snapshot().unwrap();
+        assert_eq!(u16::from_be_bytes([snapshot[4], snapshot[5]]), 6);
+        let restored =
+            QRunV06CanonicalExecutionState::decode_snapshot(&snapshot, &NETWORK, &PROFILE).unwrap();
+        assert_eq!(restored, state);
+        assert_eq!(restored.state_root().unwrap(), state.state_root().unwrap());
+        assert_eq!(
+            restored.cp0604_supply().unwrap().mining_issued_atoms(),
+            summary.mining_reward_atoms
+        );
+
+        let next_block = block_for(&restored, Vec::new());
+        let mut next_block = next_block;
+        next_block.state_root = restored
+            .preview_state_root_after(&next_block, &DigestAuthenticator)
+            .unwrap();
+        let mut resumed = restored;
+        let second = resumed
+            .apply_block(&next_block, &DigestAuthenticator)
+            .unwrap();
+        assert!(second.mining_reward_atoms > 0);
+        assert_eq!(resumed.cp0604_supply().unwrap().last_mining_height(), 2);
+        assert_eq!(
+            resumed.unified().ledger().total_value().unwrap(),
+            CP0604_FOUNDER_GENESIS_ATOMS + resumed.cp0604_supply().unwrap().mining_issued_atoms()
+        );
+    }
+
+    #[test]
+    fn q6sn_v5_snapshot_remains_compatible_after_v6_upgrade() {
+        let state = fixture();
+        let mut legacy_v5 = state.encode_snapshot().unwrap();
+        let mut component_cursor = 150usize;
+        for _ in 0..4 {
+            let component_len = u32::from_be_bytes(
+                legacy_v5[component_cursor..component_cursor + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            component_cursor += 4 + component_len;
+        }
+        component_cursor += 1; // tokenomics flag
+        assert_eq!(legacy_v5[component_cursor], 0); // no CP-0604 component in v5
+        legacy_v5.remove(component_cursor);
+        legacy_v5[4..6].copy_from_slice(&5u16.to_be_bytes());
+        let payload_len = legacy_v5.len() - 32;
+        let mut checksum = Sha256::new();
+        checksum.update(EXECUTION_SNAPSHOT_CHECKSUM_DOMAIN);
+        checksum.update(&legacy_v5[..payload_len]);
+        let checksum: [u8; 32] = checksum.finalize().into();
+        legacy_v5[payload_len..].copy_from_slice(&checksum);
+        let restored =
+            QRunV06CanonicalExecutionState::decode_snapshot(&legacy_v5, &NETWORK, &PROFILE)
+                .unwrap();
+        assert_eq!(restored, state);
+        assert_eq!(restored.state_root().unwrap(), state.state_root().unwrap());
+    }
+
+    #[test]
+    fn cp0604_rejects_legacy_category_mint_operations() {
+        let state = QRunV06CanonicalExecutionState::cp0604_genesis_candidate(
+            NETWORK,
+            PROFILE,
+            ALICE,
+            QRunV06MiningScheduleCandidate::cp0422_research_candidate(),
+        )
+        .unwrap();
+        let release = signed_category_release(
+            QRunV06AllocationBucket::CommunityAirdrop,
+            1,
+            BOB,
+            100,
+            10_000,
+        );
+        let block = block_for(
+            &state,
+            vec![QRunV06BlockOperation::CategoryRelease(release)],
+        );
+        assert_eq!(
+            state.preview_state_root_after(&block, &DigestAuthenticator),
+            Err(QRunV06ExecutionError::Cp0604LegacyOperationForbidden)
+        );
+        assert_eq!(
+            state.unified().ledger().total_value().unwrap(),
+            CP0604_FOUNDER_GENESIS_ATOMS
+        );
     }
 
     #[test]

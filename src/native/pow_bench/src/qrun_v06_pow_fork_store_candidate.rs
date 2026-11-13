@@ -153,7 +153,7 @@ impl std::fmt::Display for QRunV06ForkStoreError {
             Self::ManifestConsensusMismatch => f.write_str("QFP6 durable manifest consensus parameters differ from the requested profile"),
             Self::ProfilePinMismatch => f.write_str("verified Q6PN profile pin does not match the supplied Genesis or checkpoint identity"),
             Self::ProfilePinConsensusMismatch => f.write_str("verified Q6PN consensus fingerprint differs from the requested QFP6 parameters"),
-            Self::ProfilePinTokenomicsMismatch => f.write_str("verified Q6PN CP-0528 policy or Founder identity differs from the supplied Genesis state"),
+            Self::ProfilePinTokenomicsMismatch => f.write_str("verified Q6PN economic policy or Founder identity differs from the supplied Genesis state"),
             Self::WrongNetwork => f.write_str("QFP6 durable manifest belongs to another network"),
             Self::WrongProfile => f.write_str("QFP6 durable manifest belongs to another execution profile"),
             Self::BaseStateMismatch => f.write_str("QFP6 durable archive is not rooted in the supplied Genesis state"),
@@ -562,11 +562,11 @@ impl QRunV06DurableForkStore {
         {
             return Err(QRunV06ForkStoreError::ProfilePinMismatch);
         }
-        let tokenomics = genesis_state
-            .tokenomics()
+        let (founder_account, policy_fingerprint) = genesis_state
+            .genesis_economic_policy_identity()
             .ok_or(QRunV06ForkStoreError::ProfilePinTokenomicsMismatch)?;
-        if tokenomics.founder_account() != descriptor.founder_account()
-            || tokenomics.policy_fingerprint() != descriptor.tokenomics_policy_fingerprint()
+        if founder_account != descriptor.founder_account()
+            || policy_fingerprint != descriptor.tokenomics_policy_fingerprint()
         {
             return Err(QRunV06ForkStoreError::ProfilePinTokenomicsMismatch);
         }
@@ -867,12 +867,12 @@ impl QRunV06DurableForkStore {
         {
             return Err(QRunV06ForkStoreError::ProfilePinMismatch);
         }
-        let tokenomics = checkpoint
+        let (founder_account, policy_fingerprint) = checkpoint
             .execution_state()
-            .tokenomics()
+            .genesis_economic_policy_identity()
             .ok_or(QRunV06ForkStoreError::ProfilePinTokenomicsMismatch)?;
-        if tokenomics.founder_account() != descriptor.founder_account()
-            || tokenomics.policy_fingerprint() != descriptor.tokenomics_policy_fingerprint()
+        if founder_account != descriptor.founder_account()
+            || policy_fingerprint != descriptor.tokenomics_policy_fingerprint()
         {
             return Err(QRunV06ForkStoreError::ProfilePinTokenomicsMismatch);
         }
@@ -1074,11 +1074,11 @@ impl QRunV06DurableForkStore {
         {
             return Err(QRunV06ForkStoreError::ProfilePinMismatch);
         }
-        let tokenomics = genesis_state
-            .tokenomics()
+        let (founder_account, policy_fingerprint) = genesis_state
+            .genesis_economic_policy_identity()
             .ok_or(QRunV06ForkStoreError::ProfilePinTokenomicsMismatch)?;
-        if tokenomics.founder_account() != descriptor.founder_account()
-            || tokenomics.policy_fingerprint() != descriptor.tokenomics_policy_fingerprint()
+        if founder_account != descriptor.founder_account()
+            || policy_fingerprint != descriptor.tokenomics_policy_fingerprint()
         {
             return Err(QRunV06ForkStoreError::ProfilePinTokenomicsMismatch);
         }

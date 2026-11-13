@@ -11,7 +11,8 @@
 //! routes Q6TI submissions into a bounded pool, persists accepted pending transactions in an
 //! immutable-generation journal, restores/revalidates them against recovered QAP1 state, and
 //! selects them for QAP1 mining. This remains a candidate service seam, not a standalone
-//! production launcher, RPC server, peer-discovery service, full-history sync daemon or Mainnet.
+//! production launcher, RPC server, peer-discovery service or Mainnet. A separate permissionless
+//! startup wrapper can complete bounded history sync from operator-pinned peers before mining.
 
 use crate::{
     external_cas_anchor_candidate::{ExternalCasPin, ExternalCasProviderTransport},
@@ -20,7 +21,11 @@ use crate::{
         QRunV06BlockOperation, QRunV06CanonicalExecutionState, MAX_QRUN_V06_BLOCK_OPERATIONS,
     },
     qrun_v06_external_anchor_candidate::{QRunV06ExternalAnchorPin, QRunV06ExternalAnchorState},
-    qrun_v06_history_sync_service_candidate::QRunV06HistorySyncResponder,
+    qrun_v06_history_sync_service_candidate::{
+        sync_history_from_pinned_peer_until_complete,
+        sync_history_from_pinned_peer_until_complete_with_qap1, QRunV06HistorySyncClientConfig,
+        QRunV06HistorySyncClientReport, QRunV06HistorySyncResponder,
+    },
     qrun_v06_history_sync_wire_candidate::{
         decode_q6hi_request, decode_q6hs_request, encode_q6hr_status, Q6HI_REQUEST_MAGIC,
         Q6HS_REQUEST_MAGIC,
@@ -31,7 +36,7 @@ use crate::{
     },
     qrun_v06_peer_listener_candidate::{
         process_qfp6_peer_frame_with_permissionless_runtime, process_qfp6_peer_frame_with_qap1,
-        serve_qfp6_noise_listener, serve_qfp6_noise_listener_with_history,
+        serve_qfp6_noise_listener, serve_qfp6_noise_listener_with_history_and_q6ar_relay_pins,
         QRunV06PeerListenerConfig, QRunV06PeerListenerError, QRunV06PeerListenerStats,
         QRunV06PeerListenerStopReason,
     },
@@ -56,7 +61,8 @@ use crate::{
     v4_fat1_trust_candidate::MlDsa65Verifier,
 };
 use std::{
-    net::TcpListener,
+    collections::HashSet,
+    net::{SocketAddr, TcpListener},
     sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -197,6 +203,23 @@ pub struct QRunV06PermissionlessMiningSupervisorReport {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QRunV06PinnedBootstrapPeer {
+    pub address: SocketAddr,
+    pub noise_static_public_key: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QRunV06Qap1LaunchReport {
+    pub bootstrap_sync: QRunV06HistorySyncClientReport,
+    pub supervisor: QRunV06MiningSupervisorReport,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QRunV06PermissionlessLaunchReport {
+    pub bootstrap_sync: QRunV06HistorySyncClientReport,
+    pub supervisor: QRunV06PermissionlessMiningSupervisorReport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QRunV06MiningSupervisorReport {
     pub listener_rounds: u64,
     pub mining_rounds: u64,
@@ -232,6 +255,8 @@ pub enum QRunV06NodeSupervisorError {
     Mempool(String),
     Journal(String),
     Mining(String),
+    InvalidBootstrapPeers,
+    BootstrapSync(String),
 }
 
 impl std::fmt::Display for QRunV06NodeSupervisorError {
@@ -257,13 +282,31 @@ fn add_stats(
         &mut total.authenticated_sessions,
         next.authenticated_sessions,
     )?;
+    add_counter(
+        &mut total.unverified_peer_sessions,
+        next.unverified_peer_sessions,
+    )?;
     add_counter(&mut total.rejected_handshakes, next.rejected_handshakes)?;
     add_counter(&mut total.requests_received, next.requests_received)?;
     add_counter(&mut total.responses_written, next.responses_written)?;
     add_counter(&mut total.handler_failures, next.handler_failures)?;
     add_counter(&mut total.malformed_responses, next.malformed_responses)?;
+    add_counter(&mut total.q6ar_rejections, next.q6ar_rejections)?;
     add_counter(&mut total.sessions_closed, next.sessions_closed)?;
     Ok(())
+}
+
+fn system_now_ms() -> Result<u64, QRunV06NodeSupervisorError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            QRunV06NodeSupervisorError::Runtime(format!("system clock invalid: {error}"))
+        })?
+        .as_millis()
+        .try_into()
+        .map_err(|_| {
+            QRunV06NodeSupervisorError::Runtime("system clock exceeds millisecond range".into())
+        })
 }
 
 fn validate_identity_material(
@@ -690,7 +733,7 @@ where
 
 /// Run one finite combined Q6PB/Q6TI/Q6HS listener window. Q6PA/Q6TA replies remain
 /// fixed-width; Q6HS pages are streamed as prevalidated Q6HC records on the same pinned session.
-fn serve_qfp6_history_listener_round<F>(
+fn serve_qfp6_history_listener_round<F, G>(
     listener: &TcpListener,
     config: QRunV06PeerListenerConfig,
     local_static_private_key: &[u8; 32],
@@ -699,6 +742,8 @@ fn serve_qfp6_history_listener_round<F>(
     profile_id: &[u8; 32],
     process_shutdown: &AtomicBool,
     round_timeout: Duration,
+    q6ar_relay_static_public_key_pins: &[[u8; 32]],
+    on_q6ar: G,
     on_application_frame: F,
 ) -> Result<
     (
@@ -709,6 +754,9 @@ fn serve_qfp6_history_listener_round<F>(
 >
 where
     F: FnMut(&mut QRunV06PeerReplayGuard, &[u8]) -> Result<Vec<Vec<u8>>, String>,
+    G: FnMut(
+        crate::qrun_v06_peer_address_relay_candidate::Q6arReceivedAdvertisement,
+    ) -> Result<(), String>,
 {
     let round_shutdown = AtomicBool::new(false);
     let watcher_stop = AtomicBool::new(false);
@@ -724,14 +772,16 @@ where
             }
         });
 
-        let report = serve_qfp6_noise_listener_with_history(
+        let report = serve_qfp6_noise_listener_with_history_and_q6ar_relay_pins(
             listener,
             config,
             local_static_private_key,
             trusted_remote_static_public_keys,
+            q6ar_relay_static_public_key_pins,
             network_id,
             profile_id,
             &round_shutdown,
+            on_q6ar,
             on_application_frame,
         );
         watcher_stop.store(true, Ordering::Release);
@@ -922,6 +972,7 @@ where
                 }
                 if listener_report.stop_reason
                     == QRunV06PeerListenerStopReason::FailedHandshakeLimitReached
+                    && !trusted_remote_static_public_keys.is_empty()
                 {
                     return Err(QRunV06NodeSupervisorError::HandshakeBudgetExceeded);
                 }
@@ -1088,8 +1139,8 @@ pub fn process_qfp6_application_frame_with_permissionless_runtime<T: Transaction
 /// Run the authenticated QFP6 Noise listener and permissionless durable miner in alternating,
 /// bounded windows. The runtime must already be opened from complete Genesis-rooted history with
 /// an independently verified profile pin. The same pinned Noise listener serves bounded
-/// Q6HS/Q6HC canonical-history export requests; outbound peer discovery and automatic remote
-/// history import remain separate work.
+/// Q6HS/Q6HC canonical-history export requests. This base supervisor does not discover or
+/// auto-connect peers; the separate startup wrapper syncs only from operator-approved pins.
 #[allow(clippy::too_many_arguments)]
 pub fn run_qfp6_permissionless_mining_supervisor<T: TransactionAuthenticator>(
     listener: &TcpListener,
@@ -1103,6 +1154,75 @@ pub fn run_qfp6_permissionless_mining_supervisor<T: TransactionAuthenticator>(
     authenticator: &T,
     producer: [u8; 32],
     mempool: &mut QRunV06PermissionlessMempool,
+) -> Result<QRunV06PermissionlessMiningSupervisorReport, QRunV06NodeSupervisorError> {
+    run_qfp6_permissionless_mining_supervisor_inner(
+        listener,
+        config,
+        local_static_private_key,
+        trusted_remote_static_public_keys,
+        network_id,
+        profile_id,
+        shutdown_requested,
+        runtime,
+        authenticator,
+        producer,
+        mempool,
+        None,
+    )
+}
+
+/// Candidate-only variant: persist Q6AR only when relayed by a bootstrap-pinned Noise identity.
+#[allow(clippy::too_many_arguments)]
+pub fn run_qfp6_permissionless_mining_supervisor_with_q6ar_candidate<
+    T: TransactionAuthenticator,
+>(
+    listener: &TcpListener,
+    config: QRunV06PermissionlessMiningSupervisorConfig,
+    local_static_private_key: &[u8; 32],
+    trusted_remote_static_public_keys: &[[u8; 32]],
+    q6ar_relay_static_public_key_pins: &[[u8; 32]],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    shutdown_requested: &AtomicBool,
+    runtime: &mut QRunV06PermissionlessNodeRuntime,
+    authenticator: &T,
+    producer: [u8; 32],
+    mempool: &mut QRunV06PermissionlessMempool,
+    address_book: &mut crate::qrun_v06_peer_address_manager_candidate::QRunV06PeerAddressBookCandidate,
+) -> Result<QRunV06PermissionlessMiningSupervisorReport, QRunV06NodeSupervisorError> {
+    run_qfp6_permissionless_mining_supervisor_inner(
+        listener,
+        config,
+        local_static_private_key,
+        trusted_remote_static_public_keys,
+        network_id,
+        profile_id,
+        shutdown_requested,
+        runtime,
+        authenticator,
+        producer,
+        mempool,
+        Some((address_book, q6ar_relay_static_public_key_pins.to_vec())),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
+    listener: &TcpListener,
+    config: QRunV06PermissionlessMiningSupervisorConfig,
+    local_static_private_key: &[u8; 32],
+    trusted_remote_static_public_keys: &[[u8; 32]],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    shutdown_requested: &AtomicBool,
+    runtime: &mut QRunV06PermissionlessNodeRuntime,
+    authenticator: &T,
+    producer: [u8; 32],
+    mempool: &mut QRunV06PermissionlessMempool,
+    mut q6ar_candidate: Option<(
+        &mut crate::qrun_v06_peer_address_manager_candidate::QRunV06PeerAddressBookCandidate,
+        Vec<[u8; 32]>,
+    )>,
 ) -> Result<QRunV06PermissionlessMiningSupervisorReport, QRunV06NodeSupervisorError> {
     config.validate()?;
     validate_identity_material(local_static_private_key, network_id, profile_id)?;
@@ -1207,6 +1327,26 @@ pub fn run_qfp6_permissionless_mining_supervisor<T: TransactionAuthenticator>(
                             .map(|response| vec![response.to_vec()])
                         }
                     };
+                let q6ar_relay_pins = q6ar_candidate
+                    .as_ref()
+                    .map(|(_, pins)| pins.clone())
+                    .unwrap_or_default();
+                let mut on_q6ar = |received: crate::qrun_v06_peer_address_relay_candidate::Q6arReceivedAdvertisement| {
+                    match q6ar_candidate.as_mut() {
+                        Some((book, _)) if received.relay_origin.relay_static_key_pinned => {
+                            let now_ms = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map_err(|error| format!("system clock invalid for Q6AR: {error}"))?
+                                .as_millis()
+                                .try_into()
+                                .map_err(|_| "system clock exceeds Q6AR millisecond range".to_string())?;
+                            book.ingest_pinned_q6ar(&received, now_ms)
+                                .map(|_| ())
+                                .map_err(|error| format!("Q6AR address-book rejection: {error}"))
+                        }
+                        _ => Ok(()), // Anonymous or non-pinned relay: ignore without trust escalation.
+                    }
+                };
                 let (listener_report, process_stopped) = serve_qfp6_history_listener_round(
                     listener,
                     round_config,
@@ -1216,6 +1356,8 @@ pub fn run_qfp6_permissionless_mining_supervisor<T: TransactionAuthenticator>(
                     profile_id,
                     shutdown_requested,
                     config.listener_round_timeout,
+                    &q6ar_relay_pins,
+                    &mut on_q6ar,
                     &mut on_application_frame,
                 )?;
                 listener_rounds = listener_rounds
@@ -1224,6 +1366,7 @@ pub fn run_qfp6_permissionless_mining_supervisor<T: TransactionAuthenticator>(
                 add_stats(&mut aggregate, listener_report.stats)?;
                 if listener_report.stop_reason
                     == QRunV06PeerListenerStopReason::FailedHandshakeLimitReached
+                    && !trusted_remote_static_public_keys.is_empty()
                 {
                     return Err(QRunV06NodeSupervisorError::HandshakeBudgetExceeded);
                 }
@@ -1254,6 +1397,12 @@ pub fn run_qfp6_permissionless_mining_supervisor<T: TransactionAuthenticator>(
                     shutdown_requested,
                 ) {
                     Ok(mined) => mined,
+                    // A bounded nonce window is one mining slice, not a fatal node error.
+                    // The mempool service has advanced its nonce cursor; return to the listener
+                    // so peers/transactions are serviced before the next mining slice.
+                    Err(QRunV06PermissionlessServiceError::MiningNonceBudgetExhausted {
+                        next_nonce: _,
+                    }) => None,
                     Err(QRunV06PermissionlessServiceError::MiningCancelled)
                         if shutdown_requested.load(Ordering::Acquire) =>
                     {
@@ -1317,6 +1466,483 @@ pub fn run_qfp6_permissionless_mining_supervisor<T: TransactionAuthenticator>(
         (Ok(_), Err(error)) => Err(error),
         (Ok(report), Ok(())) => Ok(report),
     }
+}
+
+/// Permissionless inbound variant: peers may establish anonymous QFP6 Noise sessions.
+/// Transport does not authenticate peer identity; consensus and transaction validation do.
+/// Long-running open inbound supervisor. Each inner run has a finite accepted-connection
+/// budget; when that window fills, it rolls the listener window without closing the TCP socket,
+/// clearing the durable runtime, or losing Q6MJ. Ctrl-C/SIGTERM still exits the outer loop.
+#[allow(clippy::too_many_arguments)]
+pub fn run_qfp6_permissionless_mining_supervisor_open_with_q6ar_candidate<
+    T: TransactionAuthenticator,
+>(
+    listener: &TcpListener,
+    config: QRunV06PermissionlessMiningSupervisorConfig,
+    local_static_private_key: &[u8; 32],
+    q6ar_relay_static_public_key_pins: &[[u8; 32]],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    shutdown_requested: &AtomicBool,
+    runtime: &mut QRunV06PermissionlessNodeRuntime,
+    authenticator: &T,
+    producer: [u8; 32],
+    mempool: &mut QRunV06PermissionlessMempool,
+    address_book: &mut crate::qrun_v06_peer_address_manager_candidate::QRunV06PeerAddressBookCandidate,
+) -> Result<QRunV06PermissionlessMiningSupervisorReport, QRunV06NodeSupervisorError> {
+    let mut total = QRunV06PermissionlessMiningSupervisorReport {
+        listener_rounds: 0,
+        mining_rounds: 0,
+        blocks_durably_committed: 0,
+        blocks_became_canonical: 0,
+        ending_height: 0,
+        pending_mempool_transactions: 0,
+        pending_mempool_bytes: 0,
+        mempool_journal_generation: 0,
+        stats: QRunV06PeerListenerStats::default(),
+        stop_reason: QRunV06NodeSupervisorStopReason::ShutdownRequested,
+    };
+    loop {
+        if shutdown_requested.load(Ordering::Acquire) {
+            total.stop_reason = QRunV06NodeSupervisorStopReason::ShutdownRequested;
+            return Ok(total);
+        }
+        let report = run_qfp6_permissionless_mining_supervisor_with_q6ar_candidate(
+            listener,
+            config,
+            local_static_private_key,
+            &[],
+            q6ar_relay_static_public_key_pins,
+            network_id,
+            profile_id,
+            shutdown_requested,
+            runtime,
+            authenticator,
+            producer,
+            mempool,
+            address_book,
+        )?;
+        total.listener_rounds = total
+            .listener_rounds
+            .checked_add(report.listener_rounds)
+            .ok_or(QRunV06NodeSupervisorError::StatisticsOverflow)?;
+        total.mining_rounds = total
+            .mining_rounds
+            .checked_add(report.mining_rounds)
+            .ok_or(QRunV06NodeSupervisorError::StatisticsOverflow)?;
+        total.blocks_durably_committed = total
+            .blocks_durably_committed
+            .checked_add(report.blocks_durably_committed)
+            .ok_or(QRunV06NodeSupervisorError::StatisticsOverflow)?;
+        total.blocks_became_canonical = total
+            .blocks_became_canonical
+            .checked_add(report.blocks_became_canonical)
+            .ok_or(QRunV06NodeSupervisorError::StatisticsOverflow)?;
+        add_stats(&mut total.stats, report.stats)?;
+        total.ending_height = report.ending_height;
+        total.pending_mempool_transactions = report.pending_mempool_transactions;
+        total.pending_mempool_bytes = report.pending_mempool_bytes;
+        total.mempool_journal_generation = report.mempool_journal_generation;
+        total.stop_reason = report.stop_reason;
+        if report.stop_reason == QRunV06NodeSupervisorStopReason::ShutdownRequested {
+            return Ok(total);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_qfp6_permissionless_mining_supervisor_open<T: TransactionAuthenticator>(
+    listener: &TcpListener,
+    config: QRunV06PermissionlessMiningSupervisorConfig,
+    local_static_private_key: &[u8; 32],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    shutdown_requested: &AtomicBool,
+    runtime: &mut QRunV06PermissionlessNodeRuntime,
+    authenticator: &T,
+    producer: [u8; 32],
+    mempool: &mut QRunV06PermissionlessMempool,
+) -> Result<QRunV06PermissionlessMiningSupervisorReport, QRunV06NodeSupervisorError> {
+    let mut total = QRunV06PermissionlessMiningSupervisorReport {
+        listener_rounds: 0,
+        mining_rounds: 0,
+        blocks_durably_committed: 0,
+        blocks_became_canonical: 0,
+        ending_height: 0,
+        pending_mempool_transactions: 0,
+        pending_mempool_bytes: 0,
+        mempool_journal_generation: 0,
+        stats: QRunV06PeerListenerStats::default(),
+        stop_reason: QRunV06NodeSupervisorStopReason::ShutdownRequested,
+    };
+    loop {
+        if shutdown_requested.load(Ordering::Acquire) {
+            total.stop_reason = QRunV06NodeSupervisorStopReason::ShutdownRequested;
+            return Ok(total);
+        }
+        let report = run_qfp6_permissionless_mining_supervisor(
+            listener,
+            config,
+            local_static_private_key,
+            &[],
+            network_id,
+            profile_id,
+            shutdown_requested,
+            runtime,
+            authenticator,
+            producer,
+            mempool,
+        )?;
+        total.listener_rounds = total
+            .listener_rounds
+            .checked_add(report.listener_rounds)
+            .ok_or(QRunV06NodeSupervisorError::StatisticsOverflow)?;
+        total.mining_rounds = total
+            .mining_rounds
+            .checked_add(report.mining_rounds)
+            .ok_or(QRunV06NodeSupervisorError::StatisticsOverflow)?;
+        total.blocks_durably_committed = total
+            .blocks_durably_committed
+            .checked_add(report.blocks_durably_committed)
+            .ok_or(QRunV06NodeSupervisorError::StatisticsOverflow)?;
+        total.blocks_became_canonical = total
+            .blocks_became_canonical
+            .checked_add(report.blocks_became_canonical)
+            .ok_or(QRunV06NodeSupervisorError::StatisticsOverflow)?;
+        add_stats(&mut total.stats, report.stats)?;
+        total.ending_height = report.ending_height;
+        total.pending_mempool_transactions = report.pending_mempool_transactions;
+        total.pending_mempool_bytes = report.pending_mempool_bytes;
+        total.mempool_journal_generation = report.mempool_journal_generation;
+        total.stop_reason = report.stop_reason;
+        if report.stop_reason == QRunV06NodeSupervisorStopReason::ShutdownRequested {
+            return Ok(total);
+        }
+        // SessionBudgetReached is a window rotation, not a node shutdown.
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+/// Validate a static set of outbound bootstrap peers and return their Noise static-key pins.
+pub fn validate_qfp6_pinned_bootstrap_peers(
+    peers: &[QRunV06PinnedBootstrapPeer],
+) -> Result<Vec<[u8; 32]>, QRunV06NodeSupervisorError> {
+    if peers.is_empty() || peers.len() > 64 {
+        return Err(QRunV06NodeSupervisorError::InvalidBootstrapPeers);
+    }
+    let mut addresses = HashSet::new();
+    let mut keys = HashSet::new();
+    let mut trusted_keys = Vec::with_capacity(peers.len());
+    for peer in peers {
+        if peer.address.port() == 0
+            || peer.address.ip().is_unspecified()
+            || peer.address.ip().is_multicast()
+            || peer.noise_static_public_key == [0; 32]
+            || !addresses.insert(peer.address)
+            || !keys.insert(peer.noise_static_public_key)
+        {
+            return Err(QRunV06NodeSupervisorError::InvalidBootstrapPeers);
+        }
+        trusted_keys.push(peer.noise_static_public_key);
+    }
+    Ok(trusted_keys)
+}
+
+/// QAP1-only startup: authenticate and synchronize from an operator-pinned peer set, then
+/// enter the QAP1 mining supervisor. No non-QAP1 runtime or bulk-import fallback is available.
+#[allow(clippy::too_many_arguments)]
+pub fn run_qfp6_mining_supervisor_with_qap1_bootstrap<A, T, P, PV, AV, Q, F>(
+    listener: &TcpListener,
+    config: QRunV06MiningSupervisorConfig,
+    local_static_private_key: &[u8; 32],
+    bootstrap_peers: &[QRunV06PinnedBootstrapPeer],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    shutdown_requested: &AtomicBool,
+    runtime: &mut QRunV06NodeRuntime<A>,
+    authenticator: &T,
+    quote_authorizer: &mut QRunV06QuoteAssetAuthorizationProvider<'_>,
+    coordinator: &mut QRunV06Qap1ExternalCoordinator<P, PV, AV, Q>,
+    producer: [u8; 32],
+    transaction_journal: &mut QRunV06TransactionJournal,
+    next_template: F,
+    sync_config: QRunV06HistorySyncClientConfig,
+) -> Result<QRunV06Qap1LaunchReport, QRunV06NodeSupervisorError>
+where
+    A: QRunV06NodeAnchorGate,
+    T: TransactionAuthenticator,
+    P: ExternalCasProviderTransport,
+    PV: MlDsa65Verifier + Clone,
+    AV: MlDsa65Verifier,
+    Q: QRunV06Qap1AnchorTransport,
+    F: FnMut(&QRunV06CanonicalExecutionState) -> Result<(u64, Vec<QRunV06BlockOperation>), String>,
+{
+    config.validate()?;
+    sync_config
+        .validate()
+        .map_err(|error| QRunV06NodeSupervisorError::BootstrapSync(error.to_string()))?;
+    validate_identity_material(local_static_private_key, network_id, profile_id)?;
+    if producer == [0; 32] {
+        return Err(QRunV06NodeSupervisorError::InvalidIdentity);
+    }
+    let trusted_keys = validate_qfp6_pinned_bootstrap_peers(bootstrap_peers)?;
+    if !runtime.requires_qap1() || !runtime.qap1_recovery_verified() {
+        return Err(QRunV06NodeSupervisorError::RuntimeNotQap1Recovered);
+    }
+    if runtime.requires_reopen() {
+        return Err(QRunV06NodeSupervisorError::RuntimeRequiresRecovery);
+    }
+    if runtime.has_pending_external_anchor() {
+        return Err(QRunV06NodeSupervisorError::PendingAnchorTransition);
+    }
+    let anchor = runtime.committed_anchor_state();
+    if anchor.network_id != *network_id {
+        return Err(QRunV06NodeSupervisorError::NetworkMismatch);
+    }
+    if anchor.profile_id != *profile_id {
+        return Err(QRunV06NodeSupervisorError::ProfileMismatch);
+    }
+    validate_qap1_pin_bindings(anchor, coordinator.provider_pin(), coordinator.qfp6_pin())?;
+    let mut bootstrap_sync = None;
+    let mut peer_errors = Vec::new();
+    for peer in bootstrap_peers {
+        match sync_history_from_pinned_peer_until_complete_with_qap1(
+            peer.address,
+            local_static_private_key,
+            &peer.noise_static_public_key,
+            runtime,
+            authenticator,
+            quote_authorizer,
+            coordinator,
+            sync_config,
+        ) {
+            Ok(report) if report.complete => {
+                bootstrap_sync = Some(report);
+                break;
+            }
+            Ok(_) => peer_errors.push(format!(
+                "{}: bounded QAP1 sync did not reach the pinned snapshot",
+                peer.address
+            )),
+            Err(error) => {
+                peer_errors.push(format!("{}: {error}", peer.address));
+                if runtime.requires_reopen() {
+                    return Err(QRunV06NodeSupervisorError::RuntimeRequiresRecovery);
+                }
+                if runtime.has_pending_external_anchor() {
+                    return Err(QRunV06NodeSupervisorError::PendingAnchorTransition);
+                }
+            }
+        }
+    }
+    let bootstrap_sync = bootstrap_sync
+        .ok_or_else(|| QRunV06NodeSupervisorError::BootstrapSync(peer_errors.join("; ")))?;
+    let supervisor = run_qfp6_mining_supervisor(
+        listener,
+        config,
+        local_static_private_key,
+        &trusted_keys,
+        network_id,
+        profile_id,
+        shutdown_requested,
+        runtime,
+        authenticator,
+        quote_authorizer,
+        coordinator,
+        producer,
+        transaction_journal,
+        next_template,
+    )?;
+    Ok(QRunV06Qap1LaunchReport {
+        bootstrap_sync,
+        supervisor,
+    })
+}
+/// Bootstrap-synchronized variant with candidate-only Q6AR persistence. Inbound sessions remain
+/// anonymous; the bootstrap keys identify only which relays may contribute persisted addresses.
+#[allow(clippy::too_many_arguments)]
+pub fn run_qfp6_permissionless_mining_supervisor_with_bootstrap_and_q6ar_candidate<
+    T: TransactionAuthenticator,
+>(
+    listener: &TcpListener,
+    config: QRunV06PermissionlessMiningSupervisorConfig,
+    local_static_private_key: &[u8; 32],
+    bootstrap_peers: &[QRunV06PinnedBootstrapPeer],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    shutdown_requested: &AtomicBool,
+    runtime: &mut QRunV06PermissionlessNodeRuntime,
+    authenticator: &T,
+    producer: [u8; 32],
+    mempool: &mut QRunV06PermissionlessMempool,
+    sync_config: QRunV06HistorySyncClientConfig,
+    max_peer_attempts: usize,
+    address_book: &mut crate::qrun_v06_peer_address_manager_candidate::QRunV06PeerAddressBookCandidate,
+) -> Result<QRunV06PermissionlessLaunchReport, QRunV06NodeSupervisorError> {
+    config.validate()?;
+    sync_config
+        .validate()
+        .map_err(|error| QRunV06NodeSupervisorError::BootstrapSync(error.to_string()))?;
+    validate_identity_material(local_static_private_key, network_id, profile_id)?;
+    if !(1..=64).contains(&max_peer_attempts) {
+        return Err(QRunV06NodeSupervisorError::InvalidConfiguration);
+    }
+    validate_qfp6_pinned_bootstrap_peers(bootstrap_peers)?;
+    let startup = runtime
+        .status()
+        .map_err(|error| QRunV06NodeSupervisorError::Runtime(error.to_string()))?;
+    if startup.network_id != *network_id {
+        return Err(QRunV06NodeSupervisorError::NetworkMismatch);
+    }
+    if startup.profile_id != *profile_id {
+        return Err(QRunV06NodeSupervisorError::ProfileMismatch);
+    }
+    let mut bootstrap_report = None;
+    let mut peer_errors = Vec::new();
+    for peer in bootstrap_peers.iter().take(max_peer_attempts) {
+        let address_key = peer.address.to_string();
+        match sync_history_from_pinned_peer_until_complete(
+            peer.address,
+            local_static_private_key,
+            &peer.noise_static_public_key,
+            runtime,
+            authenticator,
+            sync_config,
+        ) {
+            Ok(report) if report.complete => {
+                address_book.record_success(&address_key).map_err(|error| {
+                    QRunV06NodeSupervisorError::BootstrapSync(format!(
+                        "cannot persist peer success state: {error}"
+                    ))
+                })?;
+                bootstrap_report = Some(report);
+                break;
+            }
+            Ok(_) => {
+                address_book
+                    .record_failure(&address_key, system_now_ms()?)
+                    .map_err(|error| {
+                        QRunV06NodeSupervisorError::BootstrapSync(format!(
+                            "cannot persist peer backoff: {error}"
+                        ))
+                    })?;
+                peer_errors.push(format!(
+                    "{} returned without reaching the pinned source tip",
+                    peer.address
+                ));
+            }
+            Err(error) => {
+                address_book
+                    .record_failure(&address_key, system_now_ms()?)
+                    .map_err(|store_error| {
+                        QRunV06NodeSupervisorError::BootstrapSync(format!(
+                            "{error}; additionally failed to persist peer backoff: {store_error}"
+                        ))
+                    })?;
+                peer_errors.push(format!("{}: {error}", peer.address));
+            }
+        }
+    }
+    let bootstrap_sync = bootstrap_report
+        .ok_or_else(|| QRunV06NodeSupervisorError::BootstrapSync(peer_errors.join("; ")))?;
+    let relay_pins: Vec<[u8; 32]> = bootstrap_peers
+        .iter()
+        .map(|peer| peer.noise_static_public_key)
+        .collect();
+    let supervisor = run_qfp6_permissionless_mining_supervisor_open_with_q6ar_candidate(
+        listener,
+        config,
+        local_static_private_key,
+        &relay_pins,
+        network_id,
+        profile_id,
+        shutdown_requested,
+        runtime,
+        authenticator,
+        producer,
+        mempool,
+        address_book,
+    )?;
+    Ok(QRunV06PermissionlessLaunchReport {
+        bootstrap_sync,
+        supervisor,
+    })
+}
+
+/// Startup path that refuses to begin mining until one of the configured statically pinned
+/// peers has completed Q6HI/Q6HR discovery and full bounded canonical-history synchronization.
+/// The same peer key set is then used by the permissionless inbound Noise listener.
+#[allow(clippy::too_many_arguments)]
+pub fn run_qfp6_permissionless_mining_supervisor_with_bootstrap<T: TransactionAuthenticator>(
+    listener: &TcpListener,
+    config: QRunV06PermissionlessMiningSupervisorConfig,
+    local_static_private_key: &[u8; 32],
+    bootstrap_peers: &[QRunV06PinnedBootstrapPeer],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    shutdown_requested: &AtomicBool,
+    runtime: &mut QRunV06PermissionlessNodeRuntime,
+    authenticator: &T,
+    producer: [u8; 32],
+    mempool: &mut QRunV06PermissionlessMempool,
+    sync_config: QRunV06HistorySyncClientConfig,
+) -> Result<QRunV06PermissionlessLaunchReport, QRunV06NodeSupervisorError> {
+    config.validate()?;
+    sync_config
+        .validate()
+        .map_err(|error| QRunV06NodeSupervisorError::BootstrapSync(error.to_string()))?;
+    validate_identity_material(local_static_private_key, network_id, profile_id)?;
+    validate_qfp6_pinned_bootstrap_peers(bootstrap_peers)?;
+    let startup = runtime
+        .status()
+        .map_err(|error| QRunV06NodeSupervisorError::Runtime(error.to_string()))?;
+    if startup.network_id != *network_id {
+        return Err(QRunV06NodeSupervisorError::NetworkMismatch);
+    }
+    if startup.profile_id != *profile_id {
+        return Err(QRunV06NodeSupervisorError::ProfileMismatch);
+    }
+
+    let mut bootstrap_report = None;
+    let mut peer_errors = Vec::new();
+    for peer in bootstrap_peers {
+        match sync_history_from_pinned_peer_until_complete(
+            peer.address,
+            local_static_private_key,
+            &peer.noise_static_public_key,
+            runtime,
+            authenticator,
+            sync_config,
+        ) {
+            Ok(report) if report.complete => {
+                bootstrap_report = Some(report);
+                break;
+            }
+            Ok(_) => peer_errors.push(format!(
+                "{} returned without reaching the pinned source tip",
+                peer.address
+            )),
+            Err(error) => peer_errors.push(format!("{}: {error}", peer.address)),
+        }
+    }
+    let bootstrap_sync = bootstrap_report
+        .ok_or_else(|| QRunV06NodeSupervisorError::BootstrapSync(peer_errors.join("; ")))?;
+    let supervisor = run_qfp6_permissionless_mining_supervisor_open(
+        listener,
+        config,
+        local_static_private_key,
+        network_id,
+        profile_id,
+        shutdown_requested,
+        runtime,
+        authenticator,
+        producer,
+        mempool,
+    )?;
+    Ok(QRunV06PermissionlessLaunchReport {
+        bootstrap_sync,
+        supervisor,
+    })
 }
 
 #[cfg(test)]
@@ -1467,6 +2093,162 @@ mod tests {
     }
 
     #[test]
+    fn cp0604_permissionless_supervisor_mines_and_recovers_durable_genesis_state() {
+        use crate::{
+            consensus::{ConsensusParameters, Uint256},
+            external_cas_anchor_candidate::ExternalCasPin,
+            qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint,
+            qrun_v06_cp0604_supply_candidate::Cp0604FounderControlledSupply,
+            qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
+            qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessNodeRuntime,
+            qrun_v06_permissionless_service_candidate::QRunV06PermissionlessMempool,
+            qrun_v06_profile_pin_candidate::{
+                QRunV06ProfilePinCandidate, QRunV06VerifiedProfilePin,
+            },
+            qrun_v06_tokenomics_candidate::QRunV06MiningScheduleCandidate,
+            qrun_v06_transaction_mempool_candidate::QRunV06MempoolLimits,
+            v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES,
+        };
+        use std::sync::Arc;
+
+        const NETWORK: [u8; 32] = [0xB1; 32];
+        const PROFILE: [u8; 32] = [0xB2; 32];
+        const FOUNDER: [u8; 32] = [0xB3; 32];
+        let mut params = ConsensusParameters::qrun_v06_sha256d_candidate().unwrap();
+        params.target_block_time_secs = 30;
+        params.difficulty_window_blocks = 2;
+        params.difficulty_min_ratio_divisor = 4;
+        params.difficulty_max_ratio = 4;
+        params.initial_target = Uint256::from_be_bytes([0x7F; 32]);
+        params.pow_limit = Uint256::MAX;
+        params.validate().unwrap();
+
+        let schedule = QRunV06MiningScheduleCandidate::cp0422_research_candidate();
+        let supply = Cp0604FounderControlledSupply::genesis(NETWORK, FOUNDER, schedule).unwrap();
+        let descriptor = QRunV06GenesisDescriptor::new(
+            NETWORK,
+            PROFILE,
+            FOUNDER,
+            1,
+            qrun_v06_consensus_fingerprint(&params).unwrap(),
+            supply.policy_fingerprint(),
+        )
+        .unwrap();
+        let genesis = crate::qrun_v06_canonical_execution_candidate::QRunV06CanonicalExecutionState::
+            cp0604_genesis_candidate_with_descriptor(descriptor.clone(), schedule).unwrap();
+        let bundle = QRunV06ProfilePinCandidate::new(
+            descriptor,
+            ExternalCasPin {
+                provider_id: [0xC1; 32],
+                network_id: NETWORK,
+                genesis_digest: [0xC2; 32],
+                receipt_key_id: [0xC3; 32],
+                receipt_public_key: [0xC4; ML_DSA_65_PUBLIC_KEY_BYTES],
+            },
+        )
+        .unwrap();
+        let pin_bytes = bundle.encode().unwrap();
+        let pin_commitment = bundle.commitment().unwrap();
+        let verified_pin = QRunV06VerifiedProfilePin::decode(&pin_bytes, pin_commitment).unwrap();
+
+        let store_dir = std::env::temp_dir().join(format!(
+            "qfp6-cp0604-supervisor-store-{}",
+            std::process::id()
+        ));
+        let mempool_dir = store_dir.with_extension("mempool");
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let _ = std::fs::remove_dir_all(&mempool_dir);
+        let authenticator =
+            QRunV06HybridTransactionAuthenticator::new(LibcruxMlDsa65VerifierCandidate);
+        let mut runtime = QRunV06PermissionlessNodeRuntime::open(
+            &store_dir,
+            genesis.clone(),
+            params.clone(),
+            &authenticator,
+            None,
+            &verified_pin,
+        )
+        .unwrap();
+        let mut mempool =
+            QRunV06PermissionlessMempool::open(&mempool_dir, QRunV06MempoolLimits::default())
+                .unwrap();
+
+        let noise_params = "Noise_XX_25519_ChaChaPoly_SHA256".parse().unwrap();
+        let local_pair = snow::Builder::new(noise_params).generate_keypair().unwrap();
+        let remote_pair = snow::Builder::new("Noise_XX_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let mut local_private = [0u8; 32];
+        let mut remote_public = [0u8; 32];
+        local_private.copy_from_slice(&local_pair.private);
+        remote_public.copy_from_slice(&remote_pair.public);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let signal = shutdown.clone();
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(180));
+            signal.store(true, Ordering::Release);
+        });
+        let mut config = QRunV06PermissionlessMiningSupervisorConfig::default();
+        config.peer.install_os_signal_handler = false;
+        config.peer.max_total_sessions = 8;
+        config.listener_round_timeout = Duration::from_millis(20);
+        config.max_nonce_attempts_per_block = QRUN_V06_MAX_NONCE_ATTEMPTS_PER_JOB;
+
+        let report = run_qfp6_permissionless_mining_supervisor(
+            &listener,
+            config,
+            &local_private,
+            &[remote_public],
+            &NETWORK,
+            &PROFILE,
+            shutdown.as_ref(),
+            &mut runtime,
+            &authenticator,
+            FOUNDER,
+            &mut mempool,
+        )
+        .unwrap();
+        stopper.join().unwrap();
+        local_private.fill(0);
+        let committed = runtime.status().unwrap();
+        assert_eq!(
+            report.stop_reason,
+            QRunV06NodeSupervisorStopReason::ShutdownRequested
+        );
+        assert!(report.blocks_durably_committed >= 1);
+        assert!(report.blocks_became_canonical >= 1);
+        assert!(report.ending_height >= 1);
+        assert_eq!(committed.height, report.ending_height);
+        assert_eq!(committed.network_id, NETWORK);
+        assert_eq!(committed.profile_id, PROFILE);
+        let trusted_manifest_anchor = committed.manifest_anchor;
+        let committed_root = committed.state_root;
+        drop(runtime);
+        drop(mempool);
+
+        let recovered = QRunV06PermissionlessNodeRuntime::open(
+            &store_dir,
+            genesis,
+            params,
+            &authenticator,
+            Some(trusted_manifest_anchor),
+            &verified_pin,
+        )
+        .unwrap();
+        let recovered_status = recovered.status().unwrap();
+        assert_eq!(recovered_status.height, committed.height);
+        assert_eq!(recovered_status.tip, committed.tip);
+        assert_eq!(recovered_status.state_root, committed_root);
+        assert_eq!(
+            recovered_status.manifest_generation,
+            committed.manifest_generation
+        );
+        drop(recovered);
+        std::fs::remove_dir_all(store_dir).unwrap();
+        std::fs::remove_dir_all(mempool_dir).unwrap();
+    }
+    #[test]
     fn supervisor_requires_the_recovery_coordinator_provider_and_genesis_pins_to_match() {
         let state = QRunV06ExternalAnchorState {
             network_id: [3; 32],
@@ -1586,6 +2368,34 @@ mod tests {
     }
 
     #[test]
+    fn pinned_bootstrap_peer_validation_rejects_empty_duplicate_and_zero_keys() {
+        assert_eq!(
+            validate_qfp6_pinned_bootstrap_peers(&[]),
+            Err(QRunV06NodeSupervisorError::InvalidBootstrapPeers)
+        );
+        let first = QRunV06PinnedBootstrapPeer {
+            address: "127.0.0.1:30333".parse().unwrap(),
+            noise_static_public_key: [0x31; 32],
+        };
+        assert_eq!(
+            validate_qfp6_pinned_bootstrap_peers(&[first]),
+            Ok(vec![[0x31; 32]])
+        );
+        assert_eq!(
+            validate_qfp6_pinned_bootstrap_peers(&[first, first]),
+            Err(QRunV06NodeSupervisorError::InvalidBootstrapPeers)
+        );
+        let zero_key = QRunV06PinnedBootstrapPeer {
+            noise_static_public_key: [0; 32],
+            ..first
+        };
+        assert_eq!(
+            validate_qfp6_pinned_bootstrap_peers(&[zero_key]),
+            Err(QRunV06NodeSupervisorError::InvalidBootstrapPeers)
+        );
+    }
+
+    #[test]
     fn supervisor_rejects_zero_or_unbounded_process_session_budgets() {
         let mut config = QRunV06NodeSupervisorConfig::default();
         config.max_total_sessions = 0;
@@ -1646,5 +2456,23 @@ mod tests {
             Err(QRunV06NodeSupervisorError::InvalidIdentity)
         );
         assert!(validate_identity_material(&[1; 32], &[2; 32], &[3; 32]).is_ok());
+    }
+
+    #[test]
+    fn supervisor_statistics_keep_pinned_and_unverified_peer_counts_separate() {
+        let mut total = QRunV06PeerListenerStats::default();
+        add_stats(
+            &mut total,
+            QRunV06PeerListenerStats {
+                authenticated_sessions: 2,
+                unverified_peer_sessions: 3,
+                accepted_connections: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(total.authenticated_sessions, 2);
+        assert_eq!(total.unverified_peer_sessions, 3);
+        assert_eq!(total.accepted_connections, 5);
     }
 }

@@ -138,7 +138,7 @@ pub mod qrun_v06_checkpoint_candidate;
 pub mod qrun_v06_consensus_profile_candidate;
 /// CP-0527 QFP6 bridge from durable segment state to signed external monotonic CAS anchors.
 pub mod qrun_v06_external_anchor_candidate;
-/// Immutable QFP6 Genesis descriptor binding timestamp, profile, consensus and CP-0528 policy.
+/// Immutable QFP6 Genesis descriptor binding timestamp, profile, consensus and versioned policy (CP-0604 for permissionless QFP6).
 pub mod qrun_v06_genesis_descriptor_candidate;
 /// CP-0546 append-only historical Q6TS/Q6PN/Q6QA trust-history and pinned checkpoint verifier candidate.
 pub mod qrun_v06_historical_trust_candidate;
@@ -148,6 +148,8 @@ pub mod qrun_v06_history_sync_service_candidate;
 pub mod qrun_v06_history_sync_wire_candidate;
 /// CP-0580 candidate QFP6 self-contained Ed25519 + ML-DSA-65 transaction authentication; not runtime activated.
 pub mod qrun_v06_hybrid_auth_candidate;
+/// Bitcoin-inspired local two-hour future-time guard for live peer admission only; never for replay.
+pub mod qrun_v06_live_timestamp_policy_candidate;
 /// CP-0569 branch-local QFP6 block-template construction and bounded Argon2id nonce search; caller performs durable QAP1 admission.
 pub mod qrun_v06_miner_candidate;
 /// CP-0547/0550/0551 QFP6 admission, bounded peer ingress/ACK and per-session replay guard; no production listener wiring yet.
@@ -532,7 +534,18 @@ pub mod qrun_v05_runtime_candidate;
 /// Explicit bounded worker/queue daemon candidate for the off-host Anchor Noise transport; not node startup wiring.
 pub mod external_cas_offhost_anchor_noise_daemon_candidate;
 
+/// CP-0603 owner-directed Founder Treasury arithmetic candidate; not yet Genesis/runtime wired.
+pub mod qrun_v06_founder_treasury_policy_candidate;
 /// CP-0590 Genesis-pinned permissionless full-history base admission runtime; no mandatory Q6EA/QAP1 anchor, not yet a public node launcher.
 pub mod qrun_v06_permissionless_runtime_candidate;
 /// CP-0592 permissionless Q6TI journal, native mempool and bounded PoW-to-durable-commit service adapter.
 pub mod qrun_v06_permissionless_service_candidate;
+
+/// CP-0604 versioned 7B founder Genesis / 3B mining-only supply policy candidate; not yet canonical-runtime wired.
+pub mod qrun_v06_cp0604_supply_candidate;
+
+/// Candidate-only bounded, profile-bound durable peer address book; not runtime-wired.
+pub mod qrun_v06_peer_address_manager_candidate;
+
+/// Candidate-only Q6AR network/profile-bound address relay codec; not runtime-wired.
+pub mod qrun_v06_peer_address_relay_candidate;
