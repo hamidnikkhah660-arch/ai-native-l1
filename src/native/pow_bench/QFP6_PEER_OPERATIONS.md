@@ -46,3 +46,12 @@ Before enabling this switch, use the `approve` command above for each independen
 ## Bitcoin-inspired operational rule
 
 Keep discovery, explicit peer authentication, and consensus validation separate. A peer's advertisement is not proof of its identity; a successful pinned handshake is not proof that its chain is canonical. QFP6 still validates imported blocks, PoW, cumulative-work fork choice, and Genesis-rooted state locally.
+
+
+## Fork-aware history synchronization
+
+The QFP6 history client starts from the local fork graph's verified base tip and requests parent-first pages from a pinned Noise peer. The import path accepts a page on any locally known parent branch, not only an extension of the current canonical tip. Repeated/common-prefix blocks are idempotent; a new competing suffix is durably added to the fork archive and local fork choice selects by cumulative work, not advertised height. A partial page failure leaves the valid durable prefix available for restart/resume.
+
+The source pins one immutable Q6HR snapshot across bounded reconnect windows. The responder keeps that snapshot until the final page is encoded, then releases it so the next sync can observe a newer tip. A changed or unavailable snapshot is rejected rather than mixing pages from different source tips. The destination validates every block locally (network/profile, parent links, target, PoW, execution/state root and cumulative work); a pinned Noise identity authenticates the peer transport, not the peer's claim that its chain is globally best.
+
+The integration test exercises two independently opened nodes with the same Genesis and a shared first block, then divergent branches. It syncs the higher-work branch across three separate Noise sessions, checks the reorg and retained sibling branch, then closes/reopens the destination using its trusted manifest anchor and verifies the same canonical tip/state root. This is local protocol qualification, not proof of public-network security or an enabled Mainnet.

@@ -316,6 +316,118 @@ impl QRunV06PermissionlessNodeRuntime {
             resulting_state_root: status.state_root,
         })
     }
+    /// Import a parent-first history segment onto any retained fork-choice branch.
+    /// Unlike `import_history_batch`, the first envelope may extend a known non-canonical
+    /// ancestor. Every block is still committed through the durable fork store, whose
+    /// independent PoW/consensus/execution checks select the canonical branch by cumulative work.
+    /// A failure after one or more successful submits leaves that valid prefix durable; the
+    /// caller resumes from the exact branch tip it received.
+    pub fn import_history_branch_batch<A: TransactionAuthenticator>(
+        &mut self,
+        start_height: u64,
+        expected_parent_consensus_hash: [u8; 32],
+        expected_parent_execution_hash: [u8; 32],
+        envelopes: &[Vec<u8>],
+        authenticator: &A,
+    ) -> Result<QRunV06HistorySyncReport, QRunV06HistorySyncError> {
+        if envelopes.is_empty() {
+            return Err(QRunV06HistorySyncError::EmptyBatch);
+        }
+        if envelopes.len() > QRUN_V06_HISTORY_SYNC_MAX_BATCH_BLOCKS {
+            return Err(QRunV06HistorySyncError::BatchTooLarge);
+        }
+        let initial_graph = self
+            .fork_choice_snapshot()
+            .map_err(|error| QRunV06HistorySyncError::InvalidEnvelope(error.to_string()))?;
+        let parent_tip = initial_graph
+            .tip_for_hash(&expected_parent_consensus_hash)
+            .ok_or(QRunV06HistorySyncError::NonContiguous)?;
+        let parent_state = initial_graph
+            .state_for_tip(&expected_parent_consensus_hash)
+            .ok_or(QRunV06HistorySyncError::NonContiguous)?;
+        if parent_tip.height.checked_add(1) != Some(start_height)
+            || parent_state.tip_hash() != expected_parent_execution_hash
+        {
+            return Err(QRunV06HistorySyncError::NonContiguous);
+        }
+        let params = initial_graph.consensus_parameters().clone();
+        let mut expected_consensus_parent = expected_parent_consensus_hash;
+        let mut expected_execution_parent = expected_parent_execution_hash;
+        let mut expected_height = start_height;
+        let mut total_bytes = 0usize;
+        let mut imported = 0usize;
+
+        for (index, envelope) in envelopes.iter().enumerate() {
+            if envelope.is_empty() || envelope.len() > MAX_QRUN_V06_POW_ENVELOPE_BYTES {
+                return Err(QRunV06HistorySyncError::BatchTooLarge);
+            }
+            total_bytes = total_bytes
+                .checked_add(envelope.len())
+                .ok_or(QRunV06HistorySyncError::BatchTooLarge)?;
+            if total_bytes > QRUN_V06_HISTORY_SYNC_MAX_BATCH_BYTES {
+                return Err(QRunV06HistorySyncError::BatchTooLarge);
+            }
+            let decoded = decode_qrun_v06_pow_block(envelope)
+                .map_err(|error| QRunV06HistorySyncError::InvalidEnvelope(error.to_string()))?;
+            if decoded.header.network_id != self.network_id
+                || decoded.block.network_id != self.network_id
+            {
+                return Err(QRunV06HistorySyncError::WrongNetwork);
+            }
+            if decoded.block.profile_id != self.profile_id {
+                return Err(QRunV06HistorySyncError::WrongProfile);
+            }
+            if decoded.header.height != expected_height
+                || decoded.block.height != expected_height
+                || decoded.header.previous_consensus_hash != expected_consensus_parent
+                || decoded.header.parent_hash != decoded.block.parent_hash
+                || decoded.block.parent_hash != expected_execution_parent
+            {
+                return Err(QRunV06HistorySyncError::NonContiguous);
+            }
+            let next_consensus_parent = pow_digest(&decoded.header, params.pow)
+                .map_err(|error| QRunV06HistorySyncError::InvalidEnvelope(error.to_string()))?;
+            if let Err(error) = self.submit_envelope(envelope, authenticator) {
+                return Err(QRunV06HistorySyncError::ApplyFailed {
+                    index,
+                    committed_blocks: imported,
+                    reason: error.to_string(),
+                });
+            }
+            let graph = self.fork_choice_snapshot().map_err(|error| {
+                QRunV06HistorySyncError::ApplyFailed {
+                    index: index + 1,
+                    committed_blocks: imported + 1,
+                    reason: error.to_string(),
+                }
+            })?;
+            let next_state = graph.state_for_tip(&next_consensus_parent).ok_or_else(|| {
+                QRunV06HistorySyncError::ApplyFailed {
+                    index: index + 1,
+                    committed_blocks: imported + 1,
+                    reason: "durably submitted history block is absent from the fork archive"
+                        .into(),
+                }
+            })?;
+            expected_consensus_parent = next_consensus_parent;
+            expected_execution_parent = next_state.tip_hash();
+            expected_height = expected_height
+                .checked_add(1)
+                .ok_or(QRunV06HistorySyncError::BatchTooLarge)?;
+            imported += 1;
+        }
+
+        let status = self
+            .status()
+            .map_err(|error| QRunV06HistorySyncError::InvalidEnvelope(error.to_string()))?;
+        Ok(QRunV06HistorySyncReport {
+            imported_blocks: imported,
+            resulting_height: status.height,
+            resulting_tip: status.tip,
+            resulting_state_root: status.state_root,
+        })
+    }
+
     /// Return an immutable branch-graph snapshot for mempool validation and mining-template
     /// construction. The durable store remains the sole authority for subsequent commits.
     pub fn fork_choice_snapshot(
