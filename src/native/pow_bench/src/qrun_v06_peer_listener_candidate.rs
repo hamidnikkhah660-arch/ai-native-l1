@@ -115,6 +115,8 @@ pub struct QRunV06PeerListenerStats {
     pub responses_written: usize,
     pub handler_failures: usize,
     pub malformed_responses: usize,
+    /// Rejected Q6AR advertisements. These are peer input failures, not node-fatal handler errors.
+    pub q6ar_rejections: usize,
     pub sessions_closed: usize,
 }
 
@@ -625,6 +627,41 @@ pub fn serve_qfp6_noise_listener_with_history_and_q6ar<F, G>(
     network_id: &[u8; 32],
     profile_id: &[u8; 32],
     shutdown: &AtomicBool,
+    on_q6ar: G,
+    on_application_frame: F,
+) -> Result<QRunV06PeerListenerReport, QRunV06PeerListenerError>
+where
+    F: FnMut(&mut QRunV06PeerReplayGuard, &[u8]) -> Result<Vec<Vec<u8>>, String>,
+    G: FnMut(
+        crate::qrun_v06_peer_address_relay_candidate::Q6arReceivedAdvertisement,
+    ) -> Result<(), String>,
+{
+    serve_qfp6_noise_listener_with_history_and_q6ar_relay_pins(
+        listener,
+        config,
+        local_static_private_key,
+        trusted_remote_static_public_keys,
+        &[],
+        network_id,
+        profile_id,
+        shutdown,
+        on_q6ar,
+        on_application_frame,
+    )
+}
+
+/// Q6AR-aware candidate listener with a separate optional relay-key allow-list. Inbound
+/// permissionless sessions are still accepted anonymously; only sessions whose Noise static key
+/// matches this allow-list are marked as pinned for Q6AR provenance.
+pub fn serve_qfp6_noise_listener_with_history_and_q6ar_relay_pins<F, G>(
+    listener: &TcpListener,
+    config: QRunV06PeerListenerConfig,
+    local_static_private_key: &[u8; 32],
+    trusted_remote_static_public_keys: &[[u8; 32]],
+    q6ar_relay_static_public_key_pins: &[[u8; 32]],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    shutdown: &AtomicBool,
     mut on_q6ar: G,
     mut on_application_frame: F,
 ) -> Result<QRunV06PeerListenerReport, QRunV06PeerListenerError>
@@ -649,6 +686,9 @@ where
     config.validate()?;
     if !trusted_remote_static_public_keys.is_empty() {
         validate_peer_pins(trusted_remote_static_public_keys)?;
+    }
+    if !q6ar_relay_static_public_key_pins.is_empty() {
+        validate_peer_pins(q6ar_relay_static_public_key_pins)?;
     }
     if local_static_private_key.iter().all(|byte| *byte == 0)
         || network_id.iter().all(|byte| *byte == 0)
@@ -698,11 +738,12 @@ where
             continue;
         }
         let session = if trusted_remote_static_public_keys.is_empty() {
-            QRunV06NoiseSession::accept_unpinned(
+            QRunV06NoiseSession::accept_unpinned_with_optional_pins(
                 &mut stream,
                 local_static_private_key,
                 network_id,
                 profile_id,
+                q6ar_relay_static_public_key_pins,
             )
         } else {
             QRunV06NoiseSession::accept(
@@ -738,7 +779,7 @@ where
             };
             if frame.get(..4) == Some(&Q6AR_MAGIC) {
                 if q6ar_seen || frame.len() > Q6AR_MAX_FRAME_BYTES {
-                    stats.handler_failures += 1;
+                    stats.q6ar_rejections += 1;
                     break;
                 }
                 q6ar_seen = true;
@@ -754,13 +795,13 @@ where
                     Ok(advertisement) => {
                         stats.requests_received += 1;
                         if on_q6ar(advertisement).is_err() {
-                            stats.handler_failures += 1;
+                            stats.q6ar_rejections += 1;
                             break;
                         }
                         continue;
                     }
                     Err(_) => {
-                        stats.handler_failures += 1;
+                        stats.q6ar_rejections += 1;
                         break;
                     }
                 }
@@ -1556,10 +1597,11 @@ mod tests {
             let mut config = QRunV06PeerListenerConfig::default();
             config.max_sessions = 1;
             config.max_requests_per_session = 2;
-            serve_qfp6_noise_listener_with_history_and_q6ar(
+            serve_qfp6_noise_listener_with_history_and_q6ar_relay_pins(
                 &listener,
                 config,
                 &server_private,
+                &[],
                 &[client_public],
                 &NETWORK,
                 &PROFILE,
@@ -1619,7 +1661,8 @@ mod tests {
             [0x44; 32]
         );
         assert_eq!(report.stats.requests_received, 1);
-        assert_eq!(report.stats.handler_failures, 1);
+        assert_eq!(report.stats.q6ar_rejections, 1);
+        assert_eq!(report.stats.handler_failures, 0);
     }
 
     #[test]

@@ -262,6 +262,28 @@ impl QRunV06NoiseSession {
             profile_id: *profile_id,
         })
     }
+
+    /// Accept an anonymous Noise XX peer while marking its static key as pinned only when it
+    /// matches an operator-provided allow-list. Nonmatching peers remain accepted but unverified,
+    /// so the caller can preserve permissionless ingress without granting trust to advertisements.
+    pub fn accept_unpinned_with_optional_pins(
+        stream: &mut TcpStream,
+        local_static_private_key: &[u8; 32],
+        network_id: &[u8; 32],
+        profile_id: &[u8; 32],
+        trusted_remote_static_public_keys: &[[u8; 32]],
+    ) -> Result<Self, QRunV06NoiseError> {
+        if !trusted_remote_static_public_keys.is_empty() {
+            validate_trust_set(trusted_remote_static_public_keys)?;
+        }
+        let mut session =
+            Self::accept_unpinned(stream, local_static_private_key, network_id, profile_id)?;
+        session.remote_static_key_pinned = trusted_remote_static_public_keys
+            .iter()
+            .any(|key| key == &session.remote_static_public_key);
+        Ok(session)
+    }
+
     /// Encrypt one bounded QFP6 application record with a five-second absolute deadline.
     pub fn write_record(
         &mut self,
@@ -746,11 +768,12 @@ mod tests {
         let (listener, address) = listener();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut session = QRunV06NoiseSession::accept_unpinned(
+            let mut session = QRunV06NoiseSession::accept_unpinned_with_optional_pins(
                 &mut stream,
                 &server_private,
                 &NETWORK,
                 &PROFILE,
+                &[[0x77; 32]],
             )
             .unwrap();
             assert!(!session.remote_static_key_pinned());

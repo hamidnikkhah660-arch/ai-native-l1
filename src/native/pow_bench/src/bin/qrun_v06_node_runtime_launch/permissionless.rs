@@ -11,10 +11,13 @@ use ai_native_l1_pow_bench::{
     qrun_v06_hybrid_auth_candidate::QRunV06HybridTransactionAuthenticator,
     qrun_v06_node_supervisor_candidate::{
         run_qfp6_permissionless_mining_supervisor_open,
+        run_qfp6_permissionless_mining_supervisor_open_with_q6ar_candidate,
         run_qfp6_permissionless_mining_supervisor_with_bootstrap,
+        run_qfp6_permissionless_mining_supervisor_with_bootstrap_and_q6ar_candidate,
         validate_qfp6_pinned_bootstrap_peers, QRunV06PermissionlessMiningSupervisorConfig,
         QRunV06PinnedBootstrapPeer,
     },
+    qrun_v06_peer_address_manager_candidate::{PeerAddressSource, QRunV06PeerAddressBookCandidate},
     qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessNodeRuntime,
     qrun_v06_permissionless_service_candidate::QRunV06PermissionlessMempool,
     qrun_v06_profile_pin_candidate::QRunV06VerifiedProfilePin,
@@ -173,6 +176,16 @@ fn load_peers(
     Ok(peers)
 }
 
+fn q6ar_candidate_address_book_enabled(cfg: &Value) -> Result<bool, String> {
+    match cfg.get("enable_q6ar_candidate_address_book") {
+        None => Ok(false),
+        Some(Value::Bool(enabled)) => Ok(*enabled),
+        Some(_) => Err(
+            "permissionless_runtime.enable_q6ar_candidate_address_book must be a boolean".into(),
+        ),
+    }
+}
+
 fn trusted_manifest_anchor(cfg: &Value, data_dir: &Path) -> Result<Option<[u8; 32]>, String> {
     let manifests = data_dir.join("manifests");
     let entries = match fs::symlink_metadata(&manifests) {
@@ -290,6 +303,52 @@ pub fn run_permissionless_node(
         req(cfg, "bootstrap_peers_sha256")?,
     )?;
     let peers = load_peers(&peer_path, peer_sha)?;
+    let enable_q6ar_candidate = q6ar_candidate_address_book_enabled(cfg)?;
+    let mut q6ar_address_book = if enable_q6ar_candidate {
+        let address_book_path = path(base, cfg, "q6ar_candidate_address_book_path")?;
+        if address_book_path == data_dir
+            || address_book_path.starts_with(&data_dir)
+            || data_dir.starts_with(&address_book_path)
+            || address_book_path == mempool_dir
+            || address_book_path.starts_with(&mempool_dir)
+            || mempool_dir.starts_with(&address_book_path)
+        {
+            return Err("Q6AR candidate address-book path must be separate from data and mempool directories".into());
+        }
+        let mut book = QRunV06PeerAddressBookCandidate::open(
+            &address_book_path,
+            descriptor.network_id(),
+            descriptor.profile_id(),
+        )
+        .map_err(|error| format!("Q6AR candidate address-book open failed: {error}"))?;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("system clock invalid for Q6AR address book: {error}"))?
+            .as_millis()
+            .try_into()
+            .map_err(|_| "system clock exceeds Q6AR millisecond range".to_string())?;
+        for peer in &peers {
+            book.upsert(
+                &peer.address.to_string(),
+                PeerAddressSource::Bootstrap,
+                now_ms,
+            )
+            .map_err(|error| {
+                format!("cannot seed Q6AR address book from pinned bootstrap peer: {error}")
+            })?;
+        }
+        Some(book)
+    } else {
+        None
+    };
+    let q6ar_relay_pins: Vec<[u8; 32]> = if enable_q6ar_candidate {
+        peers
+            .iter()
+            .map(|peer| peer.noise_static_public_key)
+            .collect()
+    } else {
+        Vec::new()
+    };
     let listen = endpoint(
         "permissionless_runtime.listen_address",
         req(cfg, "listen_address")?,
@@ -354,37 +413,83 @@ pub fn run_permissionless_node(
     println!("listener={listen}");
     println!("bootstrap_peer_count={}", peers.len());
     println!("Q6TS=NOT_REQUIRED; Provider=NOT_REQUIRED; Q6EA=NOT_REQUIRED; QAP1=NOT_REQUIRED");
+    if let Some(book) = q6ar_address_book.as_ref() {
+        println!("q6ar_candidate_address_book=ENABLED");
+        println!("q6ar_candidate_records_at_start={}", book.records().count());
+        println!("q6ar_pinned_relay_count={}", q6ar_relay_pins.len());
+        println!("q6ar_advertised_keys_auto_trusted=false");
+        println!("q6ar_discovered_peers_auto_connected=false");
+    } else {
+        println!("q6ar_candidate_address_book=DISABLED_DEFAULT");
+    }
     let supervisor_report = if peers.is_empty() {
         println!("bootstrap_mode=GENESIS_ROOTED_NO_SEED_PEERS");
-        run_qfp6_permissionless_mining_supervisor_open(
-            &listener,
-            supervisor_config,
-            &local_key,
-            &descriptor.network_id(),
-            &descriptor.profile_id(),
-            &shutdown,
-            &mut runtime,
-            &authenticator,
-            producer,
-            &mut mempool,
-        )
-        .map_err(|e| format!("permissionless open-network supervisor stopped: {e}"))?
+        if let Some(book) = q6ar_address_book.as_mut() {
+            run_qfp6_permissionless_mining_supervisor_open_with_q6ar_candidate(
+                &listener,
+                supervisor_config,
+                &local_key,
+                &q6ar_relay_pins,
+                &descriptor.network_id(),
+                &descriptor.profile_id(),
+                &shutdown,
+                &mut runtime,
+                &authenticator,
+                producer,
+                &mut mempool,
+                book,
+            )
+            .map_err(|e| format!("permissionless open-network/Q6AR supervisor stopped: {e}"))?
+        } else {
+            run_qfp6_permissionless_mining_supervisor_open(
+                &listener,
+                supervisor_config,
+                &local_key,
+                &descriptor.network_id(),
+                &descriptor.profile_id(),
+                &shutdown,
+                &mut runtime,
+                &authenticator,
+                producer,
+                &mut mempool,
+            )
+            .map_err(|e| format!("permissionless open-network supervisor stopped: {e}"))?
+        }
     } else {
-        let report = run_qfp6_permissionless_mining_supervisor_with_bootstrap(
-            &listener,
-            supervisor_config,
-            &local_key,
-            &peers,
-            &descriptor.network_id(),
-            &descriptor.profile_id(),
-            &shutdown,
-            &mut runtime,
-            &authenticator,
-            producer,
-            &mut mempool,
-            QRunV06HistorySyncClientConfig::default(),
-        )
-        .map_err(|e| format!("permissionless bootstrap/supervisor stopped: {e}"))?;
+        let report = if let Some(book) = q6ar_address_book.as_mut() {
+            run_qfp6_permissionless_mining_supervisor_with_bootstrap_and_q6ar_candidate(
+                &listener,
+                supervisor_config,
+                &local_key,
+                &peers,
+                &descriptor.network_id(),
+                &descriptor.profile_id(),
+                &shutdown,
+                &mut runtime,
+                &authenticator,
+                producer,
+                &mut mempool,
+                QRunV06HistorySyncClientConfig::default(),
+                book,
+            )
+            .map_err(|e| format!("permissionless bootstrap/Q6AR supervisor stopped: {e}"))?
+        } else {
+            run_qfp6_permissionless_mining_supervisor_with_bootstrap(
+                &listener,
+                supervisor_config,
+                &local_key,
+                &peers,
+                &descriptor.network_id(),
+                &descriptor.profile_id(),
+                &shutdown,
+                &mut runtime,
+                &authenticator,
+                producer,
+                &mut mempool,
+                QRunV06HistorySyncClientConfig::default(),
+            )
+            .map_err(|e| format!("permissionless bootstrap/supervisor stopped: {e}"))?
+        };
         println!(
             "permissionless_bootstrap_complete={}",
             report.bootstrap_sync.complete
@@ -411,9 +516,26 @@ pub fn run_permissionless_node(
 #[cfg(test)]
 mod tests {
     use super::{
-        endpoint, load_peers, validate_permissionless_cp0604_genesis,
-        validate_public_listener_opt_in,
+        endpoint, load_peers, q6ar_candidate_address_book_enabled,
+        validate_permissionless_cp0604_genesis, validate_public_listener_opt_in,
     };
+
+    #[test]
+    fn q6ar_address_book_is_opt_in_and_rejects_non_boolean_flags() {
+        assert!(!q6ar_candidate_address_book_enabled(&serde_json::json!({})).unwrap());
+        assert!(q6ar_candidate_address_book_enabled(
+            &serde_json::json!({"enable_q6ar_candidate_address_book": true})
+        )
+        .unwrap());
+        assert!(!q6ar_candidate_address_book_enabled(
+            &serde_json::json!({"enable_q6ar_candidate_address_book": false})
+        )
+        .unwrap());
+        assert!(q6ar_candidate_address_book_enabled(
+            &serde_json::json!({"enable_q6ar_candidate_address_book": "true"})
+        )
+        .is_err());
+    }
 
     #[test]
     fn permissionless_genesis_rejects_legacy_cp0528_and_accepts_only_cp0604_7b3b() {
