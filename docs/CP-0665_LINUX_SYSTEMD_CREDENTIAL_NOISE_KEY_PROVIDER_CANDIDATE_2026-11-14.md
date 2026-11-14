@@ -4,7 +4,7 @@ Date: 2026-11-14
 Project: AI-NATIVE L1 / QZXB / QFP6
 Branch: `feat/cp0600-bootstrap-sync-startup`
 Base documentation commit: `6184f35`
-Status: **candidate implementation added; Windows regression/build checks PASS; Linux-native compilation and host+TPM2 service qualification remain OPEN**
+Status: **candidate implementation added; Windows and WSL-native Linux compile/targeted filesystem checks PASS; native Ubuntu seed + hardware TPM2/service qualification remain OPEN**
 
 ## 1. Purpose
 
@@ -28,7 +28,7 @@ Files changed in the existing working tree:
 ### Linux systemd credential path
 
 - A distinct NPK2 payload was added: magic, version, 32-byte network ID, and exactly 32 nonzero Noise private-key bytes.
-- Provisioning calls the fixed `/usr/bin/systemd-creds` executable with `encrypt --with-key=host+tpm2 --name=<credential-id> - -`. The output-path validator requires effective UID 0 before this command can be reached; no host-only or null-key downgrade is attempted.
+- Provisioning calls the fixed `/usr/bin/systemd-creds` executable with `encrypt --with-key=host+tpm2 --tpm2-pcrs=7 --name=<credential-id> - -`. PCR 7 is made explicit rather than relying on the systemd 255 default. The output-path validator requires effective UID 0 before this command can be reached; no host-only or null-key downgrade is attempted.
 - The plaintext payload is passed through stdin, not command-line arguments or a plaintext key file, and is zeroized after the encryption attempt.
 - No host-only or null-encryption fallback is used. If systemd-creds, host+TPM2 access, or the protected output path requirements are unavailable, provisioning fails closed.
 - Encrypted output is atomically persisted under an absolute root-owned, non-symlink, non-group/world-writable parent directory. The temporary/output file is created with mode 0600.
@@ -37,6 +37,38 @@ Files changed in the existing working tree:
 - Missing credential directory, missing credential, invalid reference, wrong network, malformed envelope, or unsupported platform are rejected. There is no plaintext fallback.
 
 The provisioner now prints only the protected-file path, public network ID, public Noise static key, protection mode, runtime reference, and the corresponding systemd directive. It never prints or accepts the generated private key.
+
+### Intended system-service wiring (template; not installed)
+
+For a system service running under a dedicated unprivileged account, the encrypted file and the runtime reference must be distinct:
+
+- Encrypted, root-managed file: `/etc/credstore.encrypted/qfp6-noise-static-key`
+- QFP6 runtime config value for `node_noise_private_key_path`: `/systemd-credential/qfp6-noise-static-key`
+
+A minimal systemd service drop-in shape is:
+
+```ini
+[Service]
+User=qfp6
+Group=qfp6
+LoadCredentialEncrypted=qfp6-noise-static-key:/etc/credstore.encrypted/qfp6-noise-static-key
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+```
+
+The unit must also grant write access only to the specific durable QFP6 state directories it needs; the state path was deliberately not guessed here. systemd 255 documents that encrypted credentials are decrypted/authenticated by the service manager, exposed read-only through `$CREDENTIALS_DIRECTORY`, and accessible to the unit's `User=` identity. It also automatically adds `/dev/tpmrm0` access needed for `LoadCredentialEncrypted=` when the relevant device restrictions are enabled. This template has not been installed or tested on a real seed host.
+
+The encrypted credential is intentionally bound to both the original host installation and its TPM2 device. PCR 7 is explicitly selected; firmware/Secure Boot measurement changes may therefore make an existing credential undecryptable. Replacing the TPM or reinstalling the OS also requires a controlled key-rotation/reprovision procedure and a new public bootstrap pin. Do not copy one seed's encrypted credential to another seed or weaken the policy to recover it.
+
+The operator should provision the encrypted file as root using the Linux build of `noise_key_provisioner`, verify the printed public key/fingerprint out-of-band, set the runtime config to the virtual reference above, validate the config/package digest, then run `systemd-analyze verify` and inspect the effective unit before starting it. No service-start command is part of this candidate checkpoint.
+
+### Additional source hardening
+
+The Linux output-path validator now walks every directory component from `/` to the encrypted file's parent and requires each to be a real root-owned directory without group/world write permission. This closes the weaker case where a secure-looking final directory could sit beneath an untrusted writable ancestor.
 
 ## 3. Local validation actually completed
 
@@ -49,7 +81,19 @@ Windows development worktree:
 | `cargo fmt -- --check` | PASS |
 | `git diff --check` | PASS |
 
-The five targeted unit tests include the existing Windows DPAPI tests plus NPK2 reference/payload tests for safe credential IDs, network binding, successful payload zeroization, and wrong-network/version/key/magic/length rejection.
+The Windows target preserves the NPK1/DPAPI round-trip, network-binding, zero-key and corrupt-envelope cases. The NPK2 pure validation helpers are also exercised on Windows for safe credential IDs, network binding, version/key/magic/length rejection and payload zeroization.
+
+Linux-native development worktree (Ubuntu 26.04.1 LTS under WSL2, Rust/Cargo 1.82.0):
+
+| Check | Result |
+|---|---:|
+| `cargo check --lib --locked` | PASS |
+| `cargo test --lib noise_key_provisioning::tests --locked` | 5 passed, 0 failed |
+| `cargo check --bins --locked` | PASS, exit 0 |
+
+The Linux-target test set includes the actual filesystem loader integration test: an owner-only read-only credential file is accepted; wrong network, hardlink, symlink, writable file mode and overly accessible credential directory are rejected. Pure NPK2 validation also rejects wrong version, zero key, wrong magic and truncated data. The test payload is synthetic and the test does not invoke TPM2 or provision a real credential.
+
+Windows formatting and whitespace checks were rerun after the final test-fixture edit: `cargo fmt -- --check` and `git diff --check` both PASS. The subsequent Linux filesystem run, fixture correction, and exact Linux command results are recorded in CP-0666.
 
 WSL development smoke only:
 
@@ -58,25 +102,25 @@ WSL development smoke only:
 - A user-scoped host-key-only test credential round-trip succeeded. This was a harmless test string, not a Noise key, and does not validate the intended system-scope host+TPM2 provider.
 - No `/dev/tpm*` device was exposed to this WSL environment. The systemd TPM probe (`systemd-analyze has-tpm2`; the `systemd-creds has-tpm2` alias redirected to it) returned `partial`, with firmware, driver, subsystem and required TPM2 libraries unavailable (exit 27).
 - A system-scope host+TPM2 attempt from the unprivileged WSL user returned `InteractiveAuthenticationRequired`; it did not establish a successful TPM-backed encryption/decryption test.
-- WSL has no Cargo executable. The Windows Rust sysroot currently has only `wasm32-unknown-unknown` and `x86_64-pc-windows-msvc` targets installed; no Linux target is installed.
+- A separate Linux Rust 1.82.0 toolchain was installed inside Ubuntu WSL for development; its CARGO_HOME and build artifacts are on D:. The existing Windows Rust toolchain was left unchanged.
 
 ## 4. Explicit unverified items
 
-The Linux-specific `cfg(target_os = "linux")` source has **not yet been compiled for Linux** in this environment. The passing Cargo test/build results above are Windows-target results; pure NPK2 validation helpers are compiled into the Windows test target, but that is not a substitute for building the Linux-only filesystem and process code.
+The Linux-specific `cfg(target_os = "linux")` source has now been compiled natively on Ubuntu 26.04.1 WSL2 with Rust 1.82.0, including successful `cargo check --lib`, targeted runtime/filesystem tests, and `cargo check --bins`. This is meaningful Linux compile and WSL filesystem evidence, but **it is not native Ubuntu 24.04 host qualification and does not prove hardware TPM2/host+tpm2 encryption, systemd service delivery, or a production seed restart**. WSL exposed no usable TPM2 device.
 
 Still required before this provider can be considered qualified:
 
-1. Compile and run the provider tests on a native Ubuntu 24.04 LTS x86_64 host with the exact systemd version selected for the seed.
-2. Confirm the host exposes a usable TPM2 device and that systemd's host+TPM2 encryption works without prompting or fallback.
-3. Provision a disposable test key locally as root into a root-owned encrypted credential store, then verify the service manager's `LoadCredentialEncrypted=` delivery and actual `$CREDENTIALS_DIRECTORY` ownership/mode/path.
-4. Start and restart a disposable service under its intended unprivileged service account; verify the same public key is derived after restart without exposing private material.
-5. Run negative tests on Linux for missing credential directory, symlink/path substitution, wrong network, wrong version, malformed/truncated payload, zero key, invalid permissions, and unavailable TPM2.
-6. Review the exact systemd unit hardening, credential recovery/rotation procedure and TPM/OS reinstall recovery policy before provisioning either independent seed.
+1. Run the same provider tests on a native Ubuntu 24.04 LTS x86_64 host with the exact systemd version selected for the seed.
+2. Confirm that the host exposes a usable TPM2 device and that systemd's host+TPM2 encryption with PCR 7 works non-interactively without any host-only/null fallback.
+3. Provision only a disposable test key as root into a root-owned encrypted credential store; verify systemd `LoadCredentialEncrypted=` delivery and the actual `$CREDENTIALS_DIRECTORY` ownership/mode/path for the intended unprivileged service account.
+4. Start and restart a disposable service; verify that the same public key is derived after restart without exposing private material.
+5. Add/run native-host negative tests for absent credential directory, missing credential, path substitution, wrong network/version, malformed payload, zero key, invalid owner/modes and TPM2 unavailability. WSL currently verifies the loader filesystem rules and NPK2 parser, but not TPM2 failure inside a real system service.
+6. Review unit sandboxing, state-directory write grants, credential rotation and TPM/OS reinstall recovery before provisioning either independent seed.
 
 systemd documentation describes `host+tpm2` as requiring both the original TPM2 chip and the host installation, and documents `LoadCredentialEncrypted=`/ `$CREDENTIALS_DIRECTORY` as the service credential delivery path. References:
 
 - https://www.freedesktop.org/software/systemd/man/255/systemd-creds.html
-- https://www.freedesktop.org/software/systemd/man/250/systemd.exec.html
+- https://www.freedesktop.org/software/systemd/man/255/systemd.exec.html
 - https://github.com/systemd/systemd/blob/main/docs/CREDENTIALS.md
 
 ## 5. Release boundary
