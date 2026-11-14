@@ -33,7 +33,7 @@ Files changed in the existing working tree:
 - No host-only or null-encryption fallback is used. If systemd-creds, host+TPM2 access, or the protected output path requirements are unavailable, provisioning fails closed.
 - Encrypted output is atomically persisted under an absolute root-owned, non-symlink, non-group/world-writable parent directory. The temporary/output file is created with mode 0600.
 - The Linux runtime configuration uses an explicit virtual reference `/systemd-credential/<credential-id>`. The systemd unit operator must map the encrypted file through `LoadCredentialEncrypted=<credential-id>:<encrypted-file-path>`.
-- Runtime loading is permitted only from the service-provided `$CREDENTIALS_DIRECTORY`. The loader checks the credential path and directory, symlink/hardlink conditions, owner, file mode, exact payload length, NPK2 version, nonzero key, and network ID. It opens the credential with no-follow and close-on-exec flags, verifies the opened inode against the pre-open metadata, and zeroizes the payload buffer.
+- Runtime loading is permitted only from the service-provided `$CREDENTIALS_DIRECTORY`. The loader checks the credential path and directory, symlink/hardlink conditions, owner, access mode/ACL, exact payload length, NPK2 version, nonzero key, and network ID. It uses no-follow and close-on-exec flags and zeroizes the payload buffer. CP-0667 adds strict support for both systemd v255's root-owned POSIX ACL delivery form (directory/file mode 0550/0440, one named service-UID grant) and its no-ACL service-owned fallback (0500/0400).
 - Missing credential directory, missing credential, invalid reference, wrong network, malformed envelope, or unsupported platform are rejected. There is no plaintext fallback.
 
 The provisioner now prints only the protected-file path, public network ID, public Noise static key, protection mode, runtime reference, and the corresponding systemd directive. It never prints or accepts the generated private key.
@@ -76,7 +76,7 @@ Windows development worktree:
 
 | Check | Result |
 |---|---:|
-| `cargo test --lib noise_key_provisioning::tests --locked --offline` | 5 passed, 0 failed |
+| `cargo test --lib noise_key_provisioning::tests --locked --offline` | 7 passed, 0 failed |
 | `cargo check --bins --locked --offline` | PASS, exit 0 |
 | `cargo fmt -- --check` | PASS |
 | `git diff --check` | PASS |
@@ -88,10 +88,10 @@ Linux-native development worktree (Ubuntu 26.04.1 LTS under WSL2, Rust/Cargo 1.8
 | Check | Result |
 |---|---:|
 | `cargo check --lib --locked` | PASS |
-| `cargo test --lib noise_key_provisioning::tests --locked` | 5 passed, 0 failed |
+| `cargo test --lib noise_key_provisioning::tests --locked` | 7 passed, 0 failed, 2 ignored (both systemd integrations separately run; see CP-0667) |
 | `cargo check --bins --locked` | PASS, exit 0 |
 
-The Linux-target test set includes the actual filesystem loader integration test: an owner-only read-only credential file is accepted; wrong network, hardlink, symlink, writable file mode and overly accessible credential directory are rejected. Pure NPK2 validation also rejects wrong version, zero key, wrong magic and truncated data. The test payload is synthetic and the test does not invoke TPM2 or provision a real credential.
+The Linux-target test set includes the filesystem loader integration test: an owner-only read-only credential file is accepted; wrong network, hardlink, symlink, writable file mode and overly accessible credential directory are rejected. Pure NPK2 validation rejects wrong version, zero key, wrong magic and truncated data. CP-0667 additionally exercises (1) a root-owned POSIX ACL directory/file fixture as the unprivileged service UID and (2) the production loader inside a real transient WSL systemd service using plain `LoadCredential=`. All payloads are synthetic; these tests do not invoke TPM2 or provision a real encrypted credential.
 
 Windows formatting and whitespace checks were rerun after the final test-fixture edit: `cargo fmt -- --check` and `git diff --check` both PASS. The subsequent Linux filesystem run, fixture correction, and exact Linux command results are recorded in CP-0666.
 
@@ -106,7 +106,7 @@ WSL development smoke only:
 
 ## 4. Explicit unverified items
 
-The Linux-specific `cfg(target_os = "linux")` source has now been compiled natively on Ubuntu 26.04.1 WSL2 with Rust 1.82.0, including successful `cargo check --lib`, targeted runtime/filesystem tests, and `cargo check --bins`. This is meaningful Linux compile and WSL filesystem evidence, but **it is not native Ubuntu 24.04 host qualification and does not prove hardware TPM2/host+tpm2 encryption, systemd service delivery, or a production seed restart**. WSL exposed no usable TPM2 device.
+The Linux-specific `cfg(target_os = "linux")` source has been compiled on Ubuntu 26.04.1 WSL2 with Rust 1.82.0, including library/binary checks and direct filesystem tests for the owner-only and root-owned ACL forms (details in CP-0666 and CP-0667). This is Linux compilation, WSL filesystem evidence, and plain `LoadCredential=` service-delivery evidence, but **it is not native Ubuntu 24.04 host qualification and does not prove `LoadCredentialEncrypted=` delivery with host+TPM2, hardware TPM2 encryption, or a production seed restart**. WSL exposed no usable TPM2 device.
 
 Still required before this provider can be considered qualified:
 
@@ -122,6 +122,7 @@ systemd documentation describes `host+tpm2` as requiring both the original TPM2 
 - https://www.freedesktop.org/software/systemd/man/255/systemd-creds.html
 - https://www.freedesktop.org/software/systemd/man/255/systemd.exec.html
 - https://github.com/systemd/systemd/blob/main/docs/CREDENTIALS.md
+- systemd v255 credential ACL implementation details and Linux validation: see CP-0667.
 
 ## 5. Release boundary
 

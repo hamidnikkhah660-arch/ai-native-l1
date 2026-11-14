@@ -4,8 +4,8 @@ Date: 2026-11-14
 Project: AI-NATIVE L1 / QZXB / QFP6
 Branch: `feat/cp0600-bootstrap-sync-startup`
 Base HEAD: `88601bf docs: record TPM probe and systemd 255 provider boundary`
-Related: CP-0657, CP-0655, CP-0665
-Status: **Linux source/build and WSL filesystem tests PASS; hardware TPM2 and production systemd service qualification remain OPEN**
+Related: CP-0657, CP-0655, CP-0665, CP-0667
+Status: **Initial no-ACL Linux filesystem path PASS; systemd ACL-capable path additionally verified in CP-0667; hardware TPM2 and production systemd service qualification remain OPEN**
 
 ## 1. Scope
 
@@ -19,12 +19,12 @@ The test calls the production loader helper `load_systemd_credential_from_direct
 
 The tested acceptance/rejection behavior is:
 
-- A service-owned, private credential directory with mode 0500 and a single regular credential file with mode 0400 is accepted; the decoded key matches the synthetic fixture.
+- The no-ACL fallback path is accepted: a service-owned, private credential directory with mode 0500 and a single regular credential file with mode 0400. The decoded key matches the synthetic fixture.
 - A network-ID mismatch returns `NetworkMismatch`.
 - A hard-linked credential is rejected because link count is not exactly one.
 - A symlink credential path is rejected.
 - A credential file with mode 0600 is rejected.
-- A credential directory with group access (mode 0550) is rejected.
+- A service-owned directory with mode 0550 and no matching systemd ACL is rejected. This does not cover systemd's root-owned ACL mode 0550; that separate form was discovered and verified later in CP-0667.
 - Pure payload tests additionally reject wrong version, zero key, incorrect magic and truncated payload, and verify that successful decode zeroizes the mutable payload buffer.
 - A Linux non-Windows test verifies DPAPI calls fail closed.
 
@@ -32,7 +32,7 @@ The tested acceptance/rejection behavior is:
 
 The first Linux run returned 4 passed / 1 failed. The loader rejected the test directory because the fixture had mode 0700, which includes the owner's write bit. This is the intended fail-closed behavior for a read-only systemd credential directory; the fixture, not the loader, was inconsistent with the intended systemd contract.
 
-The fixture was corrected to use mode 0500 for acceptance tests. It temporarily switches to 0700 only while creating/removing test hardlinks/symlinks, then restores 0500 before invoking the loader. The second Linux run passed all five targeted tests.
+The fixture was corrected to use mode 0500 for acceptance tests. It temporarily switches to 0700 only while creating/removing test hardlinks/symlinks, then restores 0500 before invoking the loader. The second Linux run passed all five targeted tests. This checkpoint established the no-ACL fallback form; a later source review found that systemd v255 can instead use root-owned POSIX ACLs on ACL-capable filesystems. CP-0667 documents and tests that additional supported form.
 
 ## 3. Exact validation results
 
@@ -82,4 +82,4 @@ On an actual Ubuntu 24.04 LTS x86_64 host with a usable TPM2 device:
 
 ## 6. Repository handling
 
-The Linux provider source and provisioner source remain uncommitted in the pre-existing dirty worktree. Only this checkpoint and the documentation update to CP-0665 are intended for the documentation commit. No broad source staging, reset, push, deployment or service launch is part of CP-0666.
+The Linux provider source and provisioner source remain uncommitted in the pre-existing dirty worktree. This checkpoint, the CP-0665 update, and the CP-0667 ACL follow-up are documentation-only records; the provider source remains uncommitted. No broad source staging, reset, push, deployment or service launch is part of CP-0666.
