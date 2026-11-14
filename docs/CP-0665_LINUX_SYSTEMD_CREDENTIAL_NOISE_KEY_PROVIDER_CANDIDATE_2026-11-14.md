@@ -28,7 +28,7 @@ Files changed in the existing working tree:
 ### Linux systemd credential path
 
 - A distinct NPK2 payload was added: magic, version, 32-byte network ID, and exactly 32 nonzero Noise private-key bytes.
-- Provisioning calls the fixed `/usr/bin/systemd-creds` executable with `--no-ask-password encrypt --with-key=host+tpm2 --name=<credential-id> - -`.
+- Provisioning calls the fixed `/usr/bin/systemd-creds` executable with `encrypt --with-key=host+tpm2 --name=<credential-id> - -`. The output-path validator requires effective UID 0 before this command can be reached; no host-only or null-key downgrade is attempted.
 - The plaintext payload is passed through stdin, not command-line arguments or a plaintext key file, and is zeroized after the encryption attempt.
 - No host-only or null-encryption fallback is used. If systemd-creds, host+TPM2 access, or the protected output path requirements are unavailable, provisioning fails closed.
 - Encrypted output is atomically persisted under an absolute root-owned, non-symlink, non-group/world-writable parent directory. The temporary/output file is created with mode 0600.
@@ -56,7 +56,7 @@ WSL development smoke only:
 - Local distribution: Ubuntu 26.04.1 LTS under WSL2.
 - systemd: 259.5; `/usr/bin/systemd-creds` is present.
 - A user-scoped host-key-only test credential round-trip succeeded. This was a harmless test string, not a Noise key, and does not validate the intended system-scope host+TPM2 provider.
-- No `/dev/tpm*` device was exposed to this WSL environment.
+- No `/dev/tpm*` device was exposed to this WSL environment. The systemd TPM probe (`systemd-analyze has-tpm2`; the `systemd-creds has-tpm2` alias redirected to it) returned `partial`, with firmware, driver, subsystem and required TPM2 libraries unavailable (exit 27).
 - A system-scope host+TPM2 attempt from the unprivileged WSL user returned `InteractiveAuthenticationRequired`; it did not establish a successful TPM-backed encryption/decryption test.
 - WSL has no Cargo executable. The Windows Rust sysroot currently has only `wasm32-unknown-unknown` and `x86_64-pc-windows-msvc` targets installed; no Linux target is installed.
 
