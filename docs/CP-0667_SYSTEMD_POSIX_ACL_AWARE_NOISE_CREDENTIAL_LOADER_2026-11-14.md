@@ -4,8 +4,8 @@ Date: 2026-11-14
 Project: AI-NATIVE L1 / QZXB / QFP6
 Branch: `feat/cp0600-bootstrap-sync-startup`
 Base HEAD: `f0ae428 docs: record WSL-native Linux credential loader qualification`
-Related: CP-0657, CP-0655, CP-0665, CP-0666
-Status: **systemd-style POSIX ACL and no-ACL credential loader paths PASS in WSL/ext4; hardware TPM2, native seed service and production qualification remain OPEN**
+Related: CP-0657, CP-0655, CP-0665, CP-0666, CP-0668
+Status: **systemd-style POSIX ACL, actual plain LoadCredential service delivery, and no-ACL credential loader paths PASS in WSL/ext4; provisioner fail-closed behavior PASS without TPM2; successful host+TPM2 provisioning remains OPEN**
 
 ## 1. Security compatibility finding
 
@@ -128,7 +128,7 @@ It still does **not** establish a production systemd host+TPM2 credential round-
 - The environment is Ubuntu 26.04.1 LTS under WSL2 with systemd 259.5, not a native Ubuntu 24.04 LTS seed host running systemd 255.
 - WSL exposes no usable `/dev/tpm*` device; its TPM probe remains `partial`.
 - The root-owned ACL fixture test uses a synthetic NPK2 payload and POSIX ACLs constructed to match systemd v255 source behavior. The separate transient-service test verified actual `LoadCredential=` delivery on systemd 259.5 and invoked the production loader inside that service, but it did not invoke `LoadCredentialEncrypted=` or decrypt a TPM-bound credential.
-- No real Noise private key was generated or provisioned. No persistent seed service was installed or started; only the disposable transient WSL test unit ran.
+- No production/seed Noise private key was persisted or provisioned. CP-0668 separately ran the actual provisioner in a no-TPM failure test; it generated a one-time ephemeral keypair in memory, failed at host+TPM2 encryption, zeroized the payload/key material and left no output file. No persistent seed service was installed or started; only disposable transient WSL test units ran.
 - No independently administered second seed, public endpoint, Genesis signature or live-market operation was qualified.
 
 ## 5. Next qualification gate
@@ -144,7 +144,7 @@ On an actual Ubuntu 24.04 LTS x86_64 host with a usable TPM2 device:
 
 ## 6. Repository handling
 
-- This checkpoint is documentation-only.
+- This checkpoint is documentation-only; CP-0668 records the provisioner fail-closed run.
 - The provider source changes remain uncommitted in the pre-existing dirty worktree, mixed with earlier QFP6 development changes.
 - CP-0665/CP-0666 documentation updates and this CP-0667 document are documentation-only records; no provider source was included in the docs commit.
 - No source-wide staging, reset, clean, push, service launch, public listener or deployment is included.
