@@ -31,7 +31,13 @@ The publication branch was created from `main`. The active Windows engineering w
 
 ## Public issue synchronization
 
-GitHub Issue #72 was reviewed before publication. Its prior body still referred to an obsolete candidate commit and historical gate descriptions. The issue is intended to be updated only after the new public brief and matrix are available. No operator has been qualified by this publication.
+After the new documents and README links were published on the review branch, GitHub Issue #72 was refreshed:
+- Title now identifies AI-NATIVE L1 and the zero-value Public Testnet interest-only scope.
+- The obsolete candidate commit and historical gate descriptions were removed.
+- Current status, three-operator independence requirement, staged qualification boundaries and direct review-branch links were added.
+- A dated update comment was posted: https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/72#issuecomment-6903444425
+
+Issue #72 remains open. Its existing comments are project-maintainer updates; no external operator response or qualified operator was found.
 
 ## Honest status after this checkpoint
 
@@ -46,3 +52,12 @@ GitHub Issue #72 was reviewed before publication. Its prior body still referred 
 ## Safety boundary
 
 No external email or hosting application was sent. No account, VPS, payment, server, key, node process, listener, firewall/router/DNS/VPN/adapter configuration, or Joining configuration was created or changed. No funds or QZXB were spent or allocated.
+
+
+## Review pull request
+
+- PR: https://github.com/hamidnikkhah660-arch/ai-native-l1/pull/196
+- Head: `c9d4302293219dda24eb8c5a7bafd01b8bc4efa5`
+- Base: `main`
+- State at checkpoint: open, not merged.
+- GitHub Actions Rust validation for the PR head was observed in progress at the last check; no passing CI result is claimed.
