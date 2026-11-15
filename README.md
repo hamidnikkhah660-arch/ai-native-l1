@@ -1,6 +1,6 @@
 # QRun - QZXB Native Layer-1 & Open Ecosystem
 
-**QRun** is the public brand of an independently developed native Layer-1 project; **QZXB** is the selected native-coin ticker and **QRun Blockchain** is the network name. The source contains a Rust-native ledger research programme, deterministic state/recovery candidates, ML-DSA-65 and hybrid-identity research, an isolated EVM/revm smart-contract laboratory, and an AI-native ecosystem roadmap.
+**QRun** is the public brand of an independently developed native Layer-1 project; **QZXB** is the selected native-coin ticker and **QRun Blockchain** is the network name. The source contains a Rust-native ledger research programme, deterministic state/recovery candidates, authenticated peer-networking and release-integrity research, ML-DSA-65 and hybrid-identity work, an isolated EVM/revm smart-contract laboratory, candidate market-operation processing, wallet tooling and an AI-native ecosystem roadmap.
 
 
 ## Public ecosystem status (2026-11-16)
