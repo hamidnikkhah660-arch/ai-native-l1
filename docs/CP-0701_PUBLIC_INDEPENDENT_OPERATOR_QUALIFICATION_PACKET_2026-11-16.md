@@ -43,7 +43,7 @@ Issue #72 remains open. Its existing comments are project-maintainer updates; no
 
 - Public operator brief and qualification matrix: published on the documentation branch.
 - README links: added on that branch.
-- Issue #72 body refresh: pending verification of branch links and then update.
+- Issue #72 body refresh: completed and verified; the dated status comment is linked above.
 - Three independent operators: not yet obtained or verified.
 - Qualified independent Seed host / stable public endpoint: none.
 - Genuine Public Testnet: not launched.
@@ -57,7 +57,7 @@ No external email or hosting application was sent. No account, VPS, payment, ser
 ## Review pull request
 
 - PR: https://github.com/hamidnikkhah660-arch/ai-native-l1/pull/196
-- Head: `c9d4302293219dda24eb8c5a7bafd01b8bc4efa5`
+- Publication head before this checkpoint-record correction: `451cb903db9e4bfaf113b469415fe1d75a1644f9`.
 - Base: `main`
 - State at checkpoint: open, not merged.
-- GitHub Actions Rust validation for the PR head was observed in progress at the last check; no passing CI result is claimed.
+- GitHub Actions Rust validation for publication head `451cb903db9e4bfaf113b469415fe1d75a1644f9` completed successfully (run `43776987768`). This checkpoint-record correction is a later documentation-only commit; its own CI result must be checked separately.
