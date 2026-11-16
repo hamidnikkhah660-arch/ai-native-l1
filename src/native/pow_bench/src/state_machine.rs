@@ -141,6 +141,10 @@ pub enum StateError {
         previous: u64,
         actual: u64,
     },
+    TimestampTooFarInPast {
+        earliest_allowed: u64,
+        actual: u64,
+    },
     TimestampTooFarInFuture {
         latest_allowed: u64,
         actual: u64,
@@ -445,10 +449,111 @@ pub fn block_id(block: &Block) -> Result<[u8; 32], StateError> {
     Ok(hash_domain(b"AIN1-BLOCK-ID-V2\0", &[&canonical]))
 }
 
+/// QRun v0.5 fee-only block envelope. The producer is canonical block data, and the state root
+/// commits to the account credit funded solely by fees collected in this block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QRunV05FeeBlock {
+    pub body: Block,
+    pub producer: AccountId,
+}
+
+const QRUN_V05_FEE_BLOCK_MAGIC: [u8; 4] = *b"QFB5";
+const QRUN_V05_FEE_BLOCK_VERSION: u16 = 1;
+const QRUN_V05_FEE_BLOCK_FIXED_OVERHEAD: usize = 4 + 2 + 4 + 32;
+const QRUN_V05_FEE_BLOCK_ID_DOMAIN: &[u8] = b"QUANTUMZXB-QRUN-FEE-BLOCK-ID-V05\0";
+
+/// Canonical QFB5 encoding: magic, version, exact BLK2 body length/body, and producer account.
+/// No subsidy or claimed fee amount is accepted from the block; the payout is derived by replay.
+pub fn encode_qrun_v05_fee_block(block: &QRunV05FeeBlock) -> Result<Vec<u8>, StateError> {
+    if is_zero_account(&block.producer) {
+        return Err(StateError::InvalidAccountId);
+    }
+    let body = encode_block(&block.body)?;
+    if body.len() > u32::MAX as usize {
+        return Err(StateError::Oversize {
+            actual: body.len(),
+            limit: MAX_ENCODED_BLOCK_BYTES,
+        });
+    }
+    let mut out = Vec::with_capacity(QRUN_V05_FEE_BLOCK_FIXED_OVERHEAD + body.len());
+    out.extend_from_slice(&QRUN_V05_FEE_BLOCK_MAGIC);
+    out.extend_from_slice(&QRUN_V05_FEE_BLOCK_VERSION.to_be_bytes());
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&block.producer);
+    if out.len() > MAX_ENCODED_BLOCK_BYTES + QRUN_V05_FEE_BLOCK_FIXED_OVERHEAD {
+        return Err(StateError::Oversize {
+            actual: out.len(),
+            limit: MAX_ENCODED_BLOCK_BYTES + QRUN_V05_FEE_BLOCK_FIXED_OVERHEAD,
+        });
+    }
+    Ok(out)
+}
+
+pub fn decode_qrun_v05_fee_block(bytes: &[u8]) -> Result<QRunV05FeeBlock, StateError> {
+    let max_len = MAX_ENCODED_BLOCK_BYTES + QRUN_V05_FEE_BLOCK_FIXED_OVERHEAD;
+    if bytes.len() > max_len {
+        return Err(StateError::Oversize {
+            actual: bytes.len(),
+            limit: max_len,
+        });
+    }
+    if bytes.len() < QRUN_V05_FEE_BLOCK_FIXED_OVERHEAD + BLOCK_HEADER_LEN {
+        return Err(StateError::Malformed);
+    }
+    if bytes[..4] != QRUN_V05_FEE_BLOCK_MAGIC {
+        return Err(StateError::BadMagic);
+    }
+    let version = u16::from_be_bytes([bytes[4], bytes[5]]);
+    if version != QRUN_V05_FEE_BLOCK_VERSION {
+        return Err(StateError::UnsupportedVersion(version));
+    }
+    let body_len = u32::from_be_bytes(bytes[6..10].try_into().expect("fixed body length")) as usize;
+    if !(BLOCK_HEADER_LEN..=MAX_ENCODED_BLOCK_BYTES).contains(&body_len) {
+        return Err(StateError::Malformed);
+    }
+    let expected_len = 10usize
+        .checked_add(body_len)
+        .and_then(|len| len.checked_add(32))
+        .ok_or(StateError::Malformed)?;
+    if bytes.len() != expected_len {
+        return Err(StateError::Malformed);
+    }
+    let body_end = 10 + body_len;
+    let body = decode_block(&bytes[10..body_end])?;
+    let producer: AccountId = bytes[body_end..expected_len]
+        .try_into()
+        .expect("fixed producer ID");
+    if is_zero_account(&producer) {
+        return Err(StateError::InvalidAccountId);
+    }
+    let block = QRunV05FeeBlock { body, producer };
+    if encode_qrun_v05_fee_block(&block)? != bytes {
+        return Err(StateError::Malformed);
+    }
+    Ok(block)
+}
+
+pub fn qrun_v05_fee_block_id(block: &QRunV05FeeBlock) -> Result<[u8; 32], StateError> {
+    let canonical = encode_qrun_v05_fee_block(block)?;
+    Ok(hash_domain(QRUN_V05_FEE_BLOCK_ID_DOMAIN, &[&canonical]))
+}
 impl LedgerState {
     pub fn genesis(
         network_id: NetworkId,
         accounts: Vec<(AccountId, u64)>,
+    ) -> Result<Self, StateError> {
+        Self::genesis_at(network_id, accounts, 0)
+    }
+
+    /// Build a Genesis ledger whose last timestamp is the network's committed activation time.
+    ///
+    /// A nonzero timestamp is recommended for QRun v0.5 network identity. Legacy/test fixtures
+    /// may continue to use genesis, which preserves the zero-timestamp compatibility behavior.
+    pub fn genesis_at(
+        network_id: NetworkId,
+        accounts: Vec<(AccountId, u64)>,
+        genesis_timestamp: u64,
     ) -> Result<Self, StateError> {
         if network_id.iter().all(|byte| *byte == 0) {
             return Err(StateError::InvalidNetworkId);
@@ -468,7 +573,7 @@ impl LedgerState {
         let state = Self {
             network_id,
             height: 0,
-            last_timestamp: 0,
+            last_timestamp: genesis_timestamp,
             tip_hash: [0u8; 32],
             fee_pool: 0,
             accounts: map,
@@ -494,12 +599,470 @@ impl LedgerState {
         self.tip_hash
     }
 
+    /// Credit a locally derived QFP6 mining reward without advancing height/timestamp/tip.
+    /// This is crate-private: QFB6 must commit the matching CP-0528 mining counter and verify
+    /// the complete post-state root before the block can become canonical.
+    pub(crate) fn credit_v06_mining_reward(
+        &mut self,
+        miner: &[u8; 32],
+        reward_atoms: u128,
+    ) -> Result<(), StateError> {
+        self.credit_v06_protocol_issuance(miner, reward_atoms)
+    }
+
+    /// QFP6-only category issuance primitive. Authorization, bucket ceilings and the
+    /// canonical monetary counter must be verified/updated by the enclosing QFB6 clone.
+    pub(crate) fn credit_v06_protocol_issuance(
+        &mut self,
+        recipient: &[u8; 32],
+        amount_atoms: u128,
+    ) -> Result<(), StateError> {
+        if is_zero_account(recipient) || amount_atoms == 0 {
+            return Err(StateError::InvalidAccountId);
+        }
+        let amount = u64::try_from(amount_atoms).map_err(|_| StateError::AmountOverflow)?;
+        let mut next = self.clone();
+        if !next.accounts.contains_key(recipient) && next.accounts.len() >= MAX_ACCOUNTS {
+            return Err(StateError::TooManyAccounts);
+        }
+        let mut account = next
+            .accounts
+            .get(recipient)
+            .copied()
+            .unwrap_or(AccountState {
+                balance: 0,
+                nonce: 0,
+            });
+        account.balance = account
+            .balance
+            .checked_add(amount)
+            .ok_or(StateError::BalanceOverflow)?;
+        next.accounts.insert(*recipient, account);
+        next.total_value()?;
+        *self = next;
+        Ok(())
+    }
+
+    /// Stage the account/height/timestamp portion of a CP-0398 v0.4 mining-only candidate.
+    /// This intentionally is not a public mint API and does not set the block tip hash: the
+    /// caller must first derive and verify the complete profile-bound post-state root and block ID.
+    pub(crate) fn stage_v04_mining_reward_transition(
+        &self,
+        height: u64,
+        timestamp: u64,
+        expected_parent_hash: &[u8; 32],
+        miner: &[u8; 32],
+        reward_atoms: u128,
+    ) -> Result<Self, StateError> {
+        let expected_height = self
+            .height
+            .checked_add(1)
+            .ok_or(StateError::InvalidHeight)?;
+        if height != expected_height {
+            return Err(StateError::HeightMismatch {
+                expected: expected_height,
+                actual: height,
+            });
+        }
+        if &self.tip_hash != expected_parent_hash {
+            return Err(StateError::ParentHashMismatch);
+        }
+        if timestamp == 0 {
+            return Err(StateError::InvalidBlockTimestamp);
+        }
+        if timestamp <= self.last_timestamp {
+            return Err(StateError::TimestampNotIncreasing {
+                previous: self.last_timestamp,
+                actual: timestamp,
+            });
+        }
+        if is_zero_account(miner) {
+            return Err(StateError::InvalidAccountId);
+        }
+
+        let reward = u64::try_from(reward_atoms).map_err(|_| StateError::AmountOverflow)?;
+        let mut candidate = self.clone();
+        if reward != 0 {
+            if !candidate.accounts.contains_key(miner) && candidate.accounts.len() >= MAX_ACCOUNTS {
+                return Err(StateError::TooManyAccounts);
+            }
+            let mut account = candidate
+                .accounts
+                .get(miner)
+                .copied()
+                .unwrap_or(AccountState {
+                    balance: 0,
+                    nonce: 0,
+                });
+            account.balance = account
+                .balance
+                .checked_add(reward)
+                .ok_or(StateError::BalanceOverflow)?;
+            candidate.accounts.insert(*miner, account);
+        }
+        candidate.height = height;
+        candidate.last_timestamp = timestamp;
+        candidate.total_value()?;
+        Ok(candidate)
+    }
+
+    /// Stage a profile-bound execution candidate's normal transactions and locally derived
+    /// miner reward on one clone. This is crate-private: callers must validate the v0.4
+    /// allocation accounting and combined state root before committing the block tip.
+    pub(crate) fn stage_v04_execution_transition<A: TransactionAuthenticator>(
+        &self,
+        height: u64,
+        timestamp: u64,
+        expected_parent_hash: &[u8; 32],
+        miner: &[u8; 32],
+        reward_atoms: u128,
+        transactions: Vec<Transaction>,
+        authenticator: &A,
+    ) -> Result<(Self, u64), StateError> {
+        if expected_parent_hash != &self.tip_hash {
+            return Err(StateError::ParentHashMismatch);
+        }
+        let block = Block {
+            height,
+            timestamp,
+            parent_hash: *expected_parent_hash,
+            state_root: [0; 32],
+            transactions,
+        };
+        // Reuse the canonical transaction/signature/nonce/expiry checks, but leave the tip
+        // unchanged until the outer profile-bound block ID is known.
+        let (mut candidate, fees_collected) = self.prepare_candidate(&block, authenticator)?;
+        if is_zero_account(miner) {
+            return Err(StateError::InvalidAccountId);
+        }
+        let reward = u64::try_from(reward_atoms).map_err(|_| StateError::AmountOverflow)?;
+        if reward != 0 {
+            if !candidate.accounts.contains_key(miner) && candidate.accounts.len() >= MAX_ACCOUNTS {
+                return Err(StateError::TooManyAccounts);
+            }
+            let mut account = candidate
+                .accounts
+                .get(miner)
+                .copied()
+                .unwrap_or(AccountState {
+                    balance: 0,
+                    nonce: 0,
+                });
+            account.balance = account
+                .balance
+                .checked_add(reward)
+                .ok_or(StateError::BalanceOverflow)?;
+            candidate.accounts.insert(*miner, account);
+        }
+        // A transaction batch conserves supply; the miner credit is the only creation.
+        // total_value checks the global cap after both parts of the block have been staged.
+        candidate.total_value()?;
+        Ok((candidate, fees_collected))
+    }
+
+    /// Finalize a previously staged CP-0398 candidate after its canonical block ID is known.
+    /// The parent check prevents accidentally finalizing the clone against a different branch.
+    pub(crate) fn commit_v04_mining_tip_hash(
+        &mut self,
+        expected_parent_hash: &[u8; 32],
+        block_id: [u8; 32],
+    ) -> Result<(), StateError> {
+        if &self.tip_hash != expected_parent_hash {
+            return Err(StateError::ParentHashMismatch);
+        }
+        self.tip_hash = block_id;
+        Ok(())
+    }
+
+    /// Build the post-state candidate for a QRun v0.5 fee-only block. Prior accumulated fees are
+    /// forbidden: every accepted QFB5 block must pay exactly its own fees and leave fee_pool zero.
+    fn prepare_qrun_v05_fee_candidate<A: TransactionAuthenticator>(
+        &self,
+        block: &QRunV05FeeBlock,
+        authenticator: &A,
+    ) -> Result<(Self, u64), StateError> {
+        encode_qrun_v05_fee_block(block)?;
+        if is_zero_account(&block.producer) {
+            return Err(StateError::InvalidAccountId);
+        }
+        if self.fee_pool != 0 {
+            return Err(StateError::InvariantViolation);
+        }
+        let total_before = self.total_value()?;
+        let (mut next, fees_collected) = self.prepare_candidate(&block.body, authenticator)?;
+        if next.fee_pool != fees_collected {
+            return Err(StateError::InvariantViolation);
+        }
+        if fees_collected != 0 {
+            let old = next.accounts.get(&block.producer).copied();
+            if old.is_none() && next.accounts.len() >= MAX_ACCOUNTS {
+                return Err(StateError::TooManyAccounts);
+            }
+            let balance = old
+                .map_or(0, |account| account.balance)
+                .checked_add(fees_collected)
+                .ok_or(StateError::BalanceOverflow)?;
+            next.accounts.insert(
+                block.producer,
+                AccountState {
+                    balance,
+                    nonce: old.map_or(0, |account| account.nonce),
+                },
+            );
+            next.fee_pool = 0;
+        }
+        if next.fee_pool != 0 || next.total_value()? != total_before {
+            return Err(StateError::InvariantViolation);
+        }
+        Ok((next, fees_collected))
+    }
+
+    /// State root after the deterministic fee-only payout. No new supply is created.
+    pub fn preview_qrun_v05_fee_state_root_after<A: TransactionAuthenticator>(
+        &self,
+        block: &QRunV05FeeBlock,
+        authenticator: &A,
+    ) -> Result<[u8; 32], StateError> {
+        let (candidate, _) = self.prepare_qrun_v05_fee_candidate(block, authenticator)?;
+        Ok(candidate.state_root())
+    }
+
+    /// Atomically execute a QFB5 block, pay only fees collected in this block, and derive the tip
+    /// hash from canonical body+producer bytes. Failures leave every field unchanged.
+    pub fn apply_qrun_v05_fee_block<A: TransactionAuthenticator>(
+        &mut self,
+        block: &QRunV05FeeBlock,
+        authenticator: &A,
+    ) -> Result<BlockApplySummary, StateError> {
+        let canonical = encode_qrun_v05_fee_block(block)?;
+        let (mut next, fees_collected) =
+            self.prepare_qrun_v05_fee_candidate(block, authenticator)?;
+        let computed_state_root = next.state_root();
+        if computed_state_root != block.body.state_root {
+            return Err(StateError::StateRootMismatch);
+        }
+        let block_hash = hash_domain(QRUN_V05_FEE_BLOCK_ID_DOMAIN, &[&canonical]);
+        next.tip_hash = block_hash;
+        let summary = BlockApplySummary {
+            height: next.height,
+            block_hash,
+            state_root: computed_state_root,
+            transactions_applied: block.body.transactions.len(),
+            fees_collected,
+            account_count: next.account_count(),
+        };
+        *self = next;
+        Ok(summary)
+    }
     pub fn fee_pool(&self) -> u64 {
         self.fee_pool
     }
 
     pub fn account(&self, id: &AccountId) -> Option<AccountState> {
         self.accounts.get(id).copied()
+    }
+
+    /// Canonically ordered account snapshot for isolated cross-module transition candidates.
+    /// This exposes values, not mutable access to the ledger's internal account map.
+    pub(crate) fn account_entries(&self) -> Vec<(AccountId, AccountState)> {
+        self.accounts
+            .iter()
+            .map(|(id, state)| (*id, *state))
+            .collect()
+    }
+
+    /// Apply one authenticated TXN2 transfer inside a future QFP6 block candidate.
+    /// Height/timestamp/tip are advanced only once after the enclosing block root is checked.
+    pub(crate) fn apply_v06_signed_transaction<A: TransactionAuthenticator>(
+        &mut self,
+        tx: &Transaction,
+        inclusion_timestamp: u64,
+        authenticator: &A,
+    ) -> Result<[u8; 32], StateError> {
+        // Structural validation, including bounded signature bytes, precedes state mutation.
+        encode_transaction(tx)?;
+        if tx.network_id != self.network_id {
+            return Err(StateError::WrongNetwork);
+        }
+        if inclusion_timestamp == 0 || inclusion_timestamp >= tx.expires_at {
+            return Err(StateError::TransactionExpired {
+                expires_at: tx.expires_at,
+                block_timestamp: inclusion_timestamp,
+            });
+        }
+        let digest = transaction_signing_digest(tx)?;
+        authenticator
+            .verify(&tx.sender, &digest, &tx.signature)
+            .map_err(|_| StateError::Unauthorized)?;
+        let txid = transaction_id(tx)?;
+        let before = self.total_value()?;
+        let mut next = self.clone();
+        next.apply_transaction(tx)?;
+        if next.total_value()? != before {
+            return Err(StateError::InvariantViolation);
+        }
+        *self = next;
+        Ok(txid)
+    }
+
+    /// Validate and stage the height/timestamp part of a QFP6 candidate after all
+    /// operations and per-block fee settlement, but before computing the post-state root.
+    pub(crate) fn advance_v06_block_header(
+        &mut self,
+        height: u64,
+        timestamp: u64,
+        expected_parent: &[u8; 32],
+    ) -> Result<(), StateError> {
+        let expected_height = self
+            .height
+            .checked_add(1)
+            .ok_or(StateError::InvalidHeight)?;
+        if height != expected_height {
+            return Err(StateError::HeightMismatch {
+                expected: expected_height,
+                actual: height,
+            });
+        }
+        if &self.tip_hash != expected_parent {
+            return Err(StateError::ParentHashMismatch);
+        }
+        if timestamp == 0 {
+            return Err(StateError::InvalidBlockTimestamp);
+        }
+        if timestamp <= self.last_timestamp {
+            return Err(StateError::TimestampNotIncreasing {
+                previous: self.last_timestamp,
+                actual: timestamp,
+            });
+        }
+        self.height = height;
+        self.last_timestamp = timestamp;
+        Ok(())
+    }
+
+    /// Pay exactly the fee pool accumulated since the start of this QFP6 block.
+    /// The enclosing executor requires an empty fee pool at block entry.
+    pub(crate) fn settle_v06_block_fees(&mut self, producer: AccountId) -> Result<u64, StateError> {
+        if is_zero_account(&producer) {
+            return Err(StateError::InvalidAccountId);
+        }
+        let fees = self.fee_pool;
+        if fees == 0 {
+            return Ok(0);
+        }
+        let before = self.total_value()?;
+        let mut next = self.clone();
+        let old = next
+            .accounts
+            .get(&producer)
+            .copied()
+            .unwrap_or(AccountState {
+                balance: 0,
+                nonce: 0,
+            });
+        let balance = old
+            .balance
+            .checked_add(fees)
+            .ok_or(StateError::BalanceOverflow)?;
+        if !next.accounts.contains_key(&producer) && next.accounts.len() >= MAX_ACCOUNTS {
+            return Err(StateError::TooManyAccounts);
+        }
+        next.accounts.insert(
+            producer,
+            AccountState {
+                balance,
+                nonce: old.nonce,
+            },
+        );
+        next.fee_pool = 0;
+        if next.total_value()? != before {
+            return Err(StateError::InvariantViolation);
+        }
+        *self = next;
+        Ok(fees)
+    }
+
+    /// Finalize the QFP6 tip after canonical bytes (which include the verified state root)
+    /// have been hashed. The tip is intentionally excluded from state_root to avoid a cycle.
+    pub(crate) fn commit_v06_block_id(
+        &mut self,
+        expected_parent: &[u8; 32],
+        block_id: [u8; 32],
+    ) -> Result<(), StateError> {
+        if &self.tip_hash != expected_parent {
+            return Err(StateError::ParentHashMismatch);
+        }
+        if is_zero_account(&block_id) {
+            return Err(StateError::InvariantViolation);
+        }
+        self.tip_hash = block_id;
+        Ok(())
+    }
+
+    pub(crate) fn apply_amm_account_updates(
+        &mut self,
+        sender: AccountId,
+        sender_nonce: u64,
+        balances: &[(AccountId, u64)],
+    ) -> Result<(), StateError> {
+        if is_zero_account(&sender) {
+            return Err(StateError::InvalidAccountId);
+        }
+        let current_nonce = self.account(&sender).map_or(0, |account| account.nonce);
+        let expected_nonce = current_nonce
+            .checked_add(1)
+            .ok_or(StateError::InvalidNonce(current_nonce))?;
+        if sender_nonce != expected_nonce {
+            return Err(StateError::NonceMismatch {
+                expected: expected_nonce,
+                actual: sender_nonce,
+            });
+        }
+        let before = self.total_value()?;
+        let mut next = self.clone();
+        let mut seen = BTreeSet::new();
+        let mut sender_balance_was_supplied = false;
+        for (account_id, balance) in balances {
+            if is_zero_account(account_id) || !seen.insert(*account_id) {
+                return Err(StateError::InvariantViolation);
+            }
+            let old = next
+                .accounts
+                .get(account_id)
+                .copied()
+                .unwrap_or(AccountState {
+                    balance: 0,
+                    nonce: 0,
+                });
+            let nonce = if *account_id == sender {
+                sender_balance_was_supplied = true;
+                sender_nonce
+            } else {
+                old.nonce
+            };
+            if !next.accounts.contains_key(account_id) && *balance == 0 && nonce == 0 {
+                continue;
+            }
+            if !next.accounts.contains_key(account_id) && next.accounts.len() >= MAX_ACCOUNTS {
+                return Err(StateError::TooManyAccounts);
+            }
+            next.accounts.insert(
+                *account_id,
+                AccountState {
+                    balance: *balance,
+                    nonce,
+                },
+            );
+        }
+        if !sender_balance_was_supplied {
+            return Err(StateError::InvariantViolation);
+        }
+        let after = next.total_value()?;
+        if after != before {
+            return Err(StateError::InvariantViolation);
+        }
+        *self = next;
+        Ok(())
     }
 
     pub fn account_count(&self) -> usize {
@@ -770,6 +1333,13 @@ impl LedgerState {
                 TimestampPolicyError::NotIncreasing { previous, actual } => {
                     StateError::TimestampNotIncreasing { previous, actual }
                 }
+                TimestampPolicyError::TooFarInPast {
+                    earliest_allowed,
+                    actual,
+                } => StateError::TimestampTooFarInPast {
+                    earliest_allowed,
+                    actual,
+                },
                 TimestampPolicyError::TooFarInFuture {
                     latest_allowed,
                     actual,
@@ -779,6 +1349,54 @@ impl LedgerState {
                 },
             })?;
         self.apply_block(block, authenticator)
+    }
+
+    /// Live-admission variant for QFB5. It validates the inner body/time policy before applying
+    /// the fee-only transition, whose committed state root is the post-fee ledger root.
+    pub(crate) fn apply_qrun_v05_fee_block_with_timestamp_policy<A: TransactionAuthenticator>(
+        &mut self,
+        block: &QRunV05FeeBlock,
+        authenticator: &A,
+        reference_time: u64,
+        policy: TimestampPolicy,
+    ) -> Result<BlockApplySummary, StateError> {
+        encode_qrun_v05_fee_block(block)?;
+        let body = &block.body;
+        let expected_height = self
+            .height
+            .checked_add(1)
+            .ok_or(StateError::InvalidHeight)?;
+        if body.height != expected_height {
+            return Err(StateError::HeightMismatch {
+                expected: expected_height,
+                actual: body.height,
+            });
+        }
+        if body.parent_hash != self.tip_hash {
+            return Err(StateError::ParentHashMismatch);
+        }
+        validate_block_timestamp(self.last_timestamp, body.timestamp, reference_time, policy)
+            .map_err(|error| match error {
+                TimestampPolicyError::ZeroTimestamp => StateError::InvalidBlockTimestamp,
+                TimestampPolicyError::NotIncreasing { previous, actual } => {
+                    StateError::TimestampNotIncreasing { previous, actual }
+                }
+                TimestampPolicyError::TooFarInPast {
+                    earliest_allowed,
+                    actual,
+                } => StateError::TimestampTooFarInPast {
+                    earliest_allowed,
+                    actual,
+                },
+                TimestampPolicyError::TooFarInFuture {
+                    latest_allowed,
+                    actual,
+                } => StateError::TimestampTooFarInFuture {
+                    latest_allowed,
+                    actual,
+                },
+            })?;
+        self.apply_qrun_v05_fee_block(block, authenticator)
     }
 
     /// Atomically execute one block and require its committed state root to match.
@@ -1576,6 +2194,13 @@ impl MonetaryLedgerState {
             TimestampPolicyError::NotIncreasing { previous, actual } => {
                 StateError::TimestampNotIncreasing { previous, actual }
             }
+            TimestampPolicyError::TooFarInPast {
+                earliest_allowed,
+                actual,
+            } => StateError::TimestampTooFarInPast {
+                earliest_allowed,
+                actual,
+            },
             TimestampPolicyError::TooFarInFuture {
                 latest_allowed,
                 actual,
@@ -1634,6 +2259,13 @@ impl MonetaryLedgerState {
             TimestampPolicyError::NotIncreasing { previous, actual } => {
                 StateError::TimestampNotIncreasing { previous, actual }
             }
+            TimestampPolicyError::TooFarInPast {
+                earliest_allowed,
+                actual,
+            } => StateError::TimestampTooFarInPast {
+                earliest_allowed,
+                actual,
+            },
             TimestampPolicyError::TooFarInFuture {
                 latest_allowed,
                 actual,
@@ -2110,6 +2742,43 @@ mod tests {
         let mut state = alice_bob_state();
         let before = state.encode_snapshot().unwrap();
 
+        let mut too_old = block(1, state.tip_hash(), vec![]);
+        // QRun v0.5 live admission permits up to 300 seconds of past drift.
+        too_old.timestamp = 699;
+        too_old.state_root = state
+            .preview_state_root_after(&too_old, &TestOnlyAuthenticator)
+            .unwrap();
+        assert_eq!(
+            state.apply_block_with_timestamp_policy(
+                &too_old,
+                &TestOnlyAuthenticator,
+                1_000,
+                TimestampPolicy::qrun_v05_live(),
+            ),
+            Err(StateError::TimestampTooFarInPast {
+                earliest_allowed: 700,
+                actual: 699,
+            })
+        );
+        assert_eq!(state.encode_snapshot().unwrap(), before);
+
+        // The lower edge is inclusive for the QRun v0.5 live-only freshness window.
+        let mut past_boundary_state = alice_bob_state();
+        let mut at_past_limit = block(1, past_boundary_state.tip_hash(), vec![]);
+        at_past_limit.timestamp = 700;
+        at_past_limit.state_root = past_boundary_state
+            .preview_state_root_after(&at_past_limit, &TestOnlyAuthenticator)
+            .unwrap();
+        past_boundary_state
+            .apply_block_with_timestamp_policy(
+                &at_past_limit,
+                &TestOnlyAuthenticator,
+                1_000,
+                TimestampPolicy::qrun_v05_live(),
+            )
+            .unwrap();
+        assert_eq!(past_boundary_state.last_timestamp(), 700);
+
         let mut too_far = block(1, state.tip_hash(), vec![]);
         too_far.timestamp = 1_121;
         too_far.state_root = state
@@ -2120,7 +2789,7 @@ mod tests {
                 &too_far,
                 &TestOnlyAuthenticator,
                 1_000,
-                TimestampPolicy::testnet(),
+                TimestampPolicy::qrun_v05_live(),
             ),
             Err(StateError::TimestampTooFarInFuture {
                 latest_allowed: 1_120,
@@ -2328,6 +2997,97 @@ mod tests {
         assert_eq!(state.total_value().unwrap(), total);
     }
 
+    #[test]
+    fn qrun_v05_fee_block_pays_only_same_block_fees_without_minting() {
+        let mut state = alice_bob_state();
+        let initial_total = state.total_value().unwrap();
+        let tx = signed_tx(account(1), account(2), 1, 100, 2);
+        let mut fee_block = QRunV05FeeBlock {
+            body: block(1, state.tip_hash(), vec![tx]),
+            producer: account(3),
+        };
+        fee_block.body.state_root = state
+            .preview_qrun_v05_fee_state_root_after(&fee_block, &TestOnlyAuthenticator)
+            .unwrap();
+
+        let encoded = encode_qrun_v05_fee_block(&fee_block).unwrap();
+        assert_eq!(&encoded[..4], b"QFB5");
+        assert_eq!(decode_qrun_v05_fee_block(&encoded).unwrap(), fee_block);
+        let summary = state
+            .apply_qrun_v05_fee_block(&fee_block, &TestOnlyAuthenticator)
+            .unwrap();
+
+        assert_eq!(summary.fees_collected, 2);
+        assert_eq!(
+            summary.block_hash,
+            qrun_v05_fee_block_id(&fee_block).unwrap()
+        );
+        assert_eq!(state.account(&account(1)).unwrap().balance, 898);
+        assert_eq!(state.account(&account(2)).unwrap().balance, 105);
+        assert_eq!(state.account(&account(3)).unwrap().balance, 2);
+        assert_eq!(state.fee_pool(), 0);
+        assert_eq!(state.total_value().unwrap(), initial_total);
+    }
+
+    #[test]
+    fn qrun_v05_fee_block_binds_producer_and_rejects_noncanonical_or_stale_fee_state() {
+        let mut state = alice_bob_state();
+        let initial_snapshot = state.encode_snapshot().unwrap();
+        let tx = signed_tx(account(1), account(2), 1, 100, 2);
+        let mut fee_block = QRunV05FeeBlock {
+            body: block(1, state.tip_hash(), vec![tx]),
+            producer: account(3),
+        };
+        fee_block.body.state_root = state
+            .preview_qrun_v05_fee_state_root_after(&fee_block, &TestOnlyAuthenticator)
+            .unwrap();
+        let canonical_id = qrun_v05_fee_block_id(&fee_block).unwrap();
+
+        let mut altered_producer = fee_block.clone();
+        altered_producer.producer = account(4);
+        assert_ne!(
+            canonical_id,
+            qrun_v05_fee_block_id(&altered_producer).unwrap()
+        );
+        assert_eq!(
+            state.apply_qrun_v05_fee_block(&altered_producer, &TestOnlyAuthenticator),
+            Err(StateError::StateRootMismatch)
+        );
+        assert_eq!(state.encode_snapshot().unwrap(), initial_snapshot);
+
+        let mut with_pending_pool = alice_bob_state();
+        let legacy = committed_block(
+            &with_pending_pool,
+            vec![signed_tx(account(1), account(2), 1, 100, 2)],
+        );
+        with_pending_pool
+            .apply_block(&legacy, &TestOnlyAuthenticator)
+            .unwrap();
+        let mut stale = QRunV05FeeBlock {
+            body: block(2, with_pending_pool.tip_hash(), Vec::new()),
+            producer: account(3),
+        };
+        stale.body.state_root = with_pending_pool
+            .preview_qrun_v05_fee_state_root_after(&stale, &TestOnlyAuthenticator)
+            .unwrap_or([0; 32]);
+        assert_eq!(
+            with_pending_pool.apply_qrun_v05_fee_block(&stale, &TestOnlyAuthenticator),
+            Err(StateError::InvariantViolation)
+        );
+
+        let mut bad_magic = encode_qrun_v05_fee_block(&fee_block).unwrap();
+        bad_magic[0] ^= 0x01;
+        assert_eq!(
+            decode_qrun_v05_fee_block(&bad_magic),
+            Err(StateError::BadMagic)
+        );
+        let mut trailing = encode_qrun_v05_fee_block(&fee_block).unwrap();
+        trailing.push(0);
+        assert_eq!(
+            decode_qrun_v05_fee_block(&trailing),
+            Err(StateError::Malformed)
+        );
+    }
     #[test]
     fn fee_overflow_fixture_is_rejected_by_genesis_cap() {
         // Sum-of-fees overflow requires a starting supply above the agreed hard cap here;

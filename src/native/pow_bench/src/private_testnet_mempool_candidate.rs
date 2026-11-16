@@ -1,6 +1,8 @@
 //! Bounded, deterministic transaction-pool candidate.
 //!
-//! This module is intentionally not wired into the private node or peer protocol.
+//! This module is wired only into the opt-in, loopback-only QZBE transaction-ingress candidate.
+//! It is not wired into the legacy PTB2/PFS2 private node, public peer transaction gossip, or
+//! the canonical production node runtime.
 //! It delegates transaction/network/expiry/nonce/balance/signature checks to the
 //! canonical ledger preview path and adds local resource limits and deterministic policy.
 //! Current conflict-policy candidate: regular admission is no-replacement/first-valid-accepted;

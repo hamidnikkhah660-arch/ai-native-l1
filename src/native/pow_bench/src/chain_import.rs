@@ -301,7 +301,7 @@ mod tests {
         let mut service = ChainImportService::open(
             genesis(),
             ChainAdmissionBoundary::new(ChainAdmissionConfig::new(
-                TimestampPolicy::new(120),
+                TimestampPolicy::qrun_v05_live(),
                 ReferenceTimeSourcePolicy::ConfiguredProviderOnly,
             )),
             NoTransactionsAuthenticator,
