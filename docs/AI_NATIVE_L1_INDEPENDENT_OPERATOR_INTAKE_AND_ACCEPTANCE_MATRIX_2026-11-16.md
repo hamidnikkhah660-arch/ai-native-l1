@@ -37,7 +37,10 @@ Reject duplicate administrators or infrastructure presented as separate operator
 
 ## 4. Stage C — host capability review (still no deployment)
 
-- Linux distribution, kernel and systemd version supported by the project.
+- Linux distribution, kernel, firmware/Secure Boot mode, TPM vendor/model or vTPM implementation, and exact systemd version.
+- Record the systemd version used to create each encrypted credential as well as the version that decrypts it. The local CP-0669 qualification covers one disposable Ubuntu 24.04.5 / systemd 255 / Hyper-V vTPM2 environment only; it is not blanket qualification for other distributions, providers, firmware or TPM implementations.
+- Treat systemd credential-format compatibility as version-sensitive: upstream documents that systemd v262 and later additionally bind encrypted credentials to the TPM2 SRK and that credentials produced with this newer behavior are incompatible with earlier systemd versions. Provision and test credentials on the actual target host/version; do not assume cross-version portability. Before an upgrade or rollback, test the intended credential recovery/re-provisioning procedure in a disposable environment and document the supported upgrade path.
+- For PCR 7, record the Secure Boot state and relevant enrolled firmware certificates, verify the expected PCR bank/value on the actual host, and test reboot plus the approved Secure Boot/certificate-change recovery path. PCR 7 represents Secure Boot policy; do not describe it as a complete measurement of every boot component or as proof of runtime integrity.
 - Public route stability and provider terms allowing experimental P2P service.
 - Inbound TCP transport tested from an unrelated network on a temporary, approved test endpoint; do not start QRun for this test.
 - TPM2/vTPM presence, PCR behavior, and actual support for systemd-creds --with-key=host+tpm2 --tpm2-pcrs=7.
