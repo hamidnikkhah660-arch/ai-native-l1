@@ -61,3 +61,20 @@ No external email or hosting application was sent. No account, VPS, payment, ser
 - Base: `main`
 - State at checkpoint: open, not merged.
 - GitHub Actions Rust validation for publication head `451cb903db9e4bfaf113b469415fe1d75a1644f9` completed successfully (run `43776987768`). This checkpoint-record correction is a later documentation-only commit; its own CI result must be checked separately.
+
+
+## Follow-up technical correction — systemd/TPM qualification precision
+
+After reviewing the published acceptance matrix against the upstream systemd manuals, the Stage C host-capability gate was tightened in a separate documentation-only commit:
+
+- Record both the exact systemd version that creates an encrypted credential and the version that decrypts it.
+- Treat the CP-0669 result as scoped to the disposable Ubuntu 24.04.5 / systemd 255 / Hyper-V vTPM2 test environment, not as generic provider or hardware qualification.
+- Explicitly account for the systemd v262+ TPM2 SRK pinning change and its documented incompatibility with earlier systemd versions. Require host/version-local provisioning and a tested upgrade/rollback recovery procedure rather than assuming portability.
+- Record Secure Boot state, relevant firmware certificates and PCR 7 values; test reboot and approved recovery after Secure Boot/certificate changes.
+- Clarify that PCR 7 represents Secure Boot policy and must not be described as a complete measurement of every boot component or proof of runtime integrity.
+
+Primary references:
+- https://www.freedesktop.org/software/systemd/man/latest/systemd-creds.html
+- https://www.freedesktop.org/software/systemd/man/latest/systemd-cryptenroll.html
+
+This correction changes qualification documentation only. It does not alter runtime code, authorize deployment, or broaden the existing test scope.
