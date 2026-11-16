@@ -50,6 +50,15 @@ Reject duplicate administrators or infrastructure presented as separate operator
 
 A hosting provider's marketing claim is not evidence of TPM, public inbound transport, durable storage or stable addressing.
 
+## 4A. TPM and host-loss recovery qualification
+
+Before a Seed host can be approved, document and test the recovery behavior for TPM clear/reset, TPM or motherboard replacement, loss of the host installation or `/var/lib/systemd/credential.secret`, and loss or corruption of the encrypted credential file. The `host+tpm2` credential must not be assumed portable to a replacement host or TPM.
+
+- Run the recovery exercise on a disposable host or snapshot; do not experiment against the only copy of an operational key.
+- Choose and document an approved recovery path: restore from a separately protected recovery source, or rotate the Noise identity through the project's reviewed authorization and peer-trust update process.
+- If identity rotation is required, verify the new public fingerprint out-of-band, bind the change to the applicable owner-authorized version, update peer trust only through the reviewed process, and prove that the retired identity is no longer accepted.
+- Keep recovery material encrypted and access-controlled outside the host failure domain. Never place plaintext private keys, recovery material, or credentials in Git, public issues, or operator intake.
+- Record the tested failure mode, recovery steps, responsible authority, and evidence. If no safe recovery path is demonstrated, the host is not qualified for Seed duty.
 ## 5. Stage D — cryptographic and release gates
 
 Before any public Seed start:
