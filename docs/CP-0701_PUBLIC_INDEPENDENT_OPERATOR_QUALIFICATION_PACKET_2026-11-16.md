@@ -78,3 +78,10 @@ Primary references:
 - https://www.freedesktop.org/software/systemd/man/latest/systemd-cryptenroll.html
 
 This correction changes qualification documentation only. It does not alter runtime code, authorize deployment, or broaden the existing test scope.
+## Follow-up operational correction — TPM and host-loss recovery
+
+A further documentation-only qualification gap was identified: the existing matrix covered systemd credential version compatibility, Secure Boot/PCR 7 changes, and Anchor Vault recovery, but did not explicitly require a tested recovery path for TPM reset/replacement or loss of the host installation and its systemd credential state.
+
+The acceptance matrix now requires a disposable recovery exercise covering TPM clear/reset, TPM or motherboard replacement, host reinstall, loss of `/var/lib/systemd/credential.secret`, and loss/corruption of the encrypted credential file. The candidate operator must document an approved recovery route (protected recovery source or reviewed Noise-identity rotation), out-of-band fingerprint re-attestation and peer-trust update where rotation is used, and proof that the retired identity is no longer accepted. Recovery material must remain encrypted and outside the host failure domain; no plaintext key or recovery secret may enter Git or public intake.
+
+This is a qualification-documentation correction only. It does not create or export keys, alter runtime code, start a node/listener, approve an operator, or authorize deployment. The new gate remains to be implemented and evidenced by each future candidate host.
