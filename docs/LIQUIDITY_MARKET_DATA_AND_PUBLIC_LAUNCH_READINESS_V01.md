@@ -3,13 +3,15 @@
 Date: 2026-10-21
 Status: Engineering/commercial readiness assessment. No native market, liquidity pool, production listing or listing approval is claimed.
 
+> **Current monetary-policy notice (2026-11-17):** This assessment is aligned to CP-0651: 7B maximum accounting ceiling, 1B intended owner Genesis allocation, six non-circulating 1B accounting labels and zero block subsidy; producer compensation is fee-only in the candidate. The old 10B / 3B-mining schedule and v0.4 / CP-0566D distribution model are historical and superseded. No 3B mining reserve or active block-subsidy payout is part of current candidate economics.
+
 ## Executive view
 
 QuantumZXB already has a public project site, curated source repository, technical white paper, roadmap, founder contact route, and published research on candidate mining/halving and performance. The remaining gap is not simply "get the coin listed". The native monetary profile and public network must become reproducible, independently operated and observable before platforms can reliably track the native asset.
 
 **The proposed native QZXB coin and the QX ERC-20 experiment on Ethereum Sepolia are different assets.** Never submit the Sepolia QX contract as the native QZXB coin. No native Mainnet, native explorer, live native market price, trading pair, liquidity, confirmed sponsor, independent security audit, or verified project revenue is established in the current public evidence.
 
-The current design uses a 10,000,000,000-coin supply cap with 4B founder / 3B mining-security / 3B public-goods allocation envelopes. The current four-year halving profile is candidate arithmetic only; Gate 2 remains open. The proposed sponsor allocation is carved out of the founder's allocation and is not cash, issued market liquidity, or a guaranteed payment.
+The current candidate policy CP-0651 uses a 7,000,000,000 QZXB maximum accounting ceiling: 1,000,000,000 QZXB intended for the owner Genesis allocation and six additional 1,000,000,000-QZXB non-circulating accounting labels. Block subsidy is zero; candidate producers receive canonical transaction fees only. The old 10B / 3B-mining and halving profile is historical and superseded. The six labels are not sponsor entitlements, issued balances, or market liquidity; Gate 2 remains open and no token allocation is cash or a guaranteed payment.
 
 ## 1. Platform requirements and present gap
 
@@ -38,7 +40,7 @@ Platform rules change; the linked official documentation was checked on 21 Octob
 
 ### Gate 2 — canonical Genesis, issuance, and supply
 
-This is the highest-priority integration gate. Freeze the network ID, Genesis hash, transaction/block/snapshot versions, allocation accounting, fee rules, subsidy schedule and halving behaviour. Apply the 10B lifetime cap in block production, validation/import, fork-choice/reorg, persistence, restart/replay, snapshots and state roots. Independently implemented clients must agree on reward boundaries, balances, issued supply and state roots. Candidate modules and arithmetic tests alone do not close this gate.
+This is the highest-priority integration gate. Freeze the network ID, Genesis hash, transaction/block/snapshot versions and CP-0651 accounting rules. Apply the 7B maximum accounting ceiling consistently: 1B intended owner Genesis allocation, six 1B non-circulating labels, zero block subsidy and fee-only producer compensation. The six labels must never be treated as balances or mint permissions. Independently implemented clients must agree on Genesis, issued/circulating accounting, fees and state roots; fee-only PoW security economics must be modelled and independently reviewed. Candidate modules and arithmetic tests alone do not close this gate.
 
 ### Gate 8 — independent rollback protection and recovery
 
@@ -85,7 +87,7 @@ Never create fake trades, wash volume, synthetic candles, misleading circulating
 A native price chart must wait for real market data, but the website can show useful engineering/network telemetry as soon as a public devnet emits reliable records:
 
 - block height, block interval distribution and chain-tip progress;
-- canonical reward/subsidy by height, modelled versus observed issuance, and cumulative supply counters;
+- canonical transaction fees by block, the CP-0651 zero-subsidy invariant, modelled versus observed fee receipts, and cumulative supply/accounting counters;
 - validated/rejected transaction counts and mempool depth;
 - measured TPS and p50/p95/p99 inclusion latency from a published load test;
 - node uptime, peer count, sync rate, CPU/RAM/disk/network use and recovery results;

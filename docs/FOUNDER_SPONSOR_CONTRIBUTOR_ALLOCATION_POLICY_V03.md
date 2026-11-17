@@ -1,6 +1,6 @@
 # Founder, Sponsor and Contributor Allocation Policy - v0.3
 
-> **Superseded by policy v0.4 (2026-10-24).** The 4B founder / 3B mining / 3B public-goods structure below is historical, not the current allocation proposal. Use [policy v0.4](FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V04_2026-10-24.md).
+> **Historical-policy notice (2026-11-17):** This 4B founder / 3B mining / 3B public-goods structure was superseded by v0.4, which was itself superseded by CP-0651. Neither this v0.3 proposal nor v0.4 is the active candidate monetary policy. The current policy is documented on the [CP-0651 economics page](../economics.html).
 
 Date: 2026-10-20
 Status: **Owner-directed economic proposal; not yet encoded in a production Genesis or transferred on-chain. No lock or vesting is authorized by this policy.**

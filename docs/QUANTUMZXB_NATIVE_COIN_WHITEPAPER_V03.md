@@ -1,16 +1,16 @@
-> **Current-policy note (2026-10-24):** v0.3 updates allocation wording only; engineering/test statements retain their cited review dates. Native QZXB mainnet and liquid native-coin market are not represented as launched.
+> **Current monetary-policy notice (2026-11-17):** This document has been reconciled to CP-0651, the active candidate policy dated 2026-11-14. CP-0651 specifies a 7,000,000,000 QZXB maximum accounting ceiling: 1,000,000,000 QZXB for the owner Genesis allocation and six additional 1,000,000,000-QZXB non-circulating accounting labels. The six labels are not Genesis balances, issued or transferable supply, or mint authority. Block subsidy is zero; candidate block producers receive canonical transaction fees only. CP-0651 supersedes the earlier v0.4 / CP-0566D eight-bucket 10B proposal, the CP-0437 10B owner-only direction, and the CP-0604 7B Genesis / 3B mining candidate. Older 10B / 3B mining schedules and charts are historical research only. This is a candidate policy, not an activated Genesis, live miner payout, or Mainnet launch. See the [current economics page](../economics.html).
 
 # QuantumZXB - AI-Native L1 Native Coin and Ecosystem White Paper
-## Version 0.2 - Public Technical Engineering White Paper
+## Version 0.3 - Public Technical Engineering White Paper
 
-Date: 20 October 2026
+Date: 20 October 2026 (original issue; monetary-policy reconciliation: 17 November 2026)
 Document status: Public engineering white paper describing architecture, test evidence and integration roadmap. It is not a frozen production protocol specification or a claim that native Mainnet is active.
 
 ## Abstract
 
 QuantumZXB is the current working identity for an independently developed native Layer-1 project. Its engineering programme combines a Rust-based native ledger and proof-of-work research, deterministic state and chain-selection candidates, authenticated peer transport, durable-storage and recovery experiments, a post-quantum signature research path, and a separate EVM-compatibility laboratory for smart-contract execution.
 
-The native asset is a coin of its own network, distinct from the Ethereum Sepolia ERC-20 experiment. The current owner-directed design proposes a 10,000,000,000-coin maximum: 30% mining/network security and seven 10% buckets for community airdrop, exchange/market-integration and liquidity partnerships, major marketing partners, developers/security contributors, financial/strategic supporters, protocol burn reserve and owner allocation. These remain design terms, not active Mainnet rules. The canonical production Genesis, issuance path and all-bucket invariants must be frozen and integrated before launch. See allocation policy v0.4.
+The native asset is a coin of its own network, distinct from the Ethereum Sepolia ERC-20 experiment. The active candidate policy CP-0651 (2026-11-14) sets a 7,000,000,000-QZXB maximum accounting ceiling: 1,000,000,000 QZXB as the intended owner Genesis allocation and six additional 1,000,000,000-QZXB accounting labels. Those six labels are non-circulating accounting ceilings only; they are not Genesis balances, issued or transferable coins, or authorization to mint. The block subsidy is zero and candidate block producers receive canonical transaction fees only. This candidate policy is not an activated production Genesis, live supply, or miner-reward programme. The final Genesis, canonical issuance/fee path and all supply invariants must still pass production integration and release gates.
 
 The project has substantial code and testing infrastructure. The maintainer's complete working checkout passed a full Rust regression with 736 library tests and no failures; the locked/offline all-target build check and format check also passed. The full working checkout is larger than this curated public tree, so this test count is tied to that review scope. The separate EVM launch-asset package's local test suite also passed. These are reproducible engineering signals, not substitutes for production-network qualification or an independent protocol audit.
 
@@ -24,17 +24,21 @@ The name "AI-Native" expresses the project's intended product direction. It does
 
 - **Network/project identity:** QuantumZXB is the current working brand.
 - **Proposed native coin ticker:** QZXB; it remains a proposal rather than a frozen production network identifier or verified listing symbol.
-- **Maximum supply design:** 10,000,000,000 native coins.
-- **Atomic-unit design:** eight decimal places; the candidate representation uses up to 10^18 atomic units across the full design cap.
-- **Current planned allocation:** 3B mining/network security (30%) and seven 1B buckets (10% each): community airdrop, exchange/market integrations and liquidity partnerships, major marketing partners, developers/security contributors, financial/strategic supporters, burn reserve and owner allocation. See tokenomics policy v0.4.
+- **Current candidate accounting ceiling (CP-0651):** 7,000,000,000 QZXB; this is not evidence that the ceiling has been issued or is circulating.
+- **Atomic-unit design:** eight decimal places; CP-0651 accounting quantities are represented using 100,000,000 base units per QZXB.
+- **CP-0651 candidate accounting:** 1,000,000,000 QZXB intended for the owner Genesis allocation plus six 1,000,000,000-QZXB accounting labels (7B total ceiling). The labels are non-circulating ceilings, not pre-issued balances or mint permissions. The current candidate block subsidy is zero; compensation to block producers is limited to canonical transaction fees.
 
-The 10B cap and 30/10/10/10/10/10/10/10 allocation are design-level monetary decisions, not live supply or circulating-balance facts. They must become one versioned production monetary profile enforced in canonical production, validation/import, fork-choice/reorg, persistence, replay and snapshot/state-root paths before a native public Mainnet can rely on them.
+The 7B CP-0651 accounting ceiling and its 1B owner Genesis / six non-circulating-label structure are candidate monetary rules, not live supply or circulating-balance facts. The labels do not create balances or authorize independent issuance. One versioned production monetary profile must be enforced through canonical production, validation/import, fork-choice/reorg, persistence, replay and snapshot/state-root paths before a native public Mainnet can rely on it.
 
-### 2.1 Owner, sponsor and contributor allocation framework
+### 2.1 Owner, supporter and contributor treatment under CP-0651
 
-Under owner-directed policy v0.4, the owner allocation is 1B coins (10%). Separate 1B allocations are planned for financial/strategic supporters and developers/security contributors; neither is a sub-allocation of the owner bucket. The exchange/market-integration and major-marketing buckets are also separate. Awards remain conditional on written terms and verified milestones. This plan does not create an on-chain balance, cash raised or market liquidity.
+Under CP-0651, the intended owner Genesis allocation is 1,000,000,000 QZXB. The other six 1,000,000,000-QZXB accounting labels are non-circulating ceilings only. They do not establish token entitlements for sponsors, developers, exchanges, marketers, airdrop recipients or any other party; they are not funded balances and do not authorize minting or transfers. Any future distribution or reward programme would require a separate, explicit, owner-authorized policy revision, defined eligibility and release rules, legal review where applicable, and canonical implementation before it could be presented as an entitlement.
 
-No sponsor is currently confirmed, no entitlement under this proposal is already granted, and no production balance is created merely by describing the allocation. Sponsor and contributor quantities are internal proposal terms until an actual agreement, milestone evidence and final Genesis/issuance design exist. Coin allocation is not, by itself, company equity, revenue share, a redemption right or a promise of financial return. See `FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V04_2026-10-24.md`.
+No sponsor is currently confirmed. No entitlement, token award, production balance, cash contribution or market liquidity is created by describing an accounting label. Any separately negotiated engineering or sponsorship agreement must state its cash/in-kind consideration, deliverables and acceptance terms; it is not automatically a QZXB allocation. A coin allocation is not, by itself, company equity, revenue share, a redemption right or a promise of financial return.
+
+### 2.2 Historical mining-allocation proposals
+
+Earlier v0.4 / CP-0566D and CP-0604 material described a 10B design with a 3B proof-of-work mining/security envelope and a halving-based block subsidy. That is historical policy and candidate arithmetic only; it was superseded for the current candidate by CP-0651. The 3B figure is not part of the current QZXB accounting ceiling, there is no current 3B miner reserve, and the CP-0651 candidate has zero block subsidy. Proof-of-work research may remain in the consensus engineering programme, but it must not be described as issuing the former 3B reward allocation. Current producer compensation is fee-only in the CP-0651 candidate and its long-term security economics remain an open qualification item.
 
 ## 3. Architecture overview
 
@@ -112,7 +116,7 @@ The present release includes research assets and a separate EVM testnet demonstr
 
 ## 8. Token economics, value and market integrity
 
-The 10B design cap is not a market quotation. No price, fully diluted valuation, liquidity, revenue, exchange listing or financial return is guaranteed. An illustrative price multiplied by maximum supply is arithmetic, not an executable market value. Genuine liquidity requires actual quote assets and real transactions; the native coin cannot create external collateral by being held against itself.
+The 7B CP-0651 accounting ceiling is not a market quotation. No price, fully diluted valuation, liquidity, revenue, exchange listing or financial return is guaranteed. An illustrative price multiplied by the 7B accounting ceiling is arithmetic, not an executable market value. Genuine liquidity requires actual quote assets and real transactions; the native coin cannot create external collateral by being held against itself.
 
 The project prohibits fabricated volume, wash trading, misleading supply figures, counterfeit market data and guaranteed-return statements. Native circulating supply must be derived consistently from the canonical Genesis and supply rules, not estimated from an isolated token contract or a spreadsheet. The native L1 coin and the Sepolia QX ERC-20 must always be presented as different assets.
 
@@ -124,7 +128,7 @@ A production release should ship a source commit and checksums, reproducible bui
 
 ## 10. Phased roadmap
 
-1. **Monetary and Genesis freeze:** select one canonical runtime/profile; finalise and implement all eight allocation buckets in policy v0.4; integrate issuance and all supply invariants into block production/import, fork choice, persistence, replay and snapshots.
+1. **Monetary and Genesis freeze:** integrate the CP-0651 candidate profile: 7B maximum accounting ceiling, 1B owner Genesis allocation, six non-circulating accounting labels and zero block subsidy with fee-only producer compensation. Enforce the same policy through block production/import, fork choice, persistence, replay and snapshots; quantify fee-only security economics before any production decision.
 2. **Hybrid identity and recovery:** define the canonical signature/authentication suite and migration boundary; integrate ML-DSA into the selected native transaction path; close independent monotonic trust and crash/recovery requirements.
 3. **Native EVM execution:** ratify fork/gas rules, native account/fee/funding mapping, EVM state representation, receipts/logs/roots, canonical node storage and RPC; pass cross-client end-to-end deployment tests.
 4. **Zero-value public testnet:** operate multiple independent nodes with a frozen profile, external participants, wallet/RPC/explorer, sync and upgrade rehearsals, real workload measurements and an incident-response programme.
