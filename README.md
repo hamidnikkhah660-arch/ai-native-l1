@@ -1,13 +1,13 @@
 # QRun - QZXB Native Layer-1 & Open Ecosystem
 
-**QRun** is the public brand of an independently developed native Layer-1 project; **QZXB** is the selected native-coin ticker and **QRun Blockchain** is the network name. The source contains a Rust-native ledger research programme, deterministic state/recovery candidates, ML-DSA-65 and hybrid-identity research, an isolated EVM/revm smart-contract laboratory, and an AI-native ecosystem roadmap.
+**QRun** is the public brand of an independently developed native Layer-1 project; **QZXB** is the selected native-coin ticker and **QRun Blockchain** is the network name. The source contains a Rust-native ledger research programme, deterministic state/recovery candidates, authenticated peer-networking and release-integrity research, ML-DSA-65 and hybrid-identity work, an isolated EVM/revm smart-contract laboratory, candidate market-operation processing, wallet tooling and an AI-native ecosystem roadmap.
 
 
-## Public ecosystem status (2026-11-15)
+## Public ecosystem status (2026-11-16)
 
 The source repository and project website are public, and we are actively inviting independent node operators, code contributors, security reviewers, AI/ML researchers, application developers and milestone sponsors. **The running node remains experimental public-alpha; value-bearing native Mainnet and a genuine QZXB/USDT market are not live.** A public source tree is open for review/contribution; it is not a claim that candidate balances are publicly spendable.
 
-- **Join the ecosystem:** [operator onboarding issue #72](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/72), [independent zero-value operator brief](docs/AI_NATIVE_L1_INDEPENDENT_ZERO_VALUE_SEED_OPERATOR_BRIEF_2026-11-16.md), [operator intake and acceptance matrix](docs/AI_NATIVE_L1_INDEPENDENT_OPERATOR_INTAKE_AND_ACCEPTANCE_MATRIX_2026-11-16.md), [independent protocol review #73](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/73), [sponsors/contributors #1](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/1), and [CONTRIBUTING.md](CONTRIBUTING.md).
+- **Join the ecosystem:** [operator onboarding issue #72](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/72), [independent protocol review #73](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/73), [sponsors/contributors #1](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/1), and [CONTRIBUTING.md](CONTRIBUTING.md).
 - **Current identity:** [QRun/QZXB brand decision](docs/CP-0464_QRUN_QZXB_BRAND_IDENTITY_2026-10-29.md).
 - **Mainnet and market release decision:** [CP-0465](docs/CP-0465_QRUN_MAINNET_PUBLIC_TRADING_NO_GO_2026-10-29.md).
 - **Zero-budget liquidity routes:** [CP-0466](docs/CP-0466_QRUN_ZERO_BUDGET_REAL_LIQUIDITY_PATH_2026-10-29.md).
@@ -18,7 +18,8 @@ The source repository and project website are public, and we are actively inviti
 - **Technology guide:** [Rust Layer-1 architecture and implementation boundaries](technology.html).
 - **Cryptography guide:** [ML-DSA-65, the selected 53-case fixture, hybrid-signature limits](cryptography.html).
 - **Current economics:** [CP-0651: 7B accounting ceiling, 1B owner Genesis allocation and fee-only production](economics.html).
-- **Current Public Testnet readiness:** [CP-0652 readiness reconciliation](docs/CP-0652_PUBLIC_TESTNET_READINESS_RECONCILIATION_2026-11-14.md) — Public Testnet remains NO-GO until externally provisioned seed hosts, final Genesis/profile artifacts, owner signature and independent reviews are complete.
+- **Current Public Testnet readiness:** [Public status and ten release safeguards](status.html) — the separate Q6GA v2 authorization for zero-value Public Testnet has been owner-signed and locally verified. Public Testnet remains NO-GO until external hosts, independent operators, final network artifacts, external reachability and independent reviews are complete.
+- **Latest zero-value Public Testnet engineering update:** the separate authorization is signed and locally verified for zero-value testnet scope only. Fresh-Genesis recovery, protected identity reload and Release-node build checks have passed locally. No public network is live; see the [updated status and ten release safeguards](status.html).
 - **Release status:** [Current source branch, test inventory, production blockers](status.html).
 - **Contributions and sponsorship:** [How to submit a review, work plan or funding proposal](contribute.html).
 - **EVM toolchain security follow-up:** [Hardhat/EDR validation, clean dependency audit and CI coverage](docs/CP-0467_QRUN_EVM_TOOLCHAIN_DEPENDENCY_HARDENING_2026-10-29.md).
@@ -88,12 +89,11 @@ The codebase covers bounded wire parsing and ingress/worker queues, authenticate
 
 The active **candidate** monetary policy is a 7,000,000,000 QZXB maximum gross accounting ceiling: **1,000,000,000 QZXB** for the owner's Genesis allocation and six additional 1,000,000,000-QZXB accounting labels. Those six labels are explicitly non-circulating ceilings, not Genesis balances, not issued or transferable tokens, and not permission to mint. The block subsidy is zero; candidate producers receive canonical transaction fees only.
 
-This policy is implemented in the current candidate code and manifest but remains **unreleased**. The Genesis execution snapshot, Q6GD descriptor, Q6CP consensus profile, Q6PN network profile, bootstrap peers and owner Genesis signature are not yet final/provisioned. No native QZXB balance is represented as live, spendable or transferable; Public Testnet is not launched and Mainnet is not authorized.
+This policy is implemented in the current candidate code and manifest but remains **unreleased**. The separate Q6GA v2 authorization for a zero-value Public Testnet has now been owner-signed and locally verified. This is not a Mainnet Genesis signature or Mainnet authorization. The canonical value-bearing Genesis execution snapshot, Q6GD descriptor, frozen Q6CP consensus profile, Q6PN network profile and externally verified public bootstrap peers are still not finalized/provisioned. No native QZXB balance is represented as live, spendable or transferable; Public Testnet is not launched and Mainnet is not authorized.
 
-- **Active monetary policy:** [CP-0651 — fixed 7B ceiling / 1B owner / six non-circulating labels / fee-only](docs/CP-0651_FIXED_7B_OWNER_1B_SIX_LABELS_FEE_ONLY_ECONOMICS_2026-11-14.md).
-- **Public Testnet release gate:** [CP-0652 — readiness reconciliation](docs/CP-0652_PUBLIC_TESTNET_READINESS_RECONCILIATION_2026-11-14.md).
-- **External provisioning and owner-signing requirements:** [CP-0655](docs/CP-0655_PUBLIC_TESTNET_EXTERNAL_PROVISIONING_REQUIREMENTS_2026-11-14.md).
-- **Candidate release manifest:** [manifest.json](release/qfp6-candidate/manifest.json).
+- **Active monetary policy:** [CP-0651 — 7B candidate accounting ceiling, 1B owner Genesis allocation, six non-circulating labels and fee-only producer compensation](economics.html).
+- **Public Testnet release gate:** [Current readiness, ten release safeguards and remaining blockers](status.html).
+- **External operator participation:** [Operator onboarding issue #72](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/72).
 <details>
 <summary>Historical token-allocation proposals and CP-0437 10B owner-only target — superseded by active CP-0651</summary>
 
@@ -115,9 +115,9 @@ Both the former 4B founder / 3B mining / 3B public-goods proposal, the v0.4 perc
 
 ## Experimental branch test inventory and recorded validation (2026-10-29)
 
-The active experimental source branch is work/qzbe-v04-persistent-mining-20261026; its source lives under src/native/pow_bench. The branch is not a production release and is separate from the smaller public curated baseline described below.
+This is a historical test-inventory snapshot dated 2026-10-29 for an experimental source branch, not a statement about the current active branch or a production release.
 
-- cargo test --all-targets --locked --offline -- --list enumerated 1,187 test cases across 74 Cargo test targets, including 931 tests in src/lib.rs. This command lists test cases; it does not execute them.
+- The historical inventory command enumerated 1,187 test cases across 74 Cargo test targets, including 931 in src/lib.rs. This is a dated listing from that snapshot; the command lists tests rather than executing them, and the count is not a current project-wide metric.
 - The dated [CP-0465 release-gate report](docs/CP-0465_QRUN_MAINNET_PUBLIC_TRADING_NO_GO_2026-10-29.md) records a full local cargo test --all-targets --locked run with exit code 0, plus focused QRun node and wallet tests. These are local regression results, not an independent security review, third-party build attestation or multi-host production qualification.
 - Follow-up EVM validation on 2026-10-29: clean npm ci, npm run compile, all three npm test suites and npm audit passed (zero reported vulnerabilities) using Hardhat 3.21.1 and patched Zod/Undici resolutions. These tests use only an ephemeral loopback EVM; QX on Sepolia remains a separate test asset, not native QZXB. See [CP-0467](docs/CP-0467_QRUN_EVM_TOOLCHAIN_DEPENDENCY_HARDENING_2026-10-29.md).
 
@@ -143,6 +143,6 @@ The founder profile now reflects the founder-confirmed **Ph.D. in Artificial Int
 
 Older research records modelled a 3B mining/security envelope with a candidate 30-second target, 2,016-block difficulty window, Argon2id parameters and a halving/subsidy schedule. Those numbers remain in dated historical simulation reports only. They are not the current supply policy after CP-0651 and must not be promoted as a live emission plan.
 
-The active CP-0651 candidate policy has a 7,000,000,000 QZXB gross accounting ceiling with a 1,000,000,000 QZXB owner Genesis allocation and six non-circulating 1B accounting labels. The six labels do not authorize minting or represent issued balances. Block subsidy is zero and producer compensation is canonical transaction fees only. Canonical Genesis, issuance invariants, public peer operation, independent review and release authorization remain gates; no live supply, production mining payout or native TPS benchmark is claimed. See [CP-0651](docs/CP-0651_FIXED_7B_OWNER_1B_SIX_LABELS_FEE_ONLY_ECONOMICS_2026-11-14.md), [CP-0652](docs/CP-0652_PUBLIC_TESTNET_READINESS_RECONCILIATION_2026-11-14.md) and [CP-0465](docs/CP-0465_QRUN_MAINNET_PUBLIC_TRADING_NO_GO_2026-10-29.md).
+The active CP-0651 candidate policy has a 7,000,000,000 QZXB gross accounting ceiling with a 1,000,000,000 QZXB owner Genesis allocation and six non-circulating 1B accounting labels. The six labels do not authorize minting or represent issued balances. Block subsidy is zero and producer compensation is canonical transaction fees only. Canonical Genesis, issuance invariants, public peer operation, independent review and release authorization remain gates; no live supply, production mining payout or native TPS benchmark is claimed. See the [active candidate economics](economics.html), [current public release status](status.html) and [CP-0465 Mainnet release decision](docs/CP-0465_QRUN_MAINNET_PUBLIC_TRADING_NO_GO_2026-10-29.md).
 
 The source tree is a curated public selection. Review specific files, reproduce commands in the relevant package, and use the [current public release manifest](docs/PUBLIC_RELEASE_MANIFEST_V18_2026-10-22.md) to identify the versioned public baseline. The public white paper and roadmap describe the engineering plan; they do not assert that future integrations are already operating on native Mainnet.
