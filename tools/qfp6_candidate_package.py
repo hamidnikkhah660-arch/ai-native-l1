@@ -7,6 +7,57 @@ SCHEMA = "qfp6-candidate-package/v2"
 BASE_COMPONENTS = ("genesis_snapshot", "genesis_descriptor_q6gd", "consensus_profile_q6cp", "network_profile_q6pn", "bootstrap_peers")
 ANCHORED_COMPONENTS = BASE_COMPONENTS + ("trust_bundle_q6ts",)
 RELEASE_PROFILES = {"permissionless_full_history": BASE_COMPONENTS, "anchored_checkpoint": ANCHORED_COMPONENTS}
+CP0651_LABELS = {
+    "community_airdrop",
+    "exchange_market_liquidity_partnerships",
+    "marketing_partners",
+    "developers_security_contributors",
+    "financial_strategic_supporters",
+    "protocol_burn_reserve",
+}
+
+
+def economic_policy_errors(data: dict) -> list[str]:
+    policy = data.get("economic_policy")
+    if not isinstance(policy, dict):
+        return ["economic_policy object is missing"]
+    errors = []
+    expected = {
+        "policy_id": "CP-0651",
+        "status": "OWNER_DIRECTED_CANDIDATE_UNRELEASED",
+        "max_gross_supply_qzxb": "7000000000",
+        "max_gross_supply_atoms": "700000000000000000",
+        "owner_genesis_qzxb": "1000000000",
+        "owner_genesis_atoms": "100000000000000000",
+        "accounting_labels_total_qzxb": "6000000000",
+        "block_subsidy_atoms": "0",
+        "miner_compensation": "CANONICAL_TRANSACTION_FEES_ONLY_NO_BLOCK_SUBSIDY",
+        "separate_mining_issuance_budget_qzxb": "0",
+        "burn_reserve_policy": "ACCOUNTING_LABEL_ONLY_NO_RELEASE_AUTHORITY_UNDER_CP0651",
+    }
+    for key, value in expected.items():
+        if policy.get(key) != value:
+            errors.append(f"CP-0651 economic_policy.{key} must be {value}")
+    if policy.get("labels_are_non_circulating_accounting_ceilings") is not True:
+        errors.append("CP-0651 accounting labels must remain non-circulating ceilings")
+    labels = policy.get("accounting_labels")
+    actual = {}
+    if isinstance(labels, list) and len(labels) == 6:
+        for item in labels:
+            if isinstance(item, dict) and isinstance(item.get("id"), str):
+                actual[item["id"]] = item.get("ceiling_qzxb")
+    if len(actual) != 6 or actual != {label: "1000000000" for label in CP0651_LABELS}:
+        errors.append("CP-0651 must contain exactly six canonical 1B accounting labels")
+    schedule = policy.get("mining_schedule")
+    if not isinstance(schedule, dict) or any((
+        schedule.get("initial_subsidy_atoms") != "0",
+        schedule.get("halving_interval_blocks") != 1,
+        schedule.get("maximum_mining_issuance_qzxb") != "0",
+        schedule.get("terminal_dust_qzxb") != "0",
+        schedule.get("terminal_dust_policy") != "NO_BLOCK_SUBSIDY_FEE_ONLY",
+    )):
+        errors.append("CP-0651 mining schedule must be fee-only with zero subsidy and zero issuance")
+    return errors
 ACCOUNT_DOMAIN = b"AIN1-QFP6-ACCOUNT-ID-HYBRID-V1\0"
 ED25519_PUBLIC_KEY_BYTES = 32
 MLDSA65_PUBLIC_KEY_BYTES = 1952
@@ -40,9 +91,38 @@ def init_package(root: pathlib.Path) -> None:
         "owner_genesis_account": None,
         "founder_identity": None,
         "components": {name: {"path": None, "sha256": None, "status": "MISSING"} for name in ANCHORED_COMPONENTS},
+        "economic_policy": {
+            "policy_id": "CP-0651",
+            "status": "OWNER_DIRECTED_CANDIDATE_UNRELEASED",
+            "max_gross_supply_qzxb": "7000000000",
+            "max_gross_supply_atoms": "700000000000000000",
+            "owner_genesis_qzxb": "1000000000",
+            "owner_genesis_atoms": "100000000000000000",
+            "accounting_labels_total_qzxb": "6000000000",
+            "block_subsidy_atoms": "0",
+            "miner_compensation": "CANONICAL_TRANSACTION_FEES_ONLY_NO_BLOCK_SUBSIDY",
+            "accounting_labels": [{"id": label, "ceiling_qzxb": "1000000000"} for label in sorted(CP0651_LABELS)],
+            "labels_are_non_circulating_accounting_ceilings": True,
+            "separate_mining_issuance_budget_qzxb": "0",
+            "mining_schedule": {
+                "initial_subsidy_atoms": "0",
+                "halving_interval_blocks": 1,
+                "maximum_mining_issuance_qzxb": "0",
+                "terminal_dust_qzxb": "0",
+                "terminal_dust_policy": "NO_BLOCK_SUBSIDY_FEE_ONLY"
+            },
+            "burn_reserve_policy": "ACCOUNTING_LABEL_ONLY_NO_RELEASE_AUTHORITY_UNDER_CP0651"
+        },
         "independent_review": {"consensus": "PENDING", "cryptography": "PENDING", "economics": "PENDING"},
         "signing": {"q6ts_signatures_present": False, "trust_floor_provisioned": False, "q6ts_runtime_enforced": False},
-        "runtime": {"wired": False, "full_history_replay_qualified": False, "public_listener_qualified": False},
+        "runtime": {
+            "wired": False,
+            "full_history_replay_qualified": False,
+            "public_listener_qualified": False,
+            "permissionless_requires_cp0651_genesis": True,
+            "permissionless_cp0528_genesis_allowed": False,
+            "permissionless_cp0604_genesis_allowed": False
+        },
         "notes": [
             "Candidate scaffold only. No Genesis, trust roots, signatures, or service endpoints are fabricated.",
             "Founder identity, when bound, is public-key metadata only and does not authorize or sign a Genesis.",
@@ -119,6 +199,14 @@ def validate_package(root: pathlib.Path) -> int:
         errors.append("wrong network/protocol identity")
     if data.get("production_authorized") is not False or data.get("mainnet_status") != "NOT_AUTHORIZED":
         errors.append("candidate package must remain explicitly non-production")
+    errors.extend(economic_policy_errors(data))
+    runtime_policy = data.get("runtime") if isinstance(data.get("runtime"), dict) else {}
+    if runtime_policy.get("permissionless_requires_cp0651_genesis") is not True:
+        errors.append("permissionless runtime must require CP-0651 Genesis")
+    if runtime_policy.get("permissionless_cp0528_genesis_allowed") is not False:
+        errors.append("permissionless runtime must reject legacy CP-0528 Genesis")
+    if runtime_policy.get("permissionless_cp0604_genesis_allowed") is not False:
+        errors.append("permissionless runtime must reject legacy CP-0604 Genesis")
     founder = data.get("founder_identity")
     if founder is not None:
         try:
@@ -217,6 +305,18 @@ def self_test() -> int:
         if m.get("release_profile") != "permissionless_full_history":
             print("SELF-TEST FAILED: default profile must be permissionless full-history")
             return 1
+        if economic_policy_errors(m):
+            print("SELF-TEST FAILED: default package must pin CP-0651 economics")
+            return 1
+        wrong_economics = json.loads(json.dumps(m))
+        wrong_economics["economic_policy"]["max_gross_supply_qzxb"] = "10000000000"
+        if not economic_policy_errors(wrong_economics):
+            print("SELF-TEST FAILED: obsolete 10B policy must be rejected")
+            return 1
+        wrong_economics["economic_policy"]["block_subsidy_atoms"] = "35673515981"
+        if not economic_policy_errors(wrong_economics):
+            print("SELF-TEST FAILED: obsolete mining subsidy must be rejected")
+            return 1
         m["signing"]["q6ts_runtime_enforced"] = True
         (root / "manifest.json").write_text(json.dumps(m), encoding="utf-8")
         if validate_package(root) != 2:
@@ -262,7 +362,7 @@ def self_test() -> int:
         if validate_package(root) != 2:
             print("SELF-TEST FAILED: mismatched founder account must fail closed")
             return 1
-    print("SELF-TEST PASSED: release profiles are separated; Q6TS claims fail closed; founder binding is verified; incomplete package remains non-production")
+    print("SELF-TEST PASSED: CP-0651 economics are pinned; obsolete 10B/subsidy policies fail; release profiles are separated; Q6TS claims fail closed; founder binding is verified; incomplete package remains non-production")
     return 0
 
 

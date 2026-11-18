@@ -10,6 +10,7 @@ use ai_native_l1_pow_bench::{
     qrun_v06_bootstrap_trust_domain_candidate::BootstrapTrustDomainPolicy,
     qrun_v06_canonical_execution_candidate::QRunV06CanonicalExecutionState,
     qrun_v06_checkpoint_candidate::MAX_QRUN_V06_CHECKPOINT_BYTES,
+    qrun_v06_cp0651_supply_candidate::CP0651_OWNER_GENESIS_ATOMS,
     qrun_v06_genesis_approval_candidate::QRunV06GenesisApproval,
     qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
     qrun_v06_history_sync_service_candidate::QRunV06HistorySyncClientConfig,
@@ -37,7 +38,6 @@ use ai_native_l1_pow_bench::{
         QRunV06TrustAuthorizedProfilePin,
     },
     qrun_v06_profile_trust_dynamodb_floor_candidate::AwsDynamoDbQ6tsReadOnlyProfileTrustFloorStore,
-    qrun_v06_tokenomics_candidate::{QRunV06AllocationBucket, QRUN_V06_FOUNDER_GENESIS_ATOMS},
     qrun_v06_transaction_mempool_candidate::QRunV06MempoolLimits,
     v4_fat1_mldsa65_candidate::LibcruxMlDsa65VerifierCandidate,
 };
@@ -354,52 +354,37 @@ fn reject_duplicate_json_object_keys(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Permissionless QFP6 admits only CP-0566D: 10B total ceiling, 1B Founder Genesis,
-/// six 1B reserve ceilings and up to 3B mining issuance. Historical
-/// CP-0604 Genesis remains rejected by this runtime.
-fn validate_permissionless_cp0566d_genesis(
+/// Permissionless QFP6 admits only CP-0651: 7B total ceiling, 1B owner Genesis,
+/// six non-circulating 1B accounting labels, and zero block subsidy. Historical
+/// CP-0528/CP-0604 snapshots remain decodable but cannot start this runtime.
+fn validate_permissionless_cp0651_genesis(
     genesis: &QRunV06CanonicalExecutionState,
     owner_account: &[u8; 32],
     policy_fingerprint: &[u8; 32],
 ) -> Result<(), String> {
-    let tokenomics = genesis.tokenomics().ok_or_else(|| {
-        "permissionless QFP6 requires the CP-0566D/CP-0528 eight-bucket monetary policy".to_string()
+    let supply = genesis.cp0651_supply().ok_or_else(|| {
+        "permissionless QFP6 requires CP-0651 fixed-supply 7B/1B/six-labels/zero-subsidy Genesis".to_string()
     })?;
-    if genesis.cp0604_supply().is_some()
-        || tokenomics.founder_account() != *owner_account
-        || tokenomics.policy_fingerprint() != *policy_fingerprint
-        || tokenomics.burned_atoms() != 0
+    if genesis.tokenomics().is_some()
+        || genesis.cp0604_supply().is_some()
+        || supply.owner_account() != *owner_account
+        || supply.policy_fingerprint() != *policy_fingerprint
+        || supply.maximum_supply_atoms() != 7 * CP0651_OWNER_GENESIS_ATOMS
+        || supply.owner_genesis_atoms() != CP0651_OWNER_GENESIS_ATOMS
+        || supply.last_block_height() != 0
+        || supply.block_subsidy_atoms() != 0
+        || supply.accounting_labels_total_atoms() != 6 * CP0651_OWNER_GENESIS_ATOMS
     {
-        return Err("permissionless Genesis CP-0566D Founder/policy identity or zero-burn invariant mismatch".into());
+        return Err("permissionless Genesis CP-0651 owner/policy identity, label budget, or zero pre-mining height mismatch".into());
     }
-
-    for bucket in QRunV06AllocationBucket::ALL {
-        let expected = if bucket == QRunV06AllocationBucket::FounderAllocation {
-            QRUN_V06_FOUNDER_GENESIS_ATOMS
-        } else {
-            0
-        };
-        if tokenomics.issued_by_bucket_atoms(bucket) != expected {
-            return Err(format!(
-                "permissionless CP-0566D Genesis bucket {bucket:?} must have exactly {expected} issued atoms"
-            ));
-        }
-    }
-    if tokenomics.gross_issued_atoms().map_err(|error| {
-        format!("permissionless CP-0566D gross issuance calculation failed: {error:?}")
-    })? != QRUN_V06_FOUNDER_GENESIS_ATOMS
-    {
-        return Err("permissionless CP-0566D Genesis must issue exactly 1B QZXB".into());
-    }
-
-    let founder_balance = genesis
+    let owner_balance = genesis
         .unified()
         .ledger()
         .account(owner_account)
         .map_or(0u128, |account| account.balance as u128);
-    if founder_balance != QRUN_V06_FOUNDER_GENESIS_ATOMS {
+    if owner_balance != CP0651_OWNER_GENESIS_ATOMS {
         return Err(
-            "permissionless Genesis must credit exactly the CP-0566D 1B Founder allocation".into(),
+            "permissionless CP-0651 Genesis must credit exactly 1B QZXB to the owner".into(),
         );
     }
     let ledger_total = genesis
@@ -407,15 +392,11 @@ fn validate_permissionless_cp0566d_genesis(
         .ledger()
         .total_value()
         .map_err(|error| format!("permissionless Genesis Ledger total failed: {error:?}"))?;
-    if ledger_total != QRUN_V06_FOUNDER_GENESIS_ATOMS {
-        return Err(
-            "permissionless CP-0566D Genesis Ledger total must equal the 1B Founder issuance"
-                .into(),
-        );
-    }
-    genesis
-        .verify_invariants()
-        .map_err(|error| format!("permissionless CP-0566D Genesis invariant failed: {error:?}"))
+    supply
+        .validate_ledger_supply(ledger_total)
+        .map_err(|error| {
+            format!("permissionless Genesis CP-0651 fixed-supply invariant failed: {error:?}")
+        })
 }
 
 fn req<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
@@ -1545,16 +1526,16 @@ fn run_permissionless_node_with_visibility(
     )
     .map_err(|e| format!("Genesis snapshot decode failed: {e:?}"))?;
     // Bind decoded Genesis economics to the exact Q6CP parameters before opening
-    // any durable store or network listener. CP-0566D requires a 1B Founder
-    // Genesis, six unissued 1B reserve ceilings, and up to 3B consensus mining issuance.
-    validate_permissionless_cp0566d_genesis(
+    // any durable store or network listener. CP-0651 requires a 1B owner
+    // Genesis, six 1B accounting labels, and zero block subsidy.
+    validate_permissionless_cp0651_genesis(
         &genesis,
         &descriptor.founder_account(),
         &descriptor.tokenomics_policy_fingerprint(),
     )?;
     genesis
         .validate_consensus_parameters(&params)
-        .map_err(|e| format!("Genesis CP-0566D/Q6CP monetary-policy binding failed: {e:?}"))?;
+        .map_err(|e| format!("Genesis CP-0651/Q6CP monetary-policy binding failed: {e:?}"))?;
     let data_dir = path(base, cfg, "data_directory")?;
     let mempool_dir = path(base, cfg, "mempool_directory")?;
     if data_dir == mempool_dir
@@ -2112,7 +2093,7 @@ mod tests {
         is_publicly_routable_peer_ip, load_peers, max_approved_peer_sync_attempts,
         q6ar_candidate_address_book_enabled, q6ar_trust_domains_rotation_authorized,
         read_regular_bounded, select_approved_bootstrap_peers,
-        validate_anchor_vault_path_separation, validate_permissionless_cp0566d_genesis,
+        validate_anchor_vault_path_separation, validate_permissionless_cp0651_genesis,
         validate_public_listener_opt_in, validate_public_testnet_topology,
         validate_q6ga_local_devnet_scope, validate_runtime_mode, BootstrapTrustDomainPolicy,
         QRunV06PinnedBootstrapPeer,
@@ -2426,7 +2407,7 @@ mod tests {
     }
 
     #[test]
-    fn permissionless_genesis_accepts_cp0566d_1b_and_rejects_cp0604_7b() {
+    fn permissionless_genesis_accepts_only_cp0651_fixed_seven_billion_policy() {
         use ai_native_l1_pow_bench::{
             qrun_v06_canonical_execution_candidate::QRunV06CanonicalExecutionState,
             qrun_v06_tokenomics_candidate::QRunV06MiningScheduleCandidate,
@@ -2436,27 +2417,30 @@ mod tests {
         const OWNER: [u8; 32] = [0x63; 32];
         let schedule = QRunV06MiningScheduleCandidate::cp0422_research_candidate();
 
-        let obsolete = QRunV06CanonicalExecutionState::cp0604_genesis_candidate(
+        let legacy_0528 = QRunV06CanonicalExecutionState::cp0528_genesis_candidate(
             NETWORK, PROFILE, OWNER, schedule,
         )
         .unwrap();
-        assert!(validate_permissionless_cp0566d_genesis(&obsolete, &OWNER, &[0x64; 32]).is_err());
+        assert!(validate_permissionless_cp0651_genesis(&legacy_0528, &OWNER, &[0x64; 32]).is_err());
 
-        let current = QRunV06CanonicalExecutionState::cp0528_genesis_candidate(
+        let legacy_0604 = QRunV06CanonicalExecutionState::cp0604_genesis_candidate(
             NETWORK, PROFILE, OWNER, schedule,
         )
         .unwrap();
-        let policy_fingerprint = current.tokenomics().unwrap().policy_fingerprint();
+        assert!(validate_permissionless_cp0651_genesis(&legacy_0604, &OWNER, &[0x65; 32]).is_err());
+
+        let current =
+            QRunV06CanonicalExecutionState::cp0651_genesis_candidate(NETWORK, PROFILE, OWNER)
+                .unwrap();
+        let policy_fingerprint = current.cp0651_supply().unwrap().policy_fingerprint();
         assert!(
-            validate_permissionless_cp0566d_genesis(&current, &OWNER, &policy_fingerprint).is_ok()
+            validate_permissionless_cp0651_genesis(&current, &OWNER, &policy_fingerprint).is_ok()
         );
-        assert!(validate_permissionless_cp0566d_genesis(
-            &current,
-            &[0x65; 32],
-            &policy_fingerprint
-        )
-        .is_err());
-        assert!(validate_permissionless_cp0566d_genesis(&current, &OWNER, &[0x66; 32]).is_err());
+        assert!(
+            validate_permissionless_cp0651_genesis(&current, &[0x66; 32], &policy_fingerprint)
+                .is_err()
+        );
+        assert!(validate_permissionless_cp0651_genesis(&current, &OWNER, &[0x67; 32]).is_err());
     }
 
     #[test]
