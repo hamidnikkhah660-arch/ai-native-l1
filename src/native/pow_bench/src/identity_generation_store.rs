@@ -222,12 +222,44 @@ impl IdentityGenerationStateStore {
         })
     }
 
+    /// Read-only snapshot for the peer-anchor coordinator.
+    pub fn high_water_binding(
+        &self,
+    ) -> Result<Option<(u32, [u8; 32], u8)>, IdentityGenerationError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| IdentityGenerationError::Persistence)?;
+        Ok((state.high_generation != 0).then_some((
+            state.high_generation,
+            state.record_digest,
+            state.state,
+        )))
+    }
     pub fn high_generation(&self) -> Result<Option<u32>, IdentityGenerationError> {
         let state = self
             .state
             .lock()
             .map_err(|_| IdentityGenerationError::Persistence)?;
         Ok((state.high_generation != 0).then_some(state.high_generation))
+    }
+
+    /// Read-only check that this opened store is configured for the supplied anchor identity.
+    pub fn matches_identity_scope(
+        &self,
+        network_id: &[u8; 32],
+        key_id: u32,
+        purpose: KeyPurpose,
+        credential_id: u128,
+        issuer_id: u32,
+        issuer_public_key: &[u8; 32],
+    ) -> bool {
+        self.identity.network_id == *network_id
+            && self.identity.key_id == key_id
+            && self.identity.purpose == purpose
+            && self.identity.credential_id == credential_id
+            && self.identity.issuer_id == issuer_id
+            && self.identity.issuer_public_key == *issuer_public_key
     }
 
     /// The caller must first verify the detached issuer signature on record_bytes.
@@ -330,45 +362,87 @@ impl IdentityGenerationStateStore {
         to_generation: u32,
         to_digest: &[u8; 32],
     ) -> Result<(), IdentityGenerationError> {
-        if wire.len() != ROTATION_WIRE_LEN
-            || &wire[..4] != ROTATION_MAGIC
-            || u16::from_be_bytes(wire[4..6].try_into().unwrap()) != ROTATION_VERSION
-        {
-            return Err(IdentityGenerationError::RotationMalformed);
-        }
-        let network_id: [u8; 32] = wire[6..38].try_into().unwrap();
-        let credential_id = u128::from_be_bytes(wire[38..54].try_into().unwrap());
-        let issuer_id = u32::from_be_bytes(wire[54..58].try_into().unwrap());
-        let key_id = u32::from_be_bytes(wire[58..62].try_into().unwrap());
-        let purpose = KeyPurpose::try_from(wire[62])
-            .map_err(|_| IdentityGenerationError::RotationMalformed)?;
-        let from_generation = u32::from_be_bytes(wire[63..67].try_into().unwrap());
-        let from_digest: [u8; 32] = wire[67..99].try_into().unwrap();
-        let to_gen = u32::from_be_bytes(wire[99..103].try_into().unwrap());
-        let stated_to_digest: [u8; 32] = wire[103..135].try_into().unwrap();
-        if network_id != self.identity.network_id
-            || credential_id != self.identity.credential_id
-            || issuer_id != self.identity.issuer_id
-            || key_id != self.identity.key_id
-            || purpose != self.identity.purpose
-            || from_generation != current.high_generation
-            || from_digest != current.record_digest
-            || to_gen != to_generation
-            || &stated_to_digest != to_digest
-        {
-            return Err(IdentityGenerationError::RotationMismatch);
-        }
-        let issuer = VerifyingKey::from_bytes(&self.identity.issuer_public_key)
-            .map_err(|_| IdentityGenerationError::IdentityMismatch)?;
-        let signature = Signature::from_slice(&wire[ROTATION_CORE_LEN..])
-            .map_err(|_| IdentityGenerationError::RotationMalformed)?;
-        let mut message = Vec::with_capacity(ROTATION_DOMAIN.len() + ROTATION_CORE_LEN);
-        message.extend_from_slice(ROTATION_DOMAIN);
-        message.extend_from_slice(&wire[..ROTATION_CORE_LEN]);
-        issuer
-            .verify_strict(&message, &signature)
-            .map_err(|_| IdentityGenerationError::RotationSignature)
+        verify_signed_rotation_statement(
+            wire,
+            &self.identity.network_id,
+            self.identity.credential_id,
+            self.identity.issuer_id,
+            self.identity.key_id,
+            self.identity.purpose,
+            current.high_generation,
+            &current.record_digest,
+            to_generation,
+            to_digest,
+            &self.identity.issuer_public_key,
+        )
     }
+}
+
+/// Verify an NRT1 statement without opening or mutating an IdentityGenerationStateStore.
+/// The caller supplies the exact predecessor/successor bindings and trusted issuer key.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_signed_rotation_statement(
+    wire: &[u8],
+    network_id: &[u8; 32],
+    credential_id: u128,
+    issuer_id: u32,
+    key_id: u32,
+    purpose: KeyPurpose,
+    from_generation: u32,
+    from_digest: &[u8; 32],
+    to_generation: u32,
+    to_digest: &[u8; 32],
+    issuer_public_key: &[u8; 32],
+) -> Result<(), IdentityGenerationError> {
+    if network_id.iter().all(|byte| *byte == 0)
+        || credential_id == 0
+        || issuer_id == 0
+        || key_id == 0
+        || from_generation == 0
+        || from_generation.checked_add(1) != Some(to_generation)
+        || from_digest.iter().all(|byte| *byte == 0)
+        || to_digest.iter().all(|byte| *byte == 0)
+    {
+        return Err(IdentityGenerationError::RotationMismatch);
+    }
+    if wire.len() != ROTATION_WIRE_LEN
+        || &wire[..4] != ROTATION_MAGIC
+        || u16::from_be_bytes(wire[4..6].try_into().unwrap()) != ROTATION_VERSION
+    {
+        return Err(IdentityGenerationError::RotationMalformed);
+    }
+    let stated_network: [u8; 32] = wire[6..38].try_into().unwrap();
+    let stated_credential = u128::from_be_bytes(wire[38..54].try_into().unwrap());
+    let stated_issuer = u32::from_be_bytes(wire[54..58].try_into().unwrap());
+    let stated_key = u32::from_be_bytes(wire[58..62].try_into().unwrap());
+    let stated_purpose =
+        KeyPurpose::try_from(wire[62]).map_err(|_| IdentityGenerationError::RotationMalformed)?;
+    let stated_from_generation = u32::from_be_bytes(wire[63..67].try_into().unwrap());
+    let stated_from_digest: [u8; 32] = wire[67..99].try_into().unwrap();
+    let stated_to_generation = u32::from_be_bytes(wire[99..103].try_into().unwrap());
+    let stated_to_digest: [u8; 32] = wire[103..135].try_into().unwrap();
+    if &stated_network != network_id
+        || stated_credential != credential_id
+        || stated_issuer != issuer_id
+        || stated_key != key_id
+        || stated_purpose != purpose
+        || stated_from_generation != from_generation
+        || &stated_from_digest != from_digest
+        || stated_to_generation != to_generation
+        || &stated_to_digest != to_digest
+    {
+        return Err(IdentityGenerationError::RotationMismatch);
+    }
+    let issuer = VerifyingKey::from_bytes(issuer_public_key)
+        .map_err(|_| IdentityGenerationError::IdentityMismatch)?;
+    let signature = Signature::from_slice(&wire[ROTATION_CORE_LEN..])
+        .map_err(|_| IdentityGenerationError::RotationMalformed)?;
+    let mut message = Vec::with_capacity(ROTATION_DOMAIN.len() + ROTATION_CORE_LEN);
+    message.extend_from_slice(ROTATION_DOMAIN);
+    message.extend_from_slice(&wire[..ROTATION_CORE_LEN]);
+    issuer
+        .verify_strict(&message, &signature)
+        .map_err(|_| IdentityGenerationError::RotationSignature)
 }
 
 /// Encode an issuer-authorized, exact-successor Noise peer-key rotation statement (NRT1).
@@ -680,6 +754,68 @@ mod tests {
         assert_eq!(
             observe(&store, &next, Some(&rotation)),
             Err(IdentityGenerationError::RotationMismatch)
+        );
+    }
+
+    #[test]
+    fn pure_nrt1_verifier_checks_exact_predecessor_successor_and_issuer_signature() {
+        let f = Fixture::new();
+        let old = f.record(2, KeyState::Active, [0x21; 32]);
+        let next = f.record(3, KeyState::Active, [0x22; 32]);
+        let rotation = f.rotation(2, &old, 3, &next);
+        let old_digest: [u8; 32] = Sha256::digest(&old).into();
+        let next_digest: [u8; 32] = Sha256::digest(&next).into();
+        let issuer_public = f.issuer.verifying_key().to_bytes();
+
+        verify_signed_rotation_statement(
+            &rotation,
+            &f.network,
+            9001,
+            17,
+            700,
+            KeyPurpose::PeerAuth,
+            2,
+            &old_digest,
+            3,
+            &next_digest,
+            &issuer_public,
+        )
+        .unwrap();
+
+        assert_eq!(
+            verify_signed_rotation_statement(
+                &rotation,
+                &f.network,
+                9001,
+                17,
+                700,
+                KeyPurpose::PeerAuth,
+                2,
+                &[0x99; 32],
+                3,
+                &next_digest,
+                &issuer_public,
+            ),
+            Err(IdentityGenerationError::RotationMismatch)
+        );
+
+        let mut tampered = rotation;
+        tampered[ROTATION_CORE_LEN] ^= 1;
+        assert_eq!(
+            verify_signed_rotation_statement(
+                &tampered,
+                &f.network,
+                9001,
+                17,
+                700,
+                KeyPurpose::PeerAuth,
+                2,
+                &old_digest,
+                3,
+                &next_digest,
+                &issuer_public,
+            ),
+            Err(IdentityGenerationError::RotationSignature)
         );
     }
 

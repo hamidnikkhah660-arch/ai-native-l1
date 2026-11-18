@@ -13,6 +13,7 @@ use crate::qrun_v06_pow_wire_candidate::{
 use crate::{
     external_cas_anchor_candidate::ExternalCasProviderTransport,
     qrun_v06_canonical_execution_candidate::QRunV06CanonicalExecutionState,
+    qrun_v06_local_anchor_vault_candidate::QRunV06LocalAnchorVault,
     qrun_v06_node_runtime_candidate::{
         QRunV06NodeAnchorGate, QRunV06NodeRuntime, QRunV06NodeRuntimeError,
     },
@@ -22,19 +23,22 @@ use crate::{
         QRunV06DurableCommit, QRunV06DurableForkStore, QRunV06ForkStoreError,
     },
     qrun_v06_profile_pin_candidate::QRunV06VerifiedProfilePin,
+    qrun_v06_profile_trust_candidate::QRunV06TrustAuthorizedProfilePin,
     qrun_v06_qap1_coordinator_candidate::{
         QRunV06Qap1AnchorTransport, QRunV06Qap1ExternalCoordinator,
     },
     state_machine::TransactionAuthenticator,
     v4_fat1_trust_candidate::MlDsa65Verifier,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QRunV06PermissionlessRuntimeError {
     Store(String),
     UnresolvedQap1Intent,
     Qap1Recovery(String),
+    LocalAnchorVault(String),
+    LocalAnchorRecoveryRequired,
 }
 
 impl std::fmt::Display for QRunV06PermissionlessRuntimeError {
@@ -44,6 +48,10 @@ impl std::fmt::Display for QRunV06PermissionlessRuntimeError {
             Self::Qap1Recovery(error) => write!(f, "QFP6 QAP1 recovery failed: {error}"),
             Self::UnresolvedQap1Intent => f.write_str(
                 "QFP6 permissionless base runtime refuses a store with unresolved QAP1 intent; recover through the anchored runtime first",
+            ),
+            Self::LocalAnchorVault(error) => write!(f, "QFP6 local dual-disk anchor persistence failed: {error}"),
+            Self::LocalAnchorRecoveryRequired => f.write_str(
+                "QFP6 local anchor persistence is unresolved; stop and reopen through the local vault recovery path",
             ),
         }
     }
@@ -108,6 +116,12 @@ pub struct QRunV06PermissionlessNodeRuntime {
     store: QRunV06DurableForkStore,
     network_id: [u8; 32],
     profile_id: [u8; 32],
+    local_anchor_vault: Option<QRunV06LocalAnchorVault>,
+    local_anchor_failed: bool,
+    // Keep prior segment writer locks alive after rollover so retired stores cannot be reopened
+    // for writes while this runtime remains active.
+    retired_segments: Vec<QRunV06DurableForkStore>,
+    auto_checkpoint_rollover: Option<(PathBuf, QRunV06VerifiedProfilePin)>,
 }
 
 impl QRunV06PermissionlessNodeRuntime {
@@ -201,20 +215,767 @@ impl QRunV06PermissionlessNodeRuntime {
             store,
             network_id,
             profile_id,
+            local_anchor_vault: None,
+            local_anchor_failed: false,
+            retired_segments: Vec::new(),
+            auto_checkpoint_rollover: None,
+        })
+    }
+
+    /// Bootstrap a genuinely fresh Genesis-only store and immediately pin its generation-zero
+    /// manifest in a separate append-only anchor vault before exposing the runtime.
+    /// Existing history, an existing/partial vault, or any nonzero generation fails closed.
+    pub fn open_with_fresh_genesis_anchor_vault<A: TransactionAuthenticator>(
+        directory: impl AsRef<Path>,
+        genesis_state: QRunV06CanonicalExecutionState,
+        params: ConsensusParameters,
+        authenticator: &A,
+        verified_profile_pin: &QRunV06VerifiedProfilePin,
+        trusted_genesis_anchor: [u8; 32],
+        vault_directory: impl AsRef<Path>,
+    ) -> Result<Self, QRunV06PermissionlessRuntimeError> {
+        let descriptor = verified_profile_pin.descriptor();
+        let network_id = descriptor.network_id();
+        let profile_id = descriptor.profile_id();
+        let store = QRunV06DurableForkStore::open_with_verified_profile_pin(
+            directory,
+            genesis_state,
+            params,
+            authenticator,
+            None,
+            verified_profile_pin,
+        )?;
+        if store.has_qap1_intent()? {
+            return Err(QRunV06PermissionlessRuntimeError::UnresolvedQap1Intent);
+        }
+        if store.generation()? != 0 || store.graph()?.canonical_tip().height != 0 {
+            return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                "fresh Genesis anchor provisioning requires a generation-zero, height-zero store; existing history is never adopted automatically".into(),
+            ));
+        }
+        let genesis_anchor = store.manifest_anchor()?;
+        if genesis_anchor != trusted_genesis_anchor {
+            return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                "fresh Genesis manifest differs from the independently pinned Genesis anchor"
+                    .into(),
+            ));
+        }
+        let vault = QRunV06LocalAnchorVault::provision_genesis_root(
+            vault_directory,
+            network_id,
+            profile_id,
+            genesis_anchor,
+        )
+        .map_err(QRunV06PermissionlessRuntimeError::LocalAnchorVault)?;
+        if vault.tip().manifest_generation != 0 || vault.tip().manifest_anchor != genesis_anchor {
+            return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                "fresh Genesis anchor vault did not reopen at the exact store root".into(),
+            ));
+        }
+        Ok(Self {
+            store,
+            network_id,
+            profile_id,
+            local_anchor_vault: Some(vault),
+            local_anchor_failed: false,
+            retired_segments: Vec::new(),
+            auto_checkpoint_rollover: None,
+        })
+    }
+    /// Open the local single-owner runtime using the exact current tip of the C:-side vault.
+    /// The store accepts that pin only if it is an exact manifest ancestor, then fully replays
+    /// the remaining chain before the vault can be advanced to a single committed successor.
+    pub fn open_with_local_anchor_vault<A: TransactionAuthenticator>(
+        directory: impl AsRef<Path>,
+        genesis_state: QRunV06CanonicalExecutionState,
+        params: ConsensusParameters,
+        authenticator: &A,
+        trusted_manifest_anchor: [u8; 32],
+        trusted_manifest_generation: u64,
+        verified_profile_pin: &QRunV06VerifiedProfilePin,
+        vault_directory: impl AsRef<Path>,
+    ) -> Result<Self, QRunV06PermissionlessRuntimeError> {
+        let descriptor = verified_profile_pin.descriptor();
+        let network_id = descriptor.network_id();
+        let profile_id = descriptor.profile_id();
+        let mut vault = QRunV06LocalAnchorVault::open(vault_directory, network_id, profile_id)
+            .map_err(QRunV06PermissionlessRuntimeError::LocalAnchorVault)?;
+        let tip = vault.tip();
+        if tip.manifest_generation != trusted_manifest_generation
+            || tip.manifest_anchor != trusted_manifest_anchor
+        {
+            return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                "supplied trusted anchor differs from the independently loaded C: vault tip".into(),
+            ));
+        }
+        let store =
+            QRunV06DurableForkStore::open_with_verified_profile_pin_and_trusted_anchor_ancestor(
+                directory,
+                genesis_state,
+                params,
+                authenticator,
+                trusted_manifest_anchor,
+                trusted_manifest_generation,
+                verified_profile_pin,
+            )?;
+        if store.has_qap1_intent()? {
+            return Err(QRunV06PermissionlessRuntimeError::UnresolvedQap1Intent);
+        }
+        // Successful store open proves the exact C: anchor/generation occurs in the fully
+        // linked manifest chain; the store has also replayed and validated all branch entries.
+        vault
+            .reconcile_replayed_tip(store.generation()?, store.manifest_anchor()?)
+            .map_err(QRunV06PermissionlessRuntimeError::LocalAnchorVault)?;
+        Ok(Self {
+            store,
+            network_id,
+            profile_id,
+            local_anchor_vault: Some(vault),
+            local_anchor_failed: false,
+            retired_segments: Vec::new(),
+            auto_checkpoint_rollover: None,
+        })
+    }
+
+    /// Reopen a checkpoint-rooted segment only when its exact checkpoint and generation-zero
+    /// manifest are bound by the latest C: witness. Segment-local generations are translated
+    /// through that witness before the runtime is exposed for block admission.
+    pub fn open_from_checkpoint_with_local_anchor_vault<A: TransactionAuthenticator>(
+        directory: impl AsRef<Path>,
+        checkpoint_bytes: &[u8],
+        checkpoint_anchor: [u8; 32],
+        params: ConsensusParameters,
+        authenticator: &A,
+        verified_profile_pin: &QRunV06VerifiedProfilePin,
+        vault_directory: impl AsRef<Path>,
+    ) -> Result<Self, QRunV06PermissionlessRuntimeError> {
+        let descriptor = verified_profile_pin.descriptor();
+        let network_id = descriptor.network_id();
+        let profile_id = descriptor.profile_id();
+        let consensus_fingerprint =
+            crate::qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint(&params)
+                .map_err(|error| QRunV06PermissionlessRuntimeError::Store(format!("{error:?}")))?;
+        if descriptor.consensus_fingerprint() != consensus_fingerprint {
+            return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                "Q6PN consensus fingerprint differs from checkpoint runtime parameters".into(),
+            ));
+        }
+        let checkpoint =
+            crate::qrun_v06_checkpoint_candidate::QRunV06CheckpointCandidate::decode_snapshot(
+                checkpoint_bytes,
+                &params,
+                &network_id,
+                &profile_id,
+                checkpoint_anchor,
+            )
+            .map_err(|error| {
+                QRunV06PermissionlessRuntimeError::LocalAnchorVault(format!(
+                    "checkpoint validation failed: {error:?}"
+                ))
+            })?;
+        if checkpoint.commitment().map_err(|error| {
+            QRunV06PermissionlessRuntimeError::LocalAnchorVault(format!("{error:?}"))
+        })? != checkpoint_anchor
+            || checkpoint.genesis_descriptor_commitment() != descriptor.commitment()
+            || checkpoint.consensus_fingerprint() != consensus_fingerprint
+        {
+            return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                "checkpoint commitment/Genesis/consensus identity differs from Q6PN".into(),
+            ));
+        }
+        let checkpoint_state_root = checkpoint.execution_state().state_root().map_err(|error| {
+            QRunV06PermissionlessRuntimeError::LocalAnchorVault(format!("{error:?}"))
+        })?;
+        let mut vault = QRunV06LocalAnchorVault::open(vault_directory, network_id, profile_id)
+            .map_err(QRunV06PermissionlessRuntimeError::LocalAnchorVault)?;
+        let witness = vault.latest_checkpoint_segment_witness().ok_or_else(|| {
+            QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                "checkpoint-rooted startup requires a C: checkpoint-segment witness".into(),
+            )
+        })?;
+        if witness.checkpoint_commitment != checkpoint_anchor
+            || witness.checkpoint_base_height != checkpoint.height()
+            || witness.checkpoint_tip_hash != checkpoint.execution_tip_hash()
+            || witness.checkpoint_state_root != checkpoint_state_root
+            || witness.checkpoint_cumulative_work != checkpoint.cumulative_work().to_be_bytes()
+            || witness.network_id != network_id
+            || witness.profile_id != profile_id
+            || witness.genesis_descriptor_commitment != descriptor.commitment()
+            || witness.consensus_fingerprint != consensus_fingerprint
+        {
+            return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                "checkpoint bytes do not match the exact C: segment witness".into(),
+            ));
+        }
+        let tip = vault.tip();
+        let root_generation = witness
+            .predecessor_global_generation
+            .checked_add(1)
+            .ok_or_else(|| {
+                QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                    "global segment generation overflow".into(),
+                )
+            })?;
+        let (trusted_manifest_anchor, trusted_manifest_generation) =
+            if tip.manifest_generation == witness.predecessor_global_generation {
+                if tip.sequence != witness.predecessor_vault_sequence
+                    || tip.manifest_anchor != witness.predecessor_manifest_anchor
+                    || tip.record_digest != witness.predecessor_record_digest
+                {
+                    return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                        "pending witness predecessor is not the exact current C: vault tip".into(),
+                    ));
+                }
+                (witness.segment_root_manifest_anchor, 0)
+            } else if tip.manifest_generation >= root_generation {
+                (
+                    tip.manifest_anchor,
+                    tip.manifest_generation
+                        .checked_sub(root_generation)
+                        .ok_or_else(|| {
+                            QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                                "segment-local generation mapping underflow".into(),
+                            )
+                        })?,
+                )
+            } else {
+                return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                    "C: vault tip is inconsistent with checkpoint witness generation".into(),
+                ));
+            };
+        let store = QRunV06DurableForkStore::open_from_checkpoint_with_verified_profile_pin_and_trusted_anchor_ancestor(
+            directory,
+            checkpoint_bytes,
+            params,
+            checkpoint_anchor,
+            verified_profile_pin,
+            authenticator,
+            trusted_manifest_anchor,
+            trusted_manifest_generation,
+        )?;
+        if store.has_qap1_intent()? {
+            return Err(QRunV06PermissionlessRuntimeError::UnresolvedQap1Intent);
+        }
+        if store.checkpoint_anchor()? != Some(checkpoint_anchor)
+            || store.manifest_anchor_at_generation(0)? != Some(witness.segment_root_manifest_anchor)
+            || store.graph()?.base_height() != checkpoint.height()
+            || store.graph()?.base_tip() != checkpoint.consensus_tip_digest()
+        {
+            return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                "checkpoint segment root manifest/base state differs from C: witness".into(),
+            ));
+        }
+        vault
+            .reconcile_checkpoint_segment_root()
+            .map_err(QRunV06PermissionlessRuntimeError::LocalAnchorVault)?;
+        let local_generation = store.generation()?;
+        let local_anchor = store.manifest_anchor()?;
+        let reconciled = vault
+            .append_segment_successor(local_generation, local_anchor)
+            .map_err(QRunV06PermissionlessRuntimeError::LocalAnchorVault)?;
+        let expected_global_generation = witness
+            .predecessor_global_generation
+            .checked_add(1)
+            .and_then(|base| base.checked_add(local_generation))
+            .ok_or_else(|| {
+                QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                    "global segment generation overflow".into(),
+                )
+            })?;
+        if reconciled.manifest_generation != expected_global_generation
+            || reconciled.manifest_anchor != local_anchor
+        {
+            return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                "C: vault tip does not equal the checkpoint segment's mapped local tip".into(),
+            ));
+        }
+        Ok(Self {
+            store,
+            network_id,
+            profile_id,
+            local_anchor_vault: Some(vault),
+            local_anchor_failed: false,
+            retired_segments: Vec::new(),
+            auto_checkpoint_rollover: None,
+        })
+    }
+
+    /// Enable automatic checkpoint rollover immediately before a submission would exceed the
+    /// current segment's archive capacity. The segment root is a local storage namespace, not
+    /// a trust anchor; each selected segment is still verified against the C: witness chain.
+    pub fn enable_auto_checkpoint_rollover(
+        &mut self,
+        segments_root: impl AsRef<Path>,
+        verified_profile_pin: QRunV06VerifiedProfilePin,
+    ) -> Result<(), QRunV06PermissionlessRuntimeError> {
+        if self.local_anchor_vault.is_none() {
+            return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                "automatic checkpoint rollover requires the local C: anchor vault".into(),
+            ));
+        }
+        let descriptor = verified_profile_pin.descriptor();
+        let active_fingerprint =
+            crate::qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint(
+                self.store.graph()?.consensus_parameters(),
+            )
+            .map_err(|error| QRunV06PermissionlessRuntimeError::Store(format!("{error:?}")))?;
+        if descriptor.network_id() != self.network_id
+            || descriptor.profile_id() != self.profile_id
+            || descriptor.consensus_fingerprint() != active_fingerprint
+        {
+            return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                "automatic rollover Q6PN does not match the active runtime".into(),
+            ));
+        }
+        self.auto_checkpoint_rollover =
+            Some((segments_root.as_ref().to_path_buf(), verified_profile_pin));
+        Ok(())
+    }
+
+    fn rotate_if_archive_capacity_reached<A: TransactionAuthenticator>(
+        &mut self,
+        authenticator: &A,
+    ) -> Result<(), QRunV06PermissionlessRuntimeError> {
+        if self.store.archive_len()?
+            < crate::qrun_v06_pow_fork_choice_candidate::MAX_QRUN_V06_FORK_ARCHIVE_BLOCKS
+        {
+            return Ok(());
+        }
+        let Some((segments_root, verified_profile_pin)) = self.auto_checkpoint_rollover.as_ref()
+        else {
+            return Ok(());
+        };
+        let segments_root = segments_root.clone();
+        let verified_profile_pin = verified_profile_pin.clone();
+        let next_sequence = self
+            .local_anchor_vault
+            .as_ref()
+            .and_then(QRunV06LocalAnchorVault::latest_checkpoint_segment_witness)
+            .map(|witness| witness.sequence.checked_add(1))
+            .unwrap_or(Some(1))
+            .ok_or_else(|| {
+                QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                    "checkpoint segment sequence overflow".into(),
+                )
+            })?;
+        let next_directory = segments_root.join(format!("segment-{next_sequence:020}"));
+        self.rotate_to_checkpoint_segment(next_directory, authenticator, &verified_profile_pin)?;
+        Ok(())
+    }
+
+    /// Rotate the active durable store to a fresh checkpoint-rooted segment. The C: witness
+    /// is appended before its generation-zero manifest anchor; only after that anchor is
+    /// read-back verified does the runtime switch stores. The retired store's writer lock is
+    /// retained for the lifetime of this runtime.
+    pub fn rotate_to_checkpoint_segment<A: TransactionAuthenticator>(
+        &mut self,
+        new_directory: impl AsRef<Path>,
+        authenticator: &A,
+        verified_profile_pin: &QRunV06VerifiedProfilePin,
+    ) -> Result<[u8; 32], QRunV06PermissionlessRuntimeError> {
+        if self.local_anchor_failed {
+            return Err(QRunV06PermissionlessRuntimeError::LocalAnchorRecoveryRequired);
+        }
+        if self.store.has_qap1_intent()? {
+            return Err(QRunV06PermissionlessRuntimeError::UnresolvedQap1Intent);
+        }
+        let descriptor = verified_profile_pin.descriptor();
+        let params = self.store.graph()?.consensus_parameters().clone();
+        let active_consensus_fingerprint =
+            crate::qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint(&params)
+                .map_err(|error| QRunV06PermissionlessRuntimeError::Store(format!("{error:?}")))?;
+        if descriptor.network_id() != self.network_id
+            || descriptor.profile_id() != self.profile_id
+            || descriptor.consensus_fingerprint() != active_consensus_fingerprint
+        {
+            return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(format!(
+                "rotation Q6PN mismatch: network={}, profile={}, consensus={}, pin_fp={:02x?}, store_fp={:02x?}",
+                descriptor.network_id() == self.network_id,
+                descriptor.profile_id() == self.profile_id,
+                descriptor.consensus_fingerprint() == active_consensus_fingerprint,
+                descriptor.consensus_fingerprint(),
+                active_consensus_fingerprint,
+            )));
+        }
+        let vault_ref = self.local_anchor_vault.as_ref().ok_or_else(|| {
+            QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                "checkpoint rotation requires the local C: anchor vault".into(),
+            )
+        })?;
+        let current_vault_tip = vault_ref.tip();
+        let current_local_generation = self.store.generation()?;
+        let current_global_generation =
+            if let Some(witness) = vault_ref.latest_checkpoint_segment_witness() {
+                witness
+                    .predecessor_global_generation
+                    .checked_add(1)
+                    .and_then(|base| base.checked_add(current_local_generation))
+                    .ok_or_else(|| {
+                        QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                            "active segment global generation overflow".into(),
+                        )
+                    })?
+            } else {
+                current_local_generation
+            };
+        if current_vault_tip.manifest_generation != current_global_generation
+            || current_vault_tip.manifest_anchor != self.store.manifest_anchor()?
+        {
+            return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                "active store and C: vault are not at the exact same mapped tip; rotation refused"
+                    .into(),
+            ));
+        }
+
+        let active_graph = self.store.graph()?;
+        let canonical_span = active_graph
+            .canonical_tip()
+            .height
+            .checked_sub(active_graph.base_height())
+            .ok_or_else(|| {
+                QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                    "canonical checkpoint span underflow".into(),
+                )
+            })?;
+        if self.store.archive_len()? as u64 != canonical_span {
+            return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                "checkpoint rollover refused while competing/noncanonical branches remain; a canonical-only checkpoint would discard fork-choice candidates".into(),
+            ));
+        }
+        let (checkpoint_bytes, checkpoint_anchor) = self.store.export_canonical_checkpoint()?;
+        let checkpoint =
+            crate::qrun_v06_checkpoint_candidate::QRunV06CheckpointCandidate::decode_snapshot(
+                &checkpoint_bytes,
+                &params,
+                &self.network_id,
+                &self.profile_id,
+                checkpoint_anchor,
+            )
+            .map_err(|error| {
+                QRunV06PermissionlessRuntimeError::LocalAnchorVault(format!(
+                    "exported checkpoint failed self-validation: {error:?}"
+                ))
+            })?;
+        if checkpoint.genesis_descriptor_commitment() != descriptor.commitment()
+            || checkpoint.consensus_fingerprint() != descriptor.consensus_fingerprint()
+        {
+            return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                "exported checkpoint identity differs from the independently verified Q6PN".into(),
+            ));
+        }
+
+        let new_directory = new_directory.as_ref();
+        let segments_root = new_directory.parent().ok_or_else(|| {
+            QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                "checkpoint segment directory has no parent namespace".into(),
+            )
+        })?;
+        match std::fs::symlink_metadata(segments_root) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(segments_root).map_err(|error| {
+                    QRunV06PermissionlessRuntimeError::LocalAnchorVault(format!(
+                        "cannot create checkpoint segments root: {error}"
+                    ))
+                })?;
+            }
+            Err(error) => {
+                return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                    format!("cannot inspect checkpoint segments root: {error}"),
+                ));
+            }
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                    "checkpoint segments root must be a real non-symlink directory".into(),
+                ));
+            }
+            Ok(_) => {}
+        }
+        let root_metadata = std::fs::symlink_metadata(segments_root).map_err(|error| {
+            QRunV06PermissionlessRuntimeError::LocalAnchorVault(format!(
+                "checkpoint segments root metadata after creation: {error}"
+            ))
+        })?;
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                "checkpoint segments root changed to a non-directory or symlink".into(),
+            ));
+        }
+        match std::fs::symlink_metadata(new_directory) {
+            Ok(_) => {
+                return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                    "new checkpoint segment path must not already exist; refusing reuse".into(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                    format!("cannot inspect new checkpoint segment path: {error}"),
+                ));
+            }
+        }
+
+        let network_id = self.network_id;
+        let profile_id = self.profile_id;
+        let mut witness_written = false;
+        let result = {
+            let vault = self.local_anchor_vault.as_mut().ok_or_else(|| {
+                QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                    "local C: anchor vault disappeared during rotation".into(),
+                )
+            })?;
+            (|| {
+                let new_store =
+                    QRunV06DurableForkStore::open_from_checkpoint_with_verified_profile_pin(
+                        new_directory,
+                        &checkpoint_bytes,
+                        params,
+                        checkpoint_anchor,
+                        verified_profile_pin,
+                        authenticator,
+                        None,
+                    )?;
+                if new_store.generation()? != 0
+                    || new_store.archive_len()? != 0
+                    || new_store.checkpoint_anchor()? != Some(checkpoint_anchor)
+                    || new_store.graph()?.base_height() != checkpoint.height()
+                    || new_store.graph()?.base_tip() != checkpoint.consensus_tip_digest()
+                {
+                    return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                        "fresh checkpoint segment did not open at the exact generation-zero base"
+                            .into(),
+                    ));
+                }
+                let segment_root_anchor =
+                    new_store.manifest_anchor_at_generation(0)?.ok_or_else(|| {
+                        QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                            "fresh checkpoint segment has no generation-zero manifest".into(),
+                        )
+                    })?;
+                let predecessor = vault.tip();
+                let previous_witness = vault.latest_checkpoint_segment_witness();
+                let sequence = previous_witness
+                    .map(|witness| witness.sequence.checked_add(1))
+                    .unwrap_or(Some(1))
+                    .ok_or_else(|| {
+                        QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                            "checkpoint witness sequence overflow".into(),
+                        )
+                    })?;
+                let witness =
+                    crate::qrun_v06_local_anchor_vault_candidate::QRunV06CheckpointSegmentWitness {
+                        sequence,
+                        predecessor_vault_sequence: predecessor.sequence,
+                        predecessor_global_generation: predecessor.manifest_generation,
+                        predecessor_manifest_anchor: predecessor.manifest_anchor,
+                        predecessor_record_digest: predecessor.record_digest,
+                        checkpoint_commitment: checkpoint_anchor,
+                        segment_root_manifest_anchor: segment_root_anchor,
+                        checkpoint_base_height: checkpoint.height(),
+                        checkpoint_tip_hash: checkpoint.execution_tip_hash(),
+                        checkpoint_state_root: checkpoint.execution_state().state_root().map_err(
+                            |error| {
+                                QRunV06PermissionlessRuntimeError::LocalAnchorVault(format!(
+                                    "{error:?}"
+                                ))
+                            },
+                        )?,
+                        checkpoint_cumulative_work: checkpoint.cumulative_work().to_be_bytes(),
+                        network_id,
+                        profile_id,
+                        genesis_descriptor_commitment: descriptor.commitment(),
+                        consensus_fingerprint: descriptor.consensus_fingerprint(),
+                        previous_witness_digest: previous_witness
+                            .map(|witness| witness.witness_digest)
+                            .unwrap_or([0; 32]),
+                        witness_digest: [0; 32],
+                    };
+                vault
+                    .append_checkpoint_segment_witness(witness)
+                    .map_err(QRunV06PermissionlessRuntimeError::LocalAnchorVault)?;
+                witness_written = true;
+                let root_tip = vault
+                    .reconcile_checkpoint_segment_root()
+                    .map_err(QRunV06PermissionlessRuntimeError::LocalAnchorVault)?;
+                let expected_root_generation = predecessor
+                    .manifest_generation
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                            "global root generation overflow".into(),
+                        )
+                    })?;
+                if root_tip.manifest_generation != expected_root_generation
+                    || root_tip.manifest_anchor != segment_root_anchor
+                {
+                    return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                        "C: vault did not durably publish the exact checkpoint segment root".into(),
+                    ));
+                }
+                Ok(new_store)
+            })()
+        };
+        let new_store = match result {
+            Ok(store) => store,
+            Err(error) => {
+                if witness_written {
+                    self.local_anchor_failed = true;
+                }
+                return Err(error);
+            }
+        };
+        let retired = std::mem::replace(&mut self.store, new_store);
+        self.retired_segments.push(retired);
+        Ok(checkpoint_anchor)
+    }
+
+    fn persist_local_anchor_after_commit(
+        &mut self,
+        commit: &QRunV06DurableCommit,
+    ) -> Result<(), QRunV06PermissionlessRuntimeError> {
+        if self.local_anchor_failed {
+            return Err(QRunV06PermissionlessRuntimeError::LocalAnchorRecoveryRequired);
+        }
+        if let Some(vault) = self.local_anchor_vault.as_mut() {
+            let result = if vault.latest_checkpoint_segment_witness().is_some() {
+                vault.append_segment_successor(commit.generation, commit.manifest_anchor)
+            } else {
+                vault.append_successor(commit.generation, commit.manifest_anchor)
+            };
+            if let Err(error) = result {
+                self.local_anchor_failed = true;
+                return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(error));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn local_anchor_requires_reopen(&self) -> bool {
+        self.local_anchor_failed
+    }
+
+    pub fn local_anchor_persistence_status(&self) -> &'static str {
+        if self.local_anchor_failed {
+            "REOPEN_REQUIRED"
+        } else if self.local_anchor_vault.is_some() {
+            "LOCAL_C_VAULT_PER_COMMIT_PERSISTED"
+        } else {
+            "NOT_CONFIGURED"
+        }
+    }
+
+    pub fn local_anchor_vault_tip(
+        &self,
+    ) -> Option<crate::qrun_v06_local_anchor_vault_candidate::QRunV06LocalAnchorVaultTip> {
+        self.local_anchor_vault.as_ref().map(|vault| vault.tip())
+    }
+
+    /// Open a trust-authorized profile with fresh Q6QA verification while replaying the
+    /// complete durable history. Any external-quote block lacking valid height-bound trust
+    /// evidence aborts startup; the ordinary open() API remains fail-closed for such archives.
+    pub fn open_with_quote_asset_authorization<A: TransactionAuthenticator>(
+        directory: impl AsRef<Path>,
+        genesis_state: QRunV06CanonicalExecutionState,
+        params: ConsensusParameters,
+        authenticator: &A,
+        trusted_manifest_anchor: Option<[u8; 32]>,
+        authorized_profile_pin: &QRunV06TrustAuthorizedProfilePin,
+        quote_authorizer: &mut QRunV06QuoteAssetAuthorizationProvider<'_>,
+    ) -> Result<Self, QRunV06PermissionlessRuntimeError> {
+        let descriptor = authorized_profile_pin.verified_profile_pin().descriptor();
+        if descriptor.consensus_fingerprint()
+            != crate::qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint(&params)
+                .map_err(|error| QRunV06PermissionlessRuntimeError::Store(format!("{error:?}")))?
+        {
+            return Err(QRunV06PermissionlessRuntimeError::Store(
+                "Q6PN consensus fingerprint differs from the pinned Q6CP profile".into(),
+            ));
+        }
+        if genesis_state.genesis_descriptor() != Some(descriptor)
+            || genesis_state.network_id() != descriptor.network_id()
+            || genesis_state.profile_id() != descriptor.profile_id()
+        {
+            return Err(QRunV06PermissionlessRuntimeError::Store(
+                "Q6PN Genesis descriptor differs from the supplied canonical Genesis".into(),
+            ));
+        }
+        let (founder_account, policy_fingerprint) = genesis_state
+            .genesis_economic_policy_identity()
+            .ok_or_else(|| {
+                QRunV06PermissionlessRuntimeError::Store(
+                    "Genesis economic policy identity is absent".into(),
+                )
+            })?;
+        if founder_account != descriptor.founder_account()
+            || policy_fingerprint != descriptor.tokenomics_policy_fingerprint()
+        {
+            return Err(QRunV06PermissionlessRuntimeError::Store(
+                "Genesis founder/economic-policy identity differs from the Q6PN descriptor".into(),
+            ));
+        }
+        let network_id = descriptor.network_id();
+        let profile_id = descriptor.profile_id();
+        let store = QRunV06DurableForkStore::open_with_trust_authorized_profile_pin_and_quote_asset_authorization(
+            directory,
+            genesis_state,
+            params,
+            authenticator,
+            trusted_manifest_anchor,
+            authorized_profile_pin,
+            quote_authorizer,
+        )?;
+        if store.has_qap1_intent()? {
+            return Err(QRunV06PermissionlessRuntimeError::UnresolvedQap1Intent);
+        }
+        Ok(Self {
+            store,
+            network_id,
+            profile_id,
+            local_anchor_vault: None,
+            local_anchor_failed: false,
+            retired_segments: Vec::new(),
+            auto_checkpoint_rollover: None,
         })
     }
 
     /// Native-only base admission. A successful return means local durable commit, not a
-    /// globally acknowledged/network-finalized transaction or block.
+    /// globally acknowledged/network-finalized transaction or block. External quote activity
+    /// fails closed through this compatibility entry point.
     pub fn submit_envelope<A: TransactionAuthenticator>(
         &mut self,
         envelope: &[u8],
         authenticator: &A,
     ) -> Result<QRunV06DurableCommit, QRunV06PermissionlessRuntimeError> {
+        if self.local_anchor_failed {
+            return Err(QRunV06PermissionlessRuntimeError::LocalAnchorRecoveryRequired);
+        }
         if self.store.has_qap1_intent()? {
             return Err(QRunV06PermissionlessRuntimeError::UnresolvedQap1Intent);
         }
-        Ok(self.store.submit(envelope, authenticator)?)
+        self.rotate_if_archive_capacity_reached(authenticator)?;
+        let commit = self.store.submit(envelope, authenticator)?;
+        self.persist_local_anchor_after_commit(&commit)?;
+        Ok(commit)
+    }
+
+    pub fn submit_envelope_with_quote_asset_authorization<A: TransactionAuthenticator>(
+        &mut self,
+        envelope: &[u8],
+        authenticator: &A,
+        quote_authorizer: &mut QRunV06QuoteAssetAuthorizationProvider<'_>,
+    ) -> Result<QRunV06DurableCommit, QRunV06PermissionlessRuntimeError> {
+        if self.local_anchor_failed {
+            return Err(QRunV06PermissionlessRuntimeError::LocalAnchorRecoveryRequired);
+        }
+        if self.store.has_qap1_intent()? {
+            return Err(QRunV06PermissionlessRuntimeError::UnresolvedQap1Intent);
+        }
+        let commit = self.store.submit_with_quote_asset_authorization(
+            envelope,
+            authenticator,
+            quote_authorizer,
+        )?;
+        self.persist_local_anchor_after_commit(&commit)?;
+        Ok(commit)
     }
 
     /// Import one bounded, parent-first canonical history batch from an authenticated peer.
@@ -227,6 +988,15 @@ impl QRunV06PermissionlessNodeRuntime {
         &mut self,
         envelopes: &[Vec<u8>],
         authenticator: &A,
+    ) -> Result<QRunV06HistorySyncReport, QRunV06HistorySyncError> {
+        self.import_history_batch_with_quote_asset_authorization(envelopes, authenticator, None)
+    }
+
+    pub fn import_history_batch_with_quote_asset_authorization<A: TransactionAuthenticator>(
+        &mut self,
+        envelopes: &[Vec<u8>],
+        authenticator: &A,
+        mut quote_authorizer: Option<&mut QRunV06QuoteAssetAuthorizationProvider<'_>>,
     ) -> Result<QRunV06HistorySyncReport, QRunV06HistorySyncError> {
         if envelopes.is_empty() {
             return Err(QRunV06HistorySyncError::EmptyBatch);
@@ -293,7 +1063,15 @@ impl QRunV06PermissionlessNodeRuntime {
 
         let mut imported = 0usize;
         for (index, envelope) in envelopes.iter().enumerate() {
-            if let Err(error) = self.submit_envelope(envelope, authenticator) {
+            let result = match quote_authorizer.as_deref_mut() {
+                Some(provider) => self.submit_envelope_with_quote_asset_authorization(
+                    envelope,
+                    authenticator,
+                    provider,
+                ),
+                None => self.submit_envelope(envelope, authenticator),
+            };
+            if let Err(error) = result {
                 return Err(QRunV06HistorySyncError::ApplyFailed {
                     index,
                     committed_blocks: imported,
@@ -329,6 +1107,27 @@ impl QRunV06PermissionlessNodeRuntime {
         expected_parent_execution_hash: [u8; 32],
         envelopes: &[Vec<u8>],
         authenticator: &A,
+    ) -> Result<QRunV06HistorySyncReport, QRunV06HistorySyncError> {
+        self.import_history_branch_batch_with_quote_asset_authorization(
+            start_height,
+            expected_parent_consensus_hash,
+            expected_parent_execution_hash,
+            envelopes,
+            authenticator,
+            None,
+        )
+    }
+
+    pub fn import_history_branch_batch_with_quote_asset_authorization<
+        A: TransactionAuthenticator,
+    >(
+        &mut self,
+        start_height: u64,
+        expected_parent_consensus_hash: [u8; 32],
+        expected_parent_execution_hash: [u8; 32],
+        envelopes: &[Vec<u8>],
+        authenticator: &A,
+        mut quote_authorizer: Option<&mut QRunV06QuoteAssetAuthorizationProvider<'_>>,
     ) -> Result<QRunV06HistorySyncReport, QRunV06HistorySyncError> {
         if envelopes.is_empty() {
             return Err(QRunV06HistorySyncError::EmptyBatch);
@@ -387,7 +1186,15 @@ impl QRunV06PermissionlessNodeRuntime {
             }
             let next_consensus_parent = pow_digest(&decoded.header, params.pow)
                 .map_err(|error| QRunV06HistorySyncError::InvalidEnvelope(error.to_string()))?;
-            if let Err(error) = self.submit_envelope(envelope, authenticator) {
+            let submit_result = match quote_authorizer.as_deref_mut() {
+                Some(provider) => self.submit_envelope_with_quote_asset_authorization(
+                    envelope,
+                    authenticator,
+                    provider,
+                ),
+                None => self.submit_envelope(envelope, authenticator),
+            };
+            if let Err(error) = submit_result {
                 return Err(QRunV06HistorySyncError::ApplyFailed {
                     index,
                     committed_blocks: imported,
@@ -614,6 +1421,645 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
         std::fs::remove_dir_all(checkpoint_source_dir).unwrap();
         std::fs::remove_dir_all(checkpoint_restore_dir).unwrap();
+    }
+
+    #[test]
+    fn fresh_genesis_anchor_vault_persists_first_commit_and_recovers_one_commit_after_restart() {
+        use crate::{
+            consensus::{ConsensusParameters, Uint256},
+            external_cas_anchor_candidate::ExternalCasPin,
+            qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint,
+            qrun_v06_cp0604_supply_candidate::Cp0604FounderControlledSupply,
+            qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
+            qrun_v06_local_anchor_vault_candidate::QRunV06LocalAnchorVault,
+            qrun_v06_miner_candidate::mine_qfp6_block_on_tip_from_nonce,
+            qrun_v06_pow_fork_store_candidate::QRunV06DurableForkStore,
+            qrun_v06_profile_pin_candidate::{
+                QRunV06ProfilePinCandidate, QRunV06VerifiedProfilePin,
+            },
+            qrun_v06_tokenomics_candidate::QRunV06MiningScheduleCandidate,
+            v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES,
+        };
+        use std::{fs, sync::atomic::AtomicBool};
+
+        const NETWORK: [u8; 32] = [0x91; 32];
+        const PROFILE: [u8; 32] = [0x92; 32];
+        const FOUNDER: [u8; 32] = [0x93; 32];
+        const PRODUCER: [u8; 32] = [0x94; 32];
+        let mut params = ConsensusParameters::qrun_v06_sha256d_candidate().unwrap();
+        params.target_block_time_secs = 30;
+        params.difficulty_window_blocks = 2;
+        params.difficulty_min_ratio_divisor = 4;
+        params.difficulty_max_ratio = 4;
+        params.initial_target = Uint256::MAX;
+        params.pow_limit = Uint256::MAX;
+        params.validate().unwrap();
+        let schedule = QRunV06MiningScheduleCandidate::cp0422_research_candidate();
+        let policy = Cp0604FounderControlledSupply::genesis(NETWORK, FOUNDER, schedule).unwrap();
+        let descriptor = QRunV06GenesisDescriptor::new(
+            NETWORK,
+            PROFILE,
+            FOUNDER,
+            1,
+            qrun_v06_consensus_fingerprint(&params).unwrap(),
+            policy.policy_fingerprint(),
+        )
+        .unwrap();
+        let genesis = QRunV06CanonicalExecutionState::cp0604_genesis_candidate_with_descriptor(
+            descriptor, schedule,
+        )
+        .unwrap();
+        let bundle = QRunV06ProfilePinCandidate::new(
+            descriptor,
+            ExternalCasPin {
+                provider_id: [0x95; 32],
+                network_id: NETWORK,
+                genesis_digest: [0x96; 32],
+                receipt_key_id: [0x97; 32],
+                receipt_public_key: [0x98; ML_DSA_65_PUBLIC_KEY_BYTES],
+            },
+        )
+        .unwrap();
+        let bundle_bytes = bundle.encode().unwrap();
+        let verified_pin =
+            QRunV06VerifiedProfilePin::decode(&bundle_bytes, bundle.commitment().unwrap()).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "qfp6-fresh-genesis-anchor-runtime-{}",
+            std::process::id(),
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let data_dir = root.join("joining-data");
+        let vault_dir = root.join("joining-vault");
+        fs::create_dir_all(&data_dir).unwrap();
+        let authenticator = RejectAllTransactions;
+        let expected_genesis_dir = root.join("expected-genesis");
+        fs::create_dir_all(&expected_genesis_dir).unwrap();
+        let expected_store = QRunV06DurableForkStore::open_with_verified_profile_pin(
+            &expected_genesis_dir,
+            genesis.clone(),
+            params.clone(),
+            &authenticator,
+            None,
+            &verified_pin,
+        )
+        .unwrap();
+        let expected_genesis_anchor = expected_store.manifest_anchor().unwrap();
+        drop(expected_store);
+        fs::remove_dir_all(&expected_genesis_dir).unwrap();
+        let mut runtime = QRunV06PermissionlessNodeRuntime::open_with_fresh_genesis_anchor_vault(
+            &data_dir,
+            genesis.clone(),
+            params.clone(),
+            &authenticator,
+            &verified_pin,
+            expected_genesis_anchor,
+            &vault_dir,
+        )
+        .unwrap();
+        let genesis_status = runtime.status().unwrap();
+        assert_eq!(genesis_status.height, 0);
+        assert_eq!(genesis_status.manifest_generation, 0);
+        let genesis_anchor = genesis_status.manifest_anchor;
+        assert_eq!(
+            runtime.local_anchor_vault_tip().unwrap().manifest_anchor,
+            genesis_anchor
+        );
+        let graph = runtime.fork_choice_snapshot().unwrap();
+        let first = mine_qfp6_block_on_tip_from_nonce(
+            &graph,
+            &graph.canonical_tip().tip_hash,
+            100,
+            PRODUCER,
+            Vec::new(),
+            &authenticator,
+            0,
+            8,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        runtime
+            .submit_envelope(&first.envelope, &authenticator)
+            .unwrap();
+        assert_eq!(runtime.status().unwrap().height, 1);
+        assert_eq!(
+            runtime
+                .local_anchor_vault_tip()
+                .unwrap()
+                .manifest_generation,
+            1
+        );
+        drop(runtime);
+
+        // Data generation 2 is committed while the independent Vault deliberately remains at 1.
+        let mut interrupted_store =
+            QRunV06DurableForkStore::open_with_verified_profile_pin_and_trusted_anchor_ancestor(
+                &data_dir,
+                genesis.clone(),
+                params.clone(),
+                &authenticator,
+                genesis_anchor,
+                0,
+                &verified_pin,
+            )
+            .unwrap();
+        let graph = interrupted_store.graph().unwrap().clone();
+        let second = mine_qfp6_block_on_tip_from_nonce(
+            &graph,
+            &graph.canonical_tip().tip_hash,
+            130,
+            PRODUCER,
+            Vec::new(),
+            &authenticator,
+            0,
+            8,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        interrupted_store
+            .submit(&second.envelope, &authenticator)
+            .unwrap();
+        drop(interrupted_store);
+        let lagging_tip = QRunV06LocalAnchorVault::open(&vault_dir, NETWORK, PROFILE)
+            .unwrap()
+            .tip();
+        assert_eq!(lagging_tip.manifest_generation, 1);
+        let recovered = QRunV06PermissionlessNodeRuntime::open_with_local_anchor_vault(
+            &data_dir,
+            genesis.clone(),
+            params.clone(),
+            &authenticator,
+            lagging_tip.manifest_anchor,
+            lagging_tip.manifest_generation,
+            &verified_pin,
+            &vault_dir,
+        )
+        .unwrap();
+        assert_eq!(recovered.status().unwrap().height, 2);
+        assert_eq!(
+            recovered
+                .local_anchor_vault_tip()
+                .unwrap()
+                .manifest_generation,
+            2
+        );
+        drop(recovered);
+        assert!(
+            QRunV06PermissionlessNodeRuntime::open_with_fresh_genesis_anchor_vault(
+                &data_dir,
+                genesis,
+                params,
+                &authenticator,
+                &verified_pin,
+                expected_genesis_anchor,
+                &vault_dir,
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn checkpoint_segment_runtime_automatically_rolls_at_1024_and_recovers_unanchored_commit() {
+        use crate::{
+            consensus::{ConsensusParameters, Uint256},
+            external_cas_anchor_candidate::ExternalCasPin,
+            qrun_v06_checkpoint_candidate::{
+                qrun_v06_consensus_fingerprint, QRunV06CheckpointCandidate,
+            },
+            qrun_v06_cp0604_supply_candidate::Cp0604FounderControlledSupply,
+            qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
+            qrun_v06_local_anchor_vault_candidate::QRunV06LocalAnchorVault,
+            qrun_v06_miner_candidate::mine_qfp6_block_on_tip_from_nonce,
+            qrun_v06_pow_fork_store_candidate::QRunV06DurableForkStore,
+            qrun_v06_profile_pin_candidate::{
+                QRunV06ProfilePinCandidate, QRunV06VerifiedProfilePin,
+            },
+            qrun_v06_tokenomics_candidate::QRunV06MiningScheduleCandidate,
+            v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES,
+        };
+        use std::{fs, sync::atomic::AtomicBool};
+
+        const NETWORK: [u8; 32] = [0x61; 32];
+        const PROFILE: [u8; 32] = [0x62; 32];
+        const FOUNDER: [u8; 32] = [0x63; 32];
+        const PRODUCER: [u8; 32] = [0x64; 32];
+
+        let mut params = ConsensusParameters::qrun_v06_sha256d_candidate().unwrap();
+        params.target_block_time_secs = 30;
+        params.difficulty_window_blocks = 2;
+        params.difficulty_min_ratio_divisor = 4;
+        params.difficulty_max_ratio = 4;
+        params.initial_target = Uint256::from_be_bytes([0x7F; 32]);
+        params.pow_limit = Uint256::MAX;
+        params.validate().unwrap();
+
+        let schedule = QRunV06MiningScheduleCandidate::cp0422_research_candidate();
+        let policy = Cp0604FounderControlledSupply::genesis(NETWORK, FOUNDER, schedule).unwrap();
+        let descriptor = QRunV06GenesisDescriptor::new(
+            NETWORK,
+            PROFILE,
+            FOUNDER,
+            1,
+            qrun_v06_consensus_fingerprint(&params).unwrap(),
+            policy.policy_fingerprint(),
+        )
+        .unwrap();
+        let genesis = QRunV06CanonicalExecutionState::cp0604_genesis_candidate_with_descriptor(
+            descriptor, schedule,
+        )
+        .unwrap();
+        let bundle = QRunV06ProfilePinCandidate::new(
+            descriptor,
+            ExternalCasPin {
+                provider_id: [0x65; 32],
+                network_id: NETWORK,
+                genesis_digest: [0x66; 32],
+                receipt_key_id: [0x67; 32],
+                receipt_public_key: [0x68; ML_DSA_65_PUBLIC_KEY_BYTES],
+            },
+        )
+        .unwrap();
+        let bundle_bytes = bundle.encode().unwrap();
+        let verified_pin =
+            QRunV06VerifiedProfilePin::decode(&bundle_bytes, bundle.commitment().unwrap()).unwrap();
+
+        let root = std::env::temp_dir().join(format!(
+            "qfp6-checkpoint-witness-runtime-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let genesis_dir = root.join("genesis");
+        let segments_root = root.join("genesis.checkpoint-segments");
+        let segment_dir = segments_root.join("segment-00000000000000000001");
+        let vault_dir = root.join("c-vault");
+        fs::create_dir_all(&genesis_dir).unwrap();
+        let authenticator = RejectAllTransactions;
+        let mut genesis_store = QRunV06DurableForkStore::open_with_verified_profile_pin(
+            &genesis_dir,
+            genesis.clone(),
+            params.clone(),
+            &authenticator,
+            None,
+            &verified_pin,
+        )
+        .unwrap();
+        for height in 1..=1_024u64 {
+            let graph = genesis_store.graph().unwrap().clone();
+            let block = mine_qfp6_block_on_tip_from_nonce(
+                &graph,
+                &graph.canonical_tip().tip_hash,
+                100 + height * 30,
+                PRODUCER,
+                Vec::new(),
+                &authenticator,
+                0,
+                100_000,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            genesis_store
+                .submit(&block.envelope, &authenticator)
+                .unwrap();
+        }
+        let predecessor_generation = genesis_store.generation().unwrap();
+        let predecessor_anchor = genesis_store.manifest_anchor().unwrap();
+        let (checkpoint_bytes, checkpoint_anchor) =
+            genesis_store.export_canonical_checkpoint().unwrap();
+        drop(genesis_store);
+
+        let checkpoint = QRunV06CheckpointCandidate::decode_snapshot(
+            &checkpoint_bytes,
+            &params,
+            &NETWORK,
+            &PROFILE,
+            checkpoint_anchor,
+        )
+        .unwrap();
+        crate::qrun_v06_local_anchor_vault_candidate::provision_test_root(
+            &vault_dir,
+            NETWORK,
+            PROFILE,
+            predecessor_generation,
+            predecessor_anchor,
+        )
+        .unwrap();
+        let mut runtime = QRunV06PermissionlessNodeRuntime::open_with_local_anchor_vault(
+            &genesis_dir,
+            genesis.clone(),
+            params.clone(),
+            &authenticator,
+            predecessor_anchor,
+            predecessor_generation,
+            &verified_pin,
+            &vault_dir,
+        )
+        .unwrap();
+        runtime
+            .enable_auto_checkpoint_rollover(&segments_root, verified_pin.clone())
+            .unwrap();
+        assert_eq!(runtime.status().unwrap().height, checkpoint.height());
+        let graph = runtime.fork_choice_snapshot().unwrap();
+        let second_block = mine_qfp6_block_on_tip_from_nonce(
+            &graph,
+            &graph.canonical_tip().tip_hash,
+            100 + 1_025 * 30,
+            PRODUCER,
+            Vec::new(),
+            &authenticator,
+            0,
+            100_000,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let second_commit = runtime
+            .submit_envelope(&second_block.envelope, &authenticator)
+            .unwrap();
+        assert_eq!(runtime.status().unwrap().height, checkpoint.height() + 1);
+        assert_eq!(
+            runtime
+                .local_anchor_vault_tip()
+                .unwrap()
+                .manifest_generation,
+            predecessor_generation + 2
+        );
+        drop(runtime);
+
+        // Simulate a crash after the D: segment manifest commit but before the C: anchor append.
+        let c_tip = QRunV06LocalAnchorVault::open(&vault_dir, NETWORK, PROFILE)
+            .unwrap()
+            .tip();
+        let pinned_local_generation = c_tip
+            .manifest_generation
+            .checked_sub(predecessor_generation + 1)
+            .unwrap();
+        assert_eq!(pinned_local_generation, 1);
+        let mut interrupted_store =
+            QRunV06DurableForkStore::open_from_checkpoint_with_verified_profile_pin_and_trusted_anchor_ancestor(
+                &segment_dir,
+                &checkpoint_bytes,
+                params.clone(),
+                checkpoint_anchor,
+                &verified_pin,
+                &authenticator,
+                c_tip.manifest_anchor,
+                pinned_local_generation,
+            )
+            .unwrap();
+        let graph = interrupted_store.graph().unwrap().clone();
+        let third_block = mine_qfp6_block_on_tip_from_nonce(
+            &graph,
+            &graph.canonical_tip().tip_hash,
+            100 + 1_026 * 30,
+            PRODUCER,
+            Vec::new(),
+            &authenticator,
+            0,
+            100_000,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let third_commit = interrupted_store
+            .submit(&third_block.envelope, &authenticator)
+            .unwrap();
+        assert_eq!(interrupted_store.generation().unwrap(), 2);
+        drop(interrupted_store);
+        assert_eq!(
+            QRunV06LocalAnchorVault::open(&vault_dir, NETWORK, PROFILE)
+                .unwrap()
+                .tip()
+                .manifest_generation,
+            predecessor_generation + 2,
+            "C: must remain exactly one segment-local commit behind before recovery"
+        );
+
+        let recovered =
+            QRunV06PermissionlessNodeRuntime::open_from_checkpoint_with_local_anchor_vault(
+                &segment_dir,
+                &checkpoint_bytes,
+                checkpoint_anchor,
+                params,
+                &authenticator,
+                &verified_pin,
+                &vault_dir,
+            )
+            .unwrap();
+        assert_eq!(recovered.status().unwrap().height, checkpoint.height() + 2);
+        assert_eq!(
+            recovered
+                .local_anchor_vault_tip()
+                .unwrap()
+                .manifest_generation,
+            predecessor_generation + 3
+        );
+        assert_eq!(
+            recovered.status().unwrap().manifest_anchor,
+            third_commit.manifest_anchor
+        );
+        assert_ne!(second_commit.manifest_anchor, third_commit.manifest_anchor);
+        drop(recovered);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_dual_disk_runtime_persists_each_commit_and_recovers_one_unanchored_generation() {
+        use crate::{
+            consensus::{ConsensusParameters, Uint256},
+            external_cas_anchor_candidate::ExternalCasPin,
+            qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint,
+            qrun_v06_cp0604_supply_candidate::Cp0604FounderControlledSupply,
+            qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
+            qrun_v06_local_anchor_vault_candidate::QRunV06LocalAnchorVault,
+            qrun_v06_miner_candidate::mine_qfp6_block_on_tip_from_nonce,
+            qrun_v06_pow_fork_store_candidate::QRunV06DurableForkStore,
+            qrun_v06_profile_pin_candidate::{
+                QRunV06ProfilePinCandidate, QRunV06VerifiedProfilePin,
+            },
+            qrun_v06_tokenomics_candidate::QRunV06MiningScheduleCandidate,
+            v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES,
+        };
+        use std::{fs, sync::atomic::AtomicBool};
+
+        const NETWORK: [u8; 32] = [0xA1; 32];
+        const PROFILE: [u8; 32] = [0xB2; 32];
+        const FOUNDER: [u8; 32] = [0xC3; 32];
+        const PRODUCER: [u8; 32] = [0xD5; 32];
+
+        let mut params = ConsensusParameters::qrun_v06_sha256d_candidate().unwrap();
+        params.target_block_time_secs = 30;
+        params.difficulty_window_blocks = 2;
+        params.difficulty_min_ratio_divisor = 4;
+        params.difficulty_max_ratio = 4;
+        params.initial_target = Uint256::from_be_bytes([0x7F; 32]);
+        params.pow_limit = Uint256::MAX;
+        params.validate().unwrap();
+
+        let schedule = QRunV06MiningScheduleCandidate::cp0422_research_candidate();
+        let policy = Cp0604FounderControlledSupply::genesis(NETWORK, FOUNDER, schedule).unwrap();
+        let descriptor = QRunV06GenesisDescriptor::new(
+            NETWORK,
+            PROFILE,
+            FOUNDER,
+            1,
+            qrun_v06_consensus_fingerprint(&params).unwrap(),
+            policy.policy_fingerprint(),
+        )
+        .unwrap();
+        let genesis = QRunV06CanonicalExecutionState::cp0604_genesis_candidate_with_descriptor(
+            descriptor, schedule,
+        )
+        .unwrap();
+        let bundle = QRunV06ProfilePinCandidate::new(
+            descriptor,
+            ExternalCasPin {
+                provider_id: [0xD1; 32],
+                network_id: NETWORK,
+                genesis_digest: [0xD2; 32],
+                receipt_key_id: [0xD3; 32],
+                receipt_public_key: [0xD4; ML_DSA_65_PUBLIC_KEY_BYTES],
+            },
+        )
+        .unwrap();
+        let bundle_bytes = bundle.encode().unwrap();
+        let verified_pin =
+            QRunV06VerifiedProfilePin::decode(&bundle_bytes, bundle.commitment().unwrap()).unwrap();
+
+        let root = std::env::temp_dir().join(format!(
+            "qfp6-local-dual-disk-runtime-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let data_dir = root.join("data");
+        let vault_dir = root.join("c-vault");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        let authenticator = RejectAllTransactions;
+        let bootstrap = QRunV06PermissionlessNodeRuntime::open(
+            &data_dir,
+            genesis.clone(),
+            params.clone(),
+            &authenticator,
+            None,
+            &verified_pin,
+        )
+        .unwrap();
+        let genesis_status = bootstrap.status().unwrap();
+        drop(bootstrap);
+        crate::qrun_v06_local_anchor_vault_candidate::provision_test_root(
+            &vault_dir,
+            NETWORK,
+            PROFILE,
+            genesis_status.manifest_generation,
+            genesis_status.manifest_anchor,
+        )
+        .unwrap();
+
+        let mut runtime = QRunV06PermissionlessNodeRuntime::open_with_local_anchor_vault(
+            &data_dir,
+            genesis.clone(),
+            params.clone(),
+            &authenticator,
+            genesis_status.manifest_anchor,
+            genesis_status.manifest_generation,
+            &verified_pin,
+            &vault_dir,
+        )
+        .unwrap();
+        let graph = runtime.fork_choice_snapshot().unwrap();
+        let first_block = mine_qfp6_block_on_tip_from_nonce(
+            &graph,
+            &graph.canonical_tip().tip_hash,
+            100,
+            PRODUCER,
+            Vec::new(),
+            &authenticator,
+            0,
+            100_000,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let first_commit = runtime
+            .submit_envelope(&first_block.envelope, &authenticator)
+            .unwrap();
+        assert_eq!(
+            QRunV06LocalAnchorVault::open(&vault_dir, NETWORK, PROFILE)
+                .unwrap()
+                .tip()
+                .manifest_generation,
+            first_commit.generation,
+            "a successful runtime commit must already be present in the C: vault"
+        );
+        assert_eq!(
+            QRunV06LocalAnchorVault::open(&vault_dir, NETWORK, PROFILE)
+                .unwrap()
+                .tip()
+                .manifest_anchor,
+            first_commit.manifest_anchor
+        );
+        drop(runtime);
+
+        // Simulate a process interruption in the narrow interval after D: manifest commit
+        // but before the C: vault append. A fresh runtime must replay from the exact C: tip,
+        // then append only this single verified successor before becoming usable.
+        let c_tip = QRunV06LocalAnchorVault::open(&vault_dir, NETWORK, PROFILE)
+            .unwrap()
+            .tip();
+        let mut interrupted_store = QRunV06DurableForkStore::open_with_verified_profile_pin(
+            &data_dir,
+            genesis.clone(),
+            params.clone(),
+            &authenticator,
+            Some(c_tip.manifest_anchor),
+            &verified_pin,
+        )
+        .unwrap();
+        let graph = interrupted_store.graph().unwrap().clone();
+        let second_block = mine_qfp6_block_on_tip_from_nonce(
+            &graph,
+            &graph.canonical_tip().tip_hash,
+            130,
+            PRODUCER,
+            Vec::new(),
+            &authenticator,
+            0,
+            100_000,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let second_commit = interrupted_store
+            .submit(&second_block.envelope, &authenticator)
+            .unwrap();
+        assert_eq!(second_commit.generation, c_tip.manifest_generation + 1);
+        drop(interrupted_store);
+
+        let recovered = QRunV06PermissionlessNodeRuntime::open_with_local_anchor_vault(
+            &data_dir,
+            genesis,
+            params,
+            &authenticator,
+            c_tip.manifest_anchor,
+            c_tip.manifest_generation,
+            &verified_pin,
+            &vault_dir,
+        )
+        .unwrap();
+        let recovered_status = recovered.status().unwrap();
+        let recovered_vault_tip = QRunV06LocalAnchorVault::open(&vault_dir, NETWORK, PROFILE)
+            .unwrap()
+            .tip();
+        assert_eq!(
+            recovered_status.manifest_generation,
+            second_commit.generation
+        );
+        assert_eq!(
+            recovered_vault_tip.manifest_generation,
+            second_commit.generation
+        );
+        assert_eq!(
+            recovered_vault_tip.manifest_anchor,
+            second_commit.manifest_anchor
+        );
+        assert!(!recovered.local_anchor_requires_reopen());
+        drop(recovered);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

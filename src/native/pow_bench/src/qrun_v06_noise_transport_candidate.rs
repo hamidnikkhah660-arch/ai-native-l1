@@ -9,6 +9,7 @@ use snow::{params::NoiseParams, Builder, TransportState};
 use std::{
     io::{self, Read, Write},
     net::TcpStream,
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -34,6 +35,7 @@ pub enum QRunV06NoiseError {
     DuplicateTrustedKey,
     MalformedHandshake,
     HandshakeTimeout,
+    HandshakeCancelled,
     Handshake(String),
     UntrustedPeer,
     MalformedRecord,
@@ -152,6 +154,43 @@ impl QRunV06NoiseSession {
         network_id: &[u8; 32],
         profile_id: &[u8; 32],
     ) -> Result<Self, QRunV06NoiseError> {
+        Self::accept_with_cancellation(
+            stream,
+            local_static_private_key,
+            trusted_remote_static_public_keys,
+            network_id,
+            profile_id,
+            None,
+        )
+    }
+
+    /// Same pinned handshake, with prompt cancellation for bounded listener workers.
+    pub fn accept_with_shutdown(
+        stream: &mut TcpStream,
+        local_static_private_key: &[u8; 32],
+        trusted_remote_static_public_keys: &[[u8; 32]],
+        network_id: &[u8; 32],
+        profile_id: &[u8; 32],
+        shutdown: &AtomicBool,
+    ) -> Result<Self, QRunV06NoiseError> {
+        Self::accept_with_cancellation(
+            stream,
+            local_static_private_key,
+            trusted_remote_static_public_keys,
+            network_id,
+            profile_id,
+            Some(shutdown),
+        )
+    }
+
+    fn accept_with_cancellation(
+        stream: &mut TcpStream,
+        local_static_private_key: &[u8; 32],
+        trusted_remote_static_public_keys: &[[u8; 32]],
+        network_id: &[u8; 32],
+        profile_id: &[u8; 32],
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<Self, QRunV06NoiseError> {
         validate_context(local_static_private_key, network_id, profile_id)?;
         validate_trust_set(trusted_remote_static_public_keys)?;
         let deadline = Instant::now() + HANDSHAKE_BUDGET;
@@ -163,7 +202,7 @@ impl QRunV06NoiseSession {
         let mut payload = [0u8; MAX_HANDSHAKE_MESSAGE];
         let mut message = [0u8; MAX_HANDSHAKE_MESSAGE];
 
-        let first = read_handshake(stream, deadline)?;
+        let first = read_handshake_with_cancellation(stream, deadline, cancellation)?;
         let read = handshake
             .read_message(&first, &mut payload)
             .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
@@ -173,9 +212,9 @@ impl QRunV06NoiseSession {
         let written = handshake
             .write_message(&[], &mut message)
             .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
-        write_handshake(stream, &message[..written], deadline)?;
+        write_handshake_with_cancellation(stream, &message[..written], deadline, cancellation)?;
 
-        let third = read_handshake(stream, deadline)?;
+        let third = read_handshake_with_cancellation(stream, deadline, cancellation)?;
         let read = handshake
             .read_message(&third, &mut payload)
             .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
@@ -217,7 +256,41 @@ impl QRunV06NoiseSession {
         network_id: &[u8; 32],
         profile_id: &[u8; 32],
     ) -> Result<Self, QRunV06NoiseError> {
+        Self::accept_unpinned_with_cancellation(
+            stream,
+            local_static_private_key,
+            network_id,
+            profile_id,
+            None,
+        )
+    }
+
+    /// Anonymous responder handshake which is interruptible when the listener is shutting down.
+    pub fn accept_unpinned_with_shutdown(
+        stream: &mut TcpStream,
+        local_static_private_key: &[u8; 32],
+        network_id: &[u8; 32],
+        profile_id: &[u8; 32],
+        shutdown: &AtomicBool,
+    ) -> Result<Self, QRunV06NoiseError> {
+        Self::accept_unpinned_with_cancellation(
+            stream,
+            local_static_private_key,
+            network_id,
+            profile_id,
+            Some(shutdown),
+        )
+    }
+
+    fn accept_unpinned_with_cancellation(
+        stream: &mut TcpStream,
+        local_static_private_key: &[u8; 32],
+        network_id: &[u8; 32],
+        profile_id: &[u8; 32],
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<Self, QRunV06NoiseError> {
         validate_context(local_static_private_key, network_id, profile_id)?;
+        check_handshake_cancellation(cancellation).map_err(map_handshake_io_error)?;
         let deadline = Instant::now() + HANDSHAKE_BUDGET;
         let mut handshake = Builder::new(noise_params()?)
             .prologue(&prologue(network_id, profile_id))
@@ -227,7 +300,7 @@ impl QRunV06NoiseSession {
         let mut payload = [0u8; MAX_HANDSHAKE_MESSAGE];
         let mut message = [0u8; MAX_HANDSHAKE_MESSAGE];
 
-        let first = read_handshake(stream, deadline)?;
+        let first = read_handshake_with_cancellation(stream, deadline, cancellation)?;
         let read = handshake
             .read_message(&first, &mut payload)
             .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
@@ -237,9 +310,9 @@ impl QRunV06NoiseSession {
         let written = handshake
             .write_message(&[], &mut message)
             .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
-        write_handshake(stream, &message[..written], deadline)?;
+        write_handshake_with_cancellation(stream, &message[..written], deadline, cancellation)?;
 
-        let third = read_handshake(stream, deadline)?;
+        let third = read_handshake_with_cancellation(stream, deadline, cancellation)?;
         let read = handshake
             .read_message(&third, &mut payload)
             .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
@@ -273,11 +346,34 @@ impl QRunV06NoiseSession {
         profile_id: &[u8; 32],
         trusted_remote_static_public_keys: &[[u8; 32]],
     ) -> Result<Self, QRunV06NoiseError> {
+        Self::accept_unpinned_with_optional_pins_and_shutdown(
+            stream,
+            local_static_private_key,
+            network_id,
+            profile_id,
+            trusted_remote_static_public_keys,
+            &AtomicBool::new(false),
+        )
+    }
+
+    pub fn accept_unpinned_with_optional_pins_and_shutdown(
+        stream: &mut TcpStream,
+        local_static_private_key: &[u8; 32],
+        network_id: &[u8; 32],
+        profile_id: &[u8; 32],
+        trusted_remote_static_public_keys: &[[u8; 32]],
+        shutdown: &AtomicBool,
+    ) -> Result<Self, QRunV06NoiseError> {
         if !trusted_remote_static_public_keys.is_empty() {
             validate_trust_set(trusted_remote_static_public_keys)?;
         }
-        let mut session =
-            Self::accept_unpinned(stream, local_static_private_key, network_id, profile_id)?;
+        let mut session = Self::accept_unpinned_with_cancellation(
+            stream,
+            local_static_private_key,
+            network_id,
+            profile_id,
+            Some(shutdown),
+        )?;
         session.remote_static_key_pinned = trusted_remote_static_public_keys
             .iter()
             .any(|key| key == &session.remote_static_public_key);
@@ -370,7 +466,7 @@ impl QRunV06NoiseSession {
             .map_err(map_record_io_error)
     }
 
-    fn read_record_with_budget(
+    pub(crate) fn read_record_with_budget(
         &mut self,
         stream: &mut TcpStream,
         budget: Duration,
@@ -444,14 +540,24 @@ fn validate_trust_set(keys: &[[u8; 32]]) -> Result<(), QRunV06NoiseError> {
     Ok(())
 }
 fn read_handshake(stream: &mut TcpStream, deadline: Instant) -> Result<Vec<u8>, QRunV06NoiseError> {
+    read_handshake_with_cancellation(stream, deadline, None)
+}
+fn read_handshake_with_cancellation(
+    stream: &mut TcpStream,
+    deadline: Instant,
+    cancellation: Option<&AtomicBool>,
+) -> Result<Vec<u8>, QRunV06NoiseError> {
+    check_handshake_cancellation(cancellation).map_err(map_handshake_io_error)?;
     let mut length = [0u8; 2];
-    read_exact_until(stream, &mut length, deadline).map_err(map_handshake_io_error)?;
+    read_exact_until_with_cancellation(stream, &mut length, deadline, cancellation)
+        .map_err(map_handshake_io_error)?;
     let length = u16::from_be_bytes(length) as usize;
     if length == 0 || length > MAX_HANDSHAKE_MESSAGE {
         return Err(QRunV06NoiseError::MalformedHandshake);
     }
     let mut bytes = vec![0u8; length];
-    read_exact_until(stream, &mut bytes, deadline).map_err(map_handshake_io_error)?;
+    read_exact_until_with_cancellation(stream, &mut bytes, deadline, cancellation)
+        .map_err(map_handshake_io_error)?;
     Ok(bytes)
 }
 fn write_handshake(
@@ -459,20 +565,42 @@ fn write_handshake(
     bytes: &[u8],
     deadline: Instant,
 ) -> Result<(), QRunV06NoiseError> {
+    write_handshake_with_cancellation(stream, bytes, deadline, None)
+}
+fn write_handshake_with_cancellation(
+    stream: &mut TcpStream,
+    bytes: &[u8],
+    deadline: Instant,
+    cancellation: Option<&AtomicBool>,
+) -> Result<(), QRunV06NoiseError> {
     if bytes.is_empty() || bytes.len() > MAX_HANDSHAKE_MESSAGE || bytes.len() > u16::MAX as usize {
         return Err(QRunV06NoiseError::MalformedHandshake);
     }
-    write_all_until(stream, &(bytes.len() as u16).to_be_bytes(), deadline)
-        .and_then(|()| write_all_until(stream, bytes, deadline))
-        .map_err(map_handshake_io_error)
+    write_all_until_with_cancellation(
+        stream,
+        &(bytes.len() as u16).to_be_bytes(),
+        deadline,
+        cancellation,
+    )
+    .and_then(|()| write_all_until_with_cancellation(stream, bytes, deadline, cancellation))
+    .map_err(map_handshake_io_error)
 }
 fn read_exact_until(
     stream: &mut TcpStream,
     output: &mut [u8],
     deadline: Instant,
 ) -> io::Result<()> {
+    read_exact_until_with_cancellation(stream, output, deadline, None)
+}
+fn read_exact_until_with_cancellation(
+    stream: &mut TcpStream,
+    output: &mut [u8],
+    deadline: Instant,
+    cancellation: Option<&AtomicBool>,
+) -> io::Result<()> {
     let mut offset = 0usize;
     while offset < output.len() {
+        check_handshake_cancellation(cancellation)?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(io::Error::new(
@@ -499,11 +627,21 @@ fn read_exact_until(
             Err(error) => return Err(error),
         }
     }
+    check_handshake_cancellation(cancellation)?;
     Ok(())
 }
 fn write_all_until(stream: &mut TcpStream, bytes: &[u8], deadline: Instant) -> io::Result<()> {
+    write_all_until_with_cancellation(stream, bytes, deadline, None)
+}
+fn write_all_until_with_cancellation(
+    stream: &mut TcpStream,
+    bytes: &[u8],
+    deadline: Instant,
+    cancellation: Option<&AtomicBool>,
+) -> io::Result<()> {
     let mut offset = 0usize;
     while offset < bytes.len() {
+        check_handshake_cancellation(cancellation)?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(io::Error::new(
@@ -530,10 +668,22 @@ fn write_all_until(stream: &mut TcpStream, bytes: &[u8], deadline: Instant) -> i
             Err(error) => return Err(error),
         }
     }
+    check_handshake_cancellation(cancellation)?;
+    Ok(())
+}
+fn check_handshake_cancellation(cancellation: Option<&AtomicBool>) -> io::Result<()> {
+    if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "QFP6 Noise handshake cancelled",
+        ));
+    }
     Ok(())
 }
 fn map_handshake_io_error(error: io::Error) -> QRunV06NoiseError {
-    if error.kind() == io::ErrorKind::TimedOut || error.kind() == io::ErrorKind::WouldBlock {
+    if error.kind() == io::ErrorKind::Interrupted {
+        QRunV06NoiseError::HandshakeCancelled
+    } else if error.kind() == io::ErrorKind::TimedOut || error.kind() == io::ErrorKind::WouldBlock {
         QRunV06NoiseError::HandshakeTimeout
     } else {
         QRunV06NoiseError::Io(error.to_string())
@@ -761,6 +911,41 @@ mod tests {
             Err(QRunV06NoiseError::MalformedRecord)
         ));
     }
+    #[test]
+    fn qfp6_noise_incomplete_handshake_cancels_promptly_on_shutdown() {
+        use std::sync::mpsc::channel;
+        let (server_private, _) = keypair();
+        let (listener, address) = listener();
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+        let worker_shutdown = std::sync::Arc::clone(&shutdown);
+        let (accepted_tx, accepted_rx) = channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            accepted_tx.send(()).unwrap();
+            QRunV06NoiseSession::accept_unpinned_with_optional_pins_and_shutdown(
+                &mut stream,
+                &server_private,
+                &NETWORK,
+                &PROFILE,
+                &[],
+                &worker_shutdown,
+            )
+            .err()
+        });
+
+        let _client = TcpStream::connect(address).unwrap();
+        accepted_rx.recv().unwrap();
+        thread::sleep(Duration::from_millis(30));
+        let cancellation_started = Instant::now();
+        shutdown.store(true, Ordering::Release);
+
+        assert_eq!(
+            server.join().unwrap(),
+            Some(QRunV06NoiseError::HandshakeCancelled)
+        );
+        assert!(cancellation_started.elapsed() < Duration::from_secs(1));
+    }
+
     #[test]
     fn qfp6_noise_unpinned_mode_encrypts_without_claiming_peer_identity() {
         let (server_private, server_public) = keypair();

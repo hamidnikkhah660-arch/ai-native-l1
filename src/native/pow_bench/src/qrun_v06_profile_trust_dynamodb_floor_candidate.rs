@@ -4,6 +4,12 @@
 //! conditional PutItem CAS over the complete Q6TS floor tuple. It does not provision AWS,
 //! create tables, configure IAM/SCP, or prove operator independence. A single account/table
 //! controlled by the node operator is not an independent anti-rollback trust domain.
+use crate::external_cas_offhost_anchor_aws_dynamodb_candidate::{
+    AwsDynamoDbCliOutput, AwsDynamoDbCliRunner, SessionBoundAwsDynamoDbCliRunner,
+};
+use crate::external_cas_offhost_anchor_aws_qualification_candidate::{
+    qualified_aws_dynamodb_runner, AwsDynamoDbDeploymentPin,
+};
 use crate::qrun_v06_profile_trust_candidate::{
     MonotonicQRunV06ProfileTrustFloorStore, QRunV06ProfileTrustError, QRunV06ProfileTrustStatus,
     TrustedQRunV06ProfileTrustFloor,
@@ -452,14 +458,29 @@ impl MonotonicQRunV06ProfileTrustFloorStore for AwsDynamoDbQ6tsProfileTrustFloor
     }
 }
 
+/// Bridge from the common, pinned AWS runner to the Q6TS-specific command interface.
+struct SharedSessionQ6tsFloorCliRunner {
+    inner: Arc<dyn AwsDynamoDbCliRunner>,
+}
+
+impl AwsDynamoDbQ6tsFloorCliRunner for SharedSessionQ6tsFloorCliRunner {
+    fn run(&self, arguments: &[OsString]) -> Result<AwsDynamoDbQ6tsFloorCliOutput, String> {
+        let output: AwsDynamoDbCliOutput = self.inner.run(arguments)?;
+        Ok(AwsDynamoDbQ6tsFloorCliOutput {
+            success: output.success,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
+    }
+}
+
 /// Read-only Q6TS floor adapter for a QFP6 node process.
 ///
 /// The trust publisher uses AwsDynamoDbQ6tsProfileTrustFloorStore to provision and advance
-/// the floor. A node only needs to confirm that its Q6TS envelope is already the independently
-/// prepublished head. This wrapper deliberately refuses CAS locally, so an accidental call from
-/// the node admission path cannot become a write even when a test or misconfigured IAM role is
-/// permissive. Production IAM must independently grant this node role GetItem only and deny
-/// PutItem/UpdateItem/DeleteItem and table-management actions.
+/// the floor. A node only confirms that its Q6TS envelope is already the independently
+/// prepublished head. This wrapper refuses CAS locally and the session-bound runner also
+/// rejects every PutItem before process creation. Use a separately administered AWS account,
+/// role, table and short-lived STS session from the QAR2 Anchor deployment.
 #[derive(Clone)]
 pub struct AwsDynamoDbQ6tsReadOnlyProfileTrustFloorStore {
     inner: AwsDynamoDbQ6tsProfileTrustFloorStore,
@@ -500,6 +521,23 @@ impl AwsDynamoDbQ6tsReadOnlyProfileTrustFloorStore {
         Ok(Self {
             inner: AwsDynamoDbQ6tsProfileTrustFloorStore::with_runner(runner, region, table_name)?,
         })
+    }
+
+    /// Construct the Q6TS read-only floor from a distinct, session-bound AWS deployment.
+    /// The caller must supply a runner created with new_read_only(); this constructor additionally
+    /// revalidates the caller role and table before each read. It never provisions or advances
+    /// the Q6TS floor.
+    pub fn with_session_bound_read_only_runner(
+        runner: Arc<SessionBoundAwsDynamoDbCliRunner>,
+        deployment_pin: AwsDynamoDbDeploymentPin,
+    ) -> Result<Self, QRunV06ProfileTrustError> {
+        if runner.allows_dynamodb_put_item() || !runner.matches_deployment_pin(&deployment_pin) {
+            return Err(QRunV06ProfileTrustError::FloorUnavailable);
+        }
+        let qualified = qualified_aws_dynamodb_runner(runner, deployment_pin.clone())
+            .map_err(|_| QRunV06ProfileTrustError::FloorUnavailable)?;
+        let bridge = Arc::new(SharedSessionQ6tsFloorCliRunner { inner: qualified });
+        Self::with_runner(bridge, deployment_pin.region, deployment_pin.table_name)
     }
 }
 
@@ -617,6 +655,71 @@ mod tests {
     fn store(runner: Arc<ScriptedRunner>) -> AwsDynamoDbQ6tsProfileTrustFloorStore {
         AwsDynamoDbQ6tsProfileTrustFloorStore::with_runner(runner, "eu-west-2", "qrun-q6ts-floor")
             .unwrap()
+    }
+
+    fn session_deployment_pin() -> AwsDynamoDbDeploymentPin {
+        AwsDynamoDbDeploymentPin {
+            account_id: "999999999999".into(),
+            role_arn: "arn:aws:iam::999999999999:role/QRunQ6tsReadOnly".into(),
+            table_arn: "arn:aws:dynamodb:eu-west-2:999999999999:table/qrun-q6ts-floor".into(),
+            region: "eu-west-2".into(),
+            table_name: "qrun-q6ts-floor".into(),
+        }
+    }
+
+    fn temporary_session(
+    ) -> crate::external_cas_offhost_anchor_aws_dynamodb_candidate::AwsTemporaryCredentialSession
+    {
+        let expiry = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        crate::external_cas_offhost_anchor_aws_dynamodb_candidate::AwsTemporaryCredentialSession::new(
+            "ASIA_Q6TS_TEST".into(),
+            "synthetic-q6ts-secret".into(),
+            "synthetic-q6ts-session-token".into(),
+            expiry,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn session_bound_read_only_constructor_rejects_writable_or_substituted_runner_before_aws() {
+        let pin = session_deployment_pin();
+        let writable = Arc::new(
+            SessionBoundAwsDynamoDbCliRunner::new(
+                std::env::current_exe().unwrap(),
+                pin.clone(),
+                temporary_session(),
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            AwsDynamoDbQ6tsReadOnlyProfileTrustFloorStore::with_session_bound_read_only_runner(
+                writable,
+                pin.clone(),
+            ),
+            Err(QRunV06ProfileTrustError::FloorUnavailable)
+        ));
+
+        let read_only = Arc::new(
+            SessionBoundAwsDynamoDbCliRunner::new_read_only(
+                std::env::current_exe().unwrap(),
+                pin.clone(),
+                temporary_session(),
+            )
+            .unwrap(),
+        );
+        let mut substituted = pin;
+        substituted.region = "us-east-1".into();
+        assert!(matches!(
+            AwsDynamoDbQ6tsReadOnlyProfileTrustFloorStore::with_session_bound_read_only_runner(
+                read_only,
+                substituted,
+            ),
+            Err(QRunV06ProfileTrustError::FloorUnavailable)
+        ));
     }
 
     #[test]

@@ -279,7 +279,7 @@ fn validate_parameters(
         return Err(QRunV06ConsensusProfileError::WrongProtocolVersion);
     }
     parameters
-        .validate_monetary_execution_compatibility()
+        .validate_qfp6_monetary_execution_compatibility()
         .map_err(|_| QRunV06ConsensusProfileError::MonetaryIssuanceProfileMismatch)?;
     if parameters.pow.algorithm != PowAlgorithm::Sha256d {
         return Err(QRunV06ConsensusProfileError::UnsupportedPowAlgorithm);
@@ -478,6 +478,21 @@ mod tests {
         assert_eq!(
             QRunV06ConsensusProfile::new(NETWORK, PROFILE, [0xB3; 32], fee_only),
             Err(QRunV06ConsensusProfileError::MonetaryIssuanceProfileMismatch)
+        );
+
+        let cp0651 = ConsensusParameters::qrun_v06_cp0651_fee_only_candidate().unwrap();
+        assert_eq!(
+            cp0651.issuance.maximum_supply(),
+            7_000_000_000u128 * 100_000_000
+        );
+        assert_eq!(cp0651.issuance.initial_subsidy(), 0);
+        assert_eq!(cp0651.issuance.blocks_per_halving(), 1);
+        let cp0651_profile =
+            QRunV06ConsensusProfile::new(NETWORK, PROFILE, [0xB3; 32], cp0651).unwrap();
+        let encoded = cp0651_profile.encode().unwrap();
+        assert_eq!(
+            QRunV06ConsensusProfile::decode(&encoded).unwrap(),
+            cp0651_profile
         );
 
         let mut altered = params();

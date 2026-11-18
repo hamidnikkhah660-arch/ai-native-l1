@@ -238,6 +238,95 @@ pub fn process_q6ti_transaction_frame<A: TransactionAuthenticator>(
     Ok(response(request.request_id, status, txid, pool, state).encode())
 }
 
+/// Q6TI admission variant used when Q6MO is also enabled. It validates a cloned native
+/// pool together with the complete market queue against one canonical candidate block before
+/// mutating the live pool. This prevents a native transfer from reserving a nonce already used
+/// by a pending AMM/OrderBook operation (and vice versa).
+pub fn process_q6ti_transaction_frame_with_market_operations<A: TransactionAuthenticator>(
+    frame: &[u8],
+    replay_guard: &mut QRunV06PeerReplayGuard,
+    pool: &mut QRunV06NativeTransactionMempool,
+    market_operations: &[crate::qrun_v06_canonical_execution_candidate::QRunV06BlockOperation],
+    state: &QRunV06CanonicalExecutionState,
+    authenticator: &A,
+    producer: AccountId,
+    candidate_timestamp: u64,
+) -> Result<[u8; Q6TA_RESPONSE_BYTES], QRunV06TransactionIngressError> {
+    process_q6ti_transaction_frame_with_market_operations_and_quote_asset_authorization(
+        frame,
+        replay_guard,
+        pool,
+        market_operations,
+        state,
+        authenticator,
+        producer,
+        candidate_timestamp,
+        None,
+    )
+}
+
+pub fn process_q6ti_transaction_frame_with_market_operations_and_quote_asset_authorization<
+    A: TransactionAuthenticator,
+>(
+    frame: &[u8],
+    replay_guard: &mut QRunV06PeerReplayGuard,
+    pool: &mut QRunV06NativeTransactionMempool,
+    market_operations: &[crate::qrun_v06_canonical_execution_candidate::QRunV06BlockOperation],
+    state: &QRunV06CanonicalExecutionState,
+    authenticator: &A,
+    producer: AccountId,
+    candidate_timestamp: u64,
+    mut quote_authorizer: Option<
+        &mut crate::qrun_v06_pow_fork_choice_candidate::QRunV06QuoteAssetAuthorizationProvider<'_>,
+    >,
+) -> Result<[u8; Q6TA_RESPONSE_BYTES], QRunV06TransactionIngressError> {
+    let request = decode_q6ti_transaction_request(frame)?;
+    let txid = transaction_id_with_signature_limit(
+        &request.transaction,
+        QRUN_V06_MAX_NATIVE_TX_SIGNATURE_BYTES,
+    )?;
+    if replay_guard.accept(request.request_id).is_err() {
+        return Ok(response(
+            request.request_id,
+            QRunV06TransactionSubmitStatus::Rejected,
+            txid,
+            pool,
+            state,
+        )
+        .encode());
+    }
+
+    let mut proposed_pool = pool.clone();
+    let status = match proposed_pool.submit(
+        request.transaction,
+        state,
+        authenticator,
+        producer,
+        candidate_timestamp,
+    ) {
+        Ok(_) => {
+            let combined = crate::qrun_v06_market_ingress_candidate::build_qrun_v06_combined_candidate_block_with_quote_asset_authorization(
+                state,
+                &proposed_pool.ordered_transactions(),
+                market_operations,
+                producer,
+                candidate_timestamp,
+                authenticator,
+                quote_authorizer.as_deref_mut(),
+            );
+            if combined.is_ok() {
+                *pool = proposed_pool;
+                QRunV06TransactionSubmitStatus::Accepted
+            } else {
+                QRunV06TransactionSubmitStatus::Rejected
+            }
+        }
+        Err(QRunV06MempoolError::Duplicate) => QRunV06TransactionSubmitStatus::Duplicate,
+        Err(_) => QRunV06TransactionSubmitStatus::Rejected,
+    };
+    Ok(response(request.request_id, status, txid, pool, state).encode())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

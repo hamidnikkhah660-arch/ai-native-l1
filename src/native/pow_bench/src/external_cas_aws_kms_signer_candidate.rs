@@ -11,6 +11,9 @@
 use crate::{
     external_cas_anchor_candidate::ExternalCasPin,
     external_cas_disk_provider_candidate::ReceiptSignature,
+    external_cas_offhost_anchor_aws_dynamodb_candidate::{
+        AwsDynamoDbCliRunner, SessionBoundAwsDynamoDbCliRunner,
+    },
     external_cas_offhost_anchor_protocol_candidate::{
         ExternalCasOffhostAnchorPin, OffhostAnchorReceiptSigner,
     },
@@ -21,8 +24,10 @@ use libcrux_ml_dsa::ml_dsa_65::{portable, MLDSA65Signature, MLDSA65VerificationK
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
+    ffi::OsString,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::Arc,
 };
 
 const KMS_ALGORITHM: &str = "ML_DSA_SHAKE_256";
@@ -345,6 +350,192 @@ impl OffhostAnchorReceiptSigner for AwsKmsCliOffhostAnchorReceiptSigner {
     }
 }
 
+/// KMS receipt signer that shares the exact temporary STS runner with the DynamoDB Anchor store.
+/// The runner must have been created with this full KMS key ARN pinned; no ambient AWS profile,
+/// metadata provider, endpoint override, or second credential session is consulted.
+pub struct SessionBoundAwsKmsCliOffhostAnchorReceiptSigner {
+    runner: Arc<SessionBoundAwsDynamoDbCliRunner>,
+    key_arn: String,
+    verification_key: MLDSA65VerificationKey,
+}
+
+impl std::fmt::Debug for SessionBoundAwsKmsCliOffhostAnchorReceiptSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionBoundAwsKmsCliOffhostAnchorReceiptSigner")
+            .field("runner", &self.runner)
+            .field("key_arn", &self.key_arn)
+            .field("private_key", &"<held by AWS KMS>")
+            .finish()
+    }
+}
+
+impl SessionBoundAwsKmsCliOffhostAnchorReceiptSigner {
+    pub fn connect(
+        runner: Arc<SessionBoundAwsDynamoDbCliRunner>,
+        key_arn: impl Into<String>,
+        anchor_pin: &ExternalCasOffhostAnchorPin,
+        provider_pin: &ExternalCasPin,
+    ) -> Result<Self, AwsKmsReceiptSignerError> {
+        anchor_pin
+            .validate(provider_pin)
+            .map_err(|error| AwsKmsReceiptSignerError::Pin(error.to_string()))?;
+        let key_arn = key_arn.into();
+        if !runner.matches_kms_key_arn(&key_arn) {
+            return Err(AwsKmsReceiptSignerError::InvalidConfiguration);
+        }
+
+        let output = session_bound_kms_call(
+            runner.as_ref(),
+            &[
+                "kms",
+                "get-public-key",
+                "--key-id",
+                &key_arn,
+                "--region",
+                runner.deployment_region(),
+                "--output",
+                "json",
+                "--no-cli-pager",
+                "--cli-connect-timeout",
+                "5",
+                "--cli-read-timeout",
+                "20",
+            ],
+        )?;
+        let response: Value = serde_json::from_slice(&output)
+            .map_err(|_| AwsKmsReceiptSignerError::InvalidResponse)?;
+        if response.get("KeySpec").and_then(Value::as_str) != Some(KMS_KEY_SPEC) {
+            return Err(AwsKmsReceiptSignerError::WrongKeySpec);
+        }
+        if response.get("KeyUsage").and_then(Value::as_str) != Some(KMS_KEY_USAGE) {
+            return Err(AwsKmsReceiptSignerError::WrongKeyUsage);
+        }
+        let algorithms = response
+            .get("SigningAlgorithms")
+            .and_then(Value::as_array)
+            .ok_or(AwsKmsReceiptSignerError::InvalidResponse)?;
+        if !algorithms
+            .iter()
+            .any(|value| value.as_str() == Some(KMS_ALGORITHM))
+        {
+            return Err(AwsKmsReceiptSignerError::WrongSigningAlgorithm);
+        }
+        if response.get("KeyId").and_then(Value::as_str) != Some(key_arn.as_str()) {
+            return Err(AwsKmsReceiptSignerError::InvalidResponse);
+        }
+        let public_key_der = response
+            .get("PublicKey")
+            .and_then(Value::as_str)
+            .ok_or(AwsKmsReceiptSignerError::InvalidResponse)?;
+        let public_key_der = BASE64
+            .decode(public_key_der)
+            .map_err(|_| AwsKmsReceiptSignerError::InvalidPublicKey)?;
+        let public_key = extract_mldsa65_spki_public_key(&public_key_der)?;
+        if public_key != anchor_pin.receipt_public_key {
+            return Err(AwsKmsReceiptSignerError::PublicKeyMismatch);
+        }
+
+        let signer = Self {
+            runner,
+            key_arn,
+            verification_key: MLDSA65VerificationKey::new(anchor_pin.receipt_public_key),
+        };
+        let challenge = offhost_anchor_kms_self_test_challenge(anchor_pin, provider_pin);
+        let signature = signer.sign_digest(&challenge)?;
+        portable::verify(
+            &signer.verification_key,
+            &challenge,
+            &[],
+            &MLDSA65Signature::new(signature),
+        )
+        .map_err(|_| AwsKmsReceiptSignerError::SelfTestFailed)?;
+        Ok(signer)
+    }
+
+    pub fn sign_digest(
+        &self,
+        digest: &[u8; 32],
+    ) -> Result<ReceiptSignature, AwsKmsReceiptSignerError> {
+        let encoded_message = BASE64.encode(digest);
+        let output = session_bound_kms_call(
+            self.runner.as_ref(),
+            &[
+                "kms",
+                "sign",
+                "--key-id",
+                &self.key_arn,
+                "--message",
+                &encoded_message,
+                "--message-type",
+                "RAW",
+                "--signing-algorithm",
+                KMS_ALGORITHM,
+                "--region",
+                self.runner.deployment_region(),
+                "--output",
+                "json",
+                "--no-cli-pager",
+                "--cli-connect-timeout",
+                "5",
+                "--cli-read-timeout",
+                "20",
+            ],
+        )?;
+        let response: Value = serde_json::from_slice(&output)
+            .map_err(|_| AwsKmsReceiptSignerError::InvalidResponse)?;
+        if response.get("SigningAlgorithm").and_then(Value::as_str) != Some(KMS_ALGORITHM)
+            || response.get("KeyId").and_then(Value::as_str) != Some(self.key_arn.as_str())
+        {
+            return Err(AwsKmsReceiptSignerError::InvalidResponse);
+        }
+        let signature_text = response
+            .get("Signature")
+            .and_then(Value::as_str)
+            .ok_or(AwsKmsReceiptSignerError::InvalidResponse)?;
+        let signature_bytes = BASE64
+            .decode(signature_text)
+            .map_err(|_| AwsKmsReceiptSignerError::InvalidResponse)?;
+        let signature: ReceiptSignature = signature_bytes
+            .try_into()
+            .map_err(|_| AwsKmsReceiptSignerError::InvalidResponse)?;
+        portable::verify(
+            &self.verification_key,
+            digest,
+            &[],
+            &MLDSA65Signature::new(signature),
+        )
+        .map_err(|_| AwsKmsReceiptSignerError::InvalidSignature)?;
+        Ok(signature)
+    }
+}
+
+impl OffhostAnchorReceiptSigner for SessionBoundAwsKmsCliOffhostAnchorReceiptSigner {
+    fn sign_digest(&self, digest: &[u8; 32]) -> Result<ReceiptSignature, String> {
+        SessionBoundAwsKmsCliOffhostAnchorReceiptSigner::sign_digest(self, digest)
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn session_bound_kms_call(
+    runner: &dyn AwsDynamoDbCliRunner,
+    arguments: &[&str],
+) -> Result<Vec<u8>, AwsKmsReceiptSignerError> {
+    let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+    let output = runner
+        .run(&arguments)
+        .map_err(AwsKmsReceiptSignerError::CliStart)?;
+    if !output.success {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let safe = stderr
+            .chars()
+            .filter(|character| !character.is_control() || *character == '\n' || *character == '\t')
+            .take(512)
+            .collect::<String>();
+        return Err(AwsKmsReceiptSignerError::CliRejected(safe));
+    }
+    Ok(output.stdout)
+}
+
 fn offhost_anchor_kms_self_test_challenge(
     anchor: &ExternalCasOffhostAnchorPin,
     provider: &ExternalCasPin,
@@ -528,5 +719,71 @@ mod tests {
         let mut with_trailing = der_tlv(0x30, &body);
         with_trailing.push(0);
         assert!(extract_mldsa65_spki_public_key(&with_trailing).is_err());
+    }
+}
+
+#[cfg(test)]
+mod session_bound_anchor_kms_tests {
+    use super::*;
+    use crate::external_cas_offhost_anchor_aws_qualification_candidate::AwsDynamoDbDeploymentPin;
+
+    fn pins() -> (ExternalCasPin, ExternalCasOffhostAnchorPin) {
+        let provider = ExternalCasPin {
+            provider_id: [0x11; 32],
+            network_id: [0x22; 32],
+            genesis_digest: [0x33; 32],
+            receipt_key_id: [0x44; 32],
+            receipt_public_key: [0x45; ML_DSA_65_PUBLIC_KEY_BYTES],
+        };
+        let anchor = ExternalCasOffhostAnchorPin {
+            anchor_id: [0x91; 32],
+            provider_id: provider.provider_id,
+            network_id: provider.network_id,
+            genesis_digest: provider.genesis_digest,
+            receipt_key_id: [0x92; 32],
+            receipt_public_key: [0x93; ML_DSA_65_PUBLIC_KEY_BYTES],
+        };
+        (provider, anchor)
+    }
+
+    #[test]
+    fn session_bound_signer_rejects_unpinned_kms_key_before_any_cli_call() {
+        let (provider, anchor) = pins();
+        let pinned_key =
+            "arn:aws:kms:us-east-1:123456789012:key/123e4567-e89b-12d3-a456-426614174000";
+        let session = crate::external_cas_offhost_anchor_aws_dynamodb_candidate::AwsTemporaryCredentialSession::new(
+            "ASIA_TEST_ACCESS_KEY".into(),
+            "secret-test-only-not-real".into(),
+            "session-token-test-only-not-real".into(),
+            u64::MAX,
+        )
+        .unwrap();
+        let deployment = AwsDynamoDbDeploymentPin {
+            account_id: "123456789012".into(),
+            role_arn: "arn:aws:iam::123456789012:role/QRunAnchorCustodian".into(),
+            table_arn: "arn:aws:dynamodb:us-east-1:123456789012:table/qrun-anchor".into(),
+            region: "us-east-1".into(),
+            table_name: "qrun-anchor".into(),
+        };
+        let runner = Arc::new(
+            SessionBoundAwsDynamoDbCliRunner::new_with_kms_key_arn(
+                std::env::current_exe().unwrap(),
+                deployment,
+                session,
+                pinned_key,
+            )
+            .unwrap(),
+        );
+        let substituted_key =
+            "arn:aws:kms:us-east-1:123456789012:key/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        assert!(matches!(
+            SessionBoundAwsKmsCliOffhostAnchorReceiptSigner::connect(
+                runner,
+                substituted_key,
+                &anchor,
+                &provider,
+            ),
+            Err(AwsKmsReceiptSignerError::InvalidConfiguration)
+        ));
     }
 }

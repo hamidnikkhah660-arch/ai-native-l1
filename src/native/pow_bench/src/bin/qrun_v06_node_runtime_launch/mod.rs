@@ -13,6 +13,13 @@ use ai_native_l1_pow_bench::{
     external_cas_floor_store_candidate::ExternalCasFloorStore,
     external_cas_noise_transport_candidate::NoiseTcpExternalCasProviderTransport,
     external_cas_offhost_anchor_noise_transport_candidate::NoiseTcpOffhostAnchorTransport,
+    external_cas_offhost_anchor_noise_v2_candidate::{
+        NoiseTcpQar2OffhostAnchorTransport, QAR2Qap1AnchorTransport,
+    },
+    external_cas_offhost_anchor_protocol_candidate::{
+        ExternalCasOffhostAnchorCasRequest, ExternalCasOffhostAnchorReadRequest,
+        ExternalCasOffhostAnchorReceipt,
+    },
     noise_key_provisioning::load_protected_noise_private_key,
     qrun_v06_canonical_execution_candidate::{
         QRunV06Block, QRunV06BlockOperation, QRunV06CanonicalExecutionState,
@@ -31,7 +38,9 @@ use ai_native_l1_pow_bench::{
         QRunV06TrustAuthorizedProfilePin, QRunV06TrustAuthorizedQuoteAsset,
     },
     qrun_v06_profile_trust_dynamodb_floor_candidate::AwsDynamoDbQ6tsReadOnlyProfileTrustFloorStore,
-    qrun_v06_qap1_coordinator_candidate::QRunV06Qap1ExternalCoordinator,
+    qrun_v06_qap1_coordinator_candidate::{
+        QRunV06Qap1AnchorTransport, QRunV06Qap1ExternalCoordinator,
+    },
     qrun_v06_transaction_journal_candidate::QRunV06TransactionJournal,
     qrun_v06_transaction_mempool_candidate::QRunV06MempoolLimits,
     v4_fat1_mldsa65_candidate::LibcruxMlDsa65VerifierCandidate,
@@ -49,8 +58,59 @@ use std::{
 const MAX_RUNTIME_CONFIG_PEERS_BYTES: u64 = 16 * 1024;
 const MAX_Q6QA_BYTES: u64 = 16 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Q6eaAnchorTransportMode {
+    Qar1V1,
+    Qar2Qbt1V2,
+}
+
+enum CandidateQ6eaAnchorTransport {
+    Qar1(NoiseTcpOffhostAnchorTransport),
+    Qar2(QAR2Qap1AnchorTransport<LibcruxMlDsa65VerifierCandidate>),
+}
+
+impl QRunV06Qap1AnchorTransport for CandidateQ6eaAnchorTransport {
+    fn is_pinned_to(
+        &self,
+        anchor_pin: &ai_native_l1_pow_bench::external_cas_offhost_anchor_protocol_candidate::ExternalCasOffhostAnchorPin,
+        provider_pin: &ai_native_l1_pow_bench::external_cas_anchor_candidate::ExternalCasPin,
+    ) -> bool {
+        match self {
+            Self::Qar1(transport) => transport.is_pinned_to(anchor_pin, provider_pin),
+            Self::Qar2(transport) => transport.is_pinned_to(anchor_pin, provider_pin),
+        }
+    }
+
+    fn read(
+        &mut self,
+        request: &ExternalCasOffhostAnchorReadRequest,
+    ) -> Result<ExternalCasOffhostAnchorReceipt, String> {
+        match self {
+            Self::Qar1(transport) => transport.read(request).map_err(|error| error.to_string()),
+            Self::Qar2(transport) => transport.read(request),
+        }
+    }
+
+    fn compare_and_swap(
+        &mut self,
+        request: &ExternalCasOffhostAnchorCasRequest,
+        next_record_bytes: &[u8],
+        provider_receipt_bytes: &[u8],
+    ) -> Result<ExternalCasOffhostAnchorReceipt, String> {
+        match self {
+            Self::Qar1(transport) => transport
+                .compare_and_swap(request, next_record_bytes, provider_receipt_bytes)
+                .map_err(|error| error.to_string()),
+            Self::Qar2(transport) => {
+                transport.compare_and_swap(request, next_record_bytes, provider_receipt_bytes)
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct CandidateRuntimeConfig {
+    q6ea_anchor_transport: Q6eaAnchorTransportMode,
     data_directory: PathBuf,
     node_noise_private_key_path: PathBuf,
     listen_address: SocketAddr,
@@ -76,6 +136,47 @@ fn optional_runtime_u64(runtime: &Value, name: &str, default: u64) -> Result<u64
         Some(value) => value
             .as_u64()
             .ok_or_else(|| format!("runtime.{name} must be an unsigned integer")),
+    }
+}
+
+fn parse_q6ea_anchor_transport_mode(
+    runtime: &Value,
+    qbt1_bundle_path_configured: bool,
+    qbt1_bundle_digest_configured: bool,
+) -> Result<Q6eaAnchorTransportMode, String> {
+    if qbt1_bundle_path_configured != qbt1_bundle_digest_configured {
+        return Err(
+            "qbt1_bundle_path and qbt1_bundle_sha256 must either both be configured or both be absent"
+                .into(),
+        );
+    }
+    let qbt1_bundle_configured = qbt1_bundle_path_configured && qbt1_bundle_digest_configured;
+    match runtime.get("q6ea_anchor_transport").and_then(Value::as_str) {
+        Some("qar1-v1") if !qbt1_bundle_configured => {
+            Ok(Q6eaAnchorTransportMode::Qar1V1)
+        }
+        Some("qar1-v1") => Err(
+            "runtime.q6ea_anchor_transport=qar1-v1 cannot be combined with QBTB1 bundle inputs"
+                .into(),
+        ),
+        Some("qar2-qbt1-v2") if qbt1_bundle_configured => {
+            Ok(Q6eaAnchorTransportMode::Qar2Qbt1V2)
+        }
+        Some("qar2-qbt1-v2") => Err(
+            "runtime.q6ea_anchor_transport=qar2-qbt1-v2 requires qbt1_bundle_path and qbt1_bundle_sha256"
+                .into(),
+        ),
+        Some(other) => Err(format!(
+            "unsupported runtime.q6ea_anchor_transport '{other}'; expected qar1-v1 or qar2-qbt1-v2"
+        )),
+        None if qbt1_bundle_configured => Err(
+            "QBTB1 inputs require explicit runtime.q6ea_anchor_transport=qar2-qbt1-v2; downgrade is refused"
+                .into(),
+        ),
+        None => Err(
+            "runtime.q6ea_anchor_transport must explicitly select qar1-v1 or qar2-qbt1-v2"
+                .into(),
+        ),
     }
 }
 
@@ -165,6 +266,11 @@ fn parse_candidate_runtime_config(
     {
         return Err("runtime.allow_candidate_runtime=true is required for explicit candidate-only execution".into());
     }
+    let q6ea_anchor_transport = parse_q6ea_anchor_transport_mode(
+        runtime,
+        value.get("qbt1_bundle_path").is_some(),
+        value.get("qbt1_bundle_sha256").is_some(),
+    )?;
 
     let base = config_path
         .parent()
@@ -197,6 +303,7 @@ fn parse_candidate_runtime_config(
     }
 
     Ok(CandidateRuntimeConfig {
+        q6ea_anchor_transport,
         data_directory: path("data_directory")?,
         node_noise_private_key_path: path("node_noise_private_key_path")?,
         listen_address: parse_private_endpoint(
@@ -348,13 +455,14 @@ fn load_authorized_profile_pin(
 fn build_qap1_coordinator(
     config: &Config,
     summary: &PreflightSummary,
+    runtime_config: &CandidateRuntimeConfig,
     local_node_private_key: &[u8; 32],
 ) -> Result<
     QRunV06Qap1ExternalCoordinator<
         NoiseTcpExternalCasProviderTransport,
         LibcruxMlDsa65VerifierCandidate,
         LibcruxMlDsa65VerifierCandidate,
-        NoiseTcpOffhostAnchorTransport,
+        CandidateQ6eaAnchorTransport,
     >,
     String,
 > {
@@ -415,16 +523,52 @@ fn build_qap1_coordinator(
         }
     };
 
-    let anchor_transport_result = NoiseTcpOffhostAnchorTransport::new(
-        config.q6ea_anchor_endpoint,
-        anchor_client_key,
-        summary.q6ea_anchor_noise_server_public_key,
-        summary.q6ea_anchor_pin.clone(),
-        summary.provider_pin.clone(),
-    );
+    let anchor_transport_result = (|| -> Result<CandidateQ6eaAnchorTransport, String> {
+        match runtime_config.q6ea_anchor_transport {
+            Q6eaAnchorTransportMode::Qar1V1 => {
+                let transport = NoiseTcpOffhostAnchorTransport::new(
+                    config.q6ea_anchor_endpoint,
+                    anchor_client_key,
+                    summary.q6ea_anchor_noise_server_public_key,
+                    summary.q6ea_anchor_pin.clone(),
+                    summary.provider_pin.clone(),
+                )
+                .map_err(|error| {
+                    format!("Q6EA Anchor QAR1 Noise transport setup failed: {error:?}")
+                })?;
+                Ok(CandidateQ6eaAnchorTransport::Qar1(transport))
+            }
+            Q6eaAnchorTransportMode::Qar2Qbt1V2 => {
+                let verified_bundle = summary.qbt1_bootstrap_bundle.as_ref().ok_or_else(|| {
+                    "QAR2/QBT1 runtime mode requires a verified QBTB1 bundle from preflight"
+                        .to_string()
+                })?;
+                let trust = verified_bundle.bootstrap_trust().clone();
+                let transport = NoiseTcpQar2OffhostAnchorTransport::new(
+                    config.q6ea_anchor_endpoint,
+                    anchor_client_key,
+                    summary.q6ea_anchor_noise_server_public_key,
+                    summary.q6ea_anchor_pin.clone(),
+                    summary.provider_pin.clone(),
+                    trust.clone(),
+                )
+                .map_err(|error| {
+                    format!("Q6EA Anchor QAR2 Noise transport setup failed: {error}")
+                })?;
+                let adapter = QAR2Qap1AnchorTransport::new(
+                    transport,
+                    trust,
+                    summary.q6ea_anchor_pin.clone(),
+                    summary.provider_pin.clone(),
+                    LibcruxMlDsa65VerifierCandidate,
+                )
+                .map_err(|error| format!("QAR2/QBT1 QAP1 adapter setup failed: {error}"))?;
+                Ok(CandidateQ6eaAnchorTransport::Qar2(adapter))
+            }
+        }
+    })();
     anchor_client_key.fill(0);
-    let anchor_transport = anchor_transport_result
-        .map_err(|error| format!("Q6EA Anchor Noise transport setup failed: {error:?}"))?;
+    let anchor_transport = anchor_transport_result?;
 
     let qfp6_anchor_pin =
         QRunV06ExternalAnchorPin::new(summary.provider_pin.clone(), summary.genesis_commitment)
@@ -636,7 +780,8 @@ fn run_candidate_node_inner(
     // Authenticate any durable QAP1 intent before choosing the local Manifest anchor. Without
     // an intent, Provider and Q6EA must match the independent state. With an intent, recovery must
     // reconcile intermediate Provider/Anchor phases rather than requiring premature equality.
-    let mut recovery_coordinator = build_qap1_coordinator(config, summary, local_node_private_key)?;
+    let mut recovery_coordinator =
+        build_qap1_coordinator(config, summary, runtime_config, local_node_private_key)?;
     let qap1_journal_directory = runtime_config
         .data_directory
         .join(ai_native_l1_pow_bench::qrun_v06_qap1_journal_candidate::QAP1_DIRECTORY);
@@ -680,7 +825,8 @@ fn run_candidate_node_inner(
     )
     .map_err(|error| format!("QAP1 runtime recovery failed: {error}"))?;
 
-    let mut coordinator = build_qap1_coordinator(config, summary, local_node_private_key)?;
+    let mut coordinator =
+        build_qap1_coordinator(config, summary, runtime_config, local_node_private_key)?;
     coordinator
         .verify_current(runtime.committed_anchor_state())
         .map_err(|error| {
@@ -949,7 +1095,48 @@ mod tests {
 
         fs::remove_dir_all(&data_directory).expect("remove test manifests directory");
     }
+
+    #[test]
+    fn qbtb1_runtime_mode_is_explicit_and_never_downgrades() {
+        let legacy = serde_json::json!({
+            "q6ea_anchor_transport": "qar1-v1"
+        });
+        assert_eq!(
+            parse_q6ea_anchor_transport_mode(&legacy, false, false).unwrap(),
+            Q6eaAnchorTransportMode::Qar1V1
+        );
+        let missing_mode = serde_json::json!({});
+        assert!(parse_q6ea_anchor_transport_mode(&missing_mode, false, false).is_err());
+
+        let qbt1_runtime = serde_json::json!({
+            "q6ea_anchor_transport": "qar2-qbt1-v2"
+        });
+        assert_eq!(
+            parse_q6ea_anchor_transport_mode(&qbt1_runtime, true, true).unwrap(),
+            Q6eaAnchorTransportMode::Qar2Qbt1V2
+        );
+
+        let no_mode_with_bundle = serde_json::json!({});
+        assert!(parse_q6ea_anchor_transport_mode(&no_mode_with_bundle, true, true).is_err());
+
+        let legacy_with_bundle = serde_json::json!({
+            "q6ea_anchor_transport": "qar1-v1"
+        });
+        assert!(parse_q6ea_anchor_transport_mode(&legacy_with_bundle, true, true).is_err());
+
+        let qbt1_without_bundle = serde_json::json!({
+            "q6ea_anchor_transport": "qar2-qbt1-v2"
+        });
+        assert!(parse_q6ea_anchor_transport_mode(&qbt1_without_bundle, false, false).is_err());
+
+        assert!(parse_q6ea_anchor_transport_mode(&legacy, true, false).is_err());
+
+        let unknown = serde_json::json!({
+            "q6ea_anchor_transport": "qar1-or-whatever"
+        });
+        assert!(parse_q6ea_anchor_transport_mode(&unknown, false, false).is_err());
+    }
 }
 
 mod permissionless;
-pub(super) use permissionless::run_permissionless_node;
+pub(super) use permissionless::{run_permissionless_node, run_public_testnet_node};

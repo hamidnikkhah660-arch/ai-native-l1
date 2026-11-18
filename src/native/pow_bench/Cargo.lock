@@ -49,6 +49,7 @@ dependencies = [
  "hmac",
  "libc",
  "libcrux-ml-dsa",
+ "serde",
  "serde_json",
  "sha2",
  "snow",

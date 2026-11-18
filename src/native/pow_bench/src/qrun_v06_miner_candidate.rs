@@ -117,6 +117,36 @@ pub fn mine_qfp6_block_on_tip_from_nonce<A: TransactionAuthenticator>(
     )
 }
 
+/// Quote-aware nonce-continuation variant for a bounded mining batch. A fresh Q6QA
+/// authorization is obtained for the exact candidate block before its state root is mined.
+pub fn mine_qfp6_block_on_tip_from_nonce_with_quote_asset_authorization<
+    A: TransactionAuthenticator,
+>(
+    fork_choice: &QRunV06PowForkChoice,
+    parent_consensus_tip: &[u8; 32],
+    timestamp: u64,
+    producer: [u8; 32],
+    operations: Vec<QRunV06BlockOperation>,
+    authenticator: &A,
+    quote_authorizer: &mut QRunV06QuoteAssetAuthorizationProvider<'_>,
+    nonce_start: u64,
+    max_nonce_attempts: u64,
+    cancellation: &AtomicBool,
+) -> Result<QRunV06MinedBlock, QRunV06MiningError> {
+    mine_qfp6_block_on_tip_inner(
+        fork_choice,
+        parent_consensus_tip,
+        timestamp,
+        producer,
+        operations,
+        authenticator,
+        nonce_start,
+        max_nonce_attempts,
+        cancellation,
+        Some(quote_authorizer),
+    )
+}
+
 /// Mine one bounded batch from nonce zero. This compatibility wrapper preserves the original API.
 pub fn mine_qfp6_block_on_tip<A: TransactionAuthenticator>(
     fork_choice: &QRunV06PowForkChoice,

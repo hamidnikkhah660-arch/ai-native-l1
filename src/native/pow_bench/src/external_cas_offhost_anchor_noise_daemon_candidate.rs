@@ -5,6 +5,7 @@
 //! fixed worker count plus a bounded queue; overload is handled by closing the excess socket.
 use crate::{
     external_cas_anchor_candidate::ExternalCasPin,
+    external_cas_bootstrap_trust_candidate::VerifiedBootstrapTrust,
     external_cas_offhost_anchor_noise_transport_candidate::{
         serve_offhost_anchor_noise_connection, OffhostAnchorNoiseError,
     },
@@ -12,6 +13,7 @@ use crate::{
         ExternalCasOffhostAnchorMemoryModel, ExternalCasOffhostAnchorPin,
         OffhostAnchorReceiptSigner,
     },
+    external_cas_offhost_anchor_protocol_v2_candidate::QAR2BoundAnchorService,
     v4_fat1_trust_candidate::MlDsa65Verifier,
 };
 use std::{
@@ -175,14 +177,23 @@ impl Drop for ActiveWorkerGuard {
     }
 }
 
+enum OffhostAnchorNoiseService {
+    Qar1(Arc<ExternalCasOffhostAnchorMemoryModel>),
+    Qar2 {
+        service: Arc<QAR2BoundAnchorService>,
+        trust: Arc<VerifiedBootstrapTrust>,
+    },
+}
+
 /// Explicitly bound Anchor service. No background threads are started until run_until_shutdown or spawn.
+/// QAR1 remains the compatibility constructor; QAR2 requires the explicit QBT1-bound constructor.
 pub struct OffhostAnchorNoiseDaemon<S, V> {
     listener: TcpListener,
     local_static_private_key: Arc<SecretNoiseKey>,
     trusted_client_static_public_keys: Arc<Vec<[u8; 32]>>,
     anchor_pin: Arc<ExternalCasOffhostAnchorPin>,
     provider_pin: Arc<ExternalCasPin>,
-    model: Arc<ExternalCasOffhostAnchorMemoryModel>,
+    service: Arc<OffhostAnchorNoiseService>,
     provider_verifier: Arc<V>,
     anchor_signer: Arc<S>,
     max_workers: usize,
@@ -340,13 +351,103 @@ where
             )),
             anchor_pin: Arc::new(config.anchor_pin.clone()),
             provider_pin: Arc::new(config.provider_pin.clone()),
-            model,
+            service: Arc::new(OffhostAnchorNoiseService::Qar1(model)),
             provider_verifier,
             anchor_signer,
             max_workers: config.max_workers,
             queue_capacity: config.queue_capacity,
             counters: Arc::new(Counters::default()),
         })
+    }
+
+    /// Explicit QBT1-bound QAR2 listener. It never shares the QAR1 service branch and accepts
+    /// only a service carrying the exact already-verified bootstrap capability.
+    pub fn bind_qbt1(
+        mut config: OffhostAnchorNoiseDaemonConfig,
+        service: Arc<QAR2BoundAnchorService>,
+        trust: VerifiedBootstrapTrust,
+        provider_verifier: Arc<V>,
+        anchor_signer: Arc<S>,
+    ) -> Result<Self, OffhostAnchorNoiseError> {
+        let valid = !is_zero(&config.local_static_private_key)
+            && validate_trusted_clients(&config.trusted_client_static_public_keys)
+            && validate_limits(config.max_workers, config.queue_capacity)
+            && config.anchor_pin.validate(&config.provider_pin).is_ok()
+            && service.matches_pins(&config.anchor_pin, &config.provider_pin)
+            && service.bootstrap_trust_digest() == trust.receipt_digest()
+            && crate::external_cas_offhost_anchor_noise_v2_candidate::qar2_qbt1_noise_profile_id(
+                &trust,
+                &config.anchor_pin,
+                &config.provider_pin,
+            )
+            .is_ok();
+        if !valid {
+            return Err(OffhostAnchorNoiseError::InvalidConfiguration);
+        }
+
+        let listener = TcpListener::bind(config.bind_address)
+            .map_err(|error| OffhostAnchorNoiseError::Io(error.to_string()))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| OffhostAnchorNoiseError::Io(error.to_string()))?;
+
+        let secret_key = std::mem::replace(&mut config.local_static_private_key, [0; 32]);
+        let secret = Arc::new(SecretNoiseKey(secret_key));
+        Ok(Self {
+            listener,
+            local_static_private_key: secret,
+            trusted_client_static_public_keys: Arc::new(std::mem::take(
+                &mut config.trusted_client_static_public_keys,
+            )),
+            anchor_pin: Arc::new(config.anchor_pin.clone()),
+            provider_pin: Arc::new(config.provider_pin.clone()),
+            service: Arc::new(OffhostAnchorNoiseService::Qar2 {
+                service,
+                trust: Arc::new(trust),
+            }),
+            provider_verifier,
+            anchor_signer,
+            max_workers: config.max_workers,
+            queue_capacity: config.queue_capacity,
+            counters: Arc::new(Counters::default()),
+        })
+    }
+
+    /// Production composition entry point for the QBT1-bound Anchor service.
+    ///
+    /// The exact temporary STS session and deployment pin are used to construct and qualify
+    /// the DynamoDB-backed QAR2 service before the listener is opened. No ambient AWS credential
+    /// chain or QAR1 fallback is used. The generation-zero QBT1 record must already have been
+    /// provisioned through the separately authorized bootstrap procedure; this method never
+    /// performs first-use enrollment.
+    pub fn bind_qbt1_session_bound_aws_dynamodb(
+        config: OffhostAnchorNoiseDaemonConfig,
+        runner: Arc<crate::external_cas_offhost_anchor_aws_dynamodb_candidate::SessionBoundAwsDynamoDbCliRunner>,
+        deployment_pin: crate::external_cas_offhost_anchor_aws_qualification_candidate::AwsDynamoDbDeploymentPin,
+        trust: VerifiedBootstrapTrust,
+        provider_verifier: Arc<V>,
+        anchor_signer: Arc<S>,
+    ) -> Result<Self, OffhostAnchorNoiseError> {
+        let service = QAR2BoundAnchorService::with_session_bound_aws_dynamodb(
+            runner,
+            deployment_pin,
+            config.anchor_pin.clone(),
+            config.provider_pin.clone(),
+            trust.clone(),
+        )
+        .map_err(|error| {
+            OffhostAnchorNoiseError::Contract(format!(
+                "QAR2/QBT1 session-bound AWS service construction failed: {error:?}"
+            ))
+        })?;
+
+        Self::bind_qbt1(
+            config,
+            Arc::new(service),
+            trust,
+            provider_verifier,
+            anchor_signer,
+        )
     }
 
     /// Start the already-bound daemon under an owned shutdown/join handle.
@@ -406,7 +507,7 @@ where
                 let clients = Arc::clone(&self.trusted_client_static_public_keys);
                 let anchor_pin = Arc::clone(&self.anchor_pin);
                 let provider_pin = Arc::clone(&self.provider_pin);
-                let model = Arc::clone(&self.model);
+                let service = Arc::clone(&self.service);
                 let verifier = Arc::clone(&self.provider_verifier);
                 let signer = Arc::clone(&self.anchor_signer);
                 let counters = Arc::clone(&self.counters);
@@ -439,16 +540,36 @@ where
                                 let mut stream = stream;
                                 let mut connection =
                                     ActiveConnectionGuard::new(Arc::clone(&counters));
-                                let result = serve_offhost_anchor_noise_connection(
-                                    &mut stream,
-                                    &key.0,
-                                    clients.as_slice(),
-                                    &anchor_pin,
-                                    &provider_pin,
-                                    &model,
-                                    verifier.as_ref(),
-                                    signer.as_ref(),
-                                );
+                                let result = match service.as_ref() {
+                                    OffhostAnchorNoiseService::Qar1(model) => {
+                                        serve_offhost_anchor_noise_connection(
+                                            &mut stream,
+                                            &key.0,
+                                            clients.as_slice(),
+                                            &anchor_pin,
+                                            &provider_pin,
+                                            model,
+                                            verifier.as_ref(),
+                                            signer.as_ref(),
+                                        )
+                                    }
+                                    OffhostAnchorNoiseService::Qar2 {
+                                        service: qar2_service,
+                                        trust,
+                                    } => {
+                                        crate::external_cas_offhost_anchor_noise_v2_candidate::serve_qar2_offhost_anchor_noise_connection(
+                                            &mut stream,
+                                            &key.0,
+                                            clients.as_slice(),
+                                            &anchor_pin,
+                                            &provider_pin,
+                                            trust,
+                                            qar2_service,
+                                            verifier.as_ref(),
+                                            signer.as_ref(),
+                                        )
+                                    }
+                                };
                                 if result.is_ok() {
                                     connection.mark_completed();
                                 }
@@ -533,15 +654,21 @@ mod tests {
             ExternalCasPin, ExternalCasReceipt, ExternalCasReceiptKind, ExternalCasReceiptOutcome,
             ExternalCasRecord, ExternalCasWriteRequest,
         },
+        external_cas_bootstrap_trust_candidate::tests::verified_test_fixture,
         external_cas_offhost_anchor_candidate::{
             verify_provider_commit_for_offhost_anchor, ExternalCasOffhostAnchorState,
         },
         external_cas_offhost_anchor_file_store_candidate::ExternalCasOffhostAnchorFileStore,
         external_cas_offhost_anchor_noise_transport_candidate::NoiseTcpOffhostAnchorTransport,
+        external_cas_offhost_anchor_noise_v2_candidate::{
+            NoiseTcpQar2OffhostAnchorTransport, QAR2Qap1AnchorTransport,
+        },
         external_cas_offhost_anchor_protocol_candidate::{
             ExternalCasOffhostAnchorCasRequest, ExternalCasOffhostAnchorReadRequest,
             ExternalCasOffhostAnchorReceiptOutcome,
         },
+        external_cas_offhost_anchor_protocol_v2_candidate::QAR2BoundAnchorService,
+        qrun_v06_qap1_coordinator_candidate::QRunV06Qap1AnchorTransport,
         v4_fat1_mldsa65_candidate::LibcruxMlDsa65VerifierCandidate,
         v4_fat1_trust_candidate::ML_DSA_65_SIGNATURE_BYTES,
     };
@@ -1911,5 +2038,606 @@ mod tests {
                 .any(|line| line.contains(CP0489_HANDLER_RESTORED)),
             "signal handler restoration was not verified by the child: {output:#?}"
         );
+    }
+
+    #[test]
+    fn session_bound_aws_daemon_factory_rejects_deployment_pin_substitution() {
+        let (provider_pin, anchor_pin, trust) = verified_test_fixture();
+        let provider_keys = portable::generate_key_pair([0x11; 32]);
+        let anchor_keys = portable::generate_key_pair([0x22; 32]);
+        assert_eq!(
+            provider_pin.receipt_public_key.as_slice(),
+            provider_keys.verification_key.as_ref()
+        );
+        assert_eq!(
+            anchor_pin.receipt_public_key.as_slice(),
+            anchor_keys.verification_key.as_ref()
+        );
+
+        let runner_pin = crate::external_cas_offhost_anchor_aws_qualification_candidate::AwsDynamoDbDeploymentPin {
+            account_id: "123456789012".into(),
+            role_arn: "arn:aws:iam::123456789012:role/QRunAnchor".into(),
+            table_arn: "arn:aws:dynamodb:us-east-1:123456789012:table/QRunAnchor".into(),
+            region: "us-east-1".into(),
+            table_name: "QRunAnchor".into(),
+        };
+        let session = crate::external_cas_offhost_anchor_aws_dynamodb_candidate::AwsTemporaryCredentialSession::new(
+            "ASIATESTONLY".into(),
+            "synthetic-test-secret".into(),
+            "synthetic-test-session".into(),
+            u64::MAX,
+        )
+        .unwrap();
+        let runner = crate::external_cas_offhost_anchor_aws_dynamodb_candidate::SessionBoundAwsDynamoDbCliRunner::new(
+            std::env::current_exe().unwrap(),
+            runner_pin,
+            session,
+        )
+        .unwrap();
+
+        // A caller cannot substitute a different region/table after the runner has captured
+        // its immutable temporary credential session and deployment pin.
+        let substituted_pin = crate::external_cas_offhost_anchor_aws_qualification_candidate::AwsDynamoDbDeploymentPin {
+            account_id: "123456789012".into(),
+            role_arn: "arn:aws:iam::123456789012:role/QRunAnchor".into(),
+            table_arn: "arn:aws:dynamodb:us-west-2:123456789012:table/QRunAnchor".into(),
+            region: "us-west-2".into(),
+            table_name: "QRunAnchor".into(),
+        };
+        let (server_private, _server_public) = noise_keypair();
+        let (_client_private, client_public) = noise_keypair();
+        let config = daemon_config(
+            "127.0.0.1:0".parse().unwrap(),
+            anchor_pin,
+            provider_pin,
+            server_private,
+            client_public,
+            2,
+            8,
+        );
+        let signer = Arc::new(TestSigner {
+            key: Arc::new(anchor_keys.signing_key),
+            panic_on_sign: false,
+        });
+
+        assert!(matches!(
+            OffhostAnchorNoiseDaemon::bind_qbt1_session_bound_aws_dynamodb(
+                config,
+                Arc::new(runner),
+                substituted_pin,
+                trust,
+                Arc::new(LibcruxMlDsa65VerifierCandidate),
+                signer,
+            ),
+            Err(OffhostAnchorNoiseError::Contract(_))
+        ));
+    }
+
+    #[test]
+    fn qbt1_bound_q2_daemon_serves_only_q2_and_joins_its_worker_pool() {
+        let (provider_pin, anchor_pin, trust) = verified_test_fixture();
+        let provider_keys = portable::generate_key_pair([0x11; 32]);
+        let anchor_keys = portable::generate_key_pair([0x22; 32]);
+        assert_eq!(
+            provider_pin.receipt_public_key.as_slice(),
+            provider_keys.verification_key.as_ref()
+        );
+        assert_eq!(
+            anchor_pin.receipt_public_key.as_slice(),
+            anchor_keys.verification_key.as_ref()
+        );
+
+        let model = ExternalCasOffhostAnchorMemoryModel::new(
+            anchor_pin.clone(),
+            provider_pin.clone(),
+            trust.initial_anchor_state().clone(),
+        )
+        .unwrap();
+        let service = Arc::new(
+            QAR2BoundAnchorService::from_test_model(
+                model,
+                trust.clone(),
+                anchor_pin.clone(),
+                provider_pin.clone(),
+            )
+            .unwrap(),
+        );
+        let signer = Arc::new(TestSigner {
+            key: Arc::new(anchor_keys.signing_key),
+            panic_on_sign: false,
+        });
+        let verifier = Arc::new(LibcruxMlDsa65VerifierCandidate);
+
+        // A service/pin mismatch must fail before a listener is opened.
+        let (bad_server_private, _bad_server_public) = noise_keypair();
+        let (_bad_client_private, bad_client_public) = noise_keypair();
+        let mut bad_config = daemon_config(
+            "127.0.0.1:0".parse().unwrap(),
+            anchor_pin.clone(),
+            provider_pin.clone(),
+            bad_server_private,
+            bad_client_public,
+            2,
+            8,
+        );
+        bad_config.anchor_pin.anchor_id[0] ^= 1;
+        assert!(matches!(
+            OffhostAnchorNoiseDaemon::bind_qbt1(
+                bad_config,
+                Arc::clone(&service),
+                trust.clone(),
+                Arc::clone(&verifier),
+                Arc::clone(&signer),
+            ),
+            Err(OffhostAnchorNoiseError::InvalidConfiguration)
+        ));
+
+        let (server_private, server_public) = noise_keypair();
+        let (client_private, client_public) = noise_keypair();
+        let config = daemon_config(
+            "127.0.0.1:0".parse().unwrap(),
+            anchor_pin.clone(),
+            provider_pin.clone(),
+            server_private,
+            client_public,
+            2,
+            8,
+        );
+        let daemon =
+            OffhostAnchorNoiseDaemon::bind_qbt1(config, service, trust.clone(), verifier, signer)
+                .unwrap();
+        let address = daemon.local_addr().unwrap();
+        let task = daemon.spawn().unwrap();
+        let transport = NoiseTcpQar2OffhostAnchorTransport::new(
+            address,
+            client_private,
+            server_public,
+            anchor_pin.clone(),
+            provider_pin.clone(),
+            trust.clone(),
+        )
+        .unwrap();
+        let request = ExternalCasOffhostAnchorReadRequest {
+            challenge: [0xA1; 32],
+            operation_id: [0xA2; 32],
+            request_digest: [0xA3; 32],
+        };
+        let receipt = transport
+            .read(&request, &LibcruxMlDsa65VerifierCandidate)
+            .unwrap();
+        assert_eq!(
+            receipt
+                .verify_read(
+                    &trust,
+                    &anchor_pin,
+                    &provider_pin,
+                    &request,
+                    &LibcruxMlDsa65VerifierCandidate,
+                )
+                .unwrap(),
+            *trust.initial_anchor_state()
+        );
+
+        let stats = task.shutdown_and_join().unwrap();
+        assert_eq!(stats.completed_requests, 1);
+        assert_eq!(stats.active_worker_threads, 0);
+    }
+
+    #[test]
+    fn qbt1_q2_socket_read_cas_read_and_durable_restart_through_qap1_adapter() {
+        let (provider_pin, anchor_pin, trust) = verified_test_fixture();
+        let provider_keys = portable::generate_key_pair([0x11; 32]);
+        let anchor_keys = portable::generate_key_pair([0x22; 32]);
+        assert_eq!(
+            provider_pin.receipt_public_key.as_slice(),
+            provider_keys.verification_key.as_ref()
+        );
+        assert_eq!(
+            anchor_pin.receipt_public_key.as_slice(),
+            anchor_keys.verification_key.as_ref()
+        );
+
+        let provider_signer = TestSigner {
+            key: Arc::new(provider_keys.signing_key),
+            panic_on_sign: false,
+        };
+        let anchor_signer = Arc::new(TestSigner {
+            key: Arc::new(anchor_keys.signing_key),
+            panic_on_sign: false,
+        });
+        let verifier = Arc::new(LibcruxMlDsa65VerifierCandidate);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "qbt1_q2_socket_restart_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        // Provision the test-only durable local model from the already verified generation-zero
+        // state. This is deliberately not represented as an independent production witness.
+        let (provisioned, outcome) = ExternalCasOffhostAnchorFileStore::provision(
+            &directory,
+            anchor_pin.clone(),
+            provider_pin.clone(),
+            trust.initial_anchor_state().clone(),
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            crate::external_cas_offhost_anchor_protocol_candidate::ExternalCasOffhostAnchorStoreProvisionOutcome::Provisioned
+        ));
+        drop(provisioned);
+
+        let store: Arc<
+            dyn crate::external_cas_offhost_anchor_protocol_candidate::ExternalCasOffhostAnchorStore,
+        > = Arc::new(
+            ExternalCasOffhostAnchorFileStore::open(
+                &directory,
+                anchor_pin.clone(),
+                provider_pin.clone(),
+            )
+            .unwrap(),
+        );
+        let model = ExternalCasOffhostAnchorMemoryModel::with_store(
+            anchor_pin.clone(),
+            provider_pin.clone(),
+            Arc::clone(&store),
+        )
+        .unwrap();
+        let service = Arc::new(
+            QAR2BoundAnchorService::from_test_model(
+                model,
+                trust.clone(),
+                anchor_pin.clone(),
+                provider_pin.clone(),
+            )
+            .unwrap(),
+        );
+
+        let (server_private, server_public) = noise_keypair();
+        let (client_private, client_public) = noise_keypair();
+        let config = daemon_config(
+            "127.0.0.1:0".parse().unwrap(),
+            anchor_pin.clone(),
+            provider_pin.clone(),
+            server_private,
+            client_public,
+            2,
+            4,
+        );
+        let daemon = OffhostAnchorNoiseDaemon::bind_qbt1(
+            config,
+            Arc::clone(&service),
+            trust.clone(),
+            Arc::clone(&verifier),
+            Arc::clone(&anchor_signer),
+        )
+        .unwrap();
+        let address = daemon.local_addr().unwrap();
+        let task = daemon.spawn().unwrap();
+        assert!(wait_until(
+            || task.stats().active_worker_threads == 2,
+            Duration::from_secs(2)
+        ));
+
+        // A legacy QAR1 client may connect to the same socket, but the QAR2/QBT1
+        // Noise prologue must reject it rather than negotiate or fall back.
+        let legacy_transport = NoiseTcpOffhostAnchorTransport::new(
+            address,
+            client_private,
+            server_public,
+            anchor_pin.clone(),
+            provider_pin.clone(),
+        )
+        .unwrap();
+        let downgrade_probe = ExternalCasOffhostAnchorReadRequest {
+            challenge: [0xC1; 32],
+            operation_id: [0xC2; 32],
+            request_digest: [0xC3; 32],
+        };
+        assert!(legacy_transport.read(&downgrade_probe).is_err());
+        assert!(wait_until(
+            || task.stats().failed_requests == 1,
+            Duration::from_secs(2)
+        ));
+
+        let transport = NoiseTcpQar2OffhostAnchorTransport::new(
+            address,
+            client_private,
+            server_public,
+            anchor_pin.clone(),
+            provider_pin.clone(),
+            trust.clone(),
+        )
+        .unwrap();
+        let mut adapter = QAR2Qap1AnchorTransport::new(
+            transport,
+            trust.clone(),
+            anchor_pin.clone(),
+            provider_pin.clone(),
+            LibcruxMlDsa65VerifierCandidate,
+        )
+        .unwrap();
+
+        let read_before = ExternalCasOffhostAnchorReadRequest {
+            challenge: [0xD1; 32],
+            operation_id: [0xD2; 32],
+            request_digest: [0xD3; 32],
+        };
+        let before_receipt = adapter.read(&read_before).unwrap();
+        let before = before_receipt
+            .verify_read(
+                &anchor_pin,
+                &provider_pin,
+                &read_before,
+                &LibcruxMlDsa65VerifierCandidate,
+            )
+            .unwrap();
+        assert_eq!(before, *trust.initial_anchor_state());
+
+        let bootstrap_record = trust.initial_anchor_state().provider_record.clone();
+        let operation_id = [0xE2; 32];
+        let mut write = ExternalCasWriteRequest {
+            request_nonce: [0xE1; 32],
+            operation_id,
+            request_digest: [1; 32],
+            expected_generation: bootstrap_record.generation,
+            expected_object_generation: trust.initial_anchor_state().provider_object_generation,
+            expected_record_digest: bootstrap_record.digest().unwrap(),
+            expected_state_digest: bootstrap_record.next_state_digest,
+            next_record: ExternalCasRecord {
+                generation: bootstrap_record.generation + 1,
+                provider_id: provider_pin.provider_id,
+                network_id: provider_pin.network_id,
+                genesis_digest: provider_pin.genesis_digest,
+                previous_record_digest: bootstrap_record.digest().unwrap(),
+                previous_state_digest: bootstrap_record.next_state_digest,
+                next_state_digest: [0xE3; 32],
+                operation_id,
+                request_digest: [1; 32],
+            },
+        };
+        write.bind_request_digest(&provider_pin).unwrap();
+        let mut provider_receipt = ExternalCasReceipt {
+            kind: ExternalCasReceiptKind::Commit,
+            outcome: ExternalCasReceiptOutcome::Applied,
+            generation: write.next_record.generation,
+            object_generation: 2,
+            provider_id: provider_pin.provider_id,
+            network_id: provider_pin.network_id,
+            genesis_digest: provider_pin.genesis_digest,
+            receipt_key_id: provider_pin.receipt_key_id,
+            request_nonce: write.request_nonce,
+            record_digest: write.next_record.digest().unwrap(),
+            previous_record_digest: write.next_record.previous_record_digest,
+            previous_state_digest: write.next_record.previous_state_digest,
+            state_digest: write.next_record.next_state_digest,
+            operation_id: write.operation_id,
+            request_digest: write.request_digest,
+            signature: [0; ML_DSA_65_SIGNATURE_BYTES],
+        };
+        let provider_receipt_digest = provider_receipt.signing_digest().unwrap();
+        let provider_signature = portable::sign(
+            &provider_signer.key,
+            &provider_receipt_digest,
+            &[],
+            [0xE4; 32],
+        )
+        .unwrap();
+        provider_receipt.signature = *provider_signature.as_ref();
+
+        let verified_provider_advance = verify_provider_commit_for_offhost_anchor(
+            &provider_pin,
+            &before,
+            &write.next_record.encode().unwrap(),
+            &provider_receipt.encode().unwrap(),
+            &LibcruxMlDsa65VerifierCandidate,
+        )
+        .unwrap();
+        let cas = ExternalCasOffhostAnchorCasRequest {
+            challenge: [0xE5; 32],
+            operation_id: write.operation_id,
+            request_digest: write.request_digest,
+            expected_sequence: before.sequence,
+            expected_state_digest: before.digest().unwrap(),
+            target_state_digest: verified_provider_advance.next_state.digest().unwrap(),
+        };
+        let inner_cas_receipt = adapter
+            .compare_and_swap(
+                &cas,
+                &write.next_record.encode().unwrap(),
+                &provider_receipt.encode().unwrap(),
+            )
+            .unwrap();
+        let (outcome, accepted) = inner_cas_receipt
+            .verify_cas(
+                &anchor_pin,
+                &provider_pin,
+                &cas,
+                &LibcruxMlDsa65VerifierCandidate,
+            )
+            .unwrap();
+        assert_eq!(outcome, ExternalCasOffhostAnchorReceiptOutcome::Applied);
+        assert_eq!(accepted, verified_provider_advance.next_state);
+
+        // A stale predecessor sequence must not overwrite the applied successor.
+        let stale_cas = ExternalCasOffhostAnchorCasRequest {
+            challenge: [0xE9; 32],
+            operation_id: [0xEA; 32],
+            request_digest: [0xEB; 32],
+            expected_sequence: before.sequence,
+            expected_state_digest: before.digest().unwrap(),
+            target_state_digest: [0xEC; 32],
+        };
+        let stale_receipt = adapter
+            .compare_and_swap(
+                &stale_cas,
+                &write.next_record.encode().unwrap(),
+                &provider_receipt.encode().unwrap(),
+            )
+            .unwrap();
+        let (stale_outcome, stale_state) = stale_receipt
+            .verify_cas(
+                &anchor_pin,
+                &provider_pin,
+                &stale_cas,
+                &LibcruxMlDsa65VerifierCandidate,
+            )
+            .unwrap();
+        assert_eq!(
+            stale_outcome,
+            ExternalCasOffhostAnchorReceiptOutcome::Conflict
+        );
+        assert_eq!(stale_state, accepted);
+
+        let read_after = ExternalCasOffhostAnchorReadRequest {
+            challenge: [0xE6; 32],
+            operation_id: [0xE7; 32],
+            request_digest: [0xE8; 32],
+        };
+        let after_receipt = adapter.read(&read_after).unwrap();
+        assert_eq!(
+            after_receipt
+                .verify_read(
+                    &anchor_pin,
+                    &provider_pin,
+                    &read_after,
+                    &LibcruxMlDsa65VerifierCandidate,
+                )
+                .unwrap(),
+            accepted
+        );
+
+        drop(adapter);
+        let first_stats = task.shutdown_and_join().unwrap();
+        assert_eq!(first_stats.accepted_connections, 5);
+        assert_eq!(first_stats.completed_requests, 4);
+        assert_eq!(first_stats.failed_requests, 1);
+        assert_eq!(first_stats.active_worker_threads, 0);
+        drop(service);
+        drop(store);
+
+        // A newly opened store, daemon listener, Noise session and QAR2/QAP1 adapter must
+        // recover the exact state written by the first daemon process.
+        let reopened_store: Arc<
+            dyn crate::external_cas_offhost_anchor_protocol_candidate::ExternalCasOffhostAnchorStore,
+        > = Arc::new(
+            ExternalCasOffhostAnchorFileStore::open(
+                &directory,
+                anchor_pin.clone(),
+                provider_pin.clone(),
+            )
+            .unwrap(),
+        );
+        let reopened_model = ExternalCasOffhostAnchorMemoryModel::with_store(
+            anchor_pin.clone(),
+            provider_pin.clone(),
+            Arc::clone(&reopened_store),
+        )
+        .unwrap();
+        let reopened_service = Arc::new(
+            QAR2BoundAnchorService::from_test_model(
+                reopened_model,
+                trust.clone(),
+                anchor_pin.clone(),
+                provider_pin.clone(),
+            )
+            .unwrap(),
+        );
+        let (restart_server_private, restart_server_public) = noise_keypair();
+        let (restart_client_private, restart_client_public) = noise_keypair();
+        let restart_config = daemon_config(
+            "127.0.0.1:0".parse().unwrap(),
+            anchor_pin.clone(),
+            provider_pin.clone(),
+            restart_server_private,
+            restart_client_public,
+            2,
+            4,
+        );
+        let restarted_daemon = OffhostAnchorNoiseDaemon::bind_qbt1(
+            restart_config,
+            Arc::clone(&reopened_service),
+            trust.clone(),
+            Arc::clone(&verifier),
+            Arc::clone(&anchor_signer),
+        )
+        .unwrap();
+        let restart_address = restarted_daemon.local_addr().unwrap();
+        let restarted_task = restarted_daemon.spawn().unwrap();
+        assert!(wait_until(
+            || restarted_task.stats().active_worker_threads == 2,
+            Duration::from_secs(2)
+        ));
+        let restart_transport = NoiseTcpQar2OffhostAnchorTransport::new(
+            restart_address,
+            restart_client_private,
+            restart_server_public,
+            anchor_pin.clone(),
+            provider_pin.clone(),
+            trust.clone(),
+        )
+        .unwrap();
+        let mut restart_adapter = QAR2Qap1AnchorTransport::new(
+            restart_transport,
+            trust,
+            anchor_pin.clone(),
+            provider_pin.clone(),
+            LibcruxMlDsa65VerifierCandidate,
+        )
+        .unwrap();
+        let restart_read = ExternalCasOffhostAnchorReadRequest {
+            challenge: [0xF1; 32],
+            operation_id: [0xF2; 32],
+            request_digest: [0xF3; 32],
+        };
+        let restarted_receipt = restart_adapter.read(&restart_read).unwrap();
+        assert_eq!(
+            restarted_receipt
+                .verify_read(
+                    &anchor_pin,
+                    &provider_pin,
+                    &restart_read,
+                    &LibcruxMlDsa65VerifierCandidate,
+                )
+                .unwrap(),
+            accepted
+        );
+
+        // Replaying the old CAS after a fresh daemon/store open must still conflict.
+        let restarted_stale_receipt = restart_adapter
+            .compare_and_swap(
+                &stale_cas,
+                &write.next_record.encode().unwrap(),
+                &provider_receipt.encode().unwrap(),
+            )
+            .unwrap();
+        let (restarted_stale_outcome, restarted_stale_state) = restarted_stale_receipt
+            .verify_cas(
+                &anchor_pin,
+                &provider_pin,
+                &stale_cas,
+                &LibcruxMlDsa65VerifierCandidate,
+            )
+            .unwrap();
+        assert_eq!(
+            restarted_stale_outcome,
+            ExternalCasOffhostAnchorReceiptOutcome::Conflict
+        );
+        assert_eq!(restarted_stale_state, accepted);
+
+        drop(restart_adapter);
+        let restart_stats = restarted_task.shutdown_and_join().unwrap();
+        assert_eq!(restart_stats.accepted_connections, 2);
+        assert_eq!(restart_stats.completed_requests, 2);
+        assert_eq!(restart_stats.failed_requests, 0);
+        assert_eq!(restart_stats.active_worker_threads, 0);
+        drop(reopened_service);
+        drop(reopened_store);
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }

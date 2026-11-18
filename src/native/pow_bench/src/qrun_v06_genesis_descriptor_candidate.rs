@@ -1,7 +1,7 @@
 //! Immutable QFP6 Genesis descriptor candidate.
 //!
 //! It binds Genesis time, Network/Profile, Founder, consensus parameters and the
-//! active versioned tokenomics policy fingerprint (CP-0604 for permissionless QFP6).
+//! active versioned tokenomics policy fingerprint (CP-0651 for the current QFP6 fixed-supply candidate).
 //! A selected network profile must pin this commitment out-of-band; the encoding
 //! itself is not anti-rollback authority.
 

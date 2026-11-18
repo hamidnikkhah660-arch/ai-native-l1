@@ -351,6 +351,22 @@ pub fn import_history_branch_page<A: TransactionAuthenticator>(
     page: &QRunV06CanonicalHistoryPage,
     authenticator: &A,
 ) -> Result<QRunV06HistorySyncReport, QRunV06HistorySyncServiceError> {
+    import_history_branch_page_with_quote_asset_authorization(
+        runtime,
+        request,
+        page,
+        authenticator,
+        None,
+    )
+}
+
+pub fn import_history_branch_page_with_quote_asset_authorization<A: TransactionAuthenticator>(
+    runtime: &mut QRunV06PermissionlessNodeRuntime,
+    request: &QRunV06HistorySyncRequest,
+    page: &QRunV06CanonicalHistoryPage,
+    authenticator: &A,
+    mut quote_authorizer: Option<&mut QRunV06QuoteAssetAuthorizationProvider<'_>>,
+) -> Result<QRunV06HistorySyncReport, QRunV06HistorySyncServiceError> {
     request.validate()?;
     if page.envelopes.is_empty() {
         return Err(QRunV06HistorySyncServiceError::EmptyPage);
@@ -390,12 +406,13 @@ pub fn import_history_branch_page<A: TransactionAuthenticator>(
         }
     }
     runtime
-        .import_history_branch_batch(
+        .import_history_branch_batch_with_quote_asset_authorization(
             request.start_height,
             request.expected_parent_consensus_hash,
             request.expected_parent_execution_hash,
             &page.envelopes,
             authenticator,
+            quote_authorizer.as_deref_mut(),
         )
         .map_err(Into::into)
 }
@@ -550,6 +567,7 @@ pub struct QRunV06HistorySyncClientReport {
     pub pages_imported: u32,
     pub blocks_imported: u64,
     pub source_tip: [u8; 32],
+    pub source_execution_tip: [u8; 32],
     pub complete: bool,
 }
 
@@ -563,6 +581,26 @@ pub fn sync_history_from_pinned_peer<A: TransactionAuthenticator>(
     runtime: &mut QRunV06PermissionlessNodeRuntime,
     authenticator: &A,
     config: QRunV06HistorySyncClientConfig,
+) -> Result<QRunV06HistorySyncClientReport, QRunV06HistorySyncServiceError> {
+    sync_history_from_pinned_peer_with_quote_asset_authorization(
+        address,
+        local_static_private_key,
+        remote_static_public_key,
+        runtime,
+        authenticator,
+        config,
+        None,
+    )
+}
+
+pub fn sync_history_from_pinned_peer_with_quote_asset_authorization<A: TransactionAuthenticator>(
+    address: SocketAddr,
+    local_static_private_key: &[u8; 32],
+    remote_static_public_key: &[u8; 32],
+    runtime: &mut QRunV06PermissionlessNodeRuntime,
+    authenticator: &A,
+    config: QRunV06HistorySyncClientConfig,
+    mut quote_authorizer: Option<&mut QRunV06QuoteAssetAuthorizationProvider<'_>>,
 ) -> Result<QRunV06HistorySyncClientReport, QRunV06HistorySyncServiceError> {
     config.validate()?;
     if local_static_private_key.iter().all(|byte| *byte == 0)
@@ -706,7 +744,13 @@ pub fn sync_history_from_pinned_peer<A: TransactionAuthenticator>(
             }
             let page_blocks = page.envelopes.len() as u64;
             let complete = page.complete;
-            import_history_branch_page(runtime, &request, &page, authenticator)?;
+            import_history_branch_page_with_quote_asset_authorization(
+                runtime,
+                &request,
+                &page,
+                authenticator,
+                quote_authorizer.as_deref_mut(),
+            )?;
             let last = decode_qrun_v06_pow_block(page.envelopes.last().unwrap())
                 .map_err(|error| QRunV06HistorySyncServiceError::Wire(error.to_string()))?;
             parent_consensus = pow_digest(&last.header, params.pow)
@@ -758,6 +802,7 @@ pub fn sync_history_from_pinned_peer<A: TransactionAuthenticator>(
         pages_imported,
         blocks_imported,
         source_tip,
+        source_execution_tip,
         complete: true,
     })
 }
@@ -948,6 +993,7 @@ where
         pages_imported,
         blocks_imported,
         source_tip: source.consensus_tip,
+        source_execution_tip: source.execution_tip,
         complete,
     })
 }
@@ -1013,17 +1059,40 @@ pub fn sync_history_from_pinned_peer_until_complete<A: TransactionAuthenticator>
     authenticator: &A,
     config: QRunV06HistorySyncClientConfig,
 ) -> Result<QRunV06HistorySyncClientReport, QRunV06HistorySyncServiceError> {
+    sync_history_from_pinned_peer_until_complete_with_quote_asset_authorization(
+        address,
+        local_static_private_key,
+        remote_static_public_key,
+        runtime,
+        authenticator,
+        config,
+        None,
+    )
+}
+
+pub fn sync_history_from_pinned_peer_until_complete_with_quote_asset_authorization<
+    A: TransactionAuthenticator,
+>(
+    address: SocketAddr,
+    local_static_private_key: &[u8; 32],
+    remote_static_public_key: &[u8; 32],
+    runtime: &mut QRunV06PermissionlessNodeRuntime,
+    authenticator: &A,
+    config: QRunV06HistorySyncClientConfig,
+    mut quote_authorizer: Option<&mut QRunV06QuoteAssetAuthorizationProvider<'_>>,
+) -> Result<QRunV06HistorySyncClientReport, QRunV06HistorySyncServiceError> {
     config.validate()?;
     let mut total_pages = 0u32;
     let mut total_blocks = 0u64;
     for _ in 0..config.max_rounds {
-        let mut report = sync_history_from_pinned_peer(
+        let mut report = sync_history_from_pinned_peer_with_quote_asset_authorization(
             address,
             local_static_private_key,
             remote_static_public_key,
             runtime,
             authenticator,
             config,
+            quote_authorizer.as_deref_mut(),
         )?;
         total_pages = total_pages
             .checked_add(report.pages_imported)
@@ -1354,5 +1423,292 @@ mod tests {
         drop(recovered);
         drop(source_mempool);
         let _ = fs::remove_dir_all(test_root);
+    }
+
+    fn two_independent_noise_sources_bootstrap_case(
+        second_timestamp_offset: u64,
+        expect_divergence: bool,
+    ) {
+        use crate::{
+            consensus::ConsensusParameters, external_cas_anchor_candidate::ExternalCasPin,
+            qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint,
+            qrun_v06_node_supervisor_candidate::validate_bootstrap_source_snapshots,
+        };
+
+        const NETWORK: [u8; 32] = [0x91; 32];
+        const PROFILE: [u8; 32] = [0x92; 32];
+        const FOUNDER: [u8; 32] = [0x93; 32];
+        const DOMAIN_ONE: [u8; 32] = [0xA1; 32];
+        const DOMAIN_TWO: [u8; 32] = [0xA2; 32];
+
+        let mut params = ConsensusParameters::qrun_v06_sha256d_candidate().unwrap();
+        params.target_block_time_secs = 30;
+        params.difficulty_window_blocks = 2;
+        params.difficulty_min_ratio_divisor = 4;
+        params.difficulty_max_ratio = 4;
+        params.initial_target = Uint256::from_be_bytes([0x7F; 32]);
+        params.pow_limit = Uint256::MAX;
+        params.validate().unwrap();
+
+        let schedule = QRunV06MiningScheduleCandidate::cp0422_research_candidate();
+        let supply = Cp0604FounderControlledSupply::genesis(NETWORK, FOUNDER, schedule).unwrap();
+        let descriptor = QRunV06GenesisDescriptor::new(
+            NETWORK,
+            PROFILE,
+            FOUNDER,
+            1,
+            qrun_v06_consensus_fingerprint(&params).unwrap(),
+            supply.policy_fingerprint(),
+        )
+        .unwrap();
+        let genesis = QRunV06CanonicalExecutionState::cp0604_genesis_candidate_with_descriptor(
+            descriptor.clone(),
+            schedule,
+        )
+        .unwrap();
+        let profile_bundle = QRunV06ProfilePinCandidate::new(
+            descriptor,
+            ExternalCasPin {
+                provider_id: [0x94; 32],
+                network_id: NETWORK,
+                genesis_digest: [0x95; 32],
+                receipt_key_id: [0x96; 32],
+                receipt_public_key: [0x97; ML_DSA_65_PUBLIC_KEY_BYTES],
+            },
+        )
+        .unwrap();
+        let profile_pin_bytes = profile_bundle.encode().unwrap();
+        let verified_pin = QRunV06VerifiedProfilePin::decode(
+            &profile_pin_bytes,
+            profile_bundle.commitment().unwrap(),
+        )
+        .unwrap();
+        let authenticator =
+            QRunV06HybridTransactionAuthenticator::new(LibcruxMlDsa65VerifierCandidate);
+
+        let test_root = std::env::temp_dir().join(format!(
+            "qfp6-cp0649-two-source-divergence-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let source_one_dir = test_root.join("source-one");
+        let source_two_dir = test_root.join("source-two");
+        let destination_dir = test_root.join("destination");
+        let source_one_pool_dir = test_root.join("source-one-pool");
+        let source_two_pool_dir = test_root.join("source-two-pool");
+        fs::create_dir_all(&test_root).unwrap();
+
+        let wall_clock = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let first_timestamp = wall_clock.max(genesis.last_timestamp().saturating_add(60));
+        let second_timestamp = first_timestamp.saturating_add(second_timestamp_offset);
+        let stop_mining = AtomicBool::new(false);
+
+        let build_source = |store: &std::path::Path, pool: &std::path::Path, timestamp: u64| {
+            let mut runtime = QRunV06PermissionlessNodeRuntime::open(
+                store,
+                genesis.clone(),
+                params.clone(),
+                &authenticator,
+                None,
+                &verified_pin,
+            )
+            .unwrap();
+            let mut mempool =
+                QRunV06PermissionlessMempool::open(pool, QRunV06MempoolLimits::default()).unwrap();
+            mempool
+                .restore(&runtime, &authenticator, FOUNDER, timestamp)
+                .unwrap();
+            let mined = mempool
+                .mine_one_batch(
+                    &mut runtime,
+                    &authenticator,
+                    FOUNDER,
+                    timestamp,
+                    10_000,
+                    &stop_mining,
+                )
+                .unwrap()
+                .unwrap();
+            assert!(mined.became_canonical);
+            drop(mempool);
+            runtime
+        };
+
+        // Both source nodes validate a first block from the same pinned Genesis. With a
+        // zero offset they produce the same history; a nonzero offset creates sibling histories.
+        let source_one = build_source(&source_one_dir, &source_one_pool_dir, first_timestamp);
+        let source_two = build_source(&source_two_dir, &source_two_pool_dir, second_timestamp);
+        if expect_divergence {
+            assert_ne!(
+                source_one.status().unwrap().tip,
+                source_two.status().unwrap().tip,
+                "independent source fixtures must actually contain divergent histories"
+            );
+        } else {
+            assert_eq!(
+                source_one.status().unwrap().tip,
+                source_two.status().unwrap().tip,
+                "independent source fixtures must contain the same history"
+            );
+        }
+
+        let mut destination = QRunV06PermissionlessNodeRuntime::open(
+            &destination_dir,
+            genesis,
+            params,
+            &authenticator,
+            None,
+            &verified_pin,
+        )
+        .unwrap();
+
+        let noise_params: snow::params::NoiseParams =
+            "Noise_XX_25519_ChaChaPoly_SHA256".parse().unwrap();
+        let server_one_pair = snow::Builder::new(noise_params.clone())
+            .generate_keypair()
+            .unwrap();
+        let server_two_pair = snow::Builder::new(noise_params.clone())
+            .generate_keypair()
+            .unwrap();
+        let client_one_pair = snow::Builder::new(noise_params.clone())
+            .generate_keypair()
+            .unwrap();
+        let client_two_pair = snow::Builder::new(noise_params).generate_keypair().unwrap();
+
+        let server_one_private: [u8; 32] = server_one_pair.private.as_slice().try_into().unwrap();
+        let server_one_public: [u8; 32] = server_one_pair.public.as_slice().try_into().unwrap();
+        let server_two_private: [u8; 32] = server_two_pair.private.as_slice().try_into().unwrap();
+        let server_two_public: [u8; 32] = server_two_pair.public.as_slice().try_into().unwrap();
+        let client_one_private: [u8; 32] = client_one_pair.private.as_slice().try_into().unwrap();
+        let client_one_public: [u8; 32] = client_one_pair.public.as_slice().try_into().unwrap();
+        let client_two_private: [u8; 32] = client_two_pair.private.as_slice().try_into().unwrap();
+        let client_two_public: [u8; 32] = client_two_pair.public.as_slice().try_into().unwrap();
+
+        let listener_one = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address_one = listener_one.local_addr().unwrap();
+        let listener_two = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address_two = listener_two.local_addr().unwrap();
+
+        let shutdown_one = Arc::new(AtomicBool::new(false));
+        let shutdown_two = Arc::new(AtomicBool::new(false));
+        let server_shutdown_one = shutdown_one.clone();
+        let server_shutdown_two = shutdown_two.clone();
+
+        let server_one = thread::spawn(move || {
+            let mut listener_config = QRunV06PeerListenerConfig::default();
+            listener_config.max_sessions = 1;
+            listener_config.max_requests_per_session = 16;
+            listener_config.accept_poll_interval = Duration::from_millis(10);
+            serve_permissionless_history_sync_listener(
+                &listener_one,
+                listener_config,
+                &server_one_private,
+                &[client_one_public],
+                &NETWORK,
+                &PROFILE,
+                server_shutdown_one.as_ref(),
+                &source_one,
+            )
+        });
+        let server_two = thread::spawn(move || {
+            let mut listener_config = QRunV06PeerListenerConfig::default();
+            listener_config.max_sessions = 1;
+            listener_config.max_requests_per_session = 16;
+            listener_config.accept_poll_interval = Duration::from_millis(10);
+            serve_permissionless_history_sync_listener(
+                &listener_two,
+                listener_config,
+                &server_two_private,
+                &[client_two_public],
+                &NETWORK,
+                &PROFILE,
+                server_shutdown_two.as_ref(),
+                &source_two,
+            )
+        });
+
+        let sync_config = QRunV06HistorySyncClientConfig {
+            connect_timeout: Duration::from_secs(3),
+            io_timeout: Duration::from_secs(5),
+            max_blocks_per_page: 1,
+            max_bytes_per_page: 1024 * 1024,
+            max_pages: 1,
+            max_rounds: 4,
+        };
+        let report_one = sync_history_from_pinned_peer(
+            address_one,
+            &client_one_private,
+            &server_one_public,
+            &mut destination,
+            &authenticator,
+            sync_config,
+        )
+        .unwrap();
+        let report_two = sync_history_from_pinned_peer(
+            address_two,
+            &client_two_private,
+            &server_two_public,
+            &mut destination,
+            &authenticator,
+            sync_config,
+        )
+        .unwrap();
+
+        let server_report_one = server_one.join().unwrap().unwrap();
+        let server_report_two = server_two.join().unwrap().unwrap();
+        assert!(server_report_one.stats.authenticated_sessions >= 1);
+        assert!(server_report_two.stats.authenticated_sessions >= 1);
+        assert!(report_one.complete && report_two.complete);
+        if expect_divergence {
+            assert_ne!(report_one.source_tip, report_two.source_tip);
+            assert_ne!(
+                report_one.source_execution_tip,
+                report_two.source_execution_tip
+            );
+        } else {
+            assert_eq!(report_one.source_tip, report_two.source_tip);
+            assert_eq!(
+                report_one.source_execution_tip,
+                report_two.source_execution_tip
+            );
+        }
+
+        let graph = destination.fork_choice_snapshot().unwrap();
+        assert!(graph.tip_for_hash(&report_one.source_tip).is_some());
+        assert!(graph.tip_for_hash(&report_two.source_tip).is_some());
+        let agreement = validate_bootstrap_source_snapshots(
+            &graph,
+            &[(DOMAIN_ONE, report_one), (DOMAIN_TWO, report_two)],
+        );
+        if expect_divergence {
+            assert!(
+                agreement.unwrap_err().contains("divergent histories"),
+                "valid but divergent independently authenticated sources must fail the bootstrap gate"
+            );
+        } else {
+            assert!(
+                agreement.is_ok(),
+                "two independent Noise sources reporting the same validated history must pass the bootstrap gate"
+            );
+        }
+
+        drop(destination);
+        let _ = fs::remove_dir_all(test_root);
+    }
+
+    #[test]
+    fn two_independent_noise_sources_with_same_history_pass_bootstrap_agreement() {
+        two_independent_noise_sources_bootstrap_case(0, false);
+    }
+
+    #[test]
+    fn two_independent_noise_sources_with_divergent_histories_fail_bootstrap_agreement() {
+        two_independent_noise_sources_bootstrap_case(60, true);
     }
 }

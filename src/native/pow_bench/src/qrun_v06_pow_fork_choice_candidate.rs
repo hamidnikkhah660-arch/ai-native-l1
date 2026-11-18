@@ -1076,6 +1076,15 @@ impl QRunV06PowForkChoice {
         (best.tip_hash, best)
     }
 
+    /// Return true only when both tips are retained and `ancestor` is on `tip`'s
+    /// validated parent chain. Unknown hashes never compare as ancestors.
+    pub fn is_ancestor_tip(&self, ancestor: &[u8; 32], tip: &[u8; 32]) -> bool {
+        if self.tip_for_hash(ancestor).is_none() || self.tip_for_hash(tip).is_none() {
+            return false;
+        }
+        self.is_ancestor(*ancestor, *tip)
+    }
+
     fn is_ancestor(&self, ancestor: [u8; 32], mut tip: [u8; 32]) -> bool {
         if ancestor == self.base_tip {
             return true;
@@ -2069,6 +2078,12 @@ mod tests {
             .unwrap();
         let expected_tie_tip = tip_a_2.min(tip_b_2);
         assert_eq!(graph.canonical_tip().tip_hash, expected_tie_tip);
+        assert!(graph.is_ancestor_tip(&genesis_tip, &tip_a_2));
+        assert!(graph.is_ancestor_tip(&first_tip, &tip_b_2));
+        assert!(graph.is_ancestor_tip(&tip_a_2, &tip_a_2));
+        assert!(!graph.is_ancestor_tip(&tip_a_2, &tip_b_2));
+        assert!(!graph.is_ancestor_tip(&tip_b_2, &tip_a_2));
+        assert!(!graph.is_ancestor_tip(&[0xEE; 32], &tip_a_2));
 
         let state_a_2 = graph.state_for_tip(&tip_a_2).unwrap().clone();
         let state_b_2 = graph.state_for_tip(&tip_b_2).unwrap().clone();

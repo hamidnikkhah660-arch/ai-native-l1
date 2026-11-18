@@ -9,6 +9,9 @@ mod qrun_v06_node_runtime_launch;
 
 use ai_native_l1_pow_bench::{
     external_cas_anchor_candidate::ExternalCasPin,
+    external_cas_bootstrap_trust_bundle_candidate::{
+        verify_qbt1_bootstrap_trust_bundle, VerifiedQbt1BootstrapTrustBundle, QBTB1_BUNDLE_BYTES,
+    },
     external_cas_floor_store_candidate::ExternalCasFloorStore,
     external_cas_noise_transport_candidate::NoiseTcpExternalCasProviderTransport,
     external_cas_offhost_anchor_noise_transport_candidate::NoiseTcpOffhostAnchorTransport,
@@ -19,6 +22,7 @@ use ai_native_l1_pow_bench::{
         QRunV06ConsensusProfile, QRUN_V06_CONSENSUS_PROFILE_MAX_BYTES,
     },
     qrun_v06_cp0604_supply_candidate::CP0604_FOUNDER_GENESIS_ATOMS,
+    qrun_v06_cp0651_supply_candidate::CP0651_OWNER_GENESIS_ATOMS,
     qrun_v06_external_anchor_candidate::{QRunV06ExternalAnchorPin, QRunV06ExternalAnchorState},
     qrun_v06_profile_pin_candidate::QRunV06VerifiedProfilePin,
     qrun_v06_profile_trust_candidate::{
@@ -80,6 +84,8 @@ struct Config {
     provider_floor_store_path: Option<PathBuf>,
     q6ea_expected_state_path: Option<PathBuf>,
     q6ea_expected_state_sha256: Option<[u8; 32]>,
+    qbt1_bundle_path: Option<PathBuf>,
+    qbt1_bundle_sha256: Option<[u8; 32]>,
 }
 
 #[derive(Debug)]
@@ -113,6 +119,7 @@ struct PreflightSummary {
     provider_id: [u8; 32],
     provider_pin: ExternalCasPin,
     q6ea_anchor_pin: ExternalCasOffhostAnchorPin,
+    qbt1_bootstrap_bundle: Option<VerifiedQbt1BootstrapTrustBundle>,
     provider_noise_server_public_key: [u8; 32],
     q6ea_anchor_noise_server_public_key: [u8; 32],
 }
@@ -357,6 +364,8 @@ fn parse_config(
         provider_floor_store_path: optional_path_field("provider_floor_store_path")?,
         q6ea_expected_state_path: optional_path_field("q6ea_expected_state_path")?,
         q6ea_expected_state_sha256: optional_digest_field("q6ea_expected_state_sha256")?,
+        qbt1_bundle_path: optional_path_field("qbt1_bundle_path")?,
+        qbt1_bundle_sha256: optional_digest_field("qbt1_bundle_sha256")?,
     })
 }
 
@@ -393,7 +402,28 @@ fn verify_genesis_snapshot(
         .ledger()
         .account(founder_account)
         .map_or(0u128, |account| account.balance as u128);
-    if let Some(supply) = state.cp0604_supply() {
+    if let Some(supply) = state.cp0651_supply() {
+        if state.cp0604_supply().is_some()
+            || state.tokenomics().is_some()
+            || supply.owner_account() != *founder_account
+            || supply.policy_fingerprint() != *tokenomics_policy_fingerprint
+            || supply.last_block_height() != 0
+            || supply.block_subsidy_atoms() != 0
+            || founder_balance != CP0651_OWNER_GENESIS_ATOMS
+        {
+            return Err(
+                "full Genesis CP-0651 fixed-supply policy, owner binding, 1B allocation, or zero subsidy differs from the pinned identity".into(),
+            );
+        }
+        let ledger_total = state
+            .unified()
+            .ledger()
+            .total_value()
+            .map_err(|error| format!("CP-0651 Genesis Ledger total failed: {error:?}"))?;
+        supply
+            .validate_ledger_supply(ledger_total)
+            .map_err(|error| format!("CP-0651 Genesis supply invariant failed: {error:?}"))?;
+    } else if let Some(supply) = state.cp0604_supply() {
         if supply.founder_account() != *founder_account
             || supply.policy_fingerprint() != *tokenomics_policy_fingerprint
             || supply.mining_issued_atoms() != 0
@@ -569,6 +599,41 @@ fn preflight(
             format!("Q6EA Anchor pin is invalid or not independent from Provider: {error:?}")
         })?;
 
+    // QBTB1 is accepted only as a pair: its full-file SHA-256 is in the independently
+    // digest-pinned config, and its QBT1 profile digest must equal the verified Q6PN commitment.
+    let qbt1_bootstrap_bundle = match (
+        config.qbt1_bundle_path.as_deref(),
+        config.qbt1_bundle_sha256.as_ref(),
+    ) {
+        (Some(path), Some(expected_digest)) => {
+            let bytes = read_bounded(
+                path,
+                QBTB1_BUNDLE_BYTES as u64,
+                "QBTB1 QBT1 bootstrap trust bundle",
+            )?;
+            Some(
+                verify_qbt1_bootstrap_trust_bundle(
+                    &bytes,
+                    expected_digest,
+                    &config.profile_pin_commitment,
+                    profile_pin.bundle().external_cas_pin(),
+                    &q6ea_anchor_pin,
+                    &LibcruxMlDsa65VerifierCandidate,
+                )
+                .map_err(|error| {
+                    format!("QBTB1/QBT1 bootstrap trust verification failed: {error}")
+                })?,
+            )
+        }
+        (None, None) => None,
+        _ => {
+            return Err(
+                "qbt1_bundle_path and qbt1_bundle_sha256 must either both be configured or both be absent"
+                    .into(),
+            );
+        }
+    };
+
     // Pin the Noise XX server identities separately from the Provider/Anchor receipt keys.
     let provider_noise_server_key = read_pinned_noise_server_key(
         &config.provider_noise_server_key_path,
@@ -668,6 +733,7 @@ fn preflight(
         provider_id: profile_pin.bundle().external_cas_pin().provider_id,
         provider_pin: profile_pin.bundle().external_cas_pin().clone(),
         q6ea_anchor_pin,
+        qbt1_bootstrap_bundle,
         provider_noise_server_public_key: provider_noise_server_key,
         q6ea_anchor_noise_server_public_key: q6ea_anchor_noise_server_key,
     })
@@ -767,8 +833,9 @@ fn probe_qap1_services(
             |error| format!("existing Provider monotonic floor could not be opened: {error:?}"),
         )?;
 
-    // Client static identities are protected by Windows CurrentUser DPAPI and bound to this
-    // exact network ID. Plaintext keys never appear in the JSON config or on a command line.
+    // Client static identities use the platform-native protected-key provider and are bound
+    // to this exact network ID (Windows CurrentUser DPAPI; Linux systemd host+TPM2 credentials).
+    // Plaintext keys never appear in the JSON config or on a command line.
     let mut provider_client_key =
         load_protected_noise_private_key(provider_client_key_path, &config.network_id).map_err(
             |error| format!("protected Provider Noise client key unavailable: {error:?}"),
@@ -854,9 +921,12 @@ Usage:
   qrun_v06_node --probe-qap1 --config <path> --config-sha256 <64-hex>
   qrun_v06_node --run --config <path> --config-sha256 <64-hex>
   qrun_v06_node --permissionless-run --config <path> --config-sha256 <64-hex>
+  qrun_v06_node --public-testnet-run --config <path> --config-sha256 <64-hex>
   qrun_v06_node --help
 --run: private-candidate QAP1 mode.
---permissionless-run: Genesis-rooted base runtime candidate; not production/Mainnet authorization."#
+--permissionless-run: private/overlay Genesis-rooted base runtime candidate.
+--public-testnet-run: explicit zero-value candidate mode; requires public listener and security acknowledgements.
+Neither candidate mode authorizes production/Mainnet or value-bearing use."#
     );
 }
 fn run(args: &[String]) -> Result<(), String> {
@@ -867,14 +937,25 @@ fn run(args: &[String]) -> Result<(), String> {
     if args.len() != 5
         || !matches!(
             args[0].as_str(),
-            "--preflight" | "--probe-qap1" | "--run" | "--permissionless-run"
+            "--preflight"
+                | "--probe-qap1"
+                | "--run"
+                | "--permissionless-run"
+                | "--public-testnet-run"
         )
         || args[1] != "--config"
         || args[3] != "--config-sha256"
     {
-        return Err("expected '--preflight|--probe-qap1|--run|--permissionless-run --config <path> --config-sha256 <64-hex>' (or '--help')".into());
+        return Err("expected '--preflight|--probe-qap1|--run|--permissionless-run|--public-testnet-run --config <path> --config-sha256 <64-hex>' (or '--help')".into());
     }
     let expected_config_digest = parse_hex32("config_sha256", &args[4])?;
+    if args[0] == "--public-testnet-run" {
+        qrun_v06_node_runtime_launch::run_public_testnet_node(
+            Path::new(&args[2]),
+            &expected_config_digest,
+        )?;
+        return Ok(());
+    }
     if args[0] == "--permissionless-run" {
         qrun_v06_node_runtime_launch::run_permissionless_node(
             Path::new(&args[2]),
@@ -1306,6 +1387,41 @@ mod tests {
         .unwrap();
         assert_eq!(cp0604_root, cp0604_state.state_root().unwrap());
         assert_eq!(cp0604_founder_balance, CP0604_FOUNDER_GENESIS_ATOMS);
+
+        let cp0651_policy =
+            ai_native_l1_pow_bench::qrun_v06_cp0651_supply_candidate::Cp0651FixedSupply::genesis(
+                TEST_NETWORK,
+                [0xA3; 32],
+            )
+            .unwrap();
+        let cp0651_fingerprint = cp0651_policy.policy_fingerprint();
+        let cp0651_descriptor = QRunV06GenesisDescriptor::new(
+            TEST_NETWORK,
+            TEST_PROFILE,
+            [0xA3; 32],
+            1_800_000_000,
+            [0xA4; 32],
+            cp0651_fingerprint,
+        )
+        .unwrap();
+        let cp0651_state =
+            QRunV06CanonicalExecutionState::cp0651_genesis_candidate_with_descriptor(
+                cp0651_descriptor.clone(),
+            )
+            .unwrap();
+        let cp0651_bytes = cp0651_state.encode_snapshot().unwrap();
+        let (cp0651_root, cp0651_owner_balance) = verify_genesis_snapshot(
+            &cp0651_bytes,
+            &TEST_NETWORK,
+            &TEST_PROFILE,
+            &[0xA3; 32],
+            &[0xA4; 32],
+            &cp0651_fingerprint,
+            &cp0651_descriptor,
+        )
+        .unwrap();
+        assert_eq!(cp0651_root, cp0651_state.state_root().unwrap());
+        assert_eq!(cp0651_owner_balance, CP0651_OWNER_GENESIS_ATOMS);
 
         let mut corrupted = bytes.clone();
         let last_byte = corrupted.len() - 1;

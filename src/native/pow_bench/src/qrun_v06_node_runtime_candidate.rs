@@ -1002,10 +1002,7 @@ where
 }
 
 /// Process one Q6PB frame through the permissionless Genesis-rooted base runtime.
-/// The session replay guard is consumed before validation. Accepted means the envelope
-/// was validated and committed to this node's durable canonical store; it does not mean
-/// network-wide finality or external-anchor confirmation. This base path intentionally
-/// admits native-only blocks; quote-asset authorization remains an explicit extension.
+/// The compatibility path admits native-quote blocks only; external quote activity fails closed.
 pub fn process_qrun_v06_permissionless_peer_block_frame<T: TransactionAuthenticator>(
     runtime: &mut QRunV06PermissionlessNodeRuntime,
     replay_guard: &mut QRunV06PeerReplayGuard,
@@ -1016,32 +1013,67 @@ pub fn process_qrun_v06_permissionless_peer_block_frame<T: TransactionAuthentica
         replay_guard,
         frame,
         |envelope| {
-            // This is the live Q6PB peer-ingress boundary. Keep the wall-clock future
-            // guard here, outside deterministic fork-choice/replay, so old archive
-            // blocks remain importable while peers cannot relay far-future timestamps.
-            let decoded = decode_qrun_v06_pow_block(envelope).map_err(|error| {
-                crate::qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessRuntimeError::Store(error.to_string())
-            })?;
-            let reference_time = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|error| {
-                    crate::qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessRuntimeError::Store(
-                        format!("local reference clock is before Unix epoch: {error}"),
-                    )
-                })?
-                .as_secs();
-            crate::qrun_v06_live_timestamp_policy_candidate::validate_live_block_timestamp(
-                decoded.header.timestamp,
-                reference_time,
-            )
-            .map_err(|error| {
-                crate::qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessRuntimeError::Store(
-                    format!("live QFP6 timestamp policy rejected peer block: {error:?}"),
-                )
-            })?;
+            validate_live_qfp6_peer_envelope(envelope)?;
             runtime.submit_envelope(envelope, authenticator)
         },
     )
+}
+
+/// Q6QA-aware Q6PB peer admission. The provider re-reads the signed Q6TS record and independent
+/// floor, then verifies the pinned Q6QA qualification at the exact envelope height before the
+/// durable fork store publishes the block.
+pub fn process_qrun_v06_permissionless_peer_block_frame_with_quote_asset_authorization<
+    T: TransactionAuthenticator,
+>(
+    runtime: &mut QRunV06PermissionlessNodeRuntime,
+    replay_guard: &mut QRunV06PeerReplayGuard,
+    frame: &[u8],
+    authenticator: &T,
+    quote_authorizer: &mut QRunV06QuoteAssetAuthorizationProvider<'_>,
+) -> Result<QRunV06PeerAdmissionResponse, QRunV06PeerIngressError> {
+    process_qrun_v06_permissionless_peer_block_frame_with_admission(
+        replay_guard,
+        frame,
+        |envelope| {
+            validate_live_qfp6_peer_envelope(envelope)?;
+            runtime.submit_envelope_with_quote_asset_authorization(
+                envelope,
+                authenticator,
+                quote_authorizer,
+            )
+        },
+    )
+}
+
+fn validate_live_qfp6_peer_envelope(
+    envelope: &[u8],
+) -> Result<(), crate::qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessRuntimeError>
+{
+    // Keep the wall-clock future guard outside deterministic archive replay: historical
+    // blocks remain importable while live peers cannot relay far-future timestamps.
+    let decoded = decode_qrun_v06_pow_block(envelope).map_err(|error| {
+        crate::qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessRuntimeError::Store(
+            error.to_string(),
+        )
+    })?;
+    let reference_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            crate::qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessRuntimeError::Store(
+                format!("local reference clock is before Unix epoch: {error}"),
+            )
+        })?
+        .as_secs();
+    crate::qrun_v06_live_timestamp_policy_candidate::validate_live_block_timestamp(
+        decoded.header.timestamp,
+        reference_time,
+    )
+    .map_err(|error| {
+        crate::qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessRuntimeError::Store(
+            format!("live QFP6 timestamp policy rejected peer block: {error:?}"),
+        )
+    })?;
+    Ok(())
 }
 
 /// Read exactly one bounded Q6PB frame from a byte stream.

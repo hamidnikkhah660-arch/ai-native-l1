@@ -14,7 +14,7 @@ use ai_native_l1_pow_bench::{
     identity_generation_store::IdentityGenerationStateStore,
     identity_policy::KeyPurpose,
     noise_deployment_config::{
-        verify_signed_deployment_config, DeploymentConfigStateStore,
+        verify_signed_deployment_config_with_floors, DeploymentConfigStateStore,
         MAX_SIGNED_DEPLOYMENT_CONFIG_LEN,
     },
     noise_issuer_registry::{IssuerRegistryStateStore, MAX_REGISTRY_WIRE_LEN},
@@ -149,6 +149,7 @@ struct Config {
     deployment_config_file: Option<PathBuf>,
     deployment_authority_public_key: Option<[u8; 32]>,
     deployment_config_min_sequence: Option<u64>,
+    deployment_config_min_root_epoch: Option<u64>,
     issuer_registry_file: Option<PathBuf>,
     peer_identity_issuer_id: Option<u32>,
     test_tx_amount: u64,
@@ -210,6 +211,7 @@ fn parse_args() -> Result<Config, String> {
     let mut deployment_config_file: Option<PathBuf> = None;
     let mut deployment_authority_public_key: Option<[u8; 32]> = None;
     let mut deployment_config_min_sequence: Option<u64> = None;
+    let mut deployment_config_min_root_epoch: Option<u64> = None;
     let mut issuer_registry_file: Option<PathBuf> = None;
     let mut peer_identity_issuer_id: Option<u32> = None;
     let mut test_tx_amount = TEST_TX_AMOUNT;
@@ -236,7 +238,7 @@ fn parse_args() -> Result<Config, String> {
         let flag = args[i].as_str();
         match flag {
             "--help" | "-h" => {
-                return Err("usage: devnet_node [--public-devnet] [--test-easy-pow] --network-id HEX64 --data-dir PATH [--listen IP:PORT] [--status-listen 127.0.0.1:PORT] [--transaction-listen 127.0.0.1:PORT --v4-founder-ed25519-public-key-hex HEX64 --v4-founder-mldsa65-public-key-file PATH] [--peer 127.0.0.1:PORT ... --noise-static-private-key-dpapi-file PATH (--trusted-peer-key-hex HEX64 ... | --trusted-peer-identity-file PATH ... --deployment-config-file PATH --deployment-authority-key-hex HEX64 --deployment-config-min-sequence N --issuer-registry-file PATH --peer-identity-issuer-id N)] [--archive-range-max-page-items 1..16] [--archive-range-post-commit-delay-ms 0..5000] [--mine-blocks N] [--run-seconds N] [--monetary-candidate-local-smoke | --monetary-v4-hybrid-local-smoke | --monetary-v4-hybrid-peer-smoke [--monetary-v4-hybrid-archive-range-sync] [--test-crash-after-monetary-v4-import] [--test-reorg-after-first-archive-range-page] [--test-reorg-after-second-archive-range-page] | --monetary-candidate-peer-smoke [--monetary-candidate-archive-range-sync]]".into());
+                return Err("usage: devnet_node [--public-devnet] [--test-easy-pow] --network-id HEX64 --data-dir PATH [--listen IP:PORT] [--status-listen 127.0.0.1:PORT] [--transaction-listen 127.0.0.1:PORT --v4-founder-ed25519-public-key-hex HEX64 --v4-founder-mldsa65-public-key-file PATH] [--peer 127.0.0.1:PORT ... --noise-static-private-key-dpapi-file PATH (--trusted-peer-key-hex HEX64 ... | --trusted-peer-identity-file PATH ... --deployment-config-file PATH --deployment-authority-key-hex HEX64 --deployment-config-min-sequence N --deployment-config-min-root-epoch N --issuer-registry-file PATH --peer-identity-issuer-id N)] [--archive-range-max-page-items 1..16] [--archive-range-post-commit-delay-ms 0..5000] [--mine-blocks N] [--run-seconds N] [--monetary-candidate-local-smoke | --monetary-v4-hybrid-local-smoke | --monetary-v4-hybrid-peer-smoke [--monetary-v4-hybrid-archive-range-sync] [--test-crash-after-monetary-v4-import] [--test-reorg-after-first-archive-range-page] [--test-reorg-after-second-archive-range-page] | --monetary-candidate-peer-smoke [--monetary-candidate-archive-range-sync]]".into());
             }
             "--public-devnet" => {
                 if public_devnet {
@@ -325,6 +327,7 @@ fn parse_args() -> Result<Config, String> {
             | "--deployment-config-file"
             | "--deployment-authority-key-hex"
             | "--deployment-config-min-sequence"
+            | "--deployment-config-min-root-epoch"
             | "--issuer-registry-file"
             | "--peer-identity-issuer-id"
             | "--listen"
@@ -396,6 +399,15 @@ fn parse_args() -> Result<Config, String> {
                         })?;
                         if parsed == 0 || deployment_config_min_sequence.replace(parsed).is_some() {
                             return Err("--deployment-config-min-sequence must be a nonzero integer specified once".into());
+                        }
+                    }
+                    "--deployment-config-min-root-epoch" => {
+                        let parsed = value.parse::<u64>().map_err(|_| {
+                            "--deployment-config-min-root-epoch must be an integer".to_string()
+                        })?;
+                        if parsed == 0 || deployment_config_min_root_epoch.replace(parsed).is_some()
+                        {
+                            return Err("--deployment-config-min-root-epoch must be a nonzero integer specified once".into());
                         }
                     }
                     "--issuer-registry-file" => {
@@ -549,17 +561,19 @@ fn parse_args() -> Result<Config, String> {
     let has_deployment_trust = deployment_config_file.is_some()
         && deployment_authority_public_key.is_some()
         && deployment_config_min_sequence.is_some()
+        && deployment_config_min_root_epoch.is_some()
         && issuer_registry_file.is_some()
         && peer_identity_issuer_id.is_some();
     let any_deployment_trust = deployment_config_file.is_some()
         || deployment_authority_public_key.is_some()
         || deployment_config_min_sequence.is_some()
+        || deployment_config_min_root_epoch.is_some()
         || issuer_registry_file.is_some()
         || peer_identity_issuer_id.is_some();
     if signed_identity_mode != has_deployment_trust
         || (!signed_identity_mode && any_deployment_trust)
     {
-        return Err("signed peer identities require --deployment-config-file, --deployment-authority-key-hex, --deployment-config-min-sequence, --issuer-registry-file and --peer-identity-issuer-id; all trust options require one or more identity files".into());
+        return Err("signed peer identities require --deployment-config-file, --deployment-authority-key-hex, --deployment-config-min-sequence, --deployment-config-min-root-epoch, --issuer-registry-file and --peer-identity-issuer-id; all trust options require one or more identity files".into());
     }
     if trusted_peer_keys
         .iter()
@@ -726,6 +740,7 @@ fn parse_args() -> Result<Config, String> {
         deployment_config_file,
         deployment_authority_public_key,
         deployment_config_min_sequence,
+        deployment_config_min_root_epoch,
         issuer_registry_file,
         peer_identity_issuer_id,
         test_tx_amount,
@@ -1054,6 +1069,9 @@ fn resolve_trusted_peer_keys(
     let deployment_minimum_sequence = config
         .deployment_config_min_sequence
         .ok_or("minimum deployment-config sequence is missing")?;
+    let deployment_minimum_root_epoch = config
+        .deployment_config_min_root_epoch
+        .ok_or("minimum governance root epoch is missing")?;
     let issuer_registry_path = config
         .issuer_registry_file
         .as_deref()
@@ -1067,11 +1085,12 @@ fn resolve_trusted_peer_keys(
         MAX_SIGNED_DEPLOYMENT_CONFIG_LEN,
         "signed deployment config",
     )?;
-    let deployment = verify_signed_deployment_config(
+    let deployment = verify_signed_deployment_config_with_floors(
         &deployment_wire,
         &config.network_id,
         &deployment_authority_public_key,
         deployment_minimum_sequence,
+        deployment_minimum_root_epoch,
     )
     .map_err(|error| format!("signed deployment config rejected: {error:?}"))?;
 
@@ -7852,6 +7871,7 @@ mod signed_identity_runtime_tests {
             deployment_config_file: Some(root.join("deployment.dpc1")),
             deployment_authority_public_key: Some(authority.verifying_key().to_bytes()),
             deployment_config_min_sequence: Some(1),
+            deployment_config_min_root_epoch: Some(1),
             issuer_registry_file: Some(root.join("issuer-registry.irg1")),
             peer_identity_issuer_id: Some(17),
             test_tx_amount: TEST_TX_AMOUNT,
@@ -7997,6 +8017,7 @@ mod signed_identity_runtime_tests {
             deployment_config_file: None,
             deployment_authority_public_key: None,
             deployment_config_min_sequence: None,
+            deployment_config_min_root_epoch: None,
             issuer_registry_file: None,
             peer_identity_issuer_id: None,
             test_tx_amount: TEST_TX_AMOUNT,

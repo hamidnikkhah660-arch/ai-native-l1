@@ -46,7 +46,8 @@ const MANIFEST_CHECKSUM_DOMAIN: &[u8] = b"QRUN-V06-DURABLE-FORK-STORE-CHECKSUM-V
 const MANIFEST_COMMITMENT_DOMAIN: &[u8] = b"QRUN-V06-DURABLE-FORK-STORE-COMMITMENT-V1\0";
 const CONSENSUS_FINGERPRINT_DOMAIN: &[u8] = b"QRUN-V06-DURABLE-FORK-STORE-CONSENSUS-V1\0";
 const LOCK_NAME: &str = "qfp6-fork-store.lock";
-const CHECKPOINT_FILE: &str = "qfp6-base.checkpoint";
+pub const QRUN_V06_CHECKPOINT_FILE_NAME: &str = "qfp6-base.checkpoint";
+const CHECKPOINT_FILE: &str = QRUN_V06_CHECKPOINT_FILE_NAME;
 const BRANCH_DIR: &str = "branches";
 const MANIFEST_DIR: &str = "manifests";
 const QAP1_DIR: &str = crate::qrun_v06_qap1_journal_candidate::QAP1_DIRECTORY;
@@ -338,6 +339,8 @@ impl QRunV06DurableForkStore {
             authenticator,
             trusted_manifest_anchor,
             None,
+            false,
+            None,
         )
     }
 
@@ -347,6 +350,8 @@ impl QRunV06DurableForkStore {
         params: ConsensusParameters,
         authenticator: &A,
         trusted_manifest_anchor: Option<[u8; 32]>,
+        trusted_manifest_anchor_generation: Option<u64>,
+        allow_trusted_anchor_ancestor: bool,
         mut quote_authorizer: Option<&mut QRunV06QuoteAssetAuthorizationProvider<'_>>,
     ) -> Result<Self, QRunV06ForkStoreError> {
         if params.protocol_version != QRUN_V06_PROTOCOL_VERSION {
@@ -405,7 +410,16 @@ impl QRunV06DurableForkStore {
         {
             let supplied = trusted_manifest_anchor
                 .ok_or(QRunV06ForkStoreError::MissingTrustedManifestAnchor)?;
-            if supplied != *latest_anchor {
+            if allow_trusted_anchor_ancestor {
+                let trusted_generation = trusted_manifest_anchor_generation
+                    .ok_or(QRunV06ForkStoreError::ManifestAnchorMismatch)?;
+                let exact_ancestor = manifest_chain.iter().any(|(manifest, anchor)| {
+                    manifest.generation == trusted_generation && *anchor == supplied
+                });
+                if !exact_ancestor || trusted_generation > latest.generation {
+                    return Err(QRunV06ForkStoreError::ManifestAnchorMismatch);
+                }
+            } else if trusted_manifest_anchor_generation.is_some() || supplied != *latest_anchor {
                 return Err(QRunV06ForkStoreError::ManifestAnchorMismatch);
             }
             validate_manifest_identity(latest, &genesis_graph, fingerprint)?;
@@ -1048,6 +1062,8 @@ impl QRunV06DurableForkStore {
             params,
             authenticator,
             trusted_manifest_anchor,
+            None,
+            false,
             Some(quote_authorizer),
         )
     }
@@ -1089,6 +1105,51 @@ impl QRunV06DurableForkStore {
             authenticator,
             trusted_manifest_anchor,
             descriptor.commitment(),
+        )
+    }
+
+    /// Local dual-disk mode: the vault pins an exact historical manifest while the store
+    /// replays the complete chain to the current tip. This is not the general-purpose open path.
+    pub fn open_with_verified_profile_pin_and_trusted_anchor_ancestor<
+        A: TransactionAuthenticator,
+    >(
+        directory: impl AsRef<Path>,
+        genesis_state: QRunV06CanonicalExecutionState,
+        params: ConsensusParameters,
+        authenticator: &A,
+        trusted_manifest_anchor: [u8; 32],
+        trusted_manifest_generation: u64,
+        verified_profile_pin: &QRunV06VerifiedProfilePin,
+    ) -> Result<Self, QRunV06ForkStoreError> {
+        let descriptor = verified_profile_pin.descriptor();
+        if descriptor.consensus_fingerprint()
+            != crate::qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint(&params)?
+        {
+            return Err(QRunV06ForkStoreError::ProfilePinConsensusMismatch);
+        }
+        if genesis_state.genesis_descriptor() != Some(descriptor)
+            || genesis_state.network_id() != descriptor.network_id()
+            || genesis_state.profile_id() != descriptor.profile_id()
+        {
+            return Err(QRunV06ForkStoreError::ProfilePinMismatch);
+        }
+        let (founder_account, policy_fingerprint) = genesis_state
+            .genesis_economic_policy_identity()
+            .ok_or(QRunV06ForkStoreError::ProfilePinTokenomicsMismatch)?;
+        if founder_account != descriptor.founder_account()
+            || policy_fingerprint != descriptor.tokenomics_policy_fingerprint()
+        {
+            return Err(QRunV06ForkStoreError::ProfilePinTokenomicsMismatch);
+        }
+        Self::open_inner(
+            directory,
+            genesis_state,
+            params,
+            authenticator,
+            Some(trusted_manifest_anchor),
+            Some(trusted_manifest_generation),
+            true,
+            None,
         )
     }
 
@@ -1145,6 +1206,8 @@ impl QRunV06DurableForkStore {
             params,
             authenticator,
             trusted_manifest_anchor,
+            None,
+            false,
             Some(quote_authorizer),
         )
     }
@@ -1275,7 +1338,45 @@ impl QRunV06DurableForkStore {
             trusted_checkpoint_anchor,
             authenticator,
             trusted_manifest_anchor,
+            None,
+            false,
             Some(quote_authorizer),
+        )
+    }
+
+    /// Local dual-disk recovery: the C: vault pins an exact segment-local manifest ancestor
+    /// while this store fully replays the latest checkpoint-rooted history. The caller must
+    /// derive the anchor/generation mapping from a verified checkpoint-segment witness.
+    pub fn open_from_checkpoint_with_verified_profile_pin_and_trusted_anchor_ancestor<
+        A: TransactionAuthenticator,
+    >(
+        directory: impl AsRef<Path>,
+        checkpoint_bytes: &[u8],
+        params: ConsensusParameters,
+        trusted_checkpoint_anchor: [u8; 32],
+        verified_profile_pin: &QRunV06VerifiedProfilePin,
+        authenticator: &A,
+        trusted_manifest_anchor: [u8; 32],
+        trusted_manifest_generation: u64,
+    ) -> Result<Self, QRunV06ForkStoreError> {
+        let descriptor = verified_profile_pin.descriptor();
+        if descriptor.consensus_fingerprint()
+            != crate::qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint(&params)?
+        {
+            return Err(QRunV06ForkStoreError::ProfilePinConsensusMismatch);
+        }
+        Self::open_from_checkpoint_inner(
+            directory,
+            checkpoint_bytes,
+            params,
+            descriptor.network_id(),
+            descriptor.profile_id(),
+            trusted_checkpoint_anchor,
+            authenticator,
+            Some(trusted_manifest_anchor),
+            Some(trusted_manifest_generation),
+            true,
+            None,
         )
     }
 
@@ -1302,6 +1403,8 @@ impl QRunV06DurableForkStore {
             authenticator,
             trusted_manifest_anchor,
             None,
+            false,
+            None,
         )
     }
 
@@ -1314,6 +1417,8 @@ impl QRunV06DurableForkStore {
         trusted_checkpoint_anchor: [u8; 32],
         authenticator: &A,
         trusted_manifest_anchor: Option<[u8; 32]>,
+        trusted_manifest_anchor_generation: Option<u64>,
+        allow_trusted_anchor_ancestor: bool,
         mut quote_authorizer: Option<&mut QRunV06QuoteAssetAuthorizationProvider<'_>>,
     ) -> Result<Self, QRunV06ForkStoreError> {
         if params.protocol_version != QRUN_V06_PROTOCOL_VERSION {
@@ -1385,38 +1490,48 @@ impl QRunV06DurableForkStore {
         cleanup_temp_files(&manifests_dir)?;
         let manifest_chain = load_manifest_chain(&manifests_dir)?;
 
-        let (graph, generation, manifest_anchor) =
-            if let Some((latest, latest_anchor)) = manifest_chain.last() {
-                let supplied = trusted_manifest_anchor
-                    .ok_or(QRunV06ForkStoreError::MissingTrustedManifestAnchor)?;
-                if supplied != *latest_anchor {
+        let (graph, generation, manifest_anchor) = if let Some((latest, latest_anchor)) =
+            manifest_chain.last()
+        {
+            let supplied = trusted_manifest_anchor
+                .ok_or(QRunV06ForkStoreError::MissingTrustedManifestAnchor)?;
+            if allow_trusted_anchor_ancestor {
+                let trusted_generation = trusted_manifest_anchor_generation
+                    .ok_or(QRunV06ForkStoreError::ManifestAnchorMismatch)?;
+                let exact_ancestor = manifest_chain.iter().any(|(manifest, anchor)| {
+                    manifest.generation == trusted_generation && *anchor == supplied
+                });
+                if !exact_ancestor || trusted_generation > latest.generation {
                     return Err(QRunV06ForkStoreError::ManifestAnchorMismatch);
                 }
-                validate_manifest_identity(latest, &base_graph, fingerprint)?;
-                let envelopes = load_branch_entries(&branches_dir, &latest.entries, &params)?;
-                let rebuilt = if let Some(provider) = quote_authorizer.as_deref_mut() {
-                    base_graph.rebuild_from_current_base_with_quote_asset_authorization(
-                        envelopes,
-                        authenticator,
-                        provider,
-                    )?
-                } else {
-                    base_graph.rebuild_from_current_base(envelopes, authenticator)?
-                };
-                validate_manifest_graph(latest, &rebuilt)?;
-                reconcile_branch_directory(&branches_dir, &latest.entries)?;
-                (rebuilt, latest.generation, *latest_anchor)
+            } else if trusted_manifest_anchor_generation.is_some() || supplied != *latest_anchor {
+                return Err(QRunV06ForkStoreError::ManifestAnchorMismatch);
+            }
+            validate_manifest_identity(latest, &base_graph, fingerprint)?;
+            let envelopes = load_branch_entries(&branches_dir, &latest.entries, &params)?;
+            let rebuilt = if let Some(provider) = quote_authorizer.as_deref_mut() {
+                base_graph.rebuild_from_current_base_with_quote_asset_authorization(
+                    envelopes,
+                    authenticator,
+                    provider,
+                )?
             } else {
-                if trusted_manifest_anchor.is_some() {
-                    return Err(QRunV06ForkStoreError::ManifestAnchorMismatch);
-                }
-                reconcile_branch_directory(&branches_dir, &[])?;
-                let manifest = manifest_from_graph(0, [0; 32], &params, &base_graph)?;
-                let bytes = encode_manifest(&manifest)?;
-                let anchor = manifest_commitment(&bytes);
-                write_new_atomic(&manifests_dir.join(manifest_filename(0)), &bytes)?;
-                (base_graph, 0, anchor)
+                base_graph.rebuild_from_current_base(envelopes, authenticator)?
             };
+            validate_manifest_graph(latest, &rebuilt)?;
+            reconcile_branch_directory(&branches_dir, &latest.entries)?;
+            (rebuilt, latest.generation, *latest_anchor)
+        } else {
+            if trusted_manifest_anchor.is_some() {
+                return Err(QRunV06ForkStoreError::ManifestAnchorMismatch);
+            }
+            reconcile_branch_directory(&branches_dir, &[])?;
+            let manifest = manifest_from_graph(0, [0; 32], &params, &base_graph)?;
+            let bytes = encode_manifest(&manifest)?;
+            let anchor = manifest_commitment(&bytes);
+            write_new_atomic(&manifests_dir.join(manifest_filename(0)), &bytes)?;
+            (base_graph, 0, anchor)
+        };
 
         Ok(Self {
             branches_dir,
@@ -1875,6 +1990,20 @@ impl QRunV06DurableForkStore {
     pub fn manifest_anchor(&self) -> Result<[u8; 32], QRunV06ForkStoreError> {
         self.ensure_healthy()?;
         Ok(self.manifest_anchor)
+    }
+
+    /// Return an exact locally committed manifest anchor by segment-local generation.
+    /// Used to bind generation zero to the C: checkpoint-segment witness.
+    pub fn manifest_anchor_at_generation(
+        &self,
+        generation: u64,
+    ) -> Result<Option<[u8; 32]>, QRunV06ForkStoreError> {
+        self.ensure_healthy()?;
+        let chain = load_manifest_chain(&self.manifests_dir)?;
+        Ok(chain
+            .into_iter()
+            .find(|(manifest, _)| manifest.generation == generation)
+            .map(|(_, anchor)| anchor))
     }
 
     /// Return the fingerprint of the consensus profile validated by this store.
@@ -3151,12 +3280,20 @@ mod tests {
     struct TestDir(PathBuf);
     impl TestDir {
         fn new() -> Self {
+            static NEXT_TEST_DIR_ID: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
             let tick = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path = env::temp_dir().join(format!("qfp6_store_{}_{}", std::process::id(), tick));
-            fs::create_dir_all(&path).unwrap();
+            let sequence = NEXT_TEST_DIR_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = env::temp_dir().join(format!(
+                "qfp6_store_{}_{}_{}",
+                std::process::id(),
+                tick,
+                sequence
+            ));
+            fs::create_dir(&path).unwrap();
             Self(path)
         }
     }
@@ -4862,6 +4999,8 @@ mod tests {
             params,
             &EmptyAuthenticator,
             Some(trusted_anchor),
+            None,
+            false,
             Some(&mut replay_provider),
         )
         .unwrap();
@@ -6022,6 +6161,232 @@ mod tests {
             Err(QRunV06ForkStoreError::WriterLockHeld)
         ));
         drop(first);
+    }
+
+    #[test]
+    fn local_vault_trusted_manifest_ancestor_is_exact_and_replays_full_tip() {
+        use crate::external_cas_anchor_candidate::ExternalCasPin;
+        use crate::qrun_v06_profile_pin_candidate::{
+            QRunV06ProfilePinCandidate, QRunV06VerifiedProfilePin,
+        };
+
+        let dir = TestDir::new();
+        let genesis = genesis_state();
+        let params = params();
+        let descriptor = *genesis.genesis_descriptor().unwrap();
+        let bundle = QRunV06ProfilePinCandidate::new(
+            descriptor,
+            ExternalCasPin {
+                provider_id: [0x91; 32],
+                network_id: NETWORK,
+                genesis_digest: [0x92; 32],
+                receipt_key_id: [0x93; 32],
+                receipt_public_key: [0x94;
+                    crate::v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES],
+            },
+        )
+        .unwrap();
+        let encoded = bundle.encode().unwrap();
+        let profile_pin =
+            QRunV06VerifiedProfilePin::decode(&encoded, bundle.commitment().unwrap()).unwrap();
+
+        let mut store = QRunV06DurableForkStore::open_with_verified_profile_pin(
+            &dir.0,
+            genesis.clone(),
+            params.clone(),
+            &EmptyAuthenticator,
+            None,
+            &profile_pin,
+        )
+        .unwrap();
+        let root_generation = store.generation().unwrap();
+        let root_anchor = store.manifest_anchor().unwrap();
+        let parent_tip = store.graph().unwrap().base_tip();
+        let target = store
+            .graph()
+            .unwrap()
+            .expected_next_target(&parent_tip)
+            .unwrap();
+        let state = store.graph().unwrap().canonical_state().clone();
+        let (block, expected_tip) = candidate(&state, parent_tip, 100, target, &params);
+        let commit = store.submit(&block, &EmptyAuthenticator).unwrap();
+        assert_eq!(commit.generation, root_generation + 1);
+        drop(store);
+
+        // The legacy/latest-only path remains fail-closed for a historical root pin.
+        assert!(matches!(
+            QRunV06DurableForkStore::open_with_verified_profile_pin(
+                &dir.0,
+                genesis.clone(),
+                params.clone(),
+                &EmptyAuthenticator,
+                Some(root_anchor),
+                &profile_pin,
+            ),
+            Err(QRunV06ForkStoreError::ManifestAnchorMismatch)
+        ));
+
+        let reopened =
+            QRunV06DurableForkStore::open_with_verified_profile_pin_and_trusted_anchor_ancestor(
+                &dir.0,
+                genesis.clone(),
+                params.clone(),
+                &EmptyAuthenticator,
+                root_anchor,
+                root_generation,
+                &profile_pin,
+            )
+            .unwrap();
+        assert_eq!(reopened.generation().unwrap(), root_generation + 1);
+        assert_eq!(reopened.canonical_height().unwrap(), 1);
+        assert_eq!(reopened.canonical_tip().unwrap(), expected_tip);
+        assert_ne!(root_anchor, commit.manifest_anchor);
+        drop(reopened); // Release the store writer lock before negative-open assertions.
+
+        assert!(matches!(
+            QRunV06DurableForkStore::open_with_verified_profile_pin_and_trusted_anchor_ancestor(
+                &dir.0,
+                genesis.clone(),
+                params.clone(),
+                &EmptyAuthenticator,
+                root_anchor,
+                root_generation + 1,
+                &profile_pin,
+            ),
+            Err(QRunV06ForkStoreError::ManifestAnchorMismatch)
+        ));
+        assert!(matches!(
+            QRunV06DurableForkStore::open_with_verified_profile_pin_and_trusted_anchor_ancestor(
+                &dir.0,
+                genesis,
+                params,
+                &EmptyAuthenticator,
+                [0xEE; 32],
+                root_generation,
+                &profile_pin,
+            ),
+            Err(QRunV06ForkStoreError::ManifestAnchorMismatch)
+        ));
+    }
+
+    #[test]
+    fn checkpoint_segment_reopens_from_global_vault_ancestor_after_local_commit() {
+        use crate::external_cas_anchor_candidate::ExternalCasPin;
+        use crate::qrun_v06_profile_pin_candidate::{
+            QRunV06ProfilePinCandidate, QRunV06VerifiedProfilePin,
+        };
+
+        let genesis_dir = TestDir::new();
+        let segment_dir = TestDir::new();
+        let genesis = genesis_state();
+        let params = params();
+        let descriptor = *genesis.genesis_descriptor().unwrap();
+        let bundle = QRunV06ProfilePinCandidate::new(
+            descriptor,
+            ExternalCasPin {
+                provider_id: [0x71; 32],
+                network_id: NETWORK,
+                genesis_digest: [0x72; 32],
+                receipt_key_id: [0x73; 32],
+                receipt_public_key: [0x74;
+                    crate::v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES],
+            },
+        )
+        .unwrap();
+        let encoded = bundle.encode().unwrap();
+        let profile_pin =
+            QRunV06VerifiedProfilePin::decode(&encoded, bundle.commitment().unwrap()).unwrap();
+
+        let mut genesis_store = QRunV06DurableForkStore::open_with_verified_profile_pin(
+            &genesis_dir.0,
+            genesis.clone(),
+            params.clone(),
+            &EmptyAuthenticator,
+            None,
+            &profile_pin,
+        )
+        .unwrap();
+        let genesis_tip = genesis_store.graph().unwrap().base_tip();
+        let genesis_target = genesis_store
+            .graph()
+            .unwrap()
+            .expected_next_target(&genesis_tip)
+            .unwrap();
+        let (block_one, _) = candidate(
+            genesis_store.graph().unwrap().canonical_state(),
+            genesis_tip,
+            100,
+            genesis_target,
+            &params,
+        );
+        genesis_store
+            .submit(&block_one, &EmptyAuthenticator)
+            .unwrap();
+        let (checkpoint_bytes, checkpoint_anchor) =
+            genesis_store.export_canonical_checkpoint().unwrap();
+        drop(genesis_store);
+
+        let mut segment = QRunV06DurableForkStore::open_from_checkpoint_with_verified_profile_pin(
+            &segment_dir.0,
+            &checkpoint_bytes,
+            params.clone(),
+            checkpoint_anchor,
+            &profile_pin,
+            &EmptyAuthenticator,
+            None,
+        )
+        .unwrap();
+        let segment_root_anchor = segment.manifest_anchor_at_generation(0).unwrap().unwrap();
+        let parent = segment.graph().unwrap().canonical_tip().tip_hash;
+        let target = segment
+            .graph()
+            .unwrap()
+            .expected_next_target(&parent)
+            .unwrap();
+        let (block_two, expected_tip) = candidate(
+            segment.graph().unwrap().canonical_state(),
+            parent,
+            120,
+            target,
+            &params,
+        );
+        let commit = segment.submit(&block_two, &EmptyAuthenticator).unwrap();
+        assert_eq!(commit.generation, 1);
+        drop(segment);
+
+        // The C: vault may still pin global generation N+1 (segment-local generation zero)
+        // while D: has committed local generation one. Reopen must replay from that exact
+        // historical ancestor and expose the verified current local tip for one-step catch-up.
+        let reopened =
+            QRunV06DurableForkStore::open_from_checkpoint_with_verified_profile_pin_and_trusted_anchor_ancestor(
+                &segment_dir.0,
+                &checkpoint_bytes,
+                params.clone(),
+                checkpoint_anchor,
+                &profile_pin,
+                &EmptyAuthenticator,
+                segment_root_anchor,
+                0,
+            )
+            .unwrap();
+        assert_eq!(reopened.generation().unwrap(), 1);
+        assert_eq!(reopened.manifest_anchor().unwrap(), commit.manifest_anchor);
+        assert_eq!(reopened.canonical_tip().unwrap(), expected_tip);
+        drop(reopened);
+
+        assert!(matches!(
+            QRunV06DurableForkStore::open_from_checkpoint_with_verified_profile_pin_and_trusted_anchor_ancestor(
+                &segment_dir.0,
+                &checkpoint_bytes,
+                params,
+                checkpoint_anchor,
+                &profile_pin,
+                &EmptyAuthenticator,
+                segment_root_anchor,
+                1,
+            ),
+            Err(QRunV06ForkStoreError::ManifestAnchorMismatch)
+        ));
     }
 
     #[test]

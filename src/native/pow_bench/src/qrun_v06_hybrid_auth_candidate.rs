@@ -120,23 +120,14 @@ impl QRunV06HybridTransactionSigner {
         qrun_v06_hybrid_account_id(&self.ed25519_public_key, &self.mldsa65_public_key)
     }
 
-    /// Sign a normal QFP6 TXN2 transaction. Both algorithms sign the exact same domain-separated
-    /// digest, which already commits network, sender, recipient, nonce, amount, fee and expiry.
-    pub fn sign_transaction(
-        &self,
-        transaction: &mut Transaction,
-    ) -> Result<(), QRunV06HybridAuthError> {
-        if transaction.sender != self.account_id() {
-            return Err(QRunV06HybridAuthError::WrongSigner);
-        }
-        let digest = transaction_signing_digest(transaction)
-            .map_err(|_| QRunV06HybridAuthError::InvalidTransaction)?;
-
-        let ed25519_signature = self.ed25519_signing_key.sign(&digest).to_bytes();
+    /// Sign a domain-separated 32-byte protocol digest with both QFP6 account algorithms.
+    /// The result uses the same canonical Q6HA signature envelope as native transfers.
+    pub fn sign_digest(&self, digest: &[u8; 32]) -> Result<Vec<u8>, QRunV06HybridAuthError> {
+        let ed25519_signature = self.ed25519_signing_key.sign(digest).to_bytes();
         let mut optrand = [0u8; 32];
         getrandom::getrandom(&mut optrand)
             .map_err(|_| QRunV06HybridAuthError::RandomnessUnavailable)?;
-        let mldsa65_signature = portable::sign(&self.mldsa65_signing_key, &digest, &[], optrand)
+        let mldsa65_signature = portable::sign(&self.mldsa65_signing_key, digest, &[], optrand)
             .map_err(|_| {
                 optrand.fill(0);
                 QRunV06HybridAuthError::MlDsaSigningFailed
@@ -156,7 +147,21 @@ impl QRunV06HybridTransactionSigner {
         {
             return Err(QRunV06HybridAuthError::InvalidTransaction);
         }
-        transaction.signature = envelope;
+        Ok(envelope)
+    }
+    /// Sign a normal QFP6 TXN2 transaction. Both algorithms sign the exact same domain-separated
+    /// digest, which already commits network, sender, recipient, nonce, amount, fee and expiry.
+    pub fn sign_transaction(
+        &self,
+        transaction: &mut Transaction,
+    ) -> Result<(), QRunV06HybridAuthError> {
+        if transaction.sender != self.account_id() {
+            return Err(QRunV06HybridAuthError::WrongSigner);
+        }
+        let digest = transaction_signing_digest(transaction)
+            .map_err(|_| QRunV06HybridAuthError::InvalidTransaction)?;
+
+        transaction.signature = self.sign_digest(&digest)?;
         Ok(())
     }
 }

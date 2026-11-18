@@ -307,6 +307,16 @@ impl ConsensusParameters {
         Ok(params)
     }
 
+    /// CP-0651 QFP6 monetary profile: fixed 7B ceiling and fee-only block production.
+    /// This is a versioned network policy; it does not alter historical QFP5/QFP6 candidates.
+    pub fn qrun_v06_cp0651_fee_only_candidate() -> Result<Self, ConsensusError> {
+        let mut params = Self::qrun_v06_sha256d_candidate()?;
+        params.issuance = IssuanceParameters::fee_only(7_000_000_000u128 * ATOMS_PER_COIN)
+            .map_err(ConsensusError::Issuance)?;
+        params.validate()?;
+        Ok(params)
+    }
+
     /// Measured QRun v0.5 parameter candidate. Its initial target is derived from the lowest
     /// observed 64 MiB throughput across the current local + CI runner measurements. This is
     /// deliberately separate from candidate_testnet()'s easy smoke-test target and is not a
@@ -376,6 +386,20 @@ impl ConsensusParameters {
             return Err(ConsensusError::MonetaryIssuanceProfileMismatch);
         }
         Ok(())
+    }
+
+    /// QFP6 accepts its historical compile-time issuance identity or the separately
+    /// versioned CP-0651 fixed-7B fee-only policy. Other fee-only caps are not interchangeable.
+    pub fn validate_qfp6_monetary_execution_compatibility(&self) -> Result<(), ConsensusError> {
+        self.validate()?;
+        let cp0651_maximum_supply = 7_000_000_000u128 * ATOMS_PER_COIN;
+        if self.issuance.maximum_supply() == cp0651_maximum_supply
+            && self.issuance.initial_subsidy() == 0
+            && self.issuance.blocks_per_halving() == 1
+        {
+            return Ok(());
+        }
+        self.validate_monetary_execution_compatibility()
     }
 }
 

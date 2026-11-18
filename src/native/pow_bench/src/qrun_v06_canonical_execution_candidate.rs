@@ -15,6 +15,9 @@ use crate::qrun_v06_asset_registry_candidate::{
 use crate::qrun_v06_cp0604_supply_candidate::{
     Cp0604Error, Cp0604FounderControlledSupply, CP0604_FOUNDER_GENESIS_ATOMS, CP0604_SNAPSHOT_BYTES,
 };
+use crate::qrun_v06_cp0651_supply_candidate::{
+    Cp0651Error, Cp0651FixedSupply, CP0651_OWNER_GENESIS_ATOMS, CP0651_SNAPSHOT_BYTES,
+};
 use crate::qrun_v06_genesis_descriptor_candidate::{
     QRunV06GenesisDescriptor, QRunV06GenesisDescriptorError,
 };
@@ -52,7 +55,8 @@ pub const MAX_QRUN_V06_ASSET_SIGNATURE_BYTES: usize = 4 * 1024;
 const BLOCK_ID_DOMAIN: &[u8] = b"QRUN-V06-CANONICAL-BLOCK-ID-V5\0";
 const EXECUTION_ROOT_DOMAIN: &[u8] = b"QRUN-V06-CANONICAL-EXECUTION-ROOT-V5\0";
 const EXECUTION_SNAPSHOT_MAGIC: [u8; 4] = *b"Q6SN";
-const EXECUTION_SNAPSHOT_VERSION: u16 = 6;
+const EXECUTION_SNAPSHOT_VERSION: u16 = 7;
+const EXECUTION_SNAPSHOT_VERSION_V6: u16 = 6;
 const EXECUTION_SNAPSHOT_VERSION_V5: u16 = 5;
 const EXECUTION_SNAPSHOT_VERSION_LEGACY: u16 = 4;
 const EXECUTION_SNAPSHOT_CHECKSUM_DOMAIN: &[u8] =
@@ -116,6 +120,8 @@ pub enum QRunV06ExecutionError {
     TokenomicsConsensusMismatch,
     Cp0604(Cp0604Error),
     Cp0604GenesisRequiresEmptyLedger,
+    Cp0651(Cp0651Error),
+    Cp0651GenesisRequiresEmptyLedger,
     Cp0604LegacyOperationForbidden,
     GenesisDescriptor(QRunV06GenesisDescriptorError),
     MissingQuoteAssetAuthorization,
@@ -161,6 +167,11 @@ impl From<UnifiedAssetError> for QRunV06ExecutionError {
 impl From<Cp0604Error> for QRunV06ExecutionError {
     fn from(value: Cp0604Error) -> Self {
         Self::Cp0604(value)
+    }
+}
+impl From<Cp0651Error> for QRunV06ExecutionError {
+    fn from(value: Cp0651Error) -> Self {
+        Self::Cp0651(value)
     }
 }
 impl From<QRunV06TokenomicsError> for QRunV06ExecutionError {
@@ -300,8 +311,10 @@ pub struct QRunV06CanonicalExecutionState {
     /// None identifies a legacy/market-only QFB6 research fixture. Legacy CP-0528
     /// state is retained for compatibility; permissionless QFP6 separately requires CP-0604.
     tokenomics: Option<QRunV06TokenomicsState>,
-    /// CP-0604 founder-controlled issuance policy; mutually exclusive with legacy CP-0528.
+    /// CP-0604 legacy founder-controlled issuance policy; mutually exclusive with newer policies.
     cp0604_supply: Option<Cp0604FounderControlledSupply>,
+    /// CP-0651 fixed 7B policy with 1B owner Genesis, six accounting labels and zero subsidy.
+    cp0651_supply: Option<Cp0651FixedSupply>,
     /// Immutable Genesis descriptor. Production QFP6 admission must reject None.
     genesis_descriptor: Option<QRunV06GenesisDescriptor>,
     quote_asset_authorization: Option<QRunV06PersistedQuoteAssetAuthorization>,
@@ -343,6 +356,7 @@ impl QRunV06CanonicalExecutionState {
             profile_id,
             tokenomics: None,
             cp0604_supply: None,
+            cp0651_supply: None,
             genesis_descriptor: None,
             quote_asset_authorization: None,
         })
@@ -428,6 +442,81 @@ impl QRunV06CanonicalExecutionState {
 
     pub fn cp0604_supply(&self) -> Option<&Cp0604FounderControlledSupply> {
         self.cp0604_supply.as_ref()
+    }
+
+    /// Construct a CP-0651 Genesis with exactly 1B owner allocation and no subsidy.
+    pub fn cp0651_genesis_candidate(
+        network_id: [u8; 32],
+        profile_id: [u8; 32],
+        owner_account: [u8; 32],
+    ) -> Result<Self, QRunV06ExecutionError> {
+        let policy = Cp0651FixedSupply::genesis(network_id, owner_account)?;
+        let ledger = LedgerState::genesis(
+            network_id,
+            vec![(owner_account, CP0651_OWNER_GENESIS_ATOMS as u64)],
+        )?;
+        let amm = QzxbAmmStateCandidate::new(network_id, 32, 64, 512)?;
+        let unified = QRunV06UnifiedAssetState::new(ledger, amm)?;
+        Self::new_with_cp0651_supply(unified, profile_id, policy)
+    }
+
+    pub fn new_with_cp0651_supply(
+        unified: QRunV06UnifiedAssetState,
+        profile_id: [u8; 32],
+        policy: Cp0651FixedSupply,
+    ) -> Result<Self, QRunV06ExecutionError> {
+        if unified.block_height() != 0
+            || unified.last_block_timestamp() != 0
+            || policy.network_id() != unified.network_id()
+            || unified
+                .ledger()
+                .account(&policy.owner_account())
+                .map_or(0u128, |account| account.balance as u128)
+                != CP0651_OWNER_GENESIS_ATOMS
+            || unified
+                .ledger()
+                .account_entries()
+                .iter()
+                .any(|(account, state)| *account != policy.owner_account() && state.balance != 0)
+        {
+            return Err(QRunV06ExecutionError::Cp0651GenesisRequiresEmptyLedger);
+        }
+        let mut state = Self::new(unified, profile_id)?;
+        state.cp0651_supply = Some(policy);
+        state.verify_invariants()?;
+        Ok(state)
+    }
+
+    /// Build timestamp-anchored CP-0651 Genesis from the immutable network descriptor.
+    pub fn cp0651_genesis_candidate_with_descriptor(
+        descriptor: QRunV06GenesisDescriptor,
+    ) -> Result<Self, QRunV06ExecutionError> {
+        let network = descriptor.network_id();
+        let owner = descriptor.founder_account();
+        let policy = Cp0651FixedSupply::genesis(network, owner)?;
+        let ledger = LedgerState::genesis_at(
+            network,
+            vec![(owner, CP0651_OWNER_GENESIS_ATOMS as u64)],
+            descriptor.genesis_timestamp(),
+        )?;
+        let amm = QzxbAmmStateCandidate::new(network, 32, 64, 512)?;
+        let unified = QRunV06UnifiedAssetState::new(ledger, amm)?;
+        let mut state = Self::new(unified, descriptor.profile_id())?;
+        state.cp0651_supply = Some(policy.clone());
+        descriptor.validate_binding(
+            &network,
+            &state.profile_id,
+            &owner,
+            &descriptor.consensus_fingerprint(),
+            &policy.policy_fingerprint(),
+        )?;
+        state.genesis_descriptor = Some(descriptor);
+        state.verify_invariants()?;
+        Ok(state)
+    }
+
+    pub fn cp0651_supply(&self) -> Option<&Cp0651FixedSupply> {
+        self.cp0651_supply.as_ref()
     }
 
     /// Build an isolated CP-0528 Genesis candidate without changing QFP5 or Mainnet identity.
@@ -563,15 +652,19 @@ impl QRunV06CanonicalExecutionState {
     /// economics policy is active. This keeps profile-pin validation independent
     /// of the legacy CP-0528 representation.
     pub fn genesis_economic_policy_identity(&self) -> Option<(AccountId, [u8; 32])> {
+        if let Some(policy) = self.cp0651_supply.as_ref() {
+            return Some((policy.owner_account(), policy.policy_fingerprint()));
+        }
         if let Some(tokenomics) = self.tokenomics.as_ref() {
             return Some((
                 tokenomics.founder_account(),
                 tokenomics.policy_fingerprint(),
             ));
         }
-        self.cp0604_supply
-            .as_ref()
-            .map(|policy| (policy.founder_account(), policy.policy_fingerprint()))
+        if let Some(policy) = self.cp0604_supply.as_ref() {
+            return Some((policy.founder_account(), policy.policy_fingerprint()));
+        }
+        None
     }
 
     /// Verify and atomically apply a Founder-authorized, recipient-accepted CP-0528 release.
@@ -582,7 +675,7 @@ impl QRunV06CanonicalExecutionState {
         inclusion_timestamp: u64,
         authenticator: &A,
     ) -> Result<(), QRunV06ExecutionError> {
-        if self.cp0604_supply.is_some() {
+        if self.cp0604_supply.is_some() || self.cp0651_supply.is_some() {
             return Err(QRunV06ExecutionError::Cp0604LegacyOperationForbidden);
         }
         if inclusion_timestamp == 0 || release.network_id != self.network_id() {
@@ -636,7 +729,7 @@ impl QRunV06CanonicalExecutionState {
         inclusion_timestamp: u64,
         authenticator: &A,
     ) -> Result<(), QRunV06ExecutionError> {
-        if self.cp0604_supply.is_some() {
+        if self.cp0604_supply.is_some() || self.cp0651_supply.is_some() {
             return Err(QRunV06ExecutionError::Cp0604LegacyOperationForbidden);
         }
         if inclusion_timestamp == 0
@@ -686,18 +779,29 @@ impl QRunV06CanonicalExecutionState {
         &self,
         params: &ConsensusParameters,
     ) -> Result<(), QRunV06ExecutionError> {
-        let schedule = if let Some(policy) = &self.cp0604_supply {
-            Some(policy.mining_schedule())
+        let issuance_profile = if let Some(policy) = &self.cp0651_supply {
+            Some((policy.maximum_supply_atoms(), 0u128, 1u64))
+        } else if let Some(policy) = &self.cp0604_supply {
+            let schedule = policy.mining_schedule();
+            Some((
+                crate::qrun_v06_tokenomics_candidate::QRUN_V06_MAX_GROSS_ISSUANCE_ATOMS,
+                schedule.initial_subsidy_atoms,
+                schedule.blocks_per_halving,
+            ))
         } else {
-            self.tokenomics
-                .as_ref()
-                .map(|tokenomics| tokenomics.mining_schedule())
+            self.tokenomics.as_ref().map(|tokenomics| {
+                let schedule = tokenomics.mining_schedule();
+                (
+                    crate::qrun_v06_tokenomics_candidate::QRUN_V06_MAX_GROSS_ISSUANCE_ATOMS,
+                    schedule.initial_subsidy_atoms,
+                    schedule.blocks_per_halving,
+                )
+            })
         };
-        if let Some(schedule) = schedule {
-            if params.issuance.maximum_supply()
-                != crate::qrun_v06_tokenomics_candidate::QRUN_V06_MAX_GROSS_ISSUANCE_ATOMS
-                || params.issuance.initial_subsidy() != schedule.initial_subsidy_atoms
-                || params.issuance.blocks_per_halving() != schedule.blocks_per_halving
+        if let Some((maximum_supply, initial_subsidy, blocks_per_halving)) = issuance_profile {
+            if params.issuance.maximum_supply() != maximum_supply
+                || params.issuance.initial_subsidy() != initial_subsidy
+                || params.issuance.blocks_per_halving() != blocks_per_halving
             {
                 return Err(QRunV06ExecutionError::TokenomicsConsensusMismatch);
             }
@@ -762,11 +866,17 @@ impl QRunV06CanonicalExecutionState {
                     return Err(QRunV06ExecutionError::InvalidTimestamp);
                 }
             }
-        } else if self.genesis_descriptor.is_some() && self.cp0604_supply.is_none() {
+        } else if self.genesis_descriptor.is_some()
+            && self.cp0604_supply.is_none()
+            && self.cp0651_supply.is_none()
+        {
             return Err(QRunV06ExecutionError::TokenomicsConsensusMismatch);
         }
         if let Some(policy) = &self.cp0604_supply {
-            if self.tokenomics.is_some() || policy.network_id() != self.network_id() {
+            if self.tokenomics.is_some()
+                || self.cp0651_supply.is_some()
+                || policy.network_id() != self.network_id()
+            {
                 return Err(QRunV06ExecutionError::TokenomicsConsensusMismatch);
             }
             policy.validate_ledger_supply(self.unified.ledger().total_value()?)?;
@@ -784,6 +894,33 @@ impl QRunV06CanonicalExecutionState {
                 if self.height() > 0 && self.last_timestamp() <= descriptor.genesis_timestamp() {
                     return Err(QRunV06ExecutionError::InvalidTimestamp);
                 }
+            }
+        }
+        if let Some(policy) = &self.cp0651_supply {
+            if self.tokenomics.is_some()
+                || self.cp0604_supply.is_some()
+                || policy.network_id() != self.network_id()
+            {
+                return Err(QRunV06ExecutionError::TokenomicsConsensusMismatch);
+            }
+            policy.validate_ledger_supply(self.unified.ledger().total_value()?)?;
+            if let Some(descriptor) = &self.genesis_descriptor {
+                descriptor.validate_binding(
+                    &self.network_id(),
+                    &self.profile_id,
+                    &policy.owner_account(),
+                    &descriptor.consensus_fingerprint(),
+                    &policy.policy_fingerprint(),
+                )?;
+                if self.height() == 0 && self.last_timestamp() != descriptor.genesis_timestamp() {
+                    return Err(QRunV06ExecutionError::InvalidTimestamp);
+                }
+                if self.height() > 0 && self.last_timestamp() <= descriptor.genesis_timestamp() {
+                    return Err(QRunV06ExecutionError::InvalidTimestamp);
+                }
+            }
+            if policy.last_block_height() != self.height() {
+                return Err(QRunV06ExecutionError::TokenomicsConsensusMismatch);
             }
         }
         if let Some(quote_authorization) = &self.quote_asset_authorization {
@@ -972,7 +1109,11 @@ impl QRunV06CanonicalExecutionState {
         let unified_root = self.unified.state_root()?;
         let orderbook_root = self.orderbook.state_root()?;
         let mut hash = Sha256::new();
-        hash.update(EXECUTION_ROOT_DOMAIN);
+        if self.cp0651_supply.is_some() {
+            hash.update(b"QRUN-V06-CANONICAL-EXECUTION-ROOT-V6\0");
+        } else {
+            hash.update(EXECUTION_ROOT_DOMAIN);
+        }
         hash.update(self.network_id());
         hash.update(self.profile_id);
         hash.update(unified_root);
@@ -986,6 +1127,10 @@ impl QRunV06CanonicalExecutionState {
         }
         if let Some(policy) = &self.cp0604_supply {
             hash.update([2u8]);
+            hash.update(policy.state_root());
+        }
+        if let Some(policy) = &self.cp0651_supply {
+            hash.update([3u8]);
             hash.update(policy.state_root());
         }
         match &self.genesis_descriptor {
@@ -1066,6 +1211,13 @@ impl QRunV06CanonicalExecutionState {
             }
             None => out.push(0),
         }
+        match &self.cp0651_supply {
+            Some(policy) => {
+                out.push(1);
+                execution_snapshot_put_component(&mut out, &policy.encode_snapshot()?)?;
+            }
+            None => out.push(0),
+        }
         if out.len().saturating_add(32) > MAX_QRUN_V06_EXECUTION_SNAPSHOT_BYTES {
             return Err(QRunV06ExecutionError::SnapshotOversize);
         }
@@ -1109,6 +1261,7 @@ impl QRunV06CanonicalExecutionState {
         }
         let version = execution_snapshot_u16(&mut cursor)?;
         if version != EXECUTION_SNAPSHOT_VERSION
+            && version != EXECUTION_SNAPSHOT_VERSION_V6
             && version != EXECUTION_SNAPSHOT_VERSION_V5
             && version != EXECUTION_SNAPSHOT_VERSION_LEGACY
         {
@@ -1145,7 +1298,7 @@ impl QRunV06CanonicalExecutionState {
             )?),
             _ => return Err(QRunV06ExecutionError::SnapshotNonCanonical),
         };
-        let cp0604_supply = if version >= EXECUTION_SNAPSHOT_VERSION {
+        let cp0604_supply = if version >= EXECUTION_SNAPSHOT_VERSION_V6 {
             match execution_snapshot_read::<1>(&mut cursor)?[0] {
                 0 => None,
                 1 => Some(Cp0604FounderControlledSupply::decode_snapshot(
@@ -1178,6 +1331,18 @@ impl QRunV06CanonicalExecutionState {
         } else {
             None
         };
+        let cp0651_supply = if version >= EXECUTION_SNAPSHOT_VERSION {
+            match execution_snapshot_read::<1>(&mut cursor)?[0] {
+                0 => None,
+                1 => Some(Cp0651FixedSupply::decode_snapshot(
+                    &execution_snapshot_read_component(&mut cursor, CP0651_SNAPSHOT_BYTES)?,
+                    expected_network_id,
+                )?),
+                _ => return Err(QRunV06ExecutionError::SnapshotNonCanonical),
+            }
+        } else {
+            None
+        };
         if cursor.position() as usize != payload.len() {
             return Err(QRunV06ExecutionError::SnapshotNonCanonical);
         }
@@ -1201,6 +1366,7 @@ impl QRunV06CanonicalExecutionState {
         let mut restored = Self::new_with_orderbook(unified, profile_id, orderbook)?;
         restored.tokenomics = tokenomics;
         restored.cp0604_supply = cp0604_supply;
+        restored.cp0651_supply = cp0651_supply;
         restored.genesis_descriptor = genesis_descriptor;
         restored.quote_asset_authorization = quote_asset_authorization;
         restored.verify_invariants()?;
@@ -1613,7 +1779,13 @@ impl QRunV06CanonicalExecutionState {
         self.validate_quote_asset_decimals_for_block(block, quote_authorization)?;
         self.verify_invariants()?;
         let fees_paid_to_producer = self.unified.settle_v06_block_fees(block.producer)?;
-        let mining_reward_atoms = if let Some(policy) = &self.cp0604_supply {
+        let mining_reward_atoms = if let Some(policy) = &self.cp0651_supply {
+            let reward = policy.expected_block_subsidy_atoms(block.height)?;
+            let mut next_policy = policy.clone();
+            next_policy.record_block_subsidy(block.height, reward)?;
+            self.cp0651_supply = Some(next_policy);
+            reward
+        } else if let Some(policy) = &self.cp0604_supply {
             let reward = policy.expected_mining_reward_atoms(block.height)?;
             if reward > 0 {
                 let mut next_policy = policy.clone();
@@ -1844,6 +2016,77 @@ pub fn decode_qrun_v06_block(bytes: &[u8]) -> Result<QRunV06Block, QRunV06Execut
 pub fn qrun_v06_block_id(block: &QRunV06Block) -> Result<[u8; 32], QRunV06ExecutionError> {
     let canonical = encode_qrun_v06_block(block)?;
     Ok(qrun_v06_block_id_from_bytes(&canonical))
+}
+
+/// Q6MO's canonical operation payload. Only signed AMM and OrderBook operations
+/// are eligible. Asset registration/admin and native transfers use separate policy paths;
+/// supply-control operations remain block-governance-only.
+pub const MAX_QRUN_V06_MARKET_OPERATION_BYTES: usize = 32 * 1024;
+
+pub fn encode_qrun_v06_market_operation(
+    operation: &QRunV06BlockOperation,
+) -> Result<Vec<u8>, QRunV06ExecutionError> {
+    let (tag, payload) = match operation {
+        QRunV06BlockOperation::Amm(signed)
+            if matches!(
+                &signed.operation,
+                AmmOperation::CreatePair { .. }
+                    | AmmOperation::SwapExactIn { .. }
+                    | AmmOperation::AddLiquidity { .. }
+                    | AmmOperation::RemoveLiquidity { .. }
+            ) =>
+        {
+            encode_operation(operation)?
+        }
+        QRunV06BlockOperation::OrderBook(_) => encode_operation(operation)?,
+        _ => return Err(QRunV06ExecutionError::Malformed),
+    };
+    let total = 5usize
+        .checked_add(payload.len())
+        .ok_or(QRunV06ExecutionError::Malformed)?;
+    if total > MAX_QRUN_V06_MARKET_OPERATION_BYTES {
+        return Err(QRunV06ExecutionError::Oversize {
+            actual: total,
+            limit: MAX_QRUN_V06_MARKET_OPERATION_BYTES,
+        });
+    }
+    let payload_len = u32::try_from(payload.len()).map_err(|_| QRunV06ExecutionError::Malformed)?;
+    let mut out = Vec::with_capacity(total);
+    out.push(tag);
+    out.extend_from_slice(&payload_len.to_be_bytes());
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+pub fn decode_qrun_v06_market_operation(
+    bytes: &[u8],
+) -> Result<QRunV06BlockOperation, QRunV06ExecutionError> {
+    if bytes.len() < 5 {
+        return Err(QRunV06ExecutionError::Malformed);
+    }
+    if bytes.len() > MAX_QRUN_V06_MARKET_OPERATION_BYTES {
+        return Err(QRunV06ExecutionError::Oversize {
+            actual: bytes.len(),
+            limit: MAX_QRUN_V06_MARKET_OPERATION_BYTES,
+        });
+    }
+    let tag = bytes[0];
+    if !matches!(tag, 2 | 5) {
+        return Err(QRunV06ExecutionError::Malformed);
+    }
+    let declared = u32::from_be_bytes(
+        bytes[1..5]
+            .try_into()
+            .map_err(|_| QRunV06ExecutionError::Malformed)?,
+    ) as usize;
+    if declared == 0 || declared != bytes.len() - 5 {
+        return Err(QRunV06ExecutionError::Malformed);
+    }
+    let operation = decode_operation(tag, &bytes[5..])?;
+    if encode_qrun_v06_market_operation(&operation)?.as_slice() != bytes {
+        return Err(QRunV06ExecutionError::Malformed);
+    }
+    Ok(operation)
 }
 
 fn qrun_v06_block_id_from_bytes(bytes: &[u8]) -> [u8; 32] {
@@ -2280,7 +2523,7 @@ mod tests {
     }
 
     #[test]
-    fn genesis_economic_policy_identity_supports_cp0528_and_cp0604() {
+    fn genesis_economic_policy_identity_supports_cp0528_cp0604_and_cp0651() {
         let legacy = QRunV06CanonicalExecutionState::cp0528_genesis_candidate(
             NETWORK,
             PROFILE,
@@ -2305,6 +2548,15 @@ mod tests {
         assert_eq!(
             current.genesis_economic_policy_identity(),
             Some((ALICE, current_policy.policy_fingerprint()))
+        );
+
+        let cp0651 =
+            QRunV06CanonicalExecutionState::cp0651_genesis_candidate(NETWORK, PROFILE, ALICE)
+                .unwrap();
+        let cp0651_policy = cp0651.cp0651_supply().unwrap();
+        assert_eq!(
+            cp0651.genesis_economic_policy_identity(),
+            Some((ALICE, cp0651_policy.policy_fingerprint()))
         );
     }
 
@@ -3537,10 +3789,10 @@ mod tests {
         );
         assert_eq!(state.quote_asset_authorization_epoch(), Some(3));
 
-        // Q6SN v6 persists the Q6QA/Q6PN trust identity and keeps it in the
-        // canonical execution root after restart.
+        // Q6SN v7 persists the Q6QA/Q6PN trust identity and CP-0651 presence flag;
+        // the new policy component is appended without changing the v6 field order.
         let snapshot = state.encode_snapshot().unwrap();
-        assert_eq!(u16::from_be_bytes([snapshot[4], snapshot[5]]), 6);
+        assert_eq!(u16::from_be_bytes([snapshot[4], snapshot[5]]), 7);
         let restored =
             QRunV06CanonicalExecutionState::decode_snapshot(&snapshot, &NETWORK, &PROFILE).unwrap();
         assert_eq!(restored.state_root().unwrap(), state.state_root().unwrap());
@@ -3582,7 +3834,7 @@ mod tests {
         let quote_commitment_offset = tampered_snapshot
             .windows(32)
             .position(|window| window == [0xD7; 32])
-            .expect("Q6QA commitment must be present in Q6SN v6");
+            .expect("Q6QA commitment must be present in Q6SN v7");
         tampered_snapshot[quote_commitment_offset] ^= 1;
         let payload_len = tampered_snapshot.len() - 32;
         let mut checksum = Sha256::new();
@@ -3595,12 +3847,15 @@ mod tests {
             Err(QRunV06ExecutionError::StateRootMismatch)
         );
 
-        // Q6SN v4 snapshots have no quote-pin or CP-0604 flag. They remain readable
-        // and retain their old no-quote-pin state root after decoding.
+        // Q6SN v4 snapshots have no CP-0604, quote-pin, or CP-0651 flag. They remain
+        // readable and retain their old no-quote-pin state root after decoding.
         let legacy_state = fixture();
         let mut legacy_v4 = legacy_state.encode_snapshot().unwrap();
-        assert_eq!(u16::from_be_bytes([legacy_v4[4], legacy_v4[5]]), 6);
-        let legacy_payload_len = legacy_v4.len() - 32;
+        assert_eq!(u16::from_be_bytes([legacy_v4[4], legacy_v4[5]]), 7);
+        let mut legacy_payload_len = legacy_v4.len() - 32;
+        assert_eq!(legacy_v4[legacy_payload_len - 1], 0);
+        legacy_v4.remove(legacy_payload_len - 1); // remove v7 CP-0651 component flag
+        legacy_payload_len -= 1;
         assert_eq!(legacy_v4[legacy_payload_len - 1], 0);
         legacy_v4.remove(legacy_payload_len - 1); // remove v5+ quote authorization flag
                                                   // Remove the v6 CP-0604 component flag to reconstruct the v4 layout.
@@ -4496,6 +4751,208 @@ mod tests {
     }
 
     #[test]
+    fn cp0651_native_quote_orderbook_match_preserves_supply_and_snapshot() {
+        let mut state =
+            QRunV06CanonicalExecutionState::cp0651_genesis_candidate(NETWORK, PROFILE, ALICE)
+                .unwrap();
+        let initial_native_supply = state.unified().ledger().total_value().unwrap();
+        let policy_fingerprint = state.cp0651_supply().unwrap().policy_fingerprint();
+        let native = qzxb_native_asset_id(NETWORK).unwrap();
+
+        let mut registration = AssetRegistration {
+            network_id: NETWORK,
+            issuer: ALICE,
+            issuer_nonce: 1,
+            salt: [0x74; 32],
+            name: "CP0651 Native Orderbook Base".to_string(),
+            symbol: "NOB".to_string(),
+            decimals: 8,
+            supply_policy: AssetSupplyPolicy::Fixed {
+                total_supply: 1_000,
+            },
+            initial_supply: 1_000,
+            initial_recipient: BOB,
+            trust_policy: AssetTrustPolicy::Unverified,
+            expires_at: 50_000,
+            signature: Vec::new(),
+        };
+        registration.signature = registration.signing_digest().unwrap().to_vec();
+        let base_asset = registration.asset_id();
+        let pair_id = OrderBook::pair_id(NETWORK, base_asset, native).unwrap();
+
+        let operations = vec![
+            QRunV06BlockOperation::AssetRegistration(registration),
+            QRunV06BlockOperation::OrderBook(signed_orderbook(
+                ALICE,
+                1,
+                OrderOp::CreatePair {
+                    base: base_asset,
+                    quote: native,
+                    base_lot_atoms: 1,
+                    quote_tick_atoms: 1,
+                    max_price_ticks: 100,
+                    max_quantity_lots: 1_000,
+                    min_notional: 1,
+                    maker_fee_bps: 10,
+                    taker_fee_bps: 20,
+                    fee_collector: PRODUCER,
+                },
+            )),
+            QRunV06BlockOperation::OrderBook(signed_orderbook(
+                BOB,
+                1,
+                OrderOp::Deposit {
+                    asset: base_asset,
+                    amount: 100,
+                },
+            )),
+            QRunV06BlockOperation::OrderBook(signed_orderbook(
+                ALICE,
+                2,
+                OrderOp::Deposit {
+                    asset: native,
+                    amount: 100,
+                },
+            )),
+            QRunV06BlockOperation::OrderBook(signed_orderbook(
+                BOB,
+                2,
+                OrderOp::PlaceLimit {
+                    pair: pair_id,
+                    side: Side::Sell,
+                    price_ticks: 2,
+                    quantity_lots: 10,
+                    tif: Tif::Gtc,
+                    expires_at_height: 20,
+                },
+            )),
+            QRunV06BlockOperation::OrderBook(signed_orderbook(
+                ALICE,
+                3,
+                OrderOp::PlaceLimit {
+                    pair: pair_id,
+                    side: Side::Buy,
+                    price_ticks: 3,
+                    quantity_lots: 10,
+                    tif: Tif::Ioc,
+                    expires_at_height: 20,
+                },
+            )),
+            QRunV06BlockOperation::OrderBook(signed_orderbook(
+                PRODUCER,
+                1,
+                OrderOp::Withdraw {
+                    asset: native,
+                    amount: 2,
+                },
+            )),
+        ];
+
+        let mut block = block_for(&state, operations);
+        block.state_root = state
+            .preview_state_root_after(&block, &DigestAuthenticator)
+            .unwrap();
+        let summary = state.apply_block(&block, &DigestAuthenticator).unwrap();
+
+        assert_eq!(summary.orderbook_operations, 6);
+        assert_eq!(summary.orders_expired, 0);
+        assert_eq!(summary.mining_reward_atoms, 0);
+        assert_eq!(summary.fees_paid_to_producer, 0);
+        assert_eq!(state.orderbook().fills().len(), 1);
+        assert_eq!(state.orderbook().orders().count(), 0);
+        assert_eq!(state.orderbook().balance(&base_asset, &ALICE), 10);
+        assert_eq!(state.orderbook().balance(&base_asset, &BOB), 90);
+        assert_eq!(state.orderbook().balance(&native, &BOB), 19);
+        assert_eq!(state.orderbook().balance(&native, &PRODUCER), 0);
+        assert_eq!(
+            state.unified().ledger().account(&PRODUCER).unwrap().balance,
+            2
+        );
+        assert_eq!(
+            state.unified().ledger().total_value().unwrap(),
+            initial_native_supply
+        );
+        assert_eq!(
+            state.cp0651_supply().unwrap().policy_fingerprint(),
+            policy_fingerprint
+        );
+        assert_eq!(state.cp0651_supply().unwrap().last_block_height(), 1);
+        state.verify_invariants().unwrap();
+
+        let snapshot = state.encode_snapshot().unwrap();
+        let restored =
+            QRunV06CanonicalExecutionState::decode_snapshot(&snapshot, &NETWORK, &PROFILE).unwrap();
+        assert_eq!(restored, state);
+        assert_eq!(restored.state_root().unwrap(), state.state_root().unwrap());
+        assert_eq!(
+            restored.unified().ledger().total_value().unwrap(),
+            initial_native_supply
+        );
+        assert_eq!(restored.orderbook().fills().len(), 1);
+    }
+
+    #[test]
+    fn cp0651_fixed_supply_genesis_fee_only_blocks_and_v7_snapshot_replay() {
+        let mut state =
+            QRunV06CanonicalExecutionState::cp0651_genesis_candidate(NETWORK, PROFILE, ALICE)
+                .unwrap();
+        let policy = state.cp0651_supply().unwrap();
+        assert_eq!(policy.maximum_supply_atoms(), 700_000_000_000_000_000);
+        assert_eq!(policy.owner_genesis_atoms(), 100_000_000_000_000_000);
+        assert_eq!(
+            policy.accounting_labels_total_atoms(),
+            600_000_000_000_000_000
+        );
+        assert_eq!(policy.block_subsidy_atoms(), 0);
+        assert_eq!(
+            state.unified().ledger().total_value().unwrap(),
+            CP0651_OWNER_GENESIS_ATOMS
+        );
+
+        let mut first = block_for(
+            &state,
+            vec![QRunV06BlockOperation::NativeTransfer(transfer(
+                ALICE, BOB, 1, 1_000, 1,
+            ))],
+        );
+        first.state_root = state
+            .preview_state_root_after(&first, &DigestAuthenticator)
+            .unwrap();
+        let summary = state.apply_block(&first, &DigestAuthenticator).unwrap();
+        assert_eq!(summary.mining_reward_atoms, 0);
+        assert_eq!(summary.fees_paid_to_producer, 1);
+        assert_eq!(
+            state.unified().ledger().account(&PRODUCER).unwrap().balance,
+            1
+        );
+        assert_eq!(
+            state.unified().ledger().total_value().unwrap(),
+            CP0651_OWNER_GENESIS_ATOMS
+        );
+        assert_eq!(state.cp0651_supply().unwrap().last_block_height(), 1);
+
+        let snapshot = state.encode_snapshot().unwrap();
+        assert_eq!(u16::from_be_bytes([snapshot[4], snapshot[5]]), 7);
+        let restored =
+            QRunV06CanonicalExecutionState::decode_snapshot(&snapshot, &NETWORK, &PROFILE).unwrap();
+        assert_eq!(restored, state);
+        assert_eq!(restored.state_root().unwrap(), state.state_root().unwrap());
+
+        let mut second = block_for(&restored, Vec::new());
+        second.state_root = restored
+            .preview_state_root_after(&second, &DigestAuthenticator)
+            .unwrap();
+        let mut resumed = restored;
+        let second_summary = resumed.apply_block(&second, &DigestAuthenticator).unwrap();
+        assert_eq!(second_summary.mining_reward_atoms, 0);
+        assert_eq!(resumed.cp0651_supply().unwrap().last_block_height(), 2);
+        assert_eq!(
+            resumed.unified().ledger().total_value().unwrap(),
+            CP0651_OWNER_GENESIS_ATOMS
+        );
+    }
+
+    #[test]
     fn cp0604_canonical_genesis_transfer_mining_and_snapshot_replay() {
         let mut state = QRunV06CanonicalExecutionState::cp0604_genesis_candidate(
             NETWORK,
@@ -4544,10 +5001,26 @@ mod tests {
         assert_eq!(state.cp0604_supply().unwrap().last_mining_height(), 1);
 
         let snapshot = state.encode_snapshot().unwrap();
-        assert_eq!(u16::from_be_bytes([snapshot[4], snapshot[5]]), 6);
+        assert_eq!(u16::from_be_bytes([snapshot[4], snapshot[5]]), 7);
         let restored =
             QRunV06CanonicalExecutionState::decode_snapshot(&snapshot, &NETWORK, &PROFILE).unwrap();
         assert_eq!(restored, state);
+        let mut legacy_v6 = snapshot.clone();
+        let cp0651_flag = legacy_v6.len() - 33;
+        assert_eq!(legacy_v6[cp0651_flag], 0);
+        legacy_v6.remove(cp0651_flag);
+        legacy_v6[4..6].copy_from_slice(&6u16.to_be_bytes());
+        let legacy_v6_payload_len = legacy_v6.len() - 32;
+        let mut legacy_v6_checksum = Sha256::new();
+        legacy_v6_checksum.update(EXECUTION_SNAPSHOT_CHECKSUM_DOMAIN);
+        legacy_v6_checksum.update(&legacy_v6[..legacy_v6_payload_len]);
+        let legacy_v6_checksum: [u8; 32] = legacy_v6_checksum.finalize().into();
+        legacy_v6[legacy_v6_payload_len..].copy_from_slice(&legacy_v6_checksum);
+        assert_eq!(
+            QRunV06CanonicalExecutionState::decode_snapshot(&legacy_v6, &NETWORK, &PROFILE)
+                .unwrap(),
+            state
+        );
         assert_eq!(restored.state_root().unwrap(), state.state_root().unwrap());
         assert_eq!(
             restored.cp0604_supply().unwrap().mining_issued_atoms(),
@@ -4572,7 +5045,7 @@ mod tests {
     }
 
     #[test]
-    fn q6sn_v5_snapshot_remains_compatible_after_v6_upgrade() {
+    fn q6sn_v5_snapshot_remains_compatible_after_v7_upgrade() {
         let state = fixture();
         let mut legacy_v5 = state.encode_snapshot().unwrap();
         let mut component_cursor = 150usize;
@@ -4587,6 +5060,9 @@ mod tests {
         component_cursor += 1; // tokenomics flag
         assert_eq!(legacy_v5[component_cursor], 0); // no CP-0604 component in v5
         legacy_v5.remove(component_cursor);
+        let cp0651_flag = legacy_v5.len() - 33;
+        assert_eq!(legacy_v5[cp0651_flag], 0); // v7-only CP-0651 presence flag
+        legacy_v5.remove(cp0651_flag);
         legacy_v5[4..6].copy_from_slice(&5u16.to_be_bytes());
         let payload_len = legacy_v5.len() - 32;
         let mut checksum = Sha256::new();

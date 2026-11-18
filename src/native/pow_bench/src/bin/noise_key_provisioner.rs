@@ -1,4 +1,4 @@
-//! Provision a random Noise XX static key into a Windows CurrentUser-DPAPI NPK1 file.
+//! Provision a random Noise XX static key into the current OS protected-key store.
 //! No private-key material is accepted through process arguments or written to stdout.
 use ai_native_l1_pow_bench::noise_key_provisioning::store_protected_noise_private_key;
 use snow::{params::NoiseParams, Builder};
@@ -86,41 +86,49 @@ fn bytes_hex(bytes: &[u8]) -> String {
 }
 
 fn main_result() -> Result<(), String> {
-    #[cfg(not(windows))]
-    {
-        return Err("noise_key_provisioner requires Windows CurrentUser DPAPI".into());
+    let config = config()?;
+    if config.output.exists() && !config.replace_existing {
+        return Err("output already exists; refusing to replace protected key".into());
     }
-
-    #[cfg(windows)]
-    {
-        let config = config()?;
-        if config.output.exists() && !config.replace_existing {
-            return Err("output already exists; refusing to replace protected key".into());
-        }
-        let params: NoiseParams = PATTERN
-            .parse()
-            .map_err(|error: snow::Error| format!("Noise pattern invalid: {error}"))?;
-        let mut keypair = Builder::new(params)
-            .generate_keypair()
-            .map_err(|error| format!("secure Noise key generation failed: {error}"))?;
-        if keypair.private.len() != 32 || keypair.public.len() != 32 {
-            keypair.private.fill(0);
-            return Err("Noise provider returned an unexpected key length".into());
-        }
-        let mut private = [0u8; 32];
-        private.copy_from_slice(&keypair.private);
-        let store_result =
-            store_protected_noise_private_key(&config.output, &config.network_id, &private);
-        private.fill(0);
+    let params: NoiseParams = PATTERN
+        .parse()
+        .map_err(|error: snow::Error| format!("Noise pattern invalid: {error}"))?;
+    let mut keypair = Builder::new(params)
+        .generate_keypair()
+        .map_err(|error| format!("secure Noise key generation failed: {error}"))?;
+    if keypair.private.len() != 32 || keypair.public.len() != 32 {
         keypair.private.fill(0);
-        store_result.map_err(|error| format!("DPAPI key protection failed: {error}"))?;
-        println!("protected_key_file={}", config.output.display());
-        println!("network_id_hex={}", bytes_hex(&config.network_id));
-        println!("noise_static_public_key_hex={}", bytes_hex(&keypair.public));
-        println!("protection=Windows_CurrentUser_DPAPI_NPK1");
-        keypair.public.fill(0);
-        Ok(())
+        return Err("Noise provider returned an unexpected key length".into());
     }
+    let mut private = [0u8; 32];
+    private.copy_from_slice(&keypair.private);
+    let store_result =
+        store_protected_noise_private_key(&config.output, &config.network_id, &private);
+    private.fill(0);
+    keypair.private.fill(0);
+    store_result.map_err(|error| format!("protected Noise key provisioning failed: {error}"))?;
+
+    println!("protected_key_file={}", config.output.display());
+    println!("network_id_hex={}", bytes_hex(&config.network_id));
+    println!("noise_static_public_key_hex={}", bytes_hex(&keypair.public));
+    #[cfg(windows)]
+    println!("protection=Windows_CurrentUser_DPAPI_NPK1");
+    #[cfg(target_os = "linux")]
+    {
+        let credential_name = config
+            .output
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("credential output filename is invalid")?;
+        println!("protection=systemd-creds_host+tpm2_NPK2");
+        println!("runtime_reference=/systemd-credential/{credential_name}");
+        println!(
+            "systemd_unit=LoadCredentialEncrypted={credential_name}:{}",
+            config.output.display()
+        );
+    }
+    keypair.public.fill(0);
+    Ok(())
 }
 
 fn main() {

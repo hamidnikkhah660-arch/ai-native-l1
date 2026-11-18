@@ -83,6 +83,7 @@ pub fn select_peers(peers: &[PeerRecord], policy: Policy, now_ms: u64) -> Vec<Pe
     let mut selected = Vec::new();
     let mut prefixes = std::collections::HashMap::new();
     let mut sources = std::collections::HashMap::new();
+    let mut selected_ids = std::collections::HashSet::new();
 
     let mut established: Vec<PeerRecord> = pool
         .iter()
@@ -96,9 +97,12 @@ pub fn select_peers(peers: &[PeerRecord], policy: Policy, now_ms: u64) -> Vec<Pe
         if selected.len() >= policy.protected_established.min(policy.slots) {
             break;
         }
-        if !can_select_peer(&peer, policy, &prefixes, &sources) {
+        if selected_ids.contains(&peer.peer_id)
+            || !can_select_peer(&peer, policy, &prefixes, &sources)
+        {
             continue;
         }
+        selected_ids.insert(peer.peer_id);
         record_selected_peer(&peer, &mut prefixes, &mut sources);
         selected.push(peer.clone());
         pool.retain(|p| p.peer_id != peer.peer_id);
@@ -116,9 +120,12 @@ pub fn select_peers(peers: &[PeerRecord], policy: Policy, now_ms: u64) -> Vec<Pe
         if selected.len() >= policy.slots {
             break;
         }
-        if !can_select_peer(&peer, policy, &prefixes, &sources) {
+        if selected_ids.contains(&peer.peer_id)
+            || !can_select_peer(&peer, policy, &prefixes, &sources)
+        {
             continue;
         }
+        selected_ids.insert(peer.peer_id);
         record_selected_peer(&peer, &mut prefixes, &mut sources);
         selected.push(peer);
     }
@@ -244,5 +251,26 @@ mod tests {
         let selected = select_peers(&peers, Policy::default(), 3_600_000 + 1_000);
         assert!(selected.len() <= 8);
         assert_eq!(selected.iter().filter(|p| p.peer_id < 10).count(), 4);
+    }
+
+    #[test]
+    fn duplicate_peer_identity_cannot_consume_multiple_routing_slots() {
+        let first = honest(77, 1, 1);
+        let mut forged_duplicate = honest(77, 2, 2);
+        forged_duplicate.successful_sessions = 20;
+        let other = honest(88, 3, 3);
+        let policy = Policy {
+            slots: 8,
+            protected_established: 8,
+            minimum_tenure_ms: 1,
+            max_per_prefix: 1,
+            max_per_source: 1,
+        };
+
+        let selected = select_peers(&[first, forged_duplicate, other], policy, 3_600_000 + 1_000);
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected.iter().filter(|p| p.peer_id == 77).count(), 1);
+        assert_eq!(selected.iter().filter(|p| p.peer_id == 88).count(), 1);
     }
 }

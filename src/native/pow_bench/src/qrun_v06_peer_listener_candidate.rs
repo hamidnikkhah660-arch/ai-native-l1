@@ -1,25 +1,30 @@
 //! CP-0555 bounded QFP6 authenticated peer-listener lifecycle candidate.
 //!
-//! This module provides a deliberately serial (one active peer at a time), bounded
-//! TCP accept/session loop. It rejects wildcard/public bind addresses, authenticates
-//! peers with the CP-0552 pinned Noise XX transport, creates one replay guard per
-//! authenticated connection, caps accepted sessions and requests, validates fixed-width
-//! Q6PA/Q6TA replies and ordered multi-record Q6HC history replies, and stops on shutdown.
+//! This module provides a bounded TCP accept/session loop. The Noise XX handshake stage
+//! uses a fixed four-worker pool and an eight-connection bounded queue; after handshake,
+//! one authenticated application session at a time is dispatched on the listener thread.
+//! It rejects unsafe private-mode binds, supports pinned or explicitly anonymous public
+//! inbound sessions, creates one replay guard per connection, caps sessions/requests,
+//! validates fixed-width Q6PA/Q6TA/Q6MA replies and ordered Q6HC history replies, and shuts down
+//! with cancellable handshakes and joined workers.
 //!
 //! It is a library service candidate, not a node binary, production supervisor, miner,
-//! RPC endpoint, mempool, or Mainnet release. External trust-provider callbacks must
-//! enforce their own bounded network deadlines. Only private/overlay/loopback binding
-//! is supported by this first operational qualification stage.
+//! RPC endpoint, mempool, or Mainnet release. Pinned mode restricts binds to private/overlay/
+//! loopback addresses; explicit anonymous-open mode can serve candidate public binds, but
+//! remains unauthenticated and unqualified for broad Internet exposure. External callbacks
+//! must enforce their own bounded network deadlines.
 
 use crate::{
     external_cas_anchor_candidate::ExternalCasProviderTransport,
     qrun_v06_node_runtime_candidate::{
         decode_qrun_v06_peer_block_request, process_qrun_v06_peer_block_frame,
         process_qrun_v06_peer_block_frame_with_qap1,
-        process_qrun_v06_permissionless_peer_block_frame, QRunV06NodeAnchorGate,
-        QRunV06NodeRuntime, QRunV06PeerAdmissionResponse, QRunV06PeerAdmissionStatus,
-        QRunV06PeerIngressError, QRunV06PeerReplayGuard, QRUN_V06_PEER_ADMISSION_MAGIC,
-        QRUN_V06_PEER_ADMISSION_RESPONSE_BYTES, QRUN_V06_PEER_FRAME_VERSION,
+        process_qrun_v06_permissionless_peer_block_frame,
+        process_qrun_v06_permissionless_peer_block_frame_with_quote_asset_authorization,
+        QRunV06NodeAnchorGate, QRunV06NodeRuntime, QRunV06PeerAdmissionResponse,
+        QRunV06PeerAdmissionStatus, QRunV06PeerIngressError, QRunV06PeerReplayGuard,
+        QRUN_V06_PEER_ADMISSION_MAGIC, QRUN_V06_PEER_ADMISSION_RESPONSE_BYTES,
+        QRUN_V06_PEER_FRAME_VERSION,
     },
     qrun_v06_noise_transport_candidate::{QRunV06NoiseError, QRunV06NoiseSession},
     qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessNodeRuntime,
@@ -31,10 +36,15 @@ use crate::{
     v4_fat1_trust_candidate::MlDsa65Verifier,
 };
 use std::{
-    net::{IpAddr, Ipv4Addr, TcpListener},
-    sync::atomic::{AtomicBool, Ordering},
-    thread,
-    time::Duration,
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError},
+        Arc, Mutex,
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 pub const QRUN_V06_LISTENER_MAX_SESSIONS: usize = 1024;
@@ -43,14 +53,151 @@ pub const QRUN_V06_LISTENER_MAX_FAILED_HANDSHAKES: usize = 64;
 pub const QRUN_V06_LISTENER_MAX_ACCEPT_POLL: Duration = Duration::from_millis(250);
 pub const QRUN_V06_LISTENER_MIN_ACCEPT_POLL: Duration = Duration::from_millis(10);
 
+// Pre-authentication admission is bounded independently of peer identity and trust.
+// IPv4 peers share a /24 bucket; IPv6 peers share a /56 bucket. A small global bucket
+// also bounds work when an attacker rotates source prefixes.
+const QRUN_V06_SOURCE_PREFIX_BUCKETS_MAX: usize = 4096;
+const QRUN_V06_SOURCE_PREFIX_IDLE_TTL: Duration = Duration::from_secs(600);
+const QRUN_V06_SOURCE_PREFIX_REFILL: Duration = Duration::from_secs(2);
+const QRUN_V06_GLOBAL_HANDSHAKE_BURST: usize = 64;
+const QRUN_V06_GLOBAL_HANDSHAKE_REFILL: Duration = Duration::from_millis(250);
+const QRUN_V06_HANDSHAKE_WORKERS: usize = 4;
+const QRUN_V06_HANDSHAKE_QUEUE_CAPACITY: usize = 8;
+const QRUN_V06_MAX_APPLICATION_SESSION_DURATION: Duration = Duration::from_secs(30);
+const QRUN_V06_MAX_APPLICATION_RECORD_READ_BUDGET: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+enum QRunV06PeerSourcePrefix {
+    V4([u8; 3]),
+    V6([u8; 7]),
+}
+
+impl QRunV06PeerSourcePrefix {
+    fn from_ip(ip: IpAddr) -> Self {
+        match ip {
+            IpAddr::V4(address) => {
+                let octets = address.octets();
+                Self::V4([octets[0], octets[1], octets[2]])
+            }
+            IpAddr::V6(address) => {
+                let octets = address.octets();
+                // Normalize IPv4-mapped IPv6 addresses to the same /24 as native IPv4.
+                if octets[..10].iter().all(|byte| *byte == 0)
+                    && octets[10] == 0xff
+                    && octets[11] == 0xff
+                {
+                    Self::V4([octets[12], octets[13], octets[14]])
+                } else {
+                    let mut prefix = [0u8; 7];
+                    prefix.copy_from_slice(&octets[..7]);
+                    Self::V6(prefix)
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QRunV06AdmissionBucket {
+    tokens: usize,
+    last_refill: Instant,
+    last_seen: Instant,
+}
+
+impl QRunV06AdmissionBucket {
+    fn new(capacity: usize, now: Instant) -> Self {
+        Self {
+            tokens: capacity,
+            last_refill: now,
+            last_seen: now,
+        }
+    }
+
+    fn refill(&mut self, capacity: usize, interval: Duration, now: Instant) {
+        let interval_nanos = interval.as_nanos();
+        if interval_nanos == 0 {
+            return;
+        }
+        let elapsed_nanos = now.saturating_duration_since(self.last_refill).as_nanos();
+        let intervals = elapsed_nanos / interval_nanos;
+        if intervals == 0 {
+            return;
+        }
+        let refill = usize::try_from(intervals).unwrap_or(usize::MAX);
+        self.tokens = self.tokens.saturating_add(refill).min(capacity);
+        let advance_nanos = interval_nanos.saturating_mul(intervals);
+        let advance = Duration::from_nanos(u64::try_from(advance_nanos).unwrap_or(u64::MAX));
+        self.last_refill += advance;
+    }
+}
+
+pub(crate) struct QRunV06PeerSourceRateLimiter {
+    prefixes: HashMap<QRunV06PeerSourcePrefix, QRunV06AdmissionBucket>,
+    global: QRunV06AdmissionBucket,
+}
+
+impl QRunV06PeerSourceRateLimiter {
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            prefixes: HashMap::new(),
+            global: QRunV06AdmissionBucket::new(QRUN_V06_GLOBAL_HANDSHAKE_BURST, now),
+        }
+    }
+
+    fn allow(&mut self, peer: SocketAddr, prefix_burst: usize, now: Instant) -> bool {
+        self.prefixes.retain(|_, bucket| {
+            now.saturating_duration_since(bucket.last_seen) < QRUN_V06_SOURCE_PREFIX_IDLE_TTL
+        });
+        self.global.refill(
+            QRUN_V06_GLOBAL_HANDSHAKE_BURST,
+            QRUN_V06_GLOBAL_HANDSHAKE_REFILL,
+            now,
+        );
+        if self.global.tokens == 0 {
+            return false;
+        }
+
+        let prefix = QRunV06PeerSourcePrefix::from_ip(peer.ip());
+        if !self.prefixes.contains_key(&prefix) {
+            if self.prefixes.len() >= QRUN_V06_SOURCE_PREFIX_BUCKETS_MAX {
+                if let Some(oldest) = self
+                    .prefixes
+                    .iter()
+                    .min_by_key(|(_, bucket)| bucket.last_seen)
+                    .map(|(key, _)| *key)
+                {
+                    self.prefixes.remove(&oldest);
+                }
+            }
+            self.prefixes
+                .insert(prefix, QRunV06AdmissionBucket::new(prefix_burst, now));
+        }
+
+        let bucket = self
+            .prefixes
+            .get_mut(&prefix)
+            .expect("source-prefix bucket inserted or retained");
+        bucket.refill(prefix_burst, QRUN_V06_SOURCE_PREFIX_REFILL, now);
+        bucket.last_seen = now;
+        if bucket.tokens == 0 {
+            return false;
+        }
+
+        bucket.tokens -= 1;
+        self.global.tokens -= 1;
+        true
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QRunV06PeerListenerConfig {
-    /// The number of TCP connections accepted before this supervised run returns.
-    /// Each connection is handled serially; at most one peer session is active.
+    /// The number of successfully established Noise sessions before this supervised run returns.
+    /// Failed or throttled unauthenticated connection attempts do not consume this session budget.
     pub max_sessions: usize,
-    /// The maximum number of encrypted Q6PB/Q6PA, Q6TI/Q6TA or Q6HS/Q6HC exchanges on one authenticated session.
+    /// The maximum number of encrypted Q6PB/Q6PA, Q6TI/Q6TA, Q6MO/Q6MA or Q6HS/Q6HC exchanges on one authenticated session.
     pub max_requests_per_session: usize,
-    /// Fail closed after this many unauthenticated/invalid Noise handshakes in one run.
+    /// Per-source-prefix initial handshake burst before temporary throttling.
+    /// Buckets refill one token every two seconds; this no longer shuts down the listener.
     pub max_failed_handshakes: usize,
     /// Poll interval for nonblocking accept and shutdown observation.
     pub accept_poll_interval: Duration,
@@ -111,6 +258,12 @@ pub struct QRunV06PeerListenerStats {
     /// Established Noise sessions without an operator-pinned remote static key.
     pub unverified_peer_sessions: usize,
     pub rejected_handshakes: usize,
+    /// Connections dropped before Noise because a bounded source/global admission bucket was empty.
+    pub rate_limited_connections: usize,
+    /// Connections dropped because the bounded handshake queue was full.
+    pub handshake_queue_rejections: usize,
+    /// Handshakes interrupted because the listener/supervisor was shutting down.
+    pub cancelled_handshakes: usize,
     pub requests_received: usize,
     pub responses_written: usize,
     pub handler_failures: usize,
@@ -124,6 +277,143 @@ pub struct QRunV06PeerListenerStats {
 pub struct QRunV06PeerListenerReport {
     pub stats: QRunV06PeerListenerStats,
     pub stop_reason: QRunV06PeerListenerStopReason,
+}
+
+fn application_session_record_read_budget(
+    session_deadline: Instant,
+    now: Instant,
+) -> Option<Duration> {
+    let remaining = session_deadline.saturating_duration_since(now);
+    if remaining.is_zero() {
+        None
+    } else {
+        Some(remaining.min(QRUN_V06_MAX_APPLICATION_RECORD_READ_BUDGET))
+    }
+}
+
+struct QRunV06HandshakeJob {
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+}
+
+struct QRunV06HandshakeCompletion {
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+    result: Result<QRunV06NoiseSession, QRunV06NoiseError>,
+}
+
+/// Fixed-size handshake stage. Authenticated sessions are returned to the listener thread;
+/// canonical runtime callbacks are never invoked by these workers.
+struct QRunV06HandshakeWorkerPool {
+    jobs: Option<SyncSender<QRunV06HandshakeJob>>,
+    cancelled: Arc<AtomicBool>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl QRunV06HandshakeWorkerPool {
+    fn new(
+        local_static_private_key: &[u8; 32],
+        trusted_remote_static_public_keys: &[[u8; 32]],
+        q6ar_relay_static_public_key_pins: &[[u8; 32]],
+        network_id: &[u8; 32],
+        profile_id: &[u8; 32],
+    ) -> (Self, Receiver<QRunV06HandshakeCompletion>) {
+        let (jobs_tx, jobs_rx) =
+            sync_channel::<QRunV06HandshakeJob>(QRUN_V06_HANDSHAKE_QUEUE_CAPACITY);
+        let (completed_tx, completed_rx) =
+            sync_channel::<QRunV06HandshakeCompletion>(QRUN_V06_HANDSHAKE_WORKERS);
+        let shared_jobs = Arc::new(Mutex::new(jobs_rx));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut workers = Vec::with_capacity(QRUN_V06_HANDSHAKE_WORKERS);
+
+        for _ in 0..QRUN_V06_HANDSHAKE_WORKERS {
+            let jobs_rx = Arc::clone(&shared_jobs);
+            let completed_tx = completed_tx.clone();
+            let cancelled = Arc::clone(&cancelled);
+            let local_key = zeroize::Zeroizing::new(*local_static_private_key);
+            let trusted_keys = trusted_remote_static_public_keys.to_vec();
+            let q6ar_pins = q6ar_relay_static_public_key_pins.to_vec();
+            let network = *network_id;
+            let profile = *profile_id;
+
+            workers.push(thread::spawn(move || loop {
+                let next_job = {
+                    let receiver = match jobs_rx.lock() {
+                        Ok(receiver) => receiver,
+                        Err(_) => break,
+                    };
+                    receiver.recv()
+                };
+                let job = match next_job {
+                    Ok(job) => job,
+                    Err(_) => break,
+                };
+                if cancelled.load(Ordering::Acquire) {
+                    drop(job.stream);
+                    continue;
+                }
+
+                let mut stream = job.stream;
+                let result = if trusted_keys.is_empty() {
+                    QRunV06NoiseSession::accept_unpinned_with_optional_pins_and_shutdown(
+                        &mut stream,
+                        &local_key,
+                        &network,
+                        &profile,
+                        &q6ar_pins,
+                        &cancelled,
+                    )
+                } else {
+                    QRunV06NoiseSession::accept_with_shutdown(
+                        &mut stream,
+                        &local_key,
+                        &trusted_keys,
+                        &network,
+                        &profile,
+                        &cancelled,
+                    )
+                };
+                let completion = QRunV06HandshakeCompletion {
+                    stream,
+                    peer_addr: job.peer_addr,
+                    result,
+                };
+                if completed_tx.send(completion).is_err() {
+                    break;
+                }
+            }));
+        }
+        drop(completed_tx);
+
+        (
+            Self {
+                jobs: Some(jobs_tx),
+                cancelled,
+                workers,
+            },
+            completed_rx,
+        )
+    }
+
+    fn try_submit(
+        &self,
+        job: QRunV06HandshakeJob,
+    ) -> Result<(), TrySendError<QRunV06HandshakeJob>> {
+        match self.jobs.as_ref() {
+            Some(sender) => sender.try_send(job),
+            None => Err(TrySendError::Disconnected(job)),
+        }
+    }
+}
+
+impl Drop for QRunV06HandshakeWorkerPool {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.jobs.take();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
 }
 
 fn is_shared_ipv4(ip: Ipv4Addr) -> bool {
@@ -235,6 +525,28 @@ pub fn process_qfp6_peer_frame_with_permissionless_runtime<T: TransactionAuthent
     Ok(response.encode())
 }
 
+/// Q6QA-aware Q6PB listener callback. External quote blocks are accepted only after fresh
+/// Q6TS/Q6QA authorization against the exact envelope height and independently pinned floor.
+pub fn process_qfp6_peer_frame_with_permissionless_runtime_and_quote_asset_authorization<
+    T: TransactionAuthenticator,
+>(
+    runtime: &mut QRunV06PermissionlessNodeRuntime,
+    replay_guard: &mut QRunV06PeerReplayGuard,
+    frame: &[u8],
+    authenticator: &T,
+    quote_authorizer: &mut QRunV06QuoteAssetAuthorizationProvider<'_>,
+) -> Result<[u8; QRUN_V06_PEER_ADMISSION_RESPONSE_BYTES], String> {
+    let response = process_qrun_v06_permissionless_peer_block_frame_with_quote_asset_authorization(
+        runtime,
+        replay_guard,
+        frame,
+        authenticator,
+        quote_authorizer,
+    )
+    .map_err(|error: QRunV06PeerIngressError| error.to_string())?;
+    Ok(response.encode())
+}
+
 /// Bridge one Q6PB frame to QAP1-protected QFP6 admission and encode its Q6PA response.
 /// Use this callback for a Runtime opened with recover_qap1_after_process_restart.
 pub fn process_qfp6_peer_frame_with_qap1<A, T, P, PV, AV, Q>(
@@ -265,7 +577,8 @@ where
     Ok(response.encode())
 }
 
-/// Run a bounded, serial QFP6 Noise XX accept loop over an already-bound TCP listener.
+/// Run a bounded QFP6 Noise XX accept loop with fixed, bounded handshake concurrency
+/// over an already-bound TCP listener.
 ///
 /// Requirements:
 /// - Bind only to loopback, RFC1918/private LAN, IPv6 ULA/link-local, or NetBird/shared
@@ -275,10 +588,12 @@ where
 /// - The callback must use `process_qfp6_peer_frame_with_runtime` (or an equivalent audited
 ///   admission path) and must have bounded external-provider calls.
 ///
-/// The function is intentionally single-threaded: it serializes access to the one canonical
-/// runtime/store and permits only one active peer. It does not yet provide parallel workers,
-/// a process supervisor, automatic listener binding, public peer discovery, or node shutdown
-/// orchestration. Noise handshake and record operations have their own internal deadlines.
+/// Only one established application session is processed at a time, preserving exclusive
+/// access to the canonical runtime/store. The pre-session Noise handshake uses four fixed
+/// workers and an eight-job queue; queue overflow drops the connection before handshake.
+/// Each handshake has an eight-second absolute deadline and is cancellable during shutdown.
+/// This function does not provide parallel application-state processing, a process supervisor,
+/// automatic listener binding, public peer discovery, or node shutdown orchestration.
 pub fn serve_qfp6_noise_listener<F>(
     listener: &TcpListener,
     config: QRunV06PeerListenerConfig,
@@ -287,7 +602,38 @@ pub fn serve_qfp6_noise_listener<F>(
     network_id: &[u8; 32],
     profile_id: &[u8; 32],
     shutdown: &AtomicBool,
+    on_q6pb: F,
+) -> Result<QRunV06PeerListenerReport, QRunV06PeerListenerError>
+where
+    F: FnMut(
+        &mut QRunV06PeerReplayGuard,
+        &[u8],
+    ) -> Result<[u8; QRUN_V06_PEER_ADMISSION_RESPONSE_BYTES], String>,
+{
+    let mut source_rate_limiter = QRunV06PeerSourceRateLimiter::new(Instant::now());
+    serve_qfp6_noise_listener_with_rate_limiter(
+        listener,
+        config,
+        local_static_private_key,
+        trusted_remote_static_public_keys,
+        network_id,
+        profile_id,
+        shutdown,
+        on_q6pb,
+        &mut source_rate_limiter,
+    )
+}
+
+pub(crate) fn serve_qfp6_noise_listener_with_rate_limiter<F>(
+    listener: &TcpListener,
+    config: QRunV06PeerListenerConfig,
+    local_static_private_key: &[u8; 32],
+    trusted_remote_static_public_keys: &[[u8; 32]],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    shutdown: &AtomicBool,
     mut on_q6pb: F,
+    source_rate_limiter: &mut QRunV06PeerSourceRateLimiter,
 ) -> Result<QRunV06PeerListenerReport, QRunV06PeerListenerError>
 where
     F: FnMut(
@@ -320,14 +666,15 @@ where
         if shutdown.load(Ordering::Acquire) {
             break QRunV06PeerListenerStopReason::ShutdownRequested;
         }
-        if stats.rejected_handshakes >= config.max_failed_handshakes {
-            break QRunV06PeerListenerStopReason::FailedHandshakeLimitReached;
-        }
-        if stats.accepted_connections >= config.max_sessions {
+        if stats
+            .authenticated_sessions
+            .saturating_add(stats.unverified_peer_sessions)
+            >= config.max_sessions
+        {
             break QRunV06PeerListenerStopReason::SessionLimitReached;
         }
 
-        let (mut stream, _) = match listener.accept() {
+        let (mut stream, peer_addr) = match listener.accept() {
             Ok(connection) => connection,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(config.accept_poll_interval);
@@ -336,7 +683,12 @@ where
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(QRunV06PeerListenerError::Io(error.to_string())),
         };
-        stats.accepted_connections += 1;
+        stats.accepted_connections = stats.accepted_connections.saturating_add(1);
+        if !source_rate_limiter.allow(peer_addr, config.max_failed_handshakes, Instant::now()) {
+            stats.rate_limited_connections = stats.rate_limited_connections.saturating_add(1);
+            drop(stream);
+            continue;
+        }
         if let Err(error) = stream.set_nodelay(true) {
             stats.handler_failures += 1;
             drop(stream);
@@ -380,7 +732,8 @@ where
                 | Err(QRunV06NoiseError::InvalidPrivateKey)
                 | Err(QRunV06NoiseError::EmptyTrustSet)
                 | Err(QRunV06NoiseError::OversizedTrustSet)
-                | Err(QRunV06NoiseError::DuplicateTrustedKey) => break,
+                | Err(QRunV06NoiseError::DuplicateTrustedKey)
+                | Err(QRunV06NoiseError::HandshakeCancelled) => break,
             };
             // Dispatch by the application-frame magic before invoking the handler. Both
             // protocols share a request-ID field but have distinct codecs and ACK semantics.
@@ -476,18 +829,20 @@ where
         .map_err(|error| QRunV06PeerListenerError::Io(error.to_string()))?;
 
     let mut stats = QRunV06PeerListenerStats::default();
+    let mut source_rate_limiter = QRunV06PeerSourceRateLimiter::new(Instant::now());
     const MAX_Q6HS_SESSION_EGRESS_BYTES: usize = 64 * 1024 * 1024;
     let stop_reason = loop {
         if shutdown.load(Ordering::Acquire) {
             break QRunV06PeerListenerStopReason::ShutdownRequested;
         }
-        if stats.rejected_handshakes >= config.max_failed_handshakes {
-            break QRunV06PeerListenerStopReason::FailedHandshakeLimitReached;
-        }
-        if stats.accepted_connections >= config.max_sessions {
+        if stats
+            .authenticated_sessions
+            .saturating_add(stats.unverified_peer_sessions)
+            >= config.max_sessions
+        {
             break QRunV06PeerListenerStopReason::SessionLimitReached;
         }
-        let (mut stream, _) = match listener.accept() {
+        let (mut stream, peer_addr) = match listener.accept() {
             Ok(connection) => connection,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(config.accept_poll_interval);
@@ -496,7 +851,12 @@ where
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(QRunV06PeerListenerError::Io(error.to_string())),
         };
-        stats.accepted_connections += 1;
+        stats.accepted_connections = stats.accepted_connections.saturating_add(1);
+        if !source_rate_limiter.allow(peer_addr, config.max_failed_handshakes, Instant::now()) {
+            stats.rate_limited_connections = stats.rate_limited_connections.saturating_add(1);
+            drop(stream);
+            continue;
+        }
         if stream.set_nodelay(true).is_err() {
             stats.handler_failures += 1;
             continue;
@@ -587,8 +947,8 @@ where
     Ok(QRunV06PeerListenerReport { stats, stop_reason })
 }
 
-/// Combined Q6PB/Q6TI and Q6HS listener for the permissionless production supervisor.
-/// Fixed-width admission replies remain exactly one Q6PA/Q6TA record; Q6HS replies are a
+/// Combined Q6PB/Q6TI/Q6MO and Q6HS listener for the permissionless production supervisor.
+/// Fixed-width admission replies remain exactly one Q6PA/Q6TA/Q6MA record; Q6HS replies are a
 /// prevalidated ordered Q6HC sequence. All three request families share one Noise session,
 /// replay guard, connection budget and listener socket.
 pub fn serve_qfp6_noise_listener_with_history<F>(
@@ -662,8 +1022,43 @@ pub fn serve_qfp6_noise_listener_with_history_and_q6ar_relay_pins<F, G>(
     network_id: &[u8; 32],
     profile_id: &[u8; 32],
     shutdown: &AtomicBool,
+    on_q6ar: G,
+    on_application_frame: F,
+) -> Result<QRunV06PeerListenerReport, QRunV06PeerListenerError>
+where
+    F: FnMut(&mut QRunV06PeerReplayGuard, &[u8]) -> Result<Vec<Vec<u8>>, String>,
+    G: FnMut(
+        crate::qrun_v06_peer_address_relay_candidate::Q6arReceivedAdvertisement,
+    ) -> Result<(), String>,
+{
+    let mut source_rate_limiter = QRunV06PeerSourceRateLimiter::new(Instant::now());
+    serve_qfp6_noise_listener_with_history_and_q6ar_relay_pins_with_rate_limiter(
+        listener,
+        config,
+        local_static_private_key,
+        trusted_remote_static_public_keys,
+        q6ar_relay_static_public_key_pins,
+        network_id,
+        profile_id,
+        shutdown,
+        on_q6ar,
+        on_application_frame,
+        &mut source_rate_limiter,
+    )
+}
+
+pub(crate) fn serve_qfp6_noise_listener_with_history_and_q6ar_relay_pins_with_rate_limiter<F, G>(
+    listener: &TcpListener,
+    config: QRunV06PeerListenerConfig,
+    local_static_private_key: &[u8; 32],
+    trusted_remote_static_public_keys: &[[u8; 32]],
+    q6ar_relay_static_public_key_pins: &[[u8; 32]],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    shutdown: &AtomicBool,
     mut on_q6ar: G,
     mut on_application_frame: F,
+    source_rate_limiter: &mut QRunV06PeerSourceRateLimiter,
 ) -> Result<QRunV06PeerListenerReport, QRunV06PeerListenerError>
 where
     F: FnMut(&mut QRunV06PeerReplayGuard, &[u8]) -> Result<Vec<Vec<u8>>, String>,
@@ -674,6 +1069,9 @@ where
     use crate::qrun_v06_history_sync_wire_candidate::{
         decode_q6hi_request, decode_q6hr_status, decode_q6hs_request,
         validate_q6hc_response_sequence, Q6HI_REQUEST_MAGIC, Q6HS_REQUEST_MAGIC,
+    };
+    use crate::qrun_v06_market_ingress_candidate::{
+        decode_q6ma_response, decode_q6mo_market_operation_request, Q6MO_MAGIC,
     };
     use crate::qrun_v06_noise_transport_candidate::MAX_QFP6_NOISE_RECORD_BYTES;
     use crate::qrun_v06_peer_address_relay_candidate::{
@@ -713,52 +1111,102 @@ where
 
     let mut stats = QRunV06PeerListenerStats::default();
     const MAX_HISTORY_SESSION_EGRESS_BYTES: usize = 256 * 1024 * 1024;
-    let stop_reason = loop {
+    let (handshake_workers, completed_handshakes) = QRunV06HandshakeWorkerPool::new(
+        local_static_private_key,
+        trusted_remote_static_public_keys,
+        q6ar_relay_static_public_key_pins,
+        network_id,
+        profile_id,
+    );
+    let stop_reason = 'listener: loop {
         if shutdown.load(Ordering::Acquire) {
             break QRunV06PeerListenerStopReason::ShutdownRequested;
         }
-        if stats.rejected_handshakes >= config.max_failed_handshakes {
-            break QRunV06PeerListenerStopReason::FailedHandshakeLimitReached;
-        }
-        if stats.accepted_connections >= config.max_sessions {
+        if stats
+            .authenticated_sessions
+            .saturating_add(stats.unverified_peer_sessions)
+            >= config.max_sessions
+        {
             break QRunV06PeerListenerStopReason::SessionLimitReached;
         }
-        let (mut stream, _) = match listener.accept() {
-            Ok(connection) => connection,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(config.accept_poll_interval);
+
+        // Prefer completed handshakes. All application records and canonical callbacks remain
+        // on this thread; workers only perform the bounded Noise XX authentication stage.
+        let (mut stream, _peer_addr, mut noise) = loop {
+            if shutdown.load(Ordering::Acquire) {
+                break 'listener QRunV06PeerListenerStopReason::ShutdownRequested;
+            }
+            if stats
+                .authenticated_sessions
+                .saturating_add(stats.unverified_peer_sessions)
+                >= config.max_sessions
+            {
+                break 'listener QRunV06PeerListenerStopReason::SessionLimitReached;
+            }
+
+            match completed_handshakes.try_recv() {
+                Ok(completion) => {
+                    let stream = completion.stream;
+                    let peer_addr = completion.peer_addr;
+                    let noise = match completion.result {
+                        Ok(session) => session,
+                        Err(QRunV06NoiseError::HandshakeCancelled) => {
+                            stats.cancelled_handshakes =
+                                stats.cancelled_handshakes.saturating_add(1);
+                            continue;
+                        }
+                        Err(_) => {
+                            stats.rejected_handshakes = stats.rejected_handshakes.saturating_add(1);
+                            drop(stream);
+                            continue;
+                        }
+                    };
+                    break (stream, peer_addr, noise);
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    return Err(QRunV06PeerListenerError::Io(
+                        "all QFP6 Noise handshake workers terminated".into(),
+                    ));
+                }
+            }
+
+            let (stream, peer_addr) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(config.accept_poll_interval);
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(QRunV06PeerListenerError::Io(error.to_string()));
+                }
+            };
+            stats.accepted_connections = stats.accepted_connections.saturating_add(1);
+            if !source_rate_limiter.allow(peer_addr, config.max_failed_handshakes, Instant::now()) {
+                stats.rate_limited_connections = stats.rate_limited_connections.saturating_add(1);
+                drop(stream);
                 continue;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(QRunV06PeerListenerError::Io(error.to_string())),
-        };
-        stats.accepted_connections += 1;
-        if stream.set_nodelay(true).is_err() {
-            stats.handler_failures += 1;
-            continue;
-        }
-        let session = if trusted_remote_static_public_keys.is_empty() {
-            QRunV06NoiseSession::accept_unpinned_with_optional_pins(
-                &mut stream,
-                local_static_private_key,
-                network_id,
-                profile_id,
-                q6ar_relay_static_public_key_pins,
-            )
-        } else {
-            QRunV06NoiseSession::accept(
-                &mut stream,
-                local_static_private_key,
-                trusted_remote_static_public_keys,
-                network_id,
-                profile_id,
-            )
-        };
-        let mut noise = match session {
-            Ok(session) => session,
-            Err(_) => {
-                stats.rejected_handshakes += 1;
+            if stream.set_nodelay(true).is_err() {
+                stats.handler_failures = stats.handler_failures.saturating_add(1);
+                drop(stream);
                 continue;
+            }
+            let job = QRunV06HandshakeJob { stream, peer_addr };
+            match handshake_workers.try_submit(job) {
+                Ok(()) => {}
+                Err(TrySendError::Full(job)) => {
+                    stats.handshake_queue_rejections =
+                        stats.handshake_queue_rejections.saturating_add(1);
+                    drop(job.stream);
+                }
+                Err(TrySendError::Disconnected(job)) => {
+                    drop(job.stream);
+                    return Err(QRunV06PeerListenerError::Io(
+                        "QFP6 Noise handshake worker queue disconnected".into(),
+                    ));
+                }
             }
         };
         if noise.remote_static_key_pinned() {
@@ -769,11 +1217,17 @@ where
         let mut replay_guard = QRunV06PeerReplayGuard::new();
         let mut session_history_egress = 0usize;
         let mut q6ar_seen = false;
+        let session_deadline = Instant::now() + QRUN_V06_MAX_APPLICATION_SESSION_DURATION;
         for _ in 0..config.max_requests_per_session {
             if shutdown.load(Ordering::Acquire) {
                 break;
             }
-            let frame = match noise.read_record(&mut stream) {
+            let read_budget =
+                match application_session_record_read_budget(session_deadline, Instant::now()) {
+                    Some(budget) => budget,
+                    None => break,
+                };
+            let frame = match noise.read_record_with_budget(&mut stream, read_budget) {
                 Ok(frame) => frame,
                 Err(_) => break,
             };
@@ -806,49 +1260,58 @@ where
                     }
                 }
             }
-            let (request_id, is_history, is_info) = if frame.get(..4) == Some(&Q6HI_REQUEST_MAGIC) {
-                match decode_q6hi_request(&frame) {
-                    Ok(request)
-                        if request.network_id == *network_id
-                            && request.profile_id == *profile_id =>
-                    {
-                        (request.request_id, false, true)
+            let (request_id, is_history, is_info, is_market) =
+                if frame.get(..4) == Some(&Q6HI_REQUEST_MAGIC) {
+                    match decode_q6hi_request(&frame) {
+                        Ok(request)
+                            if request.network_id == *network_id
+                                && request.profile_id == *profile_id =>
+                        {
+                            (request.request_id, false, true, false)
+                        }
+                        _ => {
+                            stats.handler_failures += 1;
+                            break;
+                        }
                     }
-                    _ => {
-                        stats.handler_failures += 1;
-                        break;
+                } else if frame.get(..4) == Some(&Q6HS_REQUEST_MAGIC) {
+                    match decode_q6hs_request(&frame) {
+                        Ok(request)
+                            if request.network_id == *network_id
+                                && request.profile_id == *profile_id =>
+                        {
+                            (request.request_id, true, false, false)
+                        }
+                        _ => {
+                            stats.handler_failures += 1;
+                            break;
+                        }
                     }
-                }
-            } else if frame.get(..4) == Some(&Q6HS_REQUEST_MAGIC) {
-                match decode_q6hs_request(&frame) {
-                    Ok(request)
-                        if request.network_id == *network_id
-                            && request.profile_id == *profile_id =>
-                    {
-                        (request.request_id, true, false)
+                } else if frame.get(..4) == Some(&Q6MO_MAGIC) {
+                    match decode_q6mo_market_operation_request(&frame) {
+                        Ok(request) => (request.request_id, false, false, true),
+                        Err(_) => {
+                            stats.handler_failures += 1;
+                            break;
+                        }
                     }
-                    _ => {
-                        stats.handler_failures += 1;
-                        break;
+                } else if frame.get(..4) == Some(&Q6TI_MAGIC) {
+                    match decode_q6ti_transaction_request(&frame) {
+                        Ok(request) => (request.request_id, false, false, false),
+                        Err(_) => {
+                            stats.handler_failures += 1;
+                            break;
+                        }
                     }
-                }
-            } else if frame.get(..4) == Some(&Q6TI_MAGIC) {
-                match decode_q6ti_transaction_request(&frame) {
-                    Ok(request) => (request.request_id, false, false),
-                    Err(_) => {
-                        stats.handler_failures += 1;
-                        break;
+                } else {
+                    match decode_qrun_v06_peer_block_request(&frame) {
+                        Ok(request) => (request.request_id, false, false, false),
+                        Err(_) => {
+                            stats.handler_failures += 1;
+                            break;
+                        }
                     }
-                }
-            } else {
-                match decode_qrun_v06_peer_block_request(&frame) {
-                    Ok(request) => (request.request_id, false, false),
-                    Err(_) => {
-                        stats.handler_failures += 1;
-                        break;
-                    }
-                }
-            };
+                };
             stats.requests_received += 1;
             if (is_history || is_info) && replay_guard.accept(request_id).is_err() {
                 stats.handler_failures += 1;
@@ -881,6 +1344,12 @@ where
                         .and_then(|request| decode_q6hr_status(&responses[0], &request).ok())
                         .is_some();
                 if !valid_status {
+                    stats.malformed_responses += 1;
+                    break;
+                }
+            } else if is_market {
+                if responses.len() != 1 || decode_q6ma_response(&responses[0], request_id).is_err()
+                {
                     stats.malformed_responses += 1;
                     break;
                 }
@@ -968,7 +1437,7 @@ mod tests {
     use snow::Builder;
     use std::{
         net::{Ipv6Addr, SocketAddr, TcpStream},
-        sync::atomic::AtomicBool,
+        sync::{atomic::AtomicBool, Arc},
         thread,
         time::{Duration, Instant},
     };
@@ -1009,6 +1478,223 @@ mod tests {
                 Err(error) => panic!("listener did not accept local test connection: {error}"),
             }
         }
+    }
+
+    #[test]
+    fn application_session_has_absolute_lifetime_and_per_record_read_budget() {
+        let now = Instant::now();
+        let long_session_deadline = now + Duration::from_secs(60);
+        assert_eq!(
+            application_session_record_read_budget(long_session_deadline, now),
+            Some(QRUN_V06_MAX_APPLICATION_RECORD_READ_BUDGET)
+        );
+
+        let short_remaining = Duration::from_secs(2);
+        assert_eq!(
+            application_session_record_read_budget(now + short_remaining, now,),
+            Some(short_remaining)
+        );
+        assert_eq!(
+            application_session_record_read_budget(now, now + Duration::from_nanos(1),),
+            None
+        );
+    }
+
+    #[test]
+    fn bounded_handshake_workers_allow_valid_peers_while_one_peer_stalls() {
+        let (server_private, server_public) = keypair();
+        let (client_a_private, client_a_public) = keypair();
+        let (client_b_private, client_b_public) = keypair();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let (workers, completed) = QRunV06HandshakeWorkerPool::new(
+            &server_private,
+            &[client_a_public, client_b_public],
+            &[],
+            &NETWORK,
+            &PROFILE,
+        );
+
+        // This connection deliberately never sends the first Noise message. It occupies
+        // one worker, but must not block the two other bounded handshake workers.
+        let slow_stream = TcpStream::connect(address).unwrap();
+        let client_a = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            QRunV06NoiseSession::connect(
+                &mut stream,
+                &client_a_private,
+                &server_public,
+                &NETWORK,
+                &PROFILE,
+            )
+            .unwrap();
+        });
+        let client_b = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            QRunV06NoiseSession::connect(
+                &mut stream,
+                &client_b_private,
+                &server_public,
+                &NETWORK,
+                &PROFILE,
+            )
+            .unwrap();
+        });
+
+        let mut accepted = 0usize;
+        let accept_deadline = Instant::now() + Duration::from_secs(2);
+        while accepted < 3 && Instant::now() < accept_deadline {
+            match listener.accept() {
+                Ok((stream, peer_addr)) => {
+                    stream.set_nodelay(true).unwrap();
+                    workers
+                        .try_submit(QRunV06HandshakeJob { stream, peer_addr })
+                        .unwrap();
+                    accepted += 1;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("loopback accept failed: {error}"),
+            }
+        }
+        assert_eq!(accepted, 3, "all three test sockets must be queued");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut completed_keys = Vec::new();
+        while completed_keys.len() < 2 && Instant::now() < deadline {
+            match completed.recv_timeout(Duration::from_millis(50)) {
+                Ok(completion) => match completion.result {
+                    Ok(session) => {
+                        assert!(session.remote_static_key_pinned());
+                        completed_keys.push(*session.remote_static_public_key());
+                        drop(session);
+                        drop(completion.stream);
+                    }
+                    Err(error) => panic!("valid peer handshake unexpectedly failed: {error:?}"),
+                },
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(error) => panic!("handshake completion channel closed: {error}"),
+            }
+        }
+        completed_keys.sort_unstable();
+        let mut expected_keys = vec![client_a_public, client_b_public];
+        expected_keys.sort_unstable();
+        assert_eq!(completed_keys, expected_keys);
+
+        client_a.join().unwrap();
+        client_b.join().unwrap();
+        drop(slow_stream);
+        // Dropping the pool cancels its stalled worker and joins every fixed worker.
+        drop(workers);
+    }
+
+    #[test]
+    fn bounded_handshake_worker_queue_rejects_connections_above_fixed_capacity() {
+        let (server_private, _) = keypair();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (workers, _completed) =
+            QRunV06HandshakeWorkerPool::new(&server_private, &[], &[], &NETWORK, &PROFILE);
+
+        let mut clients = Vec::new();
+        for _ in 0..QRUN_V06_HANDSHAKE_WORKERS {
+            let client = TcpStream::connect(address).unwrap();
+            let (stream, peer_addr) = listener.accept().unwrap();
+            assert!(workers
+                .try_submit(QRunV06HandshakeJob { stream, peer_addr })
+                .is_ok());
+            clients.push(client);
+        }
+
+        // Let each fixed worker take one job and block on the incomplete Noise message.
+        thread::sleep(Duration::from_millis(150));
+
+        for _ in 0..QRUN_V06_HANDSHAKE_QUEUE_CAPACITY {
+            let client = TcpStream::connect(address).unwrap();
+            let (stream, peer_addr) = listener.accept().unwrap();
+            assert!(workers
+                .try_submit(QRunV06HandshakeJob { stream, peer_addr })
+                .is_ok());
+            clients.push(client);
+        }
+
+        let overflow_client = TcpStream::connect(address).unwrap();
+        let (overflow_stream, overflow_peer) = listener.accept().unwrap();
+        assert!(matches!(
+            workers.try_submit(QRunV06HandshakeJob {
+                stream: overflow_stream,
+                peer_addr: overflow_peer,
+            }),
+            Err(TrySendError::Full(_))
+        ));
+        drop(overflow_client);
+
+        // Worker-pool shutdown cancels active handshakes and discards queued jobs.
+        drop(workers);
+        drop(clients);
+    }
+
+    #[test]
+    fn source_rate_limiter_groups_ipv4_and_ipv6_prefixes_and_refills() {
+        let now = Instant::now();
+        let mut limiter = QRunV06PeerSourceRateLimiter::new(now);
+        let socket = |ip| SocketAddr::new(ip, 8333);
+
+        assert!(limiter.allow(socket(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))), 2, now,));
+        assert!(limiter.allow(socket(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 250))), 2, now,));
+        assert!(!limiter.allow(socket(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 99))), 2, now,));
+        assert!(limiter.allow(socket(IpAddr::V4(Ipv4Addr::new(198, 51, 101, 7))), 2, now,));
+
+        // An IPv4-mapped IPv6 socket shares the native IPv4 /24 bucket.
+        let mapped = "::ffff:198.51.100.9".parse::<Ipv6Addr>().unwrap();
+        assert!(limiter.allow(socket(IpAddr::V6(mapped)), 2, now + Duration::from_secs(2),));
+
+        let first_v6 = "2001:db8:abcd:0001::1".parse::<Ipv6Addr>().unwrap();
+        let second_v6 = "2001:db8:abcd:00ff::2".parse::<Ipv6Addr>().unwrap();
+        let third_v6 = "2001:db8:abcd:0080::3".parse::<Ipv6Addr>().unwrap();
+        let v6_time = now + Duration::from_secs(3);
+        assert!(limiter.allow(socket(IpAddr::V6(first_v6)), 2, v6_time));
+        assert!(limiter.allow(socket(IpAddr::V6(second_v6)), 2, v6_time));
+        assert!(!limiter.allow(socket(IpAddr::V6(third_v6)), 2, v6_time));
+    }
+
+    #[test]
+    fn source_rate_limiter_applies_global_budget_and_bounds_prefix_state() {
+        let now = Instant::now();
+        let mut limiter = QRunV06PeerSourceRateLimiter::new(now);
+        for index in 0..QRUN_V06_GLOBAL_HANDSHAKE_BURST {
+            let ip = Ipv4Addr::new(11, index as u8, 1, 1);
+            assert!(limiter.allow(
+                SocketAddr::new(IpAddr::V4(ip), 8333),
+                QRUN_V06_LISTENER_MAX_FAILED_HANDSHAKES,
+                now,
+            ));
+        }
+        assert!(!limiter.allow(
+            "12.0.0.1:8333".parse().unwrap(),
+            QRUN_V06_LISTENER_MAX_FAILED_HANDSHAKES,
+            now,
+        ));
+        assert!(limiter.allow(
+            "12.0.0.1:8333".parse().unwrap(),
+            QRUN_V06_LISTENER_MAX_FAILED_HANDSHAKES,
+            now + QRUN_V06_GLOBAL_HANDSHAKE_REFILL,
+        ));
+
+        let mut bounded = QRunV06PeerSourceRateLimiter::new(now);
+        for index in 0..(QRUN_V06_SOURCE_PREFIX_BUCKETS_MAX + 8) {
+            bounded.global.tokens = QRUN_V06_GLOBAL_HANDSHAKE_BURST;
+            let ip = Ipv4Addr::new(10, (index >> 8) as u8, index as u8, 1);
+            assert!(bounded.allow(
+                SocketAddr::new(IpAddr::V4(ip), 8333),
+                QRUN_V06_LISTENER_MAX_FAILED_HANDSHAKES,
+                now + Duration::from_millis(index as u64),
+            ));
+        }
+        assert_eq!(bounded.prefixes.len(), QRUN_V06_SOURCE_PREFIX_BUCKETS_MAX);
     }
 
     #[test]
@@ -1378,7 +2064,8 @@ mod tests {
         let (unexpected_client_private, _) = keypair();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let shutdown = AtomicBool::new(false);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = Arc::clone(&shutdown);
         let server = thread::spawn(move || {
             let mut handler_calls = 0usize;
             let mut handler = |_guard: &mut QRunV06PeerReplayGuard, _frame: &[u8]| {
@@ -1400,7 +2087,7 @@ mod tests {
                 &[pinned_client_public],
                 &NETWORK,
                 &PROFILE,
-                &shutdown,
+                &server_shutdown,
                 &mut handler,
             )
             .unwrap();
@@ -1417,6 +2104,8 @@ mod tests {
             &PROFILE,
         );
         drop(stream);
+        thread::sleep(Duration::from_millis(100));
+        shutdown.store(true, Ordering::Release);
 
         let (report, handler_calls) = server.join().unwrap();
         assert_eq!(handler_calls, 0);
@@ -1425,9 +2114,77 @@ mod tests {
         assert_eq!(report.stats.rejected_handshakes, 1);
         assert_eq!(
             report.stop_reason,
-            QRunV06PeerListenerStopReason::FailedHandshakeLimitReached
+            QRunV06PeerListenerStopReason::ShutdownRequested
         );
         let _ = pinned_client_private;
+    }
+
+    #[test]
+    fn qfp6_listener_keeps_running_after_prefix_flood_and_throttles_source() {
+        let (server_private, server_public) = keypair();
+        let (_pinned_client_private, pinned_client_public) = keypair();
+        let (attacker_one_private, _) = keypair();
+        let (attacker_two_private, _) = keypair();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = Arc::clone(&shutdown);
+        let server = thread::spawn(move || {
+            let mut handler_calls = 0usize;
+            let mut handler = |_guard: &mut QRunV06PeerReplayGuard, _frame: &[u8]| {
+                handler_calls += 1;
+                Ok(make_response(
+                    1,
+                    QRunV06PeerAdmissionStatus::Accepted as u16,
+                ))
+            };
+            let report = serve_qfp6_noise_listener(
+                &listener,
+                QRunV06PeerListenerConfig {
+                    max_sessions: 8,
+                    max_requests_per_session: 1,
+                    max_failed_handshakes: 2,
+                    accept_poll_interval: Duration::from_millis(10),
+                },
+                &server_private,
+                &[pinned_client_public],
+                &NETWORK,
+                &PROFILE,
+                &server_shutdown,
+                &mut handler,
+            )
+            .unwrap();
+            (report, handler_calls)
+        });
+
+        for attacker_private in [attacker_one_private, attacker_two_private] {
+            let mut stream = connect_until(address);
+            let _ = QRunV06NoiseSession::connect(
+                &mut stream,
+                &attacker_private,
+                &server_public,
+                &NETWORK,
+                &PROFILE,
+            );
+            drop(stream);
+        }
+
+        // The third connection is accepted by TCP but dropped before Noise by the /24 bucket.
+        let throttled = connect_until(address);
+        drop(throttled);
+        thread::sleep(Duration::from_millis(100));
+        shutdown.store(true, Ordering::Release);
+
+        let (report, handler_calls) = server.join().unwrap();
+        assert_eq!(handler_calls, 0);
+        assert_eq!(report.stats.accepted_connections, 3);
+        assert_eq!(report.stats.authenticated_sessions, 0);
+        assert_eq!(report.stats.rejected_handshakes, 2);
+        assert_eq!(report.stats.rate_limited_connections, 1);
+        assert_eq!(
+            report.stop_reason,
+            QRunV06PeerListenerStopReason::ShutdownRequested
+        );
     }
 
     #[test]
@@ -1752,6 +2509,695 @@ mod tests {
         assert_eq!(report.stats.requests_received, 1);
         assert_eq!(report.stats.responses_written, 3);
     }
+    #[test]
+    fn qfp6_noise_q6pb_listener_rejects_unqualified_quote_then_accepts_height_bound_q6qa() {
+        use crate::{
+            consensus::{ConsensusParameters, Uint256},
+            external_cas_anchor_candidate::ExternalCasPin,
+            qrun_v06_asset_registry_candidate::{
+                AssetRegistration, AssetSupplyPolicy, AssetTrustPolicy,
+            },
+            qrun_v06_canonical_execution_candidate::{
+                QRunV06BlockOperation, QRunV06CanonicalExecutionState,
+            },
+            qrun_v06_cp0651_supply_candidate::Cp0651FixedSupply,
+            qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
+            qrun_v06_miner_candidate::mine_qfp6_block_on_tip_with_quote_asset_authorization,
+            qrun_v06_node_runtime_candidate::encode_qrun_v06_peer_block_request,
+            qrun_v06_orderbook_candidate::{
+                QRunV06OrderBookOperation, QRunV06SignedOrderBookOperation,
+            },
+            qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessNodeRuntime,
+            qrun_v06_profile_pin_candidate::{
+                QRunV06ProfilePinCandidate, QRunV06QuoteAssetTrustPin,
+            },
+            qrun_v06_profile_trust_candidate::{
+                authorize_qrun_v06_profile_pin, MonotonicQRunV06ProfileTrustFloorStore,
+                PinnedQRunV06ProfileTrustAuthority, QRunV06FreshQuoteAssetAuthorizationProvider,
+                QRunV06ProfileTrustError, QRunV06ProfileTrustRecord, QRunV06ProfileTrustSource,
+                QRunV06ProfileTrustStatus, QRunV06SignedProfileTrustEnvelope,
+                TrustedQRunV06ProfileTrustFloor,
+            },
+            qrun_v06_quote_asset_qualification_candidate::{
+                CustodyModel, QRunV06QuoteAssetQualificationCandidate,
+                QRunV06SignedQuoteAssetQualificationCandidate, QualificationStatus,
+                RedemptionModel,
+            },
+            state_machine::{AccountId, TransactionAuthenticator},
+            v4_fat1_mldsa65_candidate::LibcruxMlDsa65VerifierCandidate,
+            v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES,
+        };
+        use ed25519_dalek::{Signature as Ed25519Signature, Signer, SigningKey, VerifyingKey};
+        use libcrux_ml_dsa::ml_dsa_65::portable;
+        use std::{
+            fs,
+            sync::atomic::{AtomicUsize, Ordering},
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        const OWNER: [u8; 32] = [0xA3; 32];
+        const PRODUCER: [u8; 32] = [0xA4; 32];
+
+        struct DigestAuthenticator;
+        struct Q6QaEd25519Authenticator {
+            account: AccountId,
+            key: VerifyingKey,
+        }
+        impl TransactionAuthenticator for Q6QaEd25519Authenticator {
+            fn verify(
+                &self,
+                sender: &AccountId,
+                digest: &[u8; 32],
+                signature: &[u8],
+            ) -> Result<(), ()> {
+                if sender != &self.account {
+                    return Err(());
+                }
+                let signature = Ed25519Signature::from_slice(signature).map_err(|_| ())?;
+                self.key.verify_strict(digest, &signature).map_err(|_| ())
+            }
+        }
+
+        struct LocalTestTrustFloor {
+            floor: TrustedQRunV06ProfileTrustFloor,
+        }
+        impl MonotonicQRunV06ProfileTrustFloorStore for LocalTestTrustFloor {
+            fn load(
+                &self,
+                network_id: &[u8; 32],
+                profile_id: &[u8; 32],
+            ) -> Result<TrustedQRunV06ProfileTrustFloor, QRunV06ProfileTrustError> {
+                if &self.floor.network_id != network_id || &self.floor.profile_id != profile_id {
+                    return Err(QRunV06ProfileTrustError::WrongNetworkOrProfile);
+                }
+                Ok(self.floor.clone())
+            }
+
+            fn compare_and_swap(
+                &mut self,
+                expected: &TrustedQRunV06ProfileTrustFloor,
+                next: &TrustedQRunV06ProfileTrustFloor,
+            ) -> Result<(), QRunV06ProfileTrustError> {
+                if &self.floor != expected {
+                    return Err(QRunV06ProfileTrustError::FloorCasConflict);
+                }
+                self.floor = next.clone();
+                Ok(())
+            }
+        }
+
+        struct LocalTestTrustSource {
+            envelope: Vec<u8>,
+            reads: Arc<AtomicUsize>,
+        }
+        impl QRunV06ProfileTrustSource for LocalTestTrustSource {
+            type Error = String;
+
+            fn read_current_signed_record(
+                &mut self,
+                network_id: &[u8; 32],
+                profile_id: &[u8; 32],
+            ) -> Result<Vec<u8>, Self::Error> {
+                if network_id != &NETWORK || profile_id != &PROFILE {
+                    return Err("wrong test trust-source scope".into());
+                }
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                Ok(self.envelope.clone())
+            }
+        }
+        impl TransactionAuthenticator for DigestAuthenticator {
+            fn verify(
+                &self,
+                sender: &AccountId,
+                digest: &[u8; 32],
+                signature: &[u8],
+            ) -> Result<(), ()> {
+                if *sender != [0; 32] && signature == digest {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+        }
+
+        let mut params = ConsensusParameters::qrun_v06_cp0651_fee_only_candidate().unwrap();
+        params.target_block_time_secs = 30;
+        params.difficulty_window_blocks = 2;
+        params.difficulty_min_ratio_divisor = 4;
+        params.difficulty_max_ratio = 4;
+        params.initial_target = Uint256::from_be_bytes([0x7F; 32]);
+        params.pow_limit = Uint256::MAX;
+        params.validate().unwrap();
+
+        let cp0651_policy = Cp0651FixedSupply::genesis(NETWORK, OWNER).unwrap();
+        let descriptor = QRunV06GenesisDescriptor::new(
+            NETWORK,
+            PROFILE,
+            OWNER,
+            1,
+            crate::qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint(&params).unwrap(),
+            cp0651_policy.policy_fingerprint(),
+        )
+        .unwrap();
+        let genesis = QRunV06CanonicalExecutionState::cp0651_genesis_candidate_with_descriptor(
+            descriptor.clone(),
+        )
+        .unwrap();
+        // Keep an exact Genesis/consensus copy for a post-listener durable-store reopen.
+        let genesis_for_recovery = genesis.clone();
+        let params_for_recovery = params.clone();
+
+        // Deterministic test-only authority keys. Q6TS is genuinely signed by Ed25519 and
+        // ML-DSA-65; Q6QA is genuinely signed by its pinned Ed25519 authority key.
+        let trust_ed_signing_key = SigningKey::from_bytes(&[0x61; 32]);
+        let trust_pq_keypair = portable::generate_key_pair([0x62; 32]);
+        let trust_authority = PinnedQRunV06ProfileTrustAuthority {
+            ed25519_public_key: trust_ed_signing_key.verifying_key().to_bytes(),
+            mldsa65_public_key: *trust_pq_keypair.verification_key.as_ref(),
+        };
+        let trust_pq_verifier = LibcruxMlDsa65VerifierCandidate;
+        let quote_signing_key = SigningKey::from_bytes(&[0x71; 32]);
+        let quote_authority_account = [0x95; 32];
+        let quote_authority_key_id = [0x96; 32];
+        let quote_authenticator = Q6QaEd25519Authenticator {
+            account: quote_authority_account,
+            key: quote_signing_key.verifying_key(),
+        };
+
+        let directory = std::env::temp_dir().join(format!(
+            "qfp6-q6qa-noise-listener-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let authenticator = DigestAuthenticator;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut base_registration = AssetRegistration {
+            network_id: NETWORK,
+            issuer: OWNER,
+            issuer_nonce: 1,
+            salt: [0xC1; 32],
+            name: "Q6QA Listener Base".into(),
+            symbol: "Q6LB".into(),
+            decimals: 8,
+            supply_policy: AssetSupplyPolicy::Fixed {
+                total_supply: 10_000,
+            },
+            initial_supply: 10_000,
+            initial_recipient: OWNER,
+            trust_policy: AssetTrustPolicy::Unverified,
+            expires_at: timestamp + 3_600,
+            signature: Vec::new(),
+        };
+        base_registration.signature = base_registration.signing_digest().unwrap().to_vec();
+        let base_asset = base_registration.asset_id();
+
+        let mut quote_registration = AssetRegistration {
+            network_id: NETWORK,
+            issuer: OWNER,
+            issuer_nonce: 2,
+            salt: [0xC2; 32],
+            name: "Q6QA Listener External Quote".into(),
+            symbol: "Q6LQ".into(),
+            decimals: 6,
+            supply_policy: AssetSupplyPolicy::Fixed {
+                total_supply: 10_000,
+            },
+            initial_supply: 10_000,
+            initial_recipient: OWNER,
+            trust_policy: AssetTrustPolicy::Unverified,
+            expires_at: timestamp + 3_600,
+            signature: Vec::new(),
+        };
+        quote_registration.signature = quote_registration.signing_digest().unwrap().to_vec();
+        let quote_asset = quote_registration.asset_id();
+
+        let mut create_pair = QRunV06SignedOrderBookOperation {
+            network_id: NETWORK,
+            sender: OWNER,
+            nonce: 1,
+            expires_at: timestamp + 3_600,
+            operation: QRunV06OrderBookOperation::CreatePair {
+                base: base_asset,
+                quote: quote_asset,
+                base_lot_atoms: 1,
+                quote_tick_atoms: 1,
+                max_price_ticks: 1_000,
+                max_quantity_lots: 1_000,
+                min_notional: 1,
+                maker_fee_bps: 10,
+                taker_fee_bps: 20,
+                fee_collector: PRODUCER,
+            },
+            signature: Vec::new(),
+        };
+        create_pair.signature = create_pair.signing_digest().unwrap().to_vec();
+        let operations = vec![
+            QRunV06BlockOperation::AssetRegistration(base_registration),
+            QRunV06BlockOperation::AssetRegistration(quote_registration),
+            QRunV06BlockOperation::OrderBook(create_pair),
+        ];
+
+        let q6qa_record = QRunV06QuoteAssetQualificationCandidate {
+            network_id: NETWORK,
+            profile_id: PROFILE,
+            asset_id: quote_asset,
+            external_chain_id: [0xC3; 32],
+            issuer_id: [0xC4; 32],
+            custodian_id: [0xC5; 32],
+            bridge_id: [0; 32],
+            reserve_evidence_digest: [0xC6; 32],
+            redemption_evidence_digest: [0xC7; 32],
+            control_risk_evidence_digest: [0xC8; 32],
+            authority_key_id: quote_authority_key_id,
+            authority_account: quote_authority_account,
+            qualification_epoch: 1,
+            valid_from_height: 1,
+            valid_until_height: 100,
+            decimals: 6,
+            custody_model: CustodyModel::IndependentCustodian,
+            redemption_model: RedemptionModel::CustodianRedemption,
+            status: QualificationStatus::Approved,
+            contract_address: vec![0xC9; 20],
+            symbol: "TQ6A".into(),
+            representation: "Test quote asset on isolated fixture chain".into(),
+        };
+        let q6qa_digest = q6qa_record.signing_digest().unwrap();
+        let q6qa_signature = quote_signing_key.sign(&q6qa_digest).to_bytes().to_vec();
+        let q6qa_bundle = QRunV06SignedQuoteAssetQualificationCandidate {
+            record: q6qa_record,
+            signature: q6qa_signature,
+        };
+        let q6qa_bytes = q6qa_bundle.encode().unwrap();
+        let q6qa_commitment = q6qa_bundle.commitment().unwrap();
+
+        let quote_pin = QRunV06QuoteAssetTrustPin::new(
+            1,
+            q6qa_commitment,
+            quote_asset,
+            quote_authority_key_id,
+            quote_authority_account,
+            1,
+        )
+        .unwrap();
+        let profile_pin = QRunV06ProfilePinCandidate::new_with_quote_asset_trust_pin(
+            descriptor.clone(),
+            ExternalCasPin {
+                provider_id: [0xB1; 32],
+                network_id: NETWORK,
+                genesis_digest: [0xB2; 32],
+                receipt_key_id: [0xB3; 32],
+                receipt_public_key: [0xB4; ML_DSA_65_PUBLIC_KEY_BYTES],
+            },
+            quote_pin,
+        )
+        .unwrap();
+        let profile_pin_bytes = profile_pin.encode().unwrap();
+        let profile_pin_commitment = profile_pin.commitment().unwrap();
+        assert_eq!(
+            u16::from_be_bytes([profile_pin_bytes[4], profile_pin_bytes[5]]),
+            2,
+            "Q6QA commitment must be carried by Q6PN v2"
+        );
+        let q6ts_record = QRunV06ProfileTrustRecord {
+            trust_epoch: 1,
+            status: QRunV06ProfileTrustStatus::Active,
+            network_id: NETWORK,
+            profile_id: PROFILE,
+            profile_pin_commitment,
+            previous_record_id: [0; 32],
+        };
+        let authority_keyset_id = trust_authority.keyset_id().unwrap();
+        let q6ts_digest = q6ts_record.signing_digest(&authority_keyset_id).unwrap();
+        let q6ts_ed25519_signature = trust_ed_signing_key.sign(&q6ts_digest).to_bytes();
+        let q6ts_mldsa65_signature =
+            portable::sign(&trust_pq_keypair.signing_key, &q6ts_digest, &[], [0x63; 32]).unwrap();
+        let q6ts_envelope = QRunV06SignedProfileTrustEnvelope {
+            record: q6ts_record.clone(),
+            authority_keyset_id,
+            ed25519_signature: q6ts_ed25519_signature,
+            mldsa65_signature: *q6ts_mldsa65_signature.as_ref(),
+        };
+        let q6ts_bytes = q6ts_envelope.encode().unwrap().to_vec();
+        let floor_seed = TrustedQRunV06ProfileTrustFloor::provisioned(
+            NETWORK,
+            PROFILE,
+            1,
+            QRunV06ProfileTrustStatus::Active,
+            q6ts_record.record_id().unwrap(),
+            q6ts_envelope.envelope_id().unwrap(),
+        )
+        .unwrap();
+
+        // Startup requires the Q6TS profile commitment to be already pinned; node startup never
+        // advances this floor. The floor implementation here is an in-memory test double only.
+        let mut startup_floor = LocalTestTrustFloor {
+            floor: floor_seed.clone(),
+        };
+        let authorized_profile = authorize_qrun_v06_profile_pin(
+            Some(&profile_pin_bytes),
+            &q6ts_bytes,
+            &trust_authority,
+            &trust_pq_verifier,
+            &mut startup_floor,
+            NETWORK,
+            PROFILE,
+        )
+        .unwrap();
+        let startup_reads = Arc::new(AtomicUsize::new(0));
+        let mut startup_source = LocalTestTrustSource {
+            envelope: q6ts_bytes.clone(),
+            reads: startup_reads,
+        };
+        let mut startup_quote_provider = QRunV06FreshQuoteAssetAuthorizationProvider::new(
+            &profile_pin_bytes,
+            &q6qa_bytes,
+            &trust_authority,
+            &trust_pq_verifier,
+            &mut startup_floor,
+            &mut startup_source,
+            &quote_authenticator,
+        );
+        let mut startup_authorizer =
+            |parent: &QRunV06CanonicalExecutionState,
+             block: &crate::qrun_v06_canonical_execution_candidate::QRunV06Block,
+             asset_id: [u8; 32]| {
+                startup_quote_provider
+                    .authorize_for_block(
+                        &parent.network_id(),
+                        &parent.profile_id(),
+                        &asset_id,
+                        block.height,
+                    )
+                    .map_err(|error| format!("startup Q6TS/Q6QA verification failed: {error:?}"))
+            };
+        let runtime = QRunV06PermissionlessNodeRuntime::open_with_quote_asset_authorization(
+            &directory,
+            genesis,
+            params,
+            &authenticator,
+            None,
+            &authorized_profile,
+            &mut startup_authorizer,
+        )
+        .unwrap();
+        drop(startup_authorizer);
+        drop(startup_quote_provider);
+
+        let graph = runtime.fork_choice_snapshot().unwrap();
+        let parent_tip = graph.canonical_tip().tip_hash;
+        let mining_reads = Arc::new(AtomicUsize::new(0));
+        let mut mining_source = LocalTestTrustSource {
+            envelope: q6ts_bytes.clone(),
+            reads: mining_reads.clone(),
+        };
+        let mut mining_floor = LocalTestTrustFloor {
+            floor: floor_seed.clone(),
+        };
+        let mut mining_quote_provider = QRunV06FreshQuoteAssetAuthorizationProvider::new(
+            &profile_pin_bytes,
+            &q6qa_bytes,
+            &trust_authority,
+            &trust_pq_verifier,
+            &mut mining_floor,
+            &mut mining_source,
+            &quote_authenticator,
+        );
+        let mut mining_authorizer =
+            |parent: &QRunV06CanonicalExecutionState,
+             block: &crate::qrun_v06_canonical_execution_candidate::QRunV06Block,
+             asset_id: [u8; 32]| {
+                mining_quote_provider
+                    .authorize_for_block(
+                        &parent.network_id(),
+                        &parent.profile_id(),
+                        &asset_id,
+                        block.height,
+                    )
+                    .map_err(|error| format!("mining Q6TS/Q6QA verification failed: {error:?}"))
+            };
+        let mined = mine_qfp6_block_on_tip_with_quote_asset_authorization(
+            &graph,
+            &parent_tip,
+            timestamp,
+            PRODUCER,
+            operations,
+            &authenticator,
+            &mut mining_authorizer,
+            1_000_000,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(!mined.envelope.is_empty());
+        assert_eq!(mining_reads.load(Ordering::SeqCst), 1);
+        drop(mining_authorizer);
+        drop(mining_quote_provider);
+
+        let (server_private, server_public) = keypair();
+        let (client_private, client_public) = keypair();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let authorization_calls = Arc::new(AtomicUsize::new(0));
+        let server_authorization_calls = authorization_calls.clone();
+        let server_trust_reads = Arc::new(AtomicUsize::new(0));
+        let server_trust_reads_for_source = server_trust_reads.clone();
+        let server_q6ts_bytes = q6ts_bytes.clone();
+        let server_floor_seed = floor_seed.clone();
+        let server_profile_pin_bytes = profile_pin_bytes.clone();
+        let server_q6qa_bytes = q6qa_bytes.clone();
+        let server_trust_authority = trust_authority.clone();
+
+        let server = thread::spawn(move || {
+            let mut runtime = runtime;
+            let mut server_floor = LocalTestTrustFloor {
+                floor: server_floor_seed,
+            };
+            let mut server_source = LocalTestTrustSource {
+                envelope: server_q6ts_bytes,
+                reads: server_trust_reads_for_source,
+            };
+            let server_pq_verifier = LibcruxMlDsa65VerifierCandidate;
+            let mut server_quote_provider = QRunV06FreshQuoteAssetAuthorizationProvider::new(
+                &server_profile_pin_bytes,
+                &server_q6qa_bytes,
+                &server_trust_authority,
+                &server_pq_verifier,
+                &mut server_floor,
+                &mut server_source,
+                &quote_authenticator,
+            );
+            let mut quote_authorizer =
+                |parent: &QRunV06CanonicalExecutionState,
+                 block: &crate::qrun_v06_canonical_execution_candidate::QRunV06Block,
+                 asset_id: [u8; 32]| {
+                    assert_eq!(parent.height(), 0);
+                    assert_eq!(block.height, 1);
+                    assert_eq!(asset_id, quote_asset);
+                    server_authorization_calls.fetch_add(1, Ordering::SeqCst);
+                    server_quote_provider
+                        .authorize_for_block(
+                            &parent.network_id(),
+                            &parent.profile_id(),
+                            &asset_id,
+                            block.height,
+                        )
+                        .map_err(|error| format!("fresh Q6TS/Q6QA verification failed: {error:?}"))
+                };
+            let mut config = QRunV06PeerListenerConfig::default();
+            config.max_sessions = 1;
+            config.max_requests_per_session = 2;
+            config.max_failed_handshakes = 1;
+            let report = serve_qfp6_noise_listener(
+                &listener,
+                config,
+                &server_private,
+                &[client_public],
+                &NETWORK,
+                &PROFILE,
+                &server_shutdown,
+                |guard, frame| {
+                    let request = decode_qrun_v06_peer_block_request(frame)
+                        .map_err(|error| error.to_string())?;
+                    if request.request_id == 1 {
+                        process_qfp6_peer_frame_with_permissionless_runtime(
+                            &mut runtime,
+                            guard,
+                            frame,
+                            &authenticator,
+                        )
+                    } else {
+                        process_qfp6_peer_frame_with_permissionless_runtime_and_quote_asset_authorization(
+                            &mut runtime,
+                            guard,
+                            frame,
+                            &authenticator,
+                            &mut quote_authorizer,
+                        )
+                    }
+                },
+            )
+            .unwrap();
+            let committed_status = runtime.status().unwrap();
+            (
+                report,
+                committed_status.height,
+                committed_status.tip,
+                committed_status.state_root,
+                committed_status.manifest_generation,
+                committed_status.manifest_anchor,
+                server_trust_reads.load(Ordering::SeqCst),
+            )
+        });
+
+        let mut stream = connect_until(address);
+        stream.set_nodelay(true).unwrap();
+        let mut noise = QRunV06NoiseSession::connect(
+            &mut stream,
+            &client_private,
+            &server_public,
+            &NETWORK,
+            &PROFILE,
+        )
+        .unwrap();
+
+        let first_frame = encode_qrun_v06_peer_block_request(1, &mined.envelope).unwrap();
+        noise.write_q6pb_request(&mut stream, &first_frame).unwrap();
+        let rejected = noise.read_q6pa_response(&mut stream, 1).unwrap();
+        assert_eq!(
+            u16::from_be_bytes([rejected[6], rejected[7]]),
+            crate::qrun_v06_node_runtime_candidate::QRunV06PeerAdmissionStatus::Rejected as u16
+        );
+
+        let second_frame = encode_qrun_v06_peer_block_request(2, &mined.envelope).unwrap();
+        noise
+            .write_q6pb_request(&mut stream, &second_frame)
+            .unwrap();
+        let accepted = noise.read_q6pa_response(&mut stream, 2).unwrap();
+        assert_eq!(
+            u16::from_be_bytes([accepted[6], accepted[7]]),
+            crate::qrun_v06_node_runtime_candidate::QRunV06PeerAdmissionStatus::Accepted as u16
+        );
+
+        drop(stream);
+        shutdown.store(true, Ordering::Release);
+        let (
+            report,
+            ending_height,
+            ending_tip,
+            ending_state_root,
+            ending_manifest_generation,
+            ending_manifest_anchor,
+            q6ts_source_reads,
+        ) = server.join().unwrap();
+        assert_eq!(report.stats.authenticated_sessions, 1);
+        assert_eq!(report.stats.requests_received, 2);
+        assert_eq!(report.stats.responses_written, 2);
+        assert_eq!(ending_height, 1);
+        assert_eq!(authorization_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            q6ts_source_reads, 1,
+            "the listener must reload and verify the signed Q6TS record for this block"
+        );
+
+        // The listener runtime has now been dropped by its server thread. Reopen the same
+        // durable store from Genesis and replay its external-quote block with fresh Q6TS/Q6QA.
+        let recovery_reads = Arc::new(AtomicUsize::new(0));
+        let mut recovery_source = LocalTestTrustSource {
+            envelope: q6ts_bytes.clone(),
+            reads: recovery_reads.clone(),
+        };
+        let mut recovery_floor = LocalTestTrustFloor {
+            floor: floor_seed.clone(),
+        };
+        let recovery_pq_verifier = LibcruxMlDsa65VerifierCandidate;
+        let recovery_quote_authenticator = Q6QaEd25519Authenticator {
+            account: quote_authority_account,
+            key: quote_signing_key.verifying_key(),
+        };
+        let mut recovery_quote_provider = QRunV06FreshQuoteAssetAuthorizationProvider::new(
+            &profile_pin_bytes,
+            &q6qa_bytes,
+            &trust_authority,
+            &recovery_pq_verifier,
+            &mut recovery_floor,
+            &mut recovery_source,
+            &recovery_quote_authenticator,
+        );
+        let mut recovery_authorizer =
+            |parent: &QRunV06CanonicalExecutionState,
+             block: &crate::qrun_v06_canonical_execution_candidate::QRunV06Block,
+             asset_id: [u8; 32]| {
+                recovery_quote_provider
+                    .authorize_for_block(
+                        &parent.network_id(),
+                        &parent.profile_id(),
+                        &asset_id,
+                        block.height,
+                    )
+                    .map_err(|error| format!("restart Q6TS/Q6QA verification failed: {error:?}"))
+            };
+        let recovery_authenticator = DigestAuthenticator;
+        let unanchored_reopen =
+            QRunV06PermissionlessNodeRuntime::open_with_quote_asset_authorization(
+                &directory,
+                genesis_for_recovery.clone(),
+                params_for_recovery.clone(),
+                &recovery_authenticator,
+                None,
+                &authorized_profile,
+                &mut recovery_authorizer,
+            );
+        assert!(
+            unanchored_reopen.is_err(),
+            "existing durable market history must reject restart without an independent manifest anchor"
+        );
+        assert_eq!(
+            recovery_reads.load(Ordering::SeqCst),
+            0,
+            "manifest-anchor rejection must happen before trusting/replaying quote-asset history"
+        );
+
+        let recovered_runtime =
+            QRunV06PermissionlessNodeRuntime::open_with_quote_asset_authorization(
+                &directory,
+                genesis_for_recovery,
+                params_for_recovery,
+                &recovery_authenticator,
+                Some(ending_manifest_anchor),
+                &authorized_profile,
+                &mut recovery_authorizer,
+            )
+            .unwrap();
+        drop(recovery_authorizer);
+        drop(recovery_quote_provider);
+        let recovered_status = recovered_runtime.status().unwrap();
+        assert_eq!(recovered_status.height, ending_height);
+        assert_eq!(recovered_status.tip, ending_tip);
+        assert_eq!(recovered_status.state_root, ending_state_root);
+        assert_eq!(
+            recovered_status.manifest_generation,
+            ending_manifest_generation
+        );
+        assert_eq!(recovered_status.manifest_anchor, ending_manifest_anchor);
+        assert_ne!(ending_manifest_anchor, [0; 32]);
+        assert_eq!(
+            recovery_reads.load(Ordering::SeqCst),
+            1,
+            "durable replay must freshly reload and verify Q6TS/Q6QA"
+        );
+        drop(recovered_runtime);
+
+        let _ = fs::remove_dir_all(&directory);
+    }
+
     #[test]
     fn qfp6_open_history_listener_accepts_anonymous_peer_on_wildcard_candidate_bind() {
         let (server_private, server_public) = keypair();

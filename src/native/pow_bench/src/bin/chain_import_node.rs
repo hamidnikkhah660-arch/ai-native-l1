@@ -24,7 +24,7 @@ use ai_native_l1_pow_bench::{
     identity_session::BoundSession,
     key_provider::{ProviderError, PublicKeyProvider},
     noise_deployment_config::{
-        verify_signed_deployment_config, DeploymentConfigStateStore,
+        verify_signed_deployment_config_with_floors, DeploymentConfigStateStore,
         MAX_SIGNED_DEPLOYMENT_CONFIG_LEN,
     },
     noise_issuer_registry::{IssuerRegistryStateStore, MAX_REGISTRY_WIRE_LEN},
@@ -82,6 +82,7 @@ struct Config {
     peer_noise_deployment_config_state_file: Option<PathBuf>,
     peer_noise_deployment_authority_public_key: Option<[u8; 32]>,
     peer_noise_deployment_min_sequence: Option<u64>,
+    peer_noise_deployment_min_root_epoch: Option<u64>,
     peer_noise_key_id: Option<u32>,
     peer_noise_credential_id: Option<u128>,
     peer_noise_issuer_id: Option<u32>,
@@ -290,6 +291,17 @@ fn config_from_args(args: &[String]) -> Result<Config, String> {
     if peer_noise_deployment_min_sequence == Some(0) {
         return Err("--peer-noise-deployment-min-sequence must be greater than zero".into());
     }
+    let peer_noise_deployment_min_root_epoch =
+        option(args, "--peer-noise-deployment-min-root-epoch")?
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| "invalid --peer-noise-deployment-min-root-epoch".to_string())
+            })
+            .transpose()?;
+    if peer_noise_deployment_min_root_epoch == Some(0) {
+        return Err("--peer-noise-deployment-min-root-epoch must be greater than zero".into());
+    }
     let peer_noise_key_id = option(args, "--peer-noise-key-id")?
         .map(|value| {
             value
@@ -325,6 +337,7 @@ fn config_from_args(args: &[String]) -> Result<Config, String> {
         || peer_noise_deployment_config_state_file.is_some()
         || peer_noise_deployment_authority_public_key.is_some()
         || peer_noise_deployment_min_sequence.is_some()
+        || peer_noise_deployment_min_root_epoch.is_some()
         || option(args, "--peer-noise-max-validity-seconds")?.is_some();
     let noise_identity_mode = peer_noise_identity_record_file.is_some();
     if noise_identity_mode {
@@ -335,8 +348,9 @@ fn config_from_args(args: &[String]) -> Result<Config, String> {
             || peer_noise_deployment_config_state_file.is_none()
             || peer_noise_deployment_authority_public_key.is_none()
             || peer_noise_deployment_min_sequence.is_none()
+            || peer_noise_deployment_min_root_epoch.is_none()
         {
-            return Err("provider-bound Noise XX requires identity signature/registry/state plus signed deployment config, deployment state, out-of-band config signing key, and minimum config sequence".into());
+            return Err("provider-bound Noise XX requires identity signature/registry/state plus signed deployment config, deployment state, out-of-band config signing key, minimum config sequence, and independent minimum root epoch".into());
         }
         if peer_noise_identity_state_file.is_none() || peer_noise_rotation_file.is_none() {
             return Err("provider-bound Noise XX requires --peer-noise-identity-state-file and --peer-noise-rotation-file".into());
@@ -441,6 +455,7 @@ fn config_from_args(args: &[String]) -> Result<Config, String> {
         peer_noise_deployment_config_state_file,
         peer_noise_deployment_authority_public_key,
         peer_noise_deployment_min_sequence,
+        peer_noise_deployment_min_root_epoch,
         peer_noise_key_id,
         peer_noise_credential_id,
         peer_noise_issuer_id,
@@ -1340,14 +1355,18 @@ fn main_result() -> Result<(), String> {
             config.peer_noise_deployment_min_sequence.ok_or_else(|| {
                 "provider-bound Noise mode lost its minimum deployment sequence".to_string()
             })?;
+        let minimum_root_epoch = config.peer_noise_deployment_min_root_epoch.ok_or_else(|| {
+            "provider-bound Noise mode lost its minimum governance root epoch".to_string()
+        })?;
         let manifest_wire =
             read_bounded_provider_file(manifest_path, MAX_SIGNED_DEPLOYMENT_CONFIG_LEN)
                 .map_err(|error| format!("deployment manifest read rejected: {error:?}"))?;
-        let manifest = verify_signed_deployment_config(
+        let manifest = verify_signed_deployment_config_with_floors(
             &manifest_wire,
             &config.network_id,
             &deployment_authority,
             minimum_config_sequence,
+            minimum_root_epoch,
         )
         .map_err(|error| format!("signed deployment manifest rejected: {error}"))?;
         let deployment_state = DeploymentConfigStateStore::open(
@@ -2038,6 +2057,8 @@ mod noise_peer_config_tests {
             "44".repeat(32),
             "--peer-noise-deployment-min-sequence".into(),
             "1".into(),
+            "--peer-noise-deployment-min-root-epoch".into(),
+            "1".into(),
             "--peer-noise-key-id".into(),
             "700".into(),
             "--peer-noise-credential-id".into(),
@@ -2061,6 +2082,7 @@ mod noise_peer_config_tests {
             Some([0x44; 32])
         );
         assert_eq!(config.peer_noise_deployment_min_sequence, Some(1));
+        assert_eq!(config.peer_noise_deployment_min_root_epoch, Some(1));
         assert!(config.peer_noise_allowed_public_key.is_none());
 
         let mut zero_floor = args.clone();
@@ -2072,6 +2094,16 @@ mod noise_peer_config_tests {
         assert!(config_from_args(&zero_floor)
             .unwrap_err()
             .contains("must be greater than zero"));
+
+        let mut zero_root_floor = args.clone();
+        let root_floor_index = zero_root_floor
+            .iter()
+            .position(|value| value == "--peer-noise-deployment-min-root-epoch")
+            .unwrap();
+        zero_root_floor[root_floor_index + 1] = "0".into();
+        assert!(config_from_args(&zero_root_floor)
+            .unwrap_err()
+            .contains("--peer-noise-deployment-min-root-epoch must be greater than zero"));
 
         let mut missing_trust = base_args();
         missing_trust.extend([

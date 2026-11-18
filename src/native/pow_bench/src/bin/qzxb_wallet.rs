@@ -7,6 +7,8 @@
 #[cfg(windows)]
 mod windows_wallet {
     use ai_native_l1_pow_bench::{
+        qrun_v06_genesis_approval_candidate::QRunV06GenesisApproval,
+        qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
         qrun_v06_hybrid_auth_candidate::QRunV06HybridTransactionSigner,
         qrun_v06_noise_transport_candidate::QRunV06NoiseSession,
         qrun_v06_transaction_ingress_candidate::{
@@ -94,6 +96,14 @@ mod windows_wallet {
         },
         HybridAddress {
             wallet: PathBuf,
+        },
+        ApproveLocalGenesis {
+            wallet: PathBuf,
+            package_dir: PathBuf,
+        },
+        ApprovePublicTestnetGenesis {
+            wallet: PathBuf,
+            package_dir: PathBuf,
         },
         Address {
             wallet: PathBuf,
@@ -469,6 +479,30 @@ mod windows_wallet {
                     return Err("--output must be an absolute file path".into());
                 }
                 Ok(Command::RestoreHybrid { output })
+            }
+            "approve-local-genesis" => {
+                let values = options(&args[1..], &["--wallet", "--package-dir"])?;
+                let wallet = PathBuf::from(required(&values, "--wallet")?);
+                let package_dir = PathBuf::from(required(&values, "--package-dir")?);
+                if !wallet.is_absolute() || !package_dir.is_absolute() {
+                    return Err("--wallet and --package-dir must be absolute paths".into());
+                }
+                Ok(Command::ApproveLocalGenesis {
+                    wallet,
+                    package_dir,
+                })
+            }
+            "approve-public-testnet-genesis" => {
+                let values = options(&args[1..], &["--wallet", "--package-dir"])?;
+                let wallet = PathBuf::from(required(&values, "--wallet")?);
+                let package_dir = PathBuf::from(required(&values, "--package-dir")?);
+                if !wallet.is_absolute() || !package_dir.is_absolute() {
+                    return Err("--wallet and --package-dir must be absolute paths".into());
+                }
+                Ok(Command::ApprovePublicTestnetGenesis {
+                    wallet,
+                    package_dir,
+                })
             }
             "address-qfp6-hybrid" => {
                 let values = options(&args[1..], &["--wallet"])?;
@@ -1582,6 +1616,669 @@ mod windows_wallet {
         Ok(acknowledgement)
     }
 
+    fn read_local_package_file(
+        package_dir: &Path,
+        name: &str,
+        maximum_bytes: u64,
+    ) -> Result<Vec<u8>, String> {
+        let path = package_dir.join(name);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            format!("local Devnet artifact {name} cannot be inspected: {error}")
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "local Devnet artifact {name} must be a regular non-symlink file"
+            ));
+        }
+        if metadata.len() == 0 || metadata.len() > maximum_bytes {
+            return Err(format!("local Devnet artifact {name} has an invalid size"));
+        }
+        let bytes = fs::read(&path)
+            .map_err(|error| format!("local Devnet artifact {name} cannot be read: {error}"))?;
+        if bytes.len() as u64 != metadata.len() {
+            return Err(format!(
+                "local Devnet artifact {name} changed while being read"
+            ));
+        }
+        Ok(bytes)
+    }
+
+    fn replace_file_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| "atomic update target has no parent directory".to_string())?;
+        let filename = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| "atomic update target filename is invalid".to_string())?;
+        let temporary = parent.join(format!(".{filename}.q6ga-{}.tmp", process::id()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| format!("create {}: {error}", temporary.display()))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("write {}: {error}", temporary.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("flush {}: {error}", temporary.display()))?;
+        drop(file);
+        if let Err(error) = fs::rename(&temporary, path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!("atomic replace {}: {error}", path.display()));
+        }
+        Ok(())
+    }
+
+    fn validate_local_package_config_digest(
+        manifest: &serde_json::Value,
+        config_bytes: &[u8],
+    ) -> Result<(), String> {
+        let actual: [u8; 32] = Sha256::digest(config_bytes).into();
+        if manifest
+            .get("permissionless_config_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(hex(&actual).as_str())
+        {
+            return Err(
+                "local Devnet manifest does not pin the exact pre-approval permissionless config"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_local_genesis_runtime_config(
+        runtime: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), String> {
+        if runtime.get("mode").and_then(serde_json::Value::as_str)
+            != Some("permissionless-full-history-candidate")
+            || runtime
+                .get("allow_public_listener")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+            || runtime
+                .get("listen_address")
+                .and_then(serde_json::Value::as_str)
+                != Some("127.0.0.1:30333")
+            || runtime
+                .get("enable_approved_peer_outbound_sync")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+            || runtime
+                .get("enable_q6ar_candidate_address_book")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+        {
+            return Err(
+                "Q6GA v1 owner approval requires the exact 127.0.0.1:30333 loopback profile with public listener, outbound peer sync and Q6AR disabled"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn approve_local_genesis(wallet_path: &Path, package_dir: &Path) -> Result<(), String> {
+        let package_meta = fs::symlink_metadata(package_dir).map_err(|error| {
+            format!("local Devnet package directory cannot be inspected: {error}")
+        })?;
+        if package_meta.file_type().is_symlink() || !package_meta.is_dir() {
+            return Err("--package-dir must be a real, non-symlink directory".into());
+        }
+
+        let manifest_bytes =
+            read_local_package_file(package_dir, "local-devnet-manifest.json", 64 * 1024)?;
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|_| "local Devnet manifest JSON is invalid".to_string())?;
+        if manifest.get("schema").and_then(serde_json::Value::as_str)
+            != Some("qfp6-local-only-devnet/v1")
+            || manifest.get("scope").and_then(serde_json::Value::as_str)
+                != Some("LOCAL_SINGLE_OPERATOR_LOOPBACK_ONLY")
+            || manifest
+                .get("public_testnet_authorized")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+            || manifest
+                .get("mainnet_authorized")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+            || manifest
+                .get("genesis_owner_signature_present")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+        {
+            return Err("manifest is not an unsigned local-only QFP6 Devnet package".into());
+        }
+        if manifest
+            .get("genesis_owner_allocation_qzxb")
+            .and_then(serde_json::Value::as_str)
+            != Some("1000000000")
+            || manifest
+                .get("gross_supply_ceiling_qzxb")
+                .and_then(serde_json::Value::as_str)
+                != Some("7000000000")
+            || manifest
+                .get("block_subsidy_qzxb")
+                .and_then(serde_json::Value::as_str)
+                != Some("0")
+            || manifest
+                .get("six_accounting_labels_are_spendable")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+        {
+            return Err("local Devnet manifest does not match the fixed CP-0651 economics".into());
+        }
+
+        let q6gd = read_local_package_file(package_dir, "genesis-descriptor.q6gd", 4096)?;
+        let q6cp = read_local_package_file(package_dir, "consensus-profile.q6cp", 64 * 1024)?;
+        let q6pn = read_local_package_file(package_dir, "q6pn-profile.q6pn", 64 * 1024)?;
+        let genesis =
+            read_local_package_file(package_dir, "genesis-snapshot.q6sn", 64 * 1024 * 1024)?;
+        let q6gd_hash: [u8; 32] = Sha256::digest(&q6gd).into();
+        let q6cp_hash: [u8; 32] = Sha256::digest(&q6cp).into();
+        let q6pn_hash: [u8; 32] = Sha256::digest(&q6pn).into();
+        let genesis_hash: [u8; 32] = Sha256::digest(&genesis).into();
+        let bootstrap_bytes =
+            read_local_package_file(package_dir, "bootstrap-peers.json", 1024 * 1024)?;
+        let bootstrap_hash: [u8; 32] = Sha256::digest(&bootstrap_bytes).into();
+        let bootstrap_json: serde_json::Value = serde_json::from_slice(&bootstrap_bytes)
+            .map_err(|_| "bootstrap-peers.json is invalid JSON".to_string())?;
+        if !bootstrap_json
+            .as_array()
+            .is_some_and(|peers| peers.is_empty())
+        {
+            return Err("single-operator local Genesis requires an empty bootstrap peer list; public seeds must be separately provisioned and reviewed".into());
+        }
+        if manifest
+            .get("bootstrap_peers_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(hex(&bootstrap_hash).as_str())
+            || manifest
+                .get("bootstrap_peer_count")
+                .and_then(serde_json::Value::as_u64)
+                != Some(0)
+        {
+            return Err(
+                "manifest bootstrap peer hash/count does not match the local empty peer list"
+                    .into(),
+            );
+        }
+        let descriptor = QRunV06GenesisDescriptor::decode(&q6gd)
+            .map_err(|error| format!("Q6GD descriptor validation failed: {error:?}"))?;
+
+        for (key, expected) in [
+            ("network_id_hex", hex(&descriptor.network_id())),
+            ("profile_id_hex", hex(&descriptor.profile_id())),
+            ("owner_account_id_hex", hex(&descriptor.founder_account())),
+            (
+                "genesis_descriptor_commitment_hex",
+                hex(&descriptor.commitment()),
+            ),
+            ("q6gd_sha256", hex(&q6gd_hash)),
+            ("q6cp_sha256", hex(&q6cp_hash)),
+            ("q6pn_sha256", hex(&q6pn_hash)),
+            ("genesis_snapshot_sha256", hex(&genesis_hash)),
+            ("bootstrap_peers_sha256", hex(&bootstrap_hash)),
+        ] {
+            if manifest.get(key).and_then(serde_json::Value::as_str) != Some(expected.as_str()) {
+                return Err(format!(
+                    "manifest {key} does not match the actual package bytes"
+                ));
+            }
+        }
+
+        let config_path = package_dir.join("permissionless-config.json");
+        let config_bytes =
+            read_local_package_file(package_dir, "permissionless-config.json", 64 * 1024)?;
+        validate_local_package_config_digest(&manifest, &config_bytes)?;
+        let mut config: serde_json::Value = serde_json::from_slice(&config_bytes)
+            .map_err(|_| "permissionless config JSON is invalid".to_string())?;
+        if config
+            .get("local_only_notice")
+            .and_then(serde_json::Value::as_str)
+            != Some("SINGLE_OPERATOR_LOOPBACK_DEVNET_ONLY_NOT_PUBLIC_TESTNET_NOT_MAINNET")
+        {
+            return Err(
+                "permissionless config is not marked as the exact local-only Devnet profile".into(),
+            );
+        }
+        let runtime = config
+            .get_mut("permissionless_runtime")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or("permissionless config has no runtime object")?;
+        validate_local_genesis_runtime_config(runtime)?;
+        if runtime
+            .get("producer_account")
+            .and_then(serde_json::Value::as_str)
+            != Some(hex(&descriptor.founder_account()).as_str())
+        {
+            return Err("local Devnet producer account is not the exact Q6GD owner account".into());
+        }
+        let output_path = package_dir.join("genesis-owner-approval.q6ga");
+        if output_path.exists() {
+            return Err("genesis-owner-approval.q6ga already exists; refusing to replace an existing owner signature".into());
+        }
+
+        let first_wallet = load_hybrid_wallet(wallet_path)?;
+        if first_wallet.account_id != descriptor.founder_account() {
+            return Err("QZKW2 wallet account does not equal the Q6GD owner account".into());
+        }
+        drop(first_wallet);
+
+        let commitment_hex = hex(&descriptor.commitment());
+        let confirmation = format!("APPROVE LOCAL QFP6 GENESIS {}", &commitment_hex[..16]);
+        println!("QFP6 LOCAL GENESIS OWNER-APPROVAL REVIEW");
+        println!("scope=LOCAL_SINGLE_OPERATOR_LOOPBACK_ONLY");
+        println!("network_id_hex={}", hex(&descriptor.network_id()));
+        println!("profile_id_hex={}", hex(&descriptor.profile_id()));
+        println!(
+            "owner_account_id_hex={}",
+            hex(&descriptor.founder_account())
+        );
+        println!("genesis_timestamp_unix={}", descriptor.genesis_timestamp());
+        println!("genesis_descriptor_commitment_hex={commitment_hex}");
+        println!("q6gd_sha256={}", hex(&q6gd_hash));
+        println!("q6cp_sha256={}", hex(&q6cp_hash));
+        println!("q6pn_sha256={}", hex(&q6pn_hash));
+        println!("genesis_snapshot_sha256={}", hex(&genesis_hash));
+        println!("bootstrap_peers_sha256={}", hex(&bootstrap_hash));
+        println!("owner_genesis_allocation_qzxb=1000000000");
+        println!("gross_supply_ceiling_qzxb=7000000000");
+        println!("six_accounting_labels_spendable=false");
+        println!("block_subsidy_qzxb=0");
+        println!("producer_compensation=canonical_transaction_fees_only");
+        println!("listen_address=127.0.0.1:30333");
+        println!("bootstrap_peer_count=0");
+        println!("approved_peer_outbound_sync=false");
+        println!("q6ar_candidate_address_book=false");
+        println!("public_testnet_authorized=false");
+        println!("mainnet_authorized=false");
+        println!("real_value_transfer=false");
+        println!();
+        println!("To authorize only these exact local Devnet bytes, type this phrase exactly:");
+        println!("{confirmation}");
+        print!("Owner confirmation: ");
+        io::stdout()
+            .flush()
+            .map_err(|error| format!("flush owner confirmation prompt: {error}"))?;
+        let mut entered = String::new();
+        io::stdin()
+            .read_line(&mut entered)
+            .map_err(|error| format!("read local owner confirmation: {error}"))?;
+        if entered.trim() != confirmation {
+            wipe_string(&mut entered);
+            return Err("owner confirmation did not match; no signature was created".into());
+        }
+        wipe_string(&mut entered);
+
+        let wallet = load_hybrid_wallet(wallet_path)?;
+        if wallet.account_id != descriptor.founder_account() {
+            return Err("QZKW2 owner identity changed after confirmation".into());
+        }
+        let signer =
+            QRunV06HybridTransactionSigner::from_seeds(wallet.seeds.ed25519, wallet.seeds.mldsa65)
+                .map_err(|error| {
+                    format!("QZKW2 local hybrid signer initialization failed: {error:?}")
+                })?;
+        if signer.account_id() != descriptor.founder_account() {
+            return Err("derived signing identity does not match the Genesis founder".into());
+        }
+        let approval = QRunV06GenesisApproval::sign(
+            &descriptor,
+            q6gd_hash,
+            q6cp_hash,
+            q6pn_hash,
+            genesis_hash,
+            bootstrap_hash,
+            &signer,
+        )
+        .map_err(|error| format!("Q6GA signing failed: {error:?}"))?;
+        drop(wallet);
+        drop(signer);
+        let approval_bytes = approval
+            .encode()
+            .map_err(|error| format!("Q6GA self-verification failed: {error:?}"))?;
+        let approval_hash: [u8; 32] = Sha256::digest(&approval_bytes).into();
+        let mut approval_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output_path)
+            .map_err(|error| format!("create owner approval {}: {error}", output_path.display()))?;
+        approval_file
+            .write_all(&approval_bytes)
+            .map_err(|error| format!("write owner approval: {error}"))?;
+        approval_file
+            .sync_all()
+            .map_err(|error| format!("flush owner approval: {error}"))?;
+        drop(approval_file);
+
+        runtime.insert(
+            "q6gd_descriptor_path".into(),
+            serde_json::Value::String("genesis-descriptor.q6gd".into()),
+        );
+        runtime.insert(
+            "q6gd_descriptor_sha256".into(),
+            serde_json::Value::String(hex(&q6gd_hash)),
+        );
+        runtime.insert(
+            "q6pn_profile_pin_sha256".into(),
+            serde_json::Value::String(hex(&q6pn_hash)),
+        );
+        runtime.insert(
+            "owner_genesis_approval_path".into(),
+            serde_json::Value::String("genesis-owner-approval.q6ga".into()),
+        );
+        runtime.insert(
+            "owner_genesis_approval_sha256".into(),
+            serde_json::Value::String(hex(&approval_hash)),
+        );
+        let mut next_config = serde_json::to_vec_pretty(&config)
+            .map_err(|error| format!("serialize updated local Devnet config: {error}"))?;
+        next_config.push(b'\n');
+        let config_hash: [u8; 32] = Sha256::digest(&next_config).into();
+        replace_file_atomically(&config_path, &next_config)?;
+
+        let manifest_path = package_dir.join("local-devnet-manifest.json");
+        let mut next_manifest = manifest;
+        let object = next_manifest
+            .as_object_mut()
+            .ok_or("local Devnet manifest root must be an object")?;
+        object.insert(
+            "genesis_owner_signature_present".into(),
+            serde_json::Value::Bool(true),
+        );
+        object.insert(
+            "genesis_owner_signature_format".into(),
+            serde_json::Value::String("Q6GA_V1_ED25519_MLDSA65".into()),
+        );
+        object.insert(
+            "genesis_owner_signature_sha256".into(),
+            serde_json::Value::String(hex(&approval_hash)),
+        );
+        object.insert(
+            "owner_genesis_approval_sha256".into(),
+            serde_json::Value::String(hex(&approval_hash)),
+        );
+        object.insert(
+            "permissionless_config_sha256".into(),
+            serde_json::Value::String(hex(&config_hash)),
+        );
+        object.insert(
+            "owner_approval_status".into(),
+            serde_json::Value::String("SIGNED_BY_OWNER_LOCAL_ONLY".into()),
+        );
+        let mut next_manifest_bytes = serde_json::to_vec_pretty(&next_manifest)
+            .map_err(|error| format!("serialize updated local Devnet manifest: {error}"))?;
+        next_manifest_bytes.push(b'\n');
+        replace_file_atomically(&manifest_path, &next_manifest_bytes)?;
+
+        println!();
+        println!("owner_genesis_approval=Q6GA_ED25519_MLDSA65_SIGNED_AND_SELF_VERIFIED");
+        println!("owner_genesis_approval_scope=LOCAL_CANDIDATE_ONLY_NOT_MAINNET_AUTHORIZATION");
+        println!("owner_genesis_approval_bytes={}", approval_bytes.len());
+        println!("owner_genesis_approval_sha256={}", hex(&approval_hash));
+        println!("permissionless_config_sha256={}", hex(&config_hash));
+        println!("signature_secret_output=none");
+        println!(
+            "next_action=restart_only_the_local_permissionless_node_with_the_updated_config_hash"
+        );
+        Ok(())
+    }
+
+    fn approve_public_testnet_genesis(
+        wallet_path: &Path,
+        package_dir: &Path,
+    ) -> Result<(), String> {
+        let package_meta = fs::symlink_metadata(package_dir)
+            .map_err(|error| format!("QFP6 package directory cannot be inspected: {error}"))?;
+        if package_meta.file_type().is_symlink() || !package_meta.is_dir() {
+            return Err("--package-dir must be a real, non-symlink directory".into());
+        }
+
+        let manifest_bytes =
+            read_local_package_file(package_dir, "local-devnet-manifest.json", 64 * 1024)?;
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|_| "local Devnet manifest JSON is invalid".to_string())?;
+        if manifest.get("schema").and_then(serde_json::Value::as_str)
+            != Some("qfp6-local-only-devnet/v1")
+            || manifest.get("scope").and_then(serde_json::Value::as_str)
+                != Some("LOCAL_SINGLE_OPERATOR_LOOPBACK_ONLY")
+            || manifest
+                .get("public_testnet_authorized")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+            || manifest
+                .get("mainnet_authorized")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+            || manifest
+                .get("genesis_owner_signature_present")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        {
+            return Err("package must be the owner-signed local-only QFP6 candidate; no public or Mainnet authorization may already be set".into());
+        }
+        if manifest
+            .get("genesis_owner_allocation_qzxb")
+            .and_then(serde_json::Value::as_str)
+            != Some("1000000000")
+            || manifest
+                .get("gross_supply_ceiling_qzxb")
+                .and_then(serde_json::Value::as_str)
+                != Some("7000000000")
+            || manifest
+                .get("block_subsidy_qzxb")
+                .and_then(serde_json::Value::as_str)
+                != Some("0")
+            || manifest
+                .get("six_accounting_labels_are_spendable")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+        {
+            return Err("package does not match the fixed CP-0651 zero-subsidy economics".into());
+        }
+
+        let q6gd = read_local_package_file(package_dir, "genesis-descriptor.q6gd", 4096)?;
+        let q6cp = read_local_package_file(package_dir, "consensus-profile.q6cp", 64 * 1024)?;
+        let q6pn = read_local_package_file(package_dir, "q6pn-profile.q6pn", 64 * 1024)?;
+        let genesis =
+            read_local_package_file(package_dir, "genesis-snapshot.q6sn", 64 * 1024 * 1024)?;
+        let bootstrap = read_local_package_file(package_dir, "bootstrap-peers.json", 1024 * 1024)?;
+        let q6gd_hash: [u8; 32] = Sha256::digest(&q6gd).into();
+        let q6cp_hash: [u8; 32] = Sha256::digest(&q6cp).into();
+        let q6pn_hash: [u8; 32] = Sha256::digest(&q6pn).into();
+        let genesis_hash: [u8; 32] = Sha256::digest(&genesis).into();
+        let bootstrap_hash: [u8; 32] = Sha256::digest(&bootstrap).into();
+        let bootstrap_json: serde_json::Value = serde_json::from_slice(&bootstrap)
+            .map_err(|_| "bootstrap-peers.json is invalid JSON".to_string())?;
+        if !bootstrap_json
+            .as_array()
+            .is_some_and(|peers| peers.is_empty())
+        {
+            return Err("the owner authorization source package must have an empty bootstrap peer set; per-node peers are pinned separately".into());
+        }
+
+        let descriptor = QRunV06GenesisDescriptor::decode(&q6gd)
+            .map_err(|error| format!("Q6GD descriptor validation failed: {error:?}"))?;
+        for (key, expected) in [
+            ("network_id_hex", hex(&descriptor.network_id())),
+            ("profile_id_hex", hex(&descriptor.profile_id())),
+            ("owner_account_id_hex", hex(&descriptor.founder_account())),
+            (
+                "genesis_descriptor_commitment_hex",
+                hex(&descriptor.commitment()),
+            ),
+            ("q6gd_sha256", hex(&q6gd_hash)),
+            ("q6cp_sha256", hex(&q6cp_hash)),
+            ("q6pn_sha256", hex(&q6pn_hash)),
+            ("genesis_snapshot_sha256", hex(&genesis_hash)),
+            ("bootstrap_peers_sha256", hex(&bootstrap_hash)),
+        ] {
+            if manifest.get(key).and_then(serde_json::Value::as_str) != Some(expected.as_str()) {
+                return Err(format!(
+                    "manifest {key} does not match the exact package bytes"
+                ));
+            }
+        }
+
+        let config_bytes =
+            read_local_package_file(package_dir, "permissionless-config.json", 64 * 1024)?;
+        validate_local_package_config_digest(&manifest, &config_bytes)?;
+        let config: serde_json::Value = serde_json::from_slice(&config_bytes)
+            .map_err(|_| "permissionless config JSON is invalid".to_string())?;
+        if config
+            .get("local_only_notice")
+            .and_then(serde_json::Value::as_str)
+            != Some("SINGLE_OPERATOR_LOOPBACK_DEVNET_ONLY_NOT_PUBLIC_TESTNET_NOT_MAINNET")
+        {
+            return Err("authorization source package must remain explicitly local-only".into());
+        }
+        let runtime = config
+            .get("permissionless_runtime")
+            .and_then(serde_json::Value::as_object)
+            .ok_or("permissionless config has no runtime object")?;
+        validate_local_genesis_runtime_config(runtime)?;
+
+        let local_approval =
+            read_local_package_file(package_dir, "genesis-owner-approval.q6ga", 16 * 1024)?;
+        let expected_local_approval_hash = manifest
+            .get("genesis_owner_signature_sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("manifest is missing the local Q6GA signature hash")?;
+        let local_approval_hash: [u8; 32] = Sha256::digest(&local_approval).into();
+        if hex(&local_approval_hash) != expected_local_approval_hash {
+            return Err("existing local Q6GA signature hash differs from manifest".into());
+        }
+        let local_approval = QRunV06GenesisApproval::decode(&local_approval)
+            .map_err(|error| format!("existing local Q6GA verification failed: {error:?}"))?;
+        local_approval
+            .verify_bindings(
+                &descriptor,
+                &q6gd_hash,
+                &q6cp_hash,
+                &q6pn_hash,
+                &genesis_hash,
+                &bootstrap_hash,
+            )
+            .map_err(|error| format!("existing local Q6GA artifact binding failed: {error:?}"))?;
+
+        let first_wallet = load_hybrid_wallet(wallet_path)?;
+        if first_wallet.account_id != descriptor.founder_account() {
+            return Err("QZKW2 wallet account does not equal the Q6GD owner account".into());
+        }
+        drop(first_wallet);
+
+        let commitment_hex = hex(&descriptor.commitment());
+        let confirmation = format!(
+            "APPROVE ZERO-VALUE PUBLIC TESTNET AND ACKNOWLEDGE ANONYMOUS NOISE XX {}",
+            &commitment_hex[..16]
+        );
+        println!("QFP6 ZERO-VALUE PUBLIC TESTNET OWNER-AUTHORIZATION REVIEW");
+        println!("scope=ZERO_VALUE_PUBLIC_TESTNET_ONLY");
+        println!("network_id_hex={}", hex(&descriptor.network_id()));
+        println!("profile_id_hex={}", hex(&descriptor.profile_id()));
+        println!(
+            "owner_account_id_hex={}",
+            hex(&descriptor.founder_account())
+        );
+        println!("genesis_descriptor_commitment_hex={commitment_hex}");
+        println!("q6gd_sha256={}", hex(&q6gd_hash));
+        println!("q6cp_sha256={}", hex(&q6cp_hash));
+        println!("q6pn_sha256={}", hex(&q6pn_hash));
+        println!("genesis_snapshot_sha256={}", hex(&genesis_hash));
+        println!("owner_genesis_allocation_qzxb=1000000000");
+        println!("gross_supply_ceiling_qzxb=7000000000");
+        println!("six_accounting_labels_spendable=false");
+        println!("block_subsidy_qzxb=0");
+        println!("producer_compensation=canonical_transaction_fees_only");
+        println!("mainnet_authorized=false");
+        println!("market_authorized=false");
+        println!("real_value_transfer_authorized=false");
+        println!("inbound_transport=anonymous Noise XX over classical X25519");
+        println!("inbound_peer_identity_authenticated=false");
+        println!("security_limit=an active MITM may terminate and re-encrypt an unpinned inbound session");
+        println!();
+        println!("This authorization does NOT authorize Mainnet, value-bearing transfers, token sales or a market.");
+        println!("To authorize only this network's zero-value Public Testnet scope and acknowledge the inbound transport limitation, type exactly:");
+        println!("{confirmation}");
+        print!("Owner confirmation: ");
+        io::stdout()
+            .flush()
+            .map_err(|error| format!("flush owner confirmation prompt: {error}"))?;
+        let mut entered = String::new();
+        io::stdin()
+            .read_line(&mut entered)
+            .map_err(|error| format!("read local owner confirmation: {error}"))?;
+        if entered.trim() != confirmation {
+            wipe_string(&mut entered);
+            return Err(
+                "owner confirmation did not match; no Public Testnet authorization was created"
+                    .into(),
+            );
+        }
+        wipe_string(&mut entered);
+
+        let wallet = load_hybrid_wallet(wallet_path)?;
+        if wallet.account_id != descriptor.founder_account() {
+            return Err("QZKW2 owner identity changed after confirmation".into());
+        }
+        let signer =
+            QRunV06HybridTransactionSigner::from_seeds(wallet.seeds.ed25519, wallet.seeds.mldsa65)
+                .map_err(|error| {
+                    format!("QZKW2 local hybrid signer initialization failed: {error:?}")
+                })?;
+        if signer.account_id() != descriptor.founder_account() {
+            return Err("derived signing identity does not match the Genesis owner".into());
+        }
+        let authorization = QRunV06GenesisApproval::sign_public_testnet(
+            &descriptor,
+            q6gd_hash,
+            q6cp_hash,
+            q6pn_hash,
+            genesis_hash,
+            &signer,
+        )
+        .map_err(|error| {
+            format!("Q6GA v2 Public Testnet authorization signing failed: {error:?}")
+        })?;
+        drop(wallet);
+        drop(signer);
+
+        let authorization_bytes = authorization
+            .encode()
+            .map_err(|error| format!("Q6GA v2 self-verification failed: {error:?}"))?;
+        let authorization_hash: [u8; 32] = Sha256::digest(&authorization_bytes).into();
+        let output_path = package_dir.join("public-testnet-authorization.q6ga");
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output_path)
+            .map_err(|error| {
+                format!(
+                    "create Public Testnet authorization {}: {error}",
+                    output_path.display()
+                )
+            })?;
+        output
+            .write_all(&authorization_bytes)
+            .map_err(|error| format!("write Public Testnet authorization: {error}"))?;
+        output
+            .sync_all()
+            .map_err(|error| format!("flush Public Testnet authorization: {error}"))?;
+        drop(output);
+
+        println!();
+        println!("public_testnet_authorization=Q6GA_V2_ED25519_MLDSA65_SIGNED_AND_SELF_VERIFIED");
+        println!("public_testnet_authorization_scope=ZERO_VALUE_PUBLIC_TESTNET_ONLY");
+        println!(
+            "public_testnet_authorization_sha256={}",
+            hex(&authorization_hash)
+        );
+        println!("mainnet_authorization=NOT_GRANTED");
+        println!("market_authorization=NOT_GRANTED");
+        println!("signature_secret_output=none");
+        Ok(())
+    }
+
     fn sign_transfer(
         path: &Path,
         network_id: [u8; 32],
@@ -1859,6 +2556,8 @@ Usage:\n\
   qzxb_wallet sign-transfer --wallet ABSOLUTE_PATH --network-id-hex HEX64 --recipient-id-hex HEX64 --nonce U64 --amount-atoms U64 --fee-atoms U64 --expires-at UNIX_SECONDS [--signature-mode self-contained|registered] [--submit-to IP:PORT]\n\
 Default signature mode embeds the public key with its Ed25519 signature so the sender account can be derived and checked by any validating node. `--signature-mode registered` is for legacy fixtures. `--submit-to` sends signed TXN2 using QZTS/1 and waits for the node's admission ACK; this does not imply Mainnet status or that the transaction was mined.");
                 println!("QZKW2 commands: create-qfp6-hybrid, restore-qfp6-hybrid, address-qfp6-hybrid. They use Q6HA dual signatures; sign-transfer creates an offline candidate only and refuses QZTS/1 broadcast.");
+                println!("Local-only Genesis approval: approve-local-genesis --wallet ABSOLUTE_QZKW2_PATH --package-dir ABSOLUTE_LOCAL_DEVNET_DIR. It prompts for explicit owner confirmation and writes a Q6GA v1 local-only approval.");
+                println!("Zero-value Public Testnet authorization: approve-public-testnet-genesis --wallet ABSOLUTE_QZKW2_PATH --package-dir ABSOLUTE_QFP6_PACKAGE_DIR. It requires a valid existing local Q6GA, prompts for a separate explicit owner confirmation, and writes a Q6GA v2 authorization limited to zero-value Public Testnet; it does not authorize Mainnet, markets or real-value transfers.");
                 println!("Read-only local RPC: rpc-status --rpc 127.0.0.1:PORT; balance --rpc 127.0.0.1:PORT --account-id-hex HEX64; tx-status --rpc 127.0.0.1:PORT --txid-hex HEX64. These queries are restricted to loopback and require an explicitly read-only RPC response.");
                 Ok(())
             }
@@ -1866,6 +2565,14 @@ Default signature mode embeds the public key with its Ed25519 signature so the s
             Ok(Command::Restore { output }) => restore_wallet(&output),
             Ok(Command::CreateHybrid { output }) => create_hybrid_wallet(&output),
             Ok(Command::RestoreHybrid { output }) => restore_hybrid_wallet(&output),
+            Ok(Command::ApproveLocalGenesis {
+                wallet,
+                package_dir,
+            }) => approve_local_genesis(&wallet, &package_dir),
+            Ok(Command::ApprovePublicTestnetGenesis {
+                wallet,
+                package_dir,
+            }) => approve_public_testnet_genesis(&wallet, &package_dir),
             Ok(Command::HybridAddress { wallet }) => hybrid_address(&wallet),
             Ok(Command::Address { wallet }) => address(&wallet),
             Ok(Command::RpcStatus { rpc }) => rpc_status(rpc),
@@ -1907,6 +2614,45 @@ Default signature mode embeds the public key with its Ed25519 signature so the s
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn local_genesis_approval_rejects_non_loopback_or_peer_enabled_profiles() {
+            let valid = serde_json::json!({
+                "mode": "permissionless-full-history-candidate",
+                "allow_public_listener": false,
+                "listen_address": "127.0.0.1:30333",
+                "enable_approved_peer_outbound_sync": false,
+                "enable_q6ar_candidate_address_book": false
+            });
+            assert!(validate_local_genesis_runtime_config(valid.as_object().unwrap()).is_ok());
+
+            let mut changed = valid.clone();
+            changed["listen_address"] = serde_json::json!("192.168.1.20:30333");
+            assert!(validate_local_genesis_runtime_config(changed.as_object().unwrap()).is_err());
+
+            let mut changed = valid.clone();
+            changed["enable_approved_peer_outbound_sync"] = serde_json::json!(true);
+            assert!(validate_local_genesis_runtime_config(changed.as_object().unwrap()).is_err());
+
+            let mut changed = valid.clone();
+            changed["enable_q6ar_candidate_address_book"] = serde_json::json!(true);
+            assert!(validate_local_genesis_runtime_config(changed.as_object().unwrap()).is_err());
+
+            let mut changed = valid.clone();
+            changed["allow_public_listener"] = serde_json::json!(true);
+            assert!(validate_local_genesis_runtime_config(changed.as_object().unwrap()).is_err());
+        }
+
+        #[test]
+        fn local_genesis_approval_requires_manifest_to_pin_original_config_bytes() {
+            let bytes = br#"{"permissionless_runtime":{"listen_address":"127.0.0.1:30333"}}"#;
+            let digest: [u8; 32] = Sha256::digest(bytes).into();
+            let manifest = serde_json::json!({
+                "permissionless_config_sha256": hex(&digest)
+            });
+            assert!(validate_local_package_config_digest(&manifest, bytes).is_ok());
+            assert!(validate_local_package_config_digest(&manifest, b"{}").is_err());
+        }
 
         #[test]
         fn candidate_rpc_client_rejects_non_loopback_addresses() {
