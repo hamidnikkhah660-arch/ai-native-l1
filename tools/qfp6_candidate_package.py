@@ -185,6 +185,64 @@ def bind_founder(root: pathlib.Path, identity_path: pathlib.Path) -> int:
     return 0
 
 
+
+def public_testnet_authorization_errors(root: pathlib.Path, data: dict) -> list[str]:
+    auth = data.get("signing", {}).get("q6ga_public_testnet_authorization")
+    if auth is None:
+        return []
+    errors = []
+    rel = auth.get("path")
+    expected = auth.get("sha256")
+    if not isinstance(rel, str) or not isinstance(expected, str) or len(expected) != 64:
+        return ["Q6GA public-testnet authorization path/SHA-256 metadata is malformed"]
+    artifact = (root / rel).resolve()
+    try:
+        artifact.relative_to(root.resolve())
+    except ValueError:
+        return ["Q6GA public-testnet authorization path escapes package directory"]
+    if not artifact.is_file() or artifact.is_symlink():
+        return ["Q6GA public-testnet authorization artifact is missing or not a regular file"]
+    raw = artifact.read_bytes()
+    actual = hashlib.sha256(raw).hexdigest()
+    if actual != expected:
+        errors.append("Q6GA public-testnet authorization SHA-256 mismatch")
+    if len(raw) != 5685 or raw[:4] != b"Q6GA":
+        return errors + ["Q6GA public-testnet authorization has an invalid envelope length or magic"]
+    if int.from_bytes(raw[4:6], "big") != 2 or int.from_bytes(raw[6:8], "big") != 1:
+        errors.append("Q6GA public-testnet authorization must be version 2 / Ed25519+ML-DSA-65")
+    scope_offset = 8 + 9 * 32 + 8 * 3 + 1
+    if raw[scope_offset] != 2 or raw[scope_offset + 1:scope_offset + 7] != bytes(6):
+        errors.append("Q6GA public-testnet authorization scope is not ZERO_VALUE_PUBLIC_TESTNET_ONLY")
+    if raw[264:296] != bytes(32):
+        errors.append("Q6GA v2 bootstrap-peer hash field must be zero by protocol design")
+    expected_owner = data.get("owner_genesis_account")
+    if isinstance(expected_owner, str) and raw[72:104].hex() != expected_owner:
+        errors.append("Q6GA owner account does not match candidate manifest")
+    components = data.get("components", {})
+    for name, start in (
+        ("genesis_descriptor_q6gd", 136),
+        ("consensus_profile_q6cp", 168),
+        ("network_profile_q6pn", 200),
+        ("genesis_snapshot", 232),
+    ):
+        expected_hash = components.get(name, {}).get("sha256")
+        if not isinstance(expected_hash, str) or raw[start:start + 32].hex() != expected_hash:
+            errors.append(f"Q6GA v2 is not bound to the manifest's exact {name} hash")
+    founder = data.get("founder_identity")
+    if isinstance(founder, dict):
+        if raw[328:360].hex() != founder.get("ed25519_public_key_hex"):
+            errors.append("Q6GA Ed25519 public key differs from the bound founder identity")
+        if raw[360:2312].hex() != founder.get("mldsa65_public_key_hex"):
+            errors.append("Q6GA ML-DSA-65 public key differs from the bound founder identity")
+    if int.from_bytes(raw[296:304], "big") != 700000000000000000:
+        errors.append("Q6GA gross-supply ceiling does not match CP-0651")
+    if int.from_bytes(raw[304:312], "big") != 100000000000000000:
+        errors.append("Q6GA owner Genesis allocation does not match CP-0651")
+    if int.from_bytes(raw[312:320], "big") != 0 or raw[320] != 1:
+        errors.append("Q6GA economics must be zero-subsidy / fee-only")
+    return errors
+
+
 def validate_package(root: pathlib.Path) -> int:
     manifest_path = root / "manifest.json"
     try:
@@ -271,13 +329,39 @@ def validate_package(root: pathlib.Path) -> int:
             errors.append(f"{name}: SHA-256 mismatch")
         else:
             checked.append(name)
-    if errors:
-        print("INVALID: " + "; ".join(errors))
-        return 2
+    errors.extend(public_testnet_authorization_errors(root, data))
+    readiness = data.get("network_readiness")
+    readiness_blockers = []
+    if not isinstance(readiness, dict):
+        readiness_blockers.append("network_readiness_not_attached")
+    else:
+        for key in (
+            "public_testnet_launch_ready",
+            "public_peer_discovery_qualified",
+            "inbound_peer_identity_authenticated",
+            "public_seed_endpoint_attested",
+        ):
+            if readiness.get(key) is not True:
+                readiness_blockers.append(f"{key}=false")
+        bootstrap = components.get("bootstrap_peers")
+        if isinstance(bootstrap, dict) and bootstrap.get("path"):
+            try:
+                peer_rows = json.loads((root / bootstrap["path"]).read_text(encoding="utf-8"))
+                if not isinstance(peer_rows, list):
+                    errors.append("bootstrap_peers artifact must be a JSON array")
+                elif readiness.get("bootstrap_peer_count") != len(peer_rows):
+                    errors.append("network_readiness.bootstrap_peer_count does not match bootstrap_peers artifact")
+            except Exception as exc:
+                errors.append(f"cannot parse bootstrap_peers artifact: {exc}")
     if errors:
         print("INVALID: " + "; ".join(errors))
         return 2
     print(f"package_schema={SCHEMA}")
+    if data.get("signing", {}).get("q6ga_public_testnet_authorization"):
+        print("q6ga_public_testnet_authorization=STRUCTURE_AND_ARTIFACT_BINDINGS_VALID")
+        print("q6ga_cryptographic_signature_verification=RECORDED_ON_ORIGINAL_CP0676_RUNTIME_NOT_REPEATED_BY_PYTHON_VALIDATOR")
+    else:
+        print("q6ga_public_testnet_authorization=MISSING")
     print("release_profile=" + str(profile))
     print(f"artifacts_hash_verified={len(checked)}")
     print(f"artifacts_missing={len(missing)}" + (":" + ",".join(missing) if missing else ""))
@@ -289,8 +373,10 @@ def validate_package(root: pathlib.Path) -> int:
     print("anchored_qap1_candidate_wired=" + str(runtime.get("anchored_qap1_candidate_wired") is True).lower())
     print("permissionless_base_runtime_wired=" + str(runtime.get("permissionless_base_runtime_wired") is True).lower())
     print("public_mining_authorized=false")
-    print("exit_status=" + ("INCOMPLETE" if missing else "HASHES_VALID_CANDIDATE_ONLY"))
-    return 2 if missing else 0
+    print("network_readiness_status=" + ("INCOMPLETE" if readiness_blockers else "READY_FOR_SEPARATE_OWNER_LAUNCH_DECISION"))
+    print("network_readiness_blockers=" + (",".join(readiness_blockers) if readiness_blockers else "none"))
+    print("exit_status=" + ("INCOMPLETE" if missing or readiness_blockers else "HASHES_VALID_CANDIDATE_ONLY"))
+    return 2 if missing or readiness_blockers else 0
 
 
 def self_test() -> int:

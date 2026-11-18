@@ -1,36 +1,45 @@
 QFP6 UNIFIED CANDIDATE PACKAGE
 
-Status: INTEGRATION CANDIDATE ONLY — NOT RELEASE READY.
+Status: CP-0651 GENESIS INPUTS ATTACHED ? PUBLIC PEER TOPOLOGY NOT CONNECTED.
+This is a zero-value Public Testnet candidate package, not Mainnet and not a production release.
 
-The active owner-directed monetary policy is CP-0651 (recorded in CP-0650/CP-0651):
+Canonical CP-0651 inputs attached byte-for-byte from the preserved CP-0596 workspace:
+- artifacts/genesis-snapshot.q6sn
+- artifacts/genesis-descriptor.q6gd
+- artifacts/consensus-profile.q6cp
+- artifacts/q6pn-profile.q6pn
+- artifacts/bootstrap-peers.json
+- artifacts/public-testnet-authorization.q6ga (Q6GA v2, Ed25519 + ML-DSA-65)
+
+The Q6GA v2 owner authorization is scoped only to ZERO_VALUE_PUBLIC_TESTNET_ONLY.
+It was verified by the original CP-0676 Release runtime and is hash-pinned here.
+It does NOT authorize Mainnet, real-value transfers, public mining rewards, market
+activity, exchange listing, or liquidity. The local-only Q6GA v1 file is intentionally
+not copied into this package.
+
+Active economics are CP-0651:
 - Maximum gross supply ceiling: 7,000,000,000 QZXB.
 - Owner Genesis allocation: 1,000,000,000 QZXB.
-- Six accounting labels: 1,000,000,000 QZXB each (6,000,000,000 QZXB total).
-- Block subsidy / mining issuance: exactly zero at every height.
+- Six 1B accounting labels: ceilings only, not issued balances or mint authority.
+- Block subsidy / mining issuance: exactly zero.
 - Producers receive canonical transaction fees only.
-- The six labels are ceilings, not Genesis balances, spendable accounts, or mint authority.
 
-CP-0566D/CP-0566E are preserved as historical prior 10B/3B-mining policy records.
-CP-0651 is the later owner-requested 7B/fee-only policy and is the only policy accepted
-by the permissionless launcher. CP-0528 and CP-0604 remain legacy compatibility paths
-and must not initialize this permissionless runtime.
+Important release boundary:
+- The bootstrap-peers.json file is present and hash-verified, but its array is empty.
+- The prior seed config had outbound peer sync disabled and Q6AR address-book discovery disabled.
+- The candidate runtime manifest records unauthenticated inbound Noise XX and unqualified
+  public peer discovery. A public listener alone is not a connected public P2P network.
+- The owner reports Gate 2 and Gate 8 complete and has instructed that those qualifications
+  must not be repeated. Their external receipts are not attached to this package yet.
+- No external Seed endpoint / approved peer-pin set is attached to this unified package.
+- The existing live PID 20244 / port 30333 was not stopped, reconfigured, or replaced.
 
-This package is intentionally incomplete. Do not start a public node or describe this
-folder as a deployable public Testnet/Mainnet release.
-
-Required canonical release inputs remain absent:
-- CP-0651 Genesis snapshot (.q6sn)
-- Genesis descriptor (.q6gd)
-- Consensus profile (.q6cp)
-- Network profile (.q6pn)
-- Approved bootstrap peer set
-- Founder/owner signature and independently pinned release authorization
-- External operator/host identity and endpoint attestations
-
-No placeholder artifact, invented identifier, fabricated signature, or empty bootstrap
-list is accepted as proof of public readiness. Mainnet, public mining, value-bearing
-transfers, exchange listing and trading remain unauthorized.
+Do not treat this package as launch-ready. Do not copy DPAPI credentials, local-only
+Q6GA v1 approval, runtime databases, private keys, or local anchor-vault state.
+Do not invent endpoints or peer identities. Public Testnet activation remains gated
+on attaching the already-qualified external operator/Seed records and completing the
+specific public-peer runtime binding.
 
 Run:
   python tools/qfp6_candidate_package.py self-test
-  python tools/qfp6_candidate_package.py validate <package-directory>
+  python tools/qfp6_candidate_package.py validate release/qfp6-candidate

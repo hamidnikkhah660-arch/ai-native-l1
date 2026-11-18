@@ -29,37 +29,36 @@ CP-0566D/CP-0566E remain preserved as the prior 10B/3B-mining policy; CP-0651 is
 - Combined CP-0596 QFP6 node/runtime and wallet/market modules with CP-0704 identity rotation and QAR2/QBT1/Q6TS anchor work.
 - Resolved permissionless launcher integration while retaining CP-0704 QAR2/QBT1 trust components and binding Genesis admission to CP-0651.
 - Preserved CP-0528 and CP-0604 as historical compatibility paths; the permissionless launcher accepts only CP-0651.
-- Updated release/qfp6-candidate/manifest.json to remain a non-production scaffold for the CP-0651 permissionless full-history profile.
-- Candidate package remains a structural scaffold. Genesis snapshot, Q6GD descriptor, Q6CP, Q6PN, and approved bootstrap peer artifacts are still missing in this candidate directory. Do not substitute CP-0528/CP-0604 or local research artifacts.
+- Merged the current origin/main CP-0651 public documentation into the unified branch (local merge commit 419b9376d956ccc6a0082d1c628b9e975ce562bc); newer CP-0651 public-economics and Q6GA v2 wording is retained.
+- CP-0778 attaches the exact existing CP-0651 Genesis snapshot, Q6GD, Q6CP, Q6PN, bootstrap-peers file and owner-signed Q6GA v2 Public Testnet authorization to release/qfp6-candidate/artifacts/. No artifact bytes were regenerated.
+- The old local-only Q6GA v1 approval, DPAPI protected Noise credentials, runtime databases and local anchor-vault state were deliberately not copied.
+- Candidate manifest now records exact artifact hashes, Q6GA v2 scope/bindings, and the public-network readiness boundary. The package validator checks Q6GA v2 envelope structure and exact artifact/founder-key bindings; it does not itself cryptographically verify signatures.
+- The five required component files are present and hash-verified. bootstrap-peers.json is present but contains an empty array; public outbound sync and Q6AR address-book discovery are disabled in the existing seed config. This is not a connected multi-peer network.
 
 ## Validation observed on 2026-11-19
 
-- cargo fmt --all -- --check: PASS; git diff --check: PASS.
-- cargo check --all-targets after CP-0651 gate/auditor/package-validator correction: PASS (warnings only; no compile errors).
-- Full qrun_v06_node binary suite: 46 passed, 0 failed (serial).
-- Full qrun_v06_anchor_daemon binary suite: 4 passed, 0 failed (serial).
-- CP-0651 permissionless Genesis gate on the corrected unified source: 1 passed / 0 failed. CP-0651 read-only Genesis auditor tests: 2 passed / 0 failed; verifies exact 1B owner issuance and rejects CP-0528/CP-0604.
-- Full library suite: serial run completed with 1,684 passed / 1 failed in 2,264.56s. The sole failure was qap1_peer_ingress_qualifies_separate_qfp6_process with Windows socket error 10053. Isolated rerun of that exact test passed (1 passed / 0 failed in 4.14s). All 1,685 unique library tests therefore passed across the full run plus isolated rerun; retain the first-run socket interruption in the record as a transient test-environment failure, not a suppressed result. The library source itself was not changed by the CP-0651 binary-gate correction.
-- cargo build --release --bins: PASS, exit 0 (11m24s). New hashes: qrun_v06_node.exe DC62A700E7C339447C82D01E53248B29B73BB0337B1F73E78EE50003426BFE5E; qrun_v06_anchor_daemon.exe 9E98990FFB29E107DEA33273A57665335EA314EFABABBD5740E050C138E72454; qzxb_wallet.exe 6553369C133C4F81AAB49CB3AE01477E77FE59B3DCAAA5F9F6F08EA8792F9184; qfp6_genesis_audit.exe A3AD3F2283498138E580F5BE07C2CF501E6592165ED3D2425F0F59353F5DA307. Full byte sizes in docs/UNIFIED_RELEASE_BUILD_SHA256SUMS_2026-11-18.txt. Older CP-0776 node/auditor hashes are superseded.
-- Package validator self-test after CP-0651 hardening: PASS, exit 0. Actual candidate package validation: exit 2 / INCOMPLETE as intended, with five missing release inputs. Full node/wallet/auditor help probes pass. Anchor daemon requires an absolute config path and SHA-256 positional arguments; it was not started without a provisioned QAR2/QBT1 configuration.
-
+- CP-0777 Release build and test evidence remains unchanged; no full Rust suite was rerun for this artifact/documentation-only CP-0778 change.
+- python tools/qfp6_candidate_package.py self-test: PASS, exit 0.
+- python tools/qfp6_candidate_package.py validate release/qfp6-candidate: exit 2 / INCOMPLETE as intended. It reports all five component hashes verified, Q6GA v2 structure and exact artifact/founder-key bindings valid, and the four current network-readiness blockers: public Testnet launch not ready, public peer discovery not qualified in this package, inbound peer identity not authenticated in the current config, and no public Seed endpoint attached.
+- Candidate manifest JSON parse: PASS. git diff --check: PASS.
+- Artifact hashes and sizes are recorded in docs/CP-0778_PUBLIC_TESTNET_ARTIFACT_RECONCILIATION_2026-11-19.md.
 
 ## Runtime and release boundary
 
-The pre-existing local process PID 20244 on port 30333 was not stopped or replaced. It runs the older CP-0596 local zero-value config, with an empty bootstrap list, outbound peer sync disabled and anonymous Noise XX ingress. It is not evidence that this unified build is deployed or that secure public P2P is live.
+The pre-existing local process PID 20244 on port 30333 was not stopped, replaced, or reconfigured. It still runs the older CP-0596 binary with public-testnet-seed-config-runtime.json and config digest 679088482f3204605f5e4208076b89851d84a3dfb335af9d37709f01bf95a3c3. This live process is not the CP-0777 unified build. Its current package has an empty bootstrap peer list, outbound peer sync disabled and anonymous Noise XX ingress. A public listener alone does not prove that independent peers are connected or authenticated.
 
-CP-0775 provides two-process PMT4/PFM4/TXN4/MTA4 loopback diagnostics, not public Internet or independent physical-host qualification. CP-0774 integrates Q6TS into the standalone Anchor daemon at code level, but no live independent AWS trust-floor deployment was performed. Gate 2 and Gate 8 remain OPEN in the latest qualification records.
+The owner reports Gate 2 and Gate 8 completed in prior sessions and explicitly instructs that these qualifications must not be repeated. This handoff treats both as owner-reported complete and does not schedule re-tests. Their existing external receipts and the independently operated Seed endpoint/Noise pin records are not yet attached to this unified release package. The next work is artifact/endpoint reconciliation and runtime binding, not repeating Gate 2 or Gate 8.
 
-AWS CLI is not installed on heymed, so no live AWS STS identity/session or QAR2/QBT1 external integration was verified. NetBird currently reports NeedsLogin. This does not invalidate the historical CP-0566C NetBird cross-host evidence for its already-qualified private-overlay scope; it means there is no current overlay session for qualifying the unified candidate.
+The Q6GA v2 authorization is a separate owner-signed authorization for ZERO_VALUE_PUBLIC_TESTNET_ONLY. It is not Mainnet authorization, not permission for real-value transfers, and not a market authorization. It binds the exact Genesis snapshot, Q6GD, Q6CP and Q6PN hashes plus CP-0651 economics. Its bootstrap-peer hash field is zero by protocol design; peer endpoints and Noise pins are handled by the network profile/bootstrap configuration.
 
-No production keys were read or rotated. No external AWS/NetBird services were changed. No public listener was enabled, no Genesis was promoted, and no exchange/market listing or liquidity action was initiated.
+No production keys were read or rotated. No external AWS/NetBird services were changed. No public listener was enabled or disabled by this CP-0778 operation. No Genesis was promoted, and no exchange/market listing or liquidity action was initiated.
 
 ## Next safe actions
 
-1. Obtain the independently reviewed CP-0651 public Genesis/Q6GD/Q6CP/Q6PN values and complete owner authorization locally over exact hashes. The existing local CP-0651 package and its Q6GA/config authorization are loopback-only and cannot be reused for a public profile.
-2. Make a real AWS CLI/SDK deployment session available on an independently administered Anchor host, then qualify QAR2/QBT1 authenticated reads/CAS and whole-host rollback. Current heymed cannot establish AWS STS because AWS CLI is absent.
-3. Restore an approved private overlay or provision independently operated public Seed infrastructure. Preserve CP-0566C/NetBird historical qualification, but qualify the current candidate on the exact frozen profile and genuinely independent hosts.
-4. Recruit and verify at least three independent operators. Issue #72 remains open; GitHub PRs #196 and #197 also remain open and need independent review.
-5. After Gate 2/Gate 8 and release authorization pass, publish the zero-value Public Testnet, wallet/explorer/site and independent security-review package. Exchange outreach follows a verified live network and a truthful listing dossier.
+1. Attach the already-qualified independent Seed endpoint(s), operator identity/attestation and Noise public-key fingerprints from the existing external records. Do not rerun Gate 2 or Gate 8.
+2. Reconcile the peer pins with Q6PN/Q6AR and the exact CP-0651 profile. If Q6PN changes, the existing Q6GA v2 signature must be renewed locally over the new exact hash; never export wallet secrets or request them in chat.
+3. Generate a new unified seed/joining runtime config with authenticated peer admission, approved outbound sync and address-book settings, while keeping the old PID 20244 and port 30333 untouched until a controlled replacement plan is approved.
+4. Run the candidate validator and focused disposable-config preflight on the unified build, then submit the exact CP-0778 candidate for independent code review and protected-branch approval.
+5. After the existing qualification receipts are attached and the candidate runtime is bound to the approved peer set, activate only the zero-value Public Testnet scope. Mainnet, real-value transfer, public mining rewards and market activity remain unauthorized.
 
-This handoff records an integration candidate, not a public release, production authorization, Mainnet activation, or trading readiness.
+This handoff records a unified candidate and attached owner-authorized zero-value Testnet Genesis inputs, not a claim that the multi-peer Public Testnet is already live or that Mainnet/trading is ready.
