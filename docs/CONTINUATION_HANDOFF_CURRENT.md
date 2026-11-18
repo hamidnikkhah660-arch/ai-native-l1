@@ -62,3 +62,41 @@ No production keys were read or rotated. No external AWS/NetBird services were c
 5. After the existing qualification receipts are attached and the candidate runtime is bound to the approved peer set, activate only the zero-value Public Testnet scope. Mainnet, real-value transfer, public mining rewards and market activity remain unauthorized.
 
 This handoff records a unified candidate and attached owner-authorized zero-value Testnet Genesis inputs, not a claim that the multi-peer Public Testnet is already live or that Mainnet/trading is ready.
+
+
+## CP-0780 — phased Testnet, economy/market and MiCA readiness update (2026-11-19)
+See: docs/CP-0780_PHASED_PUBLIC_TESTNET_ECONOMIC_MARKET_AND_MICA_READINESS_2026-11-19.md
+
+Owner-approved programme:
+- Phase 1: zero-value Public Testnet on independent stable public hosting; owner's laptop/hotspot is auxiliary only.
+- Phase 2: native market/UI/RPC/explorer completion, authentic liquidity preparation, platform readiness and legal classification/licensing preparation.
+- Owner budget remains USD 0 new spend unless explicitly changed. No cloud/VPS/payment commitment was made.
+
+Preserved state:
+- Unified baseline remains CP-0779 / 90dc6eb29a848e1bc8e0bbadc116db019cee541e before this checkpoint's local edits.
+- Existing PID 20244 and TCP 30333 were not stopped, restarted, replaced or reconfigured.
+- The previously provisioned Seed public Noise fingerprint remains 9407504ce70ddf91478a82143195fffa6fd3375c52c0776ef223dff1a559ec48; this is the local identity pin, not proof of a current stable public endpoint.
+- Public bootstrap list remains empty; public_seed_endpoint_attested=false; public_testnet_launch_ready=false.
+- Q6MO/Q6MA/Q6MM, AMM and OrderBook implementation evidence exists in CP-0659/0660/0662/0673; user-facing public order RPC/wallet, indexer/explorer and a real quote asset/liquidity market remain separate work.
+- Active CP-0651 economics remain 7B gross accounting ceiling, 1B owner Genesis allocation, six non-circulating 1B accounting labels, zero block subsidy and fee-only producer compensation. The old 3B mining subsidy is superseded; public mining rewards are not authorized.
+
+CI correction staged locally:
+- PR #198 baseline CI failed on Linux because one test in devnet_trust_provisioner requires Windows CurrentUser DPAPI.
+- Added cfg(windows) to the DPAPI-specific rotation test and added a dedicated Windows CI step.
+- Local Windows formatter check passed and devnet_trust_provisioner test passed 6/6 offline.
+- The two-file change is not yet committed/pushed; new PR CI has not run. Do not report CI green until the pushed commit's Linux and Windows jobs pass.
+
+Regulatory readiness:
+- Prepared technical MiCA/Poland workstream only; no legal opinion, application, licence or offer has been made.
+- See CP-0780 for current official ESMA/KNF/Sejm/Polish Tax Administration references and required legal work.
+- The 1 July 2026 MiCA transition deadline has passed; do not treat the old Polish virtual-currency register as MiCA authorization. No Polish non-EMT CASP application route should be assumed before a competent authority is designated. Cross-border use of a properly authorised EU CASP requires counsel confirmation.
+
+No Gate 2 or Gate 8 tests were repeated. They remain owner-reported complete for tracking; no new independent verification is claimed in this checkpoint.
+
+
+Focused Phase 2 regressions run on the unified candidate (not Gate 2/8):
+- Q6MO ingress protocol: 7/7 PASS.
+- Q6MM journal: 3/3 PASS.
+- Q6MO durable listener/service lifecycle through canonical block commit: 1/1 PASS.
+- CP-0651 native OrderBook supply/snapshot regression: 1/1 PASS.
+- Combined: 12 passed / 0 failed. All are local candidate tests; the Q6MO end-to-end lifecycle uses a local Noise session and does not establish a public market or independent Internet deployment.

@@ -1116,6 +1116,7 @@ mod tests {
         SigningKey::from_bytes(&[byte; 32])
     }
 
+    #[cfg(windows)]
     #[test]
     fn rotate_peer_command_requires_dual_attestation_before_writing_npi1() {
         let root = std::env::temp_dir().join(format!(
