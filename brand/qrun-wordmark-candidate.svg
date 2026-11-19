@@ -1,0 +1,17 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 190" role="img" aria-labelledby="title desc">
+  <title id="title">QRun Blockchain wordmark candidate</title>
+  <desc id="desc">Blue QRun symbol beside the QRun Blockchain name.</desc>
+  <defs>
+    <linearGradient id="qrunBlue" x1="20" y1="20" x2="170" y2="170" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#22D3EE"/><stop offset="0.55" stop-color="#2563EB"/><stop offset="1" stop-color="#7DD3FC"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(0 0)">
+    <circle cx="92" cy="88" r="57" fill="none" stroke="url(#qrunBlue)" stroke-width="16" stroke-linecap="round" stroke-dasharray="310 50" transform="rotate(-42 92 88)"/>
+    <path d="M115 111 L158 154" stroke="url(#qrunBlue)" stroke-width="15" stroke-linecap="round"/>
+    <path d="M19 119 C57 157 128 160 174 87" fill="none" stroke="#22D3EE" stroke-width="6" stroke-linecap="round"/>
+    <circle cx="19" cy="119" r="7" fill="#22D3EE"/><circle cx="174" cy="87" r="7" fill="#7DD3FC"/>
+  </g>
+  <text x="215" y="104" font-family="Inter, Arial, sans-serif" font-size="88" font-weight="650" letter-spacing="-4" fill="#07152F">QRun</text>
+  <text x="222" y="151" font-family="Inter, Arial, sans-serif" font-size="27" font-weight="600" letter-spacing="8" fill="#2563EB">BLOCKCHAIN</text>
+</svg>
