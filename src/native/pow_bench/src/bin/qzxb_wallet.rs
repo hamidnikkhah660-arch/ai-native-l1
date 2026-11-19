@@ -7,10 +7,14 @@
 #[cfg(windows)]
 mod windows_wallet {
     use ai_native_l1_pow_bench::{
+        qrun_v06_canonical_execution_candidate::QRunV06CanonicalExecutionState,
+        qrun_v06_consensus_profile_candidate::QRunV06ConsensusProfile,
+        qrun_v06_cp0651_supply_candidate::CP0651_OWNER_GENESIS_ATOMS,
         qrun_v06_genesis_approval_candidate::QRunV06GenesisApproval,
         qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
         qrun_v06_hybrid_auth_candidate::QRunV06HybridTransactionSigner,
         qrun_v06_noise_transport_candidate::QRunV06NoiseSession,
+        qrun_v06_profile_pin_candidate::QRunV06VerifiedProfilePin,
         qrun_v06_transaction_ingress_candidate::{
             decode_q6ta_response, encode_q6ti_transaction_request,
             QRunV06TransactionSubmitResponse, QRunV06TransactionSubmitStatus,
@@ -29,7 +33,7 @@ mod windows_wallet {
         ffi::c_void,
         fs::{self, File, OpenOptions},
         io::{self, Read, Write},
-        net::{Shutdown, SocketAddr, TcpStream},
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream},
         path::{Path, PathBuf},
         process, ptr,
         sync::atomic::{AtomicU64, Ordering},
@@ -102,6 +106,10 @@ mod windows_wallet {
             package_dir: PathBuf,
         },
         ApprovePublicTestnetGenesis {
+            wallet: PathBuf,
+            package_dir: PathBuf,
+        },
+        ApproveMainnetGenesis {
             wallet: PathBuf,
             package_dir: PathBuf,
         },
@@ -500,6 +508,18 @@ mod windows_wallet {
                     return Err("--wallet and --package-dir must be absolute paths".into());
                 }
                 Ok(Command::ApprovePublicTestnetGenesis {
+                    wallet,
+                    package_dir,
+                })
+            }
+            "approve-mainnet-genesis" => {
+                let values = options(&args[1..], &["--wallet", "--package-dir"])?;
+                let wallet = PathBuf::from(required(&values, "--wallet")?);
+                let package_dir = PathBuf::from(required(&values, "--package-dir")?);
+                if !wallet.is_absolute() || !package_dir.is_absolute() {
+                    return Err("--wallet and --package-dir must be absolute paths".into());
+                }
+                Ok(Command::ApproveMainnetGenesis {
                     wallet,
                     package_dir,
                 })
@@ -2279,6 +2299,697 @@ mod windows_wallet {
         Ok(())
     }
 
+    const MAINNET_NATIVE_MODE: &str = "mainnet-native-value-candidate";
+    const MAINNET_NATIVE_ACK: &str = "QZXB_MAINNET_NATIVE_VALUE_OWNER_AUTHORIZATION_REQUIRED";
+    const MAINNET_NATIVE_INBOUND_ACK: &str = "PINNED_NOISE_STATIC_KEY_ALLOWLIST_REQUIRED";
+
+    fn ipv4_mainnet_in_prefix(address: Ipv4Addr, network: Ipv4Addr, prefix: u32) -> bool {
+        let mask = if prefix == 0 {
+            0
+        } else {
+            u32::MAX << (32 - prefix)
+        };
+        (u32::from(address) & mask) == (u32::from(network) & mask)
+    }
+
+    fn ipv6_mainnet_in_prefix(address: Ipv6Addr, network: Ipv6Addr, prefix: u32) -> bool {
+        let mask = if prefix == 0 {
+            0
+        } else {
+            u128::MAX << (128 - prefix)
+        };
+        (u128::from(address) & mask) == (u128::from(network) & mask)
+    }
+
+    /// Strict numeric-unicast filter for the owner-approved Mainnet bootstrap set.
+    /// Wildcards are only valid as listener binds, never as peer endpoints.
+    fn is_publicly_routable_mainnet_peer(ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(address) => {
+                !address.is_unspecified()
+                    && !address.is_loopback()
+                    && !address.is_private()
+                    && !address.is_link_local()
+                    && !address.is_multicast()
+                    && !address.is_broadcast()
+                    && !ipv4_mainnet_in_prefix(address, Ipv4Addr::new(0, 0, 0, 0), 8)
+                    && !ipv4_mainnet_in_prefix(address, Ipv4Addr::new(100, 64, 0, 0), 10)
+                    && !ipv4_mainnet_in_prefix(address, Ipv4Addr::new(192, 0, 0, 0), 24)
+                    && !ipv4_mainnet_in_prefix(address, Ipv4Addr::new(192, 0, 2, 0), 24)
+                    && !ipv4_mainnet_in_prefix(address, Ipv4Addr::new(192, 88, 99, 0), 24)
+                    && !ipv4_mainnet_in_prefix(address, Ipv4Addr::new(198, 18, 0, 0), 15)
+                    && !ipv4_mainnet_in_prefix(address, Ipv4Addr::new(198, 51, 100, 0), 24)
+                    && !ipv4_mainnet_in_prefix(address, Ipv4Addr::new(203, 0, 113, 0), 24)
+                    && !ipv4_mainnet_in_prefix(address, Ipv4Addr::new(240, 0, 0, 0), 4)
+            }
+            IpAddr::V6(address) => {
+                let octets = address.octets();
+                let ipv4_mapped = octets[..10].iter().all(|byte| *byte == 0)
+                    && octets[10] == 0xff
+                    && octets[11] == 0xff;
+                if ipv4_mapped {
+                    return is_publicly_routable_mainnet_peer(IpAddr::V4(Ipv4Addr::new(
+                        octets[12], octets[13], octets[14], octets[15],
+                    )));
+                }
+                let unique_local = octets[0] & 0xfe == 0xfc;
+                let link_local = octets[0] == 0xfe && octets[1] & 0xc0 == 0x80;
+                !address.is_unspecified()
+                    && !address.is_loopback()
+                    && !address.is_multicast()
+                    && !unique_local
+                    && !link_local
+                    && !ipv6_mainnet_in_prefix(
+                        address,
+                        Ipv6Addr::from([
+                            0x00, 0x64, 0xff, 0x9b, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        ]),
+                        48,
+                    )
+                    && !ipv6_mainnet_in_prefix(
+                        address,
+                        Ipv6Addr::from([0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                        64,
+                    )
+                    && !ipv6_mainnet_in_prefix(
+                        address,
+                        Ipv6Addr::from([
+                            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        ]),
+                        32,
+                    )
+                    && !ipv6_mainnet_in_prefix(
+                        address,
+                        Ipv6Addr::from([0x20, 0x01, 0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                        48,
+                    )
+                    && !ipv6_mainnet_in_prefix(
+                        address,
+                        Ipv6Addr::from([0x20, 0x01, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                        28,
+                    )
+                    && !ipv6_mainnet_in_prefix(
+                        address,
+                        Ipv6Addr::from([0x20, 0x01, 0, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                        28,
+                    )
+                    && !ipv6_mainnet_in_prefix(
+                        address,
+                        Ipv6Addr::from([0x20, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                        16,
+                    )
+                    && !ipv6_mainnet_in_prefix(
+                        address,
+                        Ipv6Addr::from([0x3f, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                        20,
+                    )
+            }
+        }
+    }
+
+    fn validate_mainnet_bootstrap_peers(bytes: &[u8]) -> Result<usize, String> {
+        use std::collections::BTreeSet;
+
+        if bytes.is_empty() || bytes.len() > 1024 * 1024 {
+            return Err("mainnet-bootstrap-peers.json is empty or exceeds 1 MiB".into());
+        }
+        let value: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|_| "mainnet-bootstrap-peers.json is invalid JSON".to_string())?;
+        let rows = value
+            .as_array()
+            .filter(|rows| !rows.is_empty() && rows.len() <= 64)
+            .ok_or("Mainnet bootstrap peer set must contain between 1 and 64 peers")?;
+        let mut endpoints = BTreeSet::new();
+        let mut public_keys = BTreeSet::new();
+        for (index, row) in rows.iter().enumerate() {
+            let object = row
+                .as_object()
+                .ok_or_else(|| format!("Mainnet bootstrap peer {index} must be an object"))?;
+            if object.len() != 2
+                || !object.contains_key("address")
+                || !object.contains_key("noise_static_public_key")
+            {
+                return Err(format!(
+                    "Mainnet bootstrap peer {index} must contain exactly address and noise_static_public_key"
+                ));
+            }
+            let address_text = row
+                .get("address")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("Mainnet bootstrap peer {index} has no numeric address"))?;
+            let address = address_text.parse::<SocketAddr>().map_err(|_| {
+                format!("Mainnet bootstrap peer {index} address must be a numeric IP:port")
+            })?;
+            if address.port() == 0 || !is_publicly_routable_mainnet_peer(address.ip()) {
+                return Err(format!(
+                    "Mainnet bootstrap peer {index} endpoint is not a globally routable unicast IP:port"
+                ));
+            }
+            if let SocketAddr::V6(v6) = address {
+                if v6.scope_id() != 0 || v6.flowinfo() != 0 {
+                    return Err(format!(
+                        "Mainnet bootstrap peer {index} IPv6 endpoint must not carry a scope ID or flow label"
+                    ));
+                }
+            }
+            if !endpoints.insert(address) {
+                return Err("Mainnet bootstrap peer set contains a duplicate endpoint".into());
+            }
+            let key_text = row
+                .get("noise_static_public_key")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("Mainnet bootstrap peer {index} has no Noise static key"))?;
+            let key = parse_hex32(key_text, "Mainnet bootstrap Noise static public key")?;
+            if key.iter().all(|byte| *byte == 0) || !public_keys.insert(key) {
+                return Err(
+                    "Mainnet bootstrap peer set contains a zero or duplicate Noise key".into(),
+                );
+            }
+        }
+        Ok(rows.len())
+    }
+
+    fn validate_mainnet_runtime_config(
+        runtime: &serde_json::Map<String, serde_json::Value>,
+        descriptor: &QRunV06GenesisDescriptor,
+        q6gd_hash: &[u8; 32],
+        q6cp_hash: &[u8; 32],
+        q6pn_hash: &[u8; 32],
+        q6pn_commitment: &[u8; 32],
+        genesis_hash: &[u8; 32],
+        bootstrap_hash: &[u8; 32],
+    ) -> Result<(), String> {
+        let get = |name: &str| {
+            runtime
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("permissionless_runtime.{name} is required"))
+        };
+        if get("mode")? != MAINNET_NATIVE_MODE
+            || runtime
+                .get("allow_candidate_runtime")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            || runtime
+                .get("allow_public_listener")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            || get("mainnet_native_acknowledgement")? != MAINNET_NATIVE_ACK
+            || get("public_inbound_security_acknowledgement")? != MAINNET_NATIVE_INBOUND_ACK
+        {
+            return Err("permissionless_runtime is not the exact pinned-inbound Mainnet-native candidate profile".into());
+        }
+        if runtime.contains_key("public_testnet_acknowledgement")
+            || runtime.contains_key("public_testnet_authorization_path")
+            || runtime.contains_key("public_testnet_authorization_sha256")
+        {
+            return Err(
+                "Mainnet-native config must not contain Public Testnet authorization fields".into(),
+            );
+        }
+        let role = get("node_role")?;
+        if !matches!(role, "seed" | "joining") {
+            return Err("Mainnet-native node_role must be seed or joining".into());
+        }
+        let listen = get("listen_address")?
+            .parse::<SocketAddr>()
+            .map_err(|_| "Mainnet listen_address must be a numeric IP:port".to_string())?;
+        if listen.port() == 0
+            || (!listen.ip().is_unspecified() && !is_publicly_routable_mainnet_peer(listen.ip()))
+        {
+            return Err(
+                "Mainnet listen_address must be a public unicast address or explicit wildcard"
+                    .into(),
+            );
+        }
+        if get("bootstrap_peers_path")? != "mainnet-bootstrap-peers.json"
+            || get("bootstrap_peers_sha256")? != hex(bootstrap_hash)
+            || get("producer_account")? != hex(&descriptor.founder_account())
+            || get("q6gd_descriptor_path")? != "genesis-descriptor.q6gd"
+            || get("q6gd_descriptor_sha256")? != hex(q6gd_hash)
+            || get("q6cp_profile_path")? != "consensus-profile.q6cp"
+            || get("q6cp_profile_sha256")? != hex(q6cp_hash)
+            || get("q6pn_profile_pin_path")? != "q6pn-profile.q6pn"
+            || get("q6pn_profile_pin_sha256")? != hex(q6pn_hash)
+            || get("q6pn_profile_pin_commitment")? != hex(q6pn_commitment)
+            || get("genesis_snapshot_path")? != "genesis-snapshot.q6sn"
+            || get("genesis_snapshot_sha256")? != hex(genesis_hash)
+            || get("mainnet_native_authorization_path")? != "mainnet-native-authorization.q6ga"
+        {
+            return Err("Mainnet-native runtime config does not bind the exact owner, Q6GD, Q6PN, peer set or Q6GA v3 output path".into());
+        }
+        if runtime.contains_key("mainnet_native_authorization_sha256") {
+            return Err("Mainnet-native config already contains an authorization digest; refusing to replace or reuse a prior signature".into());
+        }
+        Ok(())
+    }
+
+    fn validate_mainnet_manifest(
+        manifest: &serde_json::Value,
+        descriptor: &QRunV06GenesisDescriptor,
+        hashes: &[[u8; 32]; 5],
+        peer_count: usize,
+        config_bytes: &[u8],
+    ) -> Result<(), String> {
+        if manifest.get("schema").and_then(serde_json::Value::as_str)
+            != Some("qfp6-mainnet-native-package/v1")
+            || manifest.get("scope").and_then(serde_json::Value::as_str)
+                != Some("MAINNET_NATIVE_VALUE_ONLY")
+            || manifest
+                .get("mainnet_authorized")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+            || manifest
+                .get("public_testnet_authorized")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+            || manifest
+                .get("market_authorized")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+            || manifest
+                .get("owner_genesis_signature_present")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+        {
+            return Err("Mainnet manifest must be an unsigned qfp6-mainnet-native-package/v1 with Mainnet and market authorization both false".into());
+        }
+        let hash_names = [
+            "q6gd_sha256",
+            "q6cp_sha256",
+            "q6pn_sha256",
+            "genesis_snapshot_sha256",
+            "bootstrap_peers_sha256",
+        ];
+        for (name, expected) in hash_names.iter().zip(hashes.iter()) {
+            if manifest.get(*name).and_then(serde_json::Value::as_str)
+                != Some(hex(expected).as_str())
+            {
+                return Err(format!(
+                    "Mainnet manifest {name} does not match the exact package bytes"
+                ));
+            }
+        }
+        for (name, expected) in [
+            ("network_id_hex", hex(&descriptor.network_id())),
+            ("profile_id_hex", hex(&descriptor.profile_id())),
+            ("owner_account_id_hex", hex(&descriptor.founder_account())),
+            (
+                "genesis_descriptor_commitment_hex",
+                hex(&descriptor.commitment()),
+            ),
+        ] {
+            if manifest.get(name).and_then(serde_json::Value::as_str) != Some(expected.as_str()) {
+                return Err(format!(
+                    "Mainnet manifest {name} does not match the decoded Q6GD descriptor"
+                ));
+            }
+        }
+        if manifest
+            .get("bootstrap_peer_count")
+            .and_then(serde_json::Value::as_u64)
+            != Some(peer_count as u64)
+        {
+            return Err(
+                "Mainnet manifest bootstrap_peer_count does not match the validated peer set"
+                    .into(),
+            );
+        }
+        if manifest
+            .get("genesis_owner_allocation_qzxb")
+            .and_then(serde_json::Value::as_str)
+            != Some("1000000000")
+            || manifest
+                .get("gross_supply_ceiling_qzxb")
+                .and_then(serde_json::Value::as_str)
+                != Some("7000000000")
+            || manifest
+                .get("block_subsidy_qzxb")
+                .and_then(serde_json::Value::as_str)
+                != Some("0")
+            || manifest
+                .get("six_accounting_labels_are_spendable")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+        {
+            return Err("Mainnet manifest does not match the CP-0651 fixed-supply, one-billion-owner, zero-subsidy policy".into());
+        }
+        validate_local_package_config_digest(manifest, config_bytes)
+    }
+
+    fn approve_mainnet_genesis(wallet_path: &Path, package_dir: &Path) -> Result<(), String> {
+        let package_meta = fs::symlink_metadata(package_dir)
+            .map_err(|error| format!("Mainnet package directory cannot be inspected: {error}"))?;
+        if package_meta.file_type().is_symlink() || !package_meta.is_dir() {
+            return Err("--package-dir must be a real, non-symlink directory".into());
+        }
+
+        let manifest_path = package_dir.join("mainnet-native-manifest.json");
+        let config_path = package_dir.join("permissionless-config.json");
+        let output_path = package_dir.join("mainnet-native-authorization.q6ga");
+        if output_path.exists() {
+            return Err("mainnet-native-authorization.q6ga already exists; refusing to replace an owner signature".into());
+        }
+        let manifest_bytes =
+            read_local_package_file(package_dir, "mainnet-native-manifest.json", 64 * 1024)?;
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|_| "Mainnet-native manifest JSON is invalid".to_string())?;
+
+        let q6gd = read_local_package_file(package_dir, "genesis-descriptor.q6gd", 4096)?;
+        let q6cp = read_local_package_file(package_dir, "consensus-profile.q6cp", 64 * 1024)?;
+        let q6pn = read_local_package_file(package_dir, "q6pn-profile.q6pn", 64 * 1024)?;
+        let genesis =
+            read_local_package_file(package_dir, "genesis-snapshot.q6sn", 64 * 1024 * 1024)?;
+        let peers =
+            read_local_package_file(package_dir, "mainnet-bootstrap-peers.json", 1024 * 1024)?;
+        let config_bytes =
+            read_local_package_file(package_dir, "permissionless-config.json", 64 * 1024)?;
+
+        let hashes = [
+            Sha256::digest(&q6gd).into(),
+            Sha256::digest(&q6cp).into(),
+            Sha256::digest(&q6pn).into(),
+            Sha256::digest(&genesis).into(),
+            Sha256::digest(&peers).into(),
+        ];
+        let peer_count = validate_mainnet_bootstrap_peers(&peers)?;
+        let descriptor = QRunV06GenesisDescriptor::decode(&q6gd)
+            .map_err(|error| format!("Q6GD descriptor validation failed: {error:?}"))?;
+        let profile = QRunV06ConsensusProfile::decode(&q6cp)
+            .map_err(|error| format!("Q6CP consensus profile validation failed: {error:?}"))?;
+        let state = QRunV06CanonicalExecutionState::decode_snapshot(
+            &genesis,
+            &descriptor.network_id(),
+            &descriptor.profile_id(),
+        )
+        .map_err(|error| format!("Genesis snapshot validation failed: {error:?}"))?;
+        state
+            .verify_invariants()
+            .map_err(|error| format!("Genesis state invariants failed: {error:?}"))?;
+        if state.height() != 0 || state.genesis_descriptor() != Some(&descriptor) {
+            return Err(
+                "Mainnet Genesis snapshot must be height zero and bind the exact Q6GD descriptor"
+                    .into(),
+            );
+        }
+        state
+            .validate_consensus_parameters(profile.parameters())
+            .map_err(|error| format!("Genesis/Q6CP consensus binding failed: {error:?}"))?;
+        let owner_balance = state
+            .unified()
+            .ledger()
+            .account(&descriptor.founder_account())
+            .map_or(0u128, |account| account.balance as u128);
+        if owner_balance != CP0651_OWNER_GENESIS_ATOMS {
+            return Err("Mainnet Genesis owner balance does not equal the CP-0651 one-billion-QZXB allocation".into());
+        }
+
+        validate_mainnet_manifest(&manifest, &descriptor, &hashes, peer_count, &config_bytes)?;
+        let mut config: serde_json::Value = serde_json::from_slice(&config_bytes)
+            .map_err(|_| "Mainnet permissionless config JSON is invalid".to_string())?;
+        let runtime = config
+            .get_mut("permissionless_runtime")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or("Mainnet permissionless config has no runtime object")?;
+        let q6pn_commitment = parse_hex32(
+            runtime
+                .get("q6pn_profile_pin_commitment")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(
+                    "Mainnet config is missing the independently pinned Q6PN profile commitment",
+                )?,
+            "Q6PN profile pin commitment",
+        )?;
+        let verified_q6pn =
+            QRunV06VerifiedProfilePin::decode(&q6pn, q6pn_commitment).map_err(|error| {
+                format!("Q6PN independent profile-pin verification failed: {error:?}")
+            })?;
+        if verified_q6pn.descriptor() != &descriptor {
+            return Err(
+                "Q6PN profile pin does not contain the exact Mainnet Q6GD descriptor".into(),
+            );
+        }
+        validate_mainnet_runtime_config(
+            runtime,
+            &descriptor,
+            &hashes[0],
+            &hashes[1],
+            &hashes[2],
+            &q6pn_commitment,
+            &hashes[3],
+            &hashes[4],
+        )?;
+
+        let first_wallet = load_hybrid_wallet(wallet_path)?;
+        if first_wallet.account_id != descriptor.founder_account() {
+            return Err(
+                "QZKW2 wallet account does not equal the exact Q6GD Genesis owner account".into(),
+            );
+        }
+        drop(first_wallet);
+
+        let commitment_hex = hex(&descriptor.commitment());
+        let peers_hash_hex = hex(&hashes[4]);
+        let confirmation = format!(
+            "APPROVE QZXB MAINNET NATIVE VALUE {} {}",
+            &commitment_hex[..16],
+            &peers_hash_hex[..16]
+        );
+        println!("QZXB MAINNET-NATIVE OWNER SIGNING REVIEW");
+        println!("scope=MAINNET_NATIVE_VALUE_ONLY");
+        println!("network_id_hex={}", hex(&descriptor.network_id()));
+        println!("profile_id_hex={}", hex(&descriptor.profile_id()));
+        println!(
+            "owner_account_id_hex={}",
+            hex(&descriptor.founder_account())
+        );
+        println!("genesis_descriptor_commitment_hex={commitment_hex}");
+        println!("q6gd_sha256={}", hex(&hashes[0]));
+        println!("q6cp_sha256={}", hex(&hashes[1]));
+        println!("q6pn_sha256={}", hex(&hashes[2]));
+        println!("genesis_snapshot_sha256={}", hex(&hashes[3]));
+        println!("mainnet_bootstrap_peers_sha256={peers_hash_hex}");
+        println!("mainnet_bootstrap_peer_count={peer_count}");
+        println!("owner_genesis_allocation_qzxb=1000000000");
+        println!("gross_supply_ceiling_qzxb=7000000000");
+        println!("six_accounting_labels_spendable=false");
+        println!("block_subsidy_qzxb=0");
+        println!("producer_compensation=canonical_transaction_fees_only");
+        println!("market_authorized=false");
+        println!("external_quote_asset_authorized=false");
+        println!("exchange_listing_or_custody_authorized=false");
+        println!("signature_format=Q6GA_V3_ED25519_MLDSA65");
+        println!("existing_signatures_replaced=false");
+        println!("private_key_output=none");
+        println!();
+        println!("This signs only the displayed Genesis and pinned peer-set hashes.");
+        println!("It does not approve a market, quote asset, token sale, listing, custody service or third-party exchange.");
+        println!("Type this exact phrase to create the owner signature:");
+        println!("{confirmation}");
+        print!("Owner confirmation: ");
+        io::stdout()
+            .flush()
+            .map_err(|error| format!("flush Mainnet owner confirmation prompt: {error}"))?;
+        let mut entered = String::new();
+        io::stdin()
+            .read_line(&mut entered)
+            .map_err(|error| format!("read local Mainnet owner confirmation: {error}"))?;
+        if entered.trim() != confirmation {
+            wipe_string(&mut entered);
+            return Err(
+                "owner confirmation did not match; no Mainnet signature was created".into(),
+            );
+        }
+        wipe_string(&mut entered);
+
+        // Refuse a time-of-check/time-of-use change while the owner was reviewing the package.
+        for (name, expected) in [
+            ("mainnet-native-manifest.json", manifest_bytes.as_slice()),
+            ("genesis-descriptor.q6gd", q6gd.as_slice()),
+            ("consensus-profile.q6cp", q6cp.as_slice()),
+            ("q6pn-profile.q6pn", q6pn.as_slice()),
+            ("genesis-snapshot.q6sn", genesis.as_slice()),
+            ("mainnet-bootstrap-peers.json", peers.as_slice()),
+            ("permissionless-config.json", config_bytes.as_slice()),
+        ] {
+            let reread = read_local_package_file(
+                package_dir,
+                name,
+                if name == "genesis-snapshot.q6sn" {
+                    64 * 1024 * 1024
+                } else if name == "mainnet-bootstrap-peers.json" {
+                    1024 * 1024
+                } else {
+                    64 * 1024
+                },
+            )?;
+            if reread != expected {
+                return Err(format!(
+                    "{name} changed during owner review; no signature was created"
+                ));
+            }
+        }
+
+        let wallet = load_hybrid_wallet(wallet_path)?;
+        if wallet.account_id != descriptor.founder_account() {
+            return Err("QZKW2 owner identity changed after confirmation".into());
+        }
+        let signer =
+            QRunV06HybridTransactionSigner::from_seeds(wallet.seeds.ed25519, wallet.seeds.mldsa65)
+                .map_err(|error| {
+                    format!("QZKW2 local hybrid signer initialization failed: {error:?}")
+                })?;
+        if signer.account_id() != descriptor.founder_account() {
+            return Err("derived QZKW2 signing identity does not match the Genesis owner".into());
+        }
+        let approval = QRunV06GenesisApproval::sign_mainnet_native(
+            &descriptor,
+            hashes[0],
+            hashes[1],
+            hashes[2],
+            hashes[3],
+            hashes[4],
+            &signer,
+        )
+        .map_err(|error| format!("Q6GA v3 Mainnet-native signing failed: {error:?}"))?;
+        drop(wallet);
+        drop(signer);
+
+        let approval_bytes = approval
+            .encode()
+            .map_err(|error| format!("Q6GA v3 self-verification failed: {error:?}"))?;
+        let decoded = QRunV06GenesisApproval::decode(&approval_bytes)
+            .map_err(|error| format!("Q6GA v3 decode/self-verification failed: {error:?}"))?;
+        decoded
+            .verify_mainnet_native_bindings(
+                &descriptor,
+                &hashes[0],
+                &hashes[1],
+                &hashes[2],
+                &hashes[3],
+                &hashes[4],
+            )
+            .map_err(|error| format!("Q6GA v3 exact artifact binding failed: {error:?}"))?;
+        let approval_hash: [u8; 32] = Sha256::digest(&approval_bytes).into();
+
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output_path)
+            .map_err(|error| {
+                format!(
+                    "create Mainnet authorization {}: {error}",
+                    output_path.display()
+                )
+            })?;
+        if let Err(error) = output.write_all(&approval_bytes) {
+            drop(output);
+            let rollback = fs::remove_file(&output_path);
+            return Err(format!(
+                "write Mainnet authorization failed ({error}); partial-file rollback={}",
+                if rollback.is_ok() {
+                    "removed"
+                } else {
+                    "FAILED_CHECK_Q6GA_FILE"
+                }
+            ));
+        }
+        if let Err(error) = output.sync_all() {
+            drop(output);
+            let rollback = fs::remove_file(&output_path);
+            return Err(format!(
+                "flush Mainnet authorization failed ({error}); partial-file rollback={}",
+                if rollback.is_ok() {
+                    "removed"
+                } else {
+                    "FAILED_CHECK_Q6GA_FILE"
+                }
+            ));
+        }
+        drop(output);
+
+        let runtime = config
+            .get_mut("permissionless_runtime")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or("Mainnet config runtime object disappeared")?;
+        runtime.insert(
+            "mainnet_native_authorization_sha256".into(),
+            serde_json::Value::String(hex(&approval_hash)),
+        );
+        let mut next_config = serde_json::to_vec_pretty(&config)
+            .map_err(|error| format!("serialize signed Mainnet config: {error}"))?;
+        next_config.push(b'\n');
+        let config_hash: [u8; 32] = Sha256::digest(&next_config).into();
+        if let Err(error) = replace_file_atomically(&config_path, &next_config) {
+            let rollback = fs::remove_file(&output_path);
+            return Err(format!(
+                "Mainnet config update failed ({error}); signature rollback={}; no launch is permitted",
+                if rollback.is_ok() { "removed" } else { "FAILED_CHECK_OUTPUT_FILE" }
+            ));
+        }
+
+        let mut next_manifest = manifest;
+        let object = next_manifest
+            .as_object_mut()
+            .ok_or("Mainnet manifest root must be an object")?;
+        object.insert("mainnet_authorized".into(), serde_json::Value::Bool(true));
+        object.insert(
+            "owner_genesis_signature_present".into(),
+            serde_json::Value::Bool(true),
+        );
+        object.insert(
+            "mainnet_authorization_sha256".into(),
+            serde_json::Value::String(hex(&approval_hash)),
+        );
+        object.insert(
+            "mainnet_authorization_format".into(),
+            serde_json::Value::String("Q6GA_V3_ED25519_MLDSA65".into()),
+        );
+        object.insert(
+            "mainnet_authorization_scope".into(),
+            serde_json::Value::String("MAINNET_NATIVE_VALUE_ONLY".into()),
+        );
+        object.insert(
+            "mainnet_authorization_scope_version".into(),
+            serde_json::Value::Number(3u64.into()),
+        );
+        object.insert(
+            "bootstrap_peers_hash_bound".into(),
+            serde_json::Value::Bool(true),
+        );
+        object.insert("market_authorized".into(), serde_json::Value::Bool(false));
+        object.insert(
+            "permissionless_config_sha256".into(),
+            serde_json::Value::String(hex(&config_hash)),
+        );
+        let mut next_manifest_bytes = serde_json::to_vec_pretty(&next_manifest)
+            .map_err(|error| format!("serialize signed Mainnet manifest: {error}"))?;
+        next_manifest_bytes.push(b'\n');
+        if let Err(error) = replace_file_atomically(&manifest_path, &next_manifest_bytes) {
+            let config_rollback = replace_file_atomically(&config_path, &config_bytes);
+            let signature_rollback = fs::remove_file(&output_path);
+            return Err(format!(
+                "Mainnet manifest update failed ({error}); config rollback={}; signature rollback={}; no launch is permitted",
+                if config_rollback.is_ok() { "restored" } else { "FAILED_CHECK_PERMISSIONLESS_CONFIG" },
+                if signature_rollback.is_ok() { "removed" } else { "FAILED_CHECK_Q6GA_FILE" }
+            ));
+        }
+
+        println!();
+        println!("mainnet_native_authorization=Q6GA_V3_ED25519_MLDSA65_SIGNED_AND_SELF_VERIFIED");
+        println!("mainnet_native_authorization_scope=MAINNET_NATIVE_VALUE_ONLY");
+        println!(
+            "mainnet_native_authorization_sha256={}",
+            hex(&approval_hash)
+        );
+        println!("mainnet_bootstrap_peers_sha256={peers_hash_hex}");
+        println!("permissionless_config_sha256={}", hex(&config_hash));
+        println!("market_authorized=false");
+        println!("signature_secret_output=none");
+        println!("node_started=false");
+        Ok(())
+    }
+
     fn sign_transfer(
         path: &Path,
         network_id: [u8; 32],
@@ -2558,6 +3269,7 @@ Default signature mode embeds the public key with its Ed25519 signature so the s
                 println!("QZKW2 commands: create-qfp6-hybrid, restore-qfp6-hybrid, address-qfp6-hybrid. They use Q6HA dual signatures; sign-transfer creates an offline candidate only and refuses QZTS/1 broadcast.");
                 println!("Local-only Genesis approval: approve-local-genesis --wallet ABSOLUTE_QZKW2_PATH --package-dir ABSOLUTE_LOCAL_DEVNET_DIR. It prompts for explicit owner confirmation and writes a Q6GA v1 local-only approval.");
                 println!("Zero-value Public Testnet authorization: approve-public-testnet-genesis --wallet ABSOLUTE_QZKW2_PATH --package-dir ABSOLUTE_QFP6_PACKAGE_DIR. It requires a valid existing local Q6GA, prompts for a separate explicit owner confirmation, and writes a Q6GA v2 authorization limited to zero-value Public Testnet; it does not authorize Mainnet, markets or real-value transfers.");
+                println!("Mainnet-native owner authorization: approve-mainnet-genesis --wallet ABSOLUTE_QZKW2_PATH --package-dir ABSOLUTE_MAINNET_NATIVE_PACKAGE_DIR. Requires mainnet-native-manifest.json, the exact Q6GD/Q6CP/Q6PN/Genesis files, a non-empty globally routable Noise peer-pin file, a Mainnet-native permissionless config and explicit owner confirmation. Writes Q6GA v3 only; it does not authorize a market, quote asset, exchange, custody or listing.");
                 println!("Read-only local RPC: rpc-status --rpc 127.0.0.1:PORT; balance --rpc 127.0.0.1:PORT --account-id-hex HEX64; tx-status --rpc 127.0.0.1:PORT --txid-hex HEX64. These queries are restricted to loopback and require an explicitly read-only RPC response.");
                 Ok(())
             }
@@ -2573,6 +3285,10 @@ Default signature mode embeds the public key with its Ed25519 signature so the s
                 wallet,
                 package_dir,
             }) => approve_public_testnet_genesis(&wallet, &package_dir),
+            Ok(Command::ApproveMainnetGenesis {
+                wallet,
+                package_dir,
+            }) => approve_mainnet_genesis(&wallet, &package_dir),
             Ok(Command::HybridAddress { wallet }) => hybrid_address(&wallet),
             Ok(Command::Address { wallet }) => address(&wallet),
             Ok(Command::RpcStatus { rpc }) => rpc_status(rpc),
@@ -2614,6 +3330,297 @@ Default signature mode embeds the public key with its Ed25519 signature so the s
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn mainnet_peer_set_requires_nonempty_public_numeric_endpoints_and_unique_pins() {
+            let key = "11".repeat(32);
+            let valid =
+                format!(r#"[{{"address":"1.1.1.1:30333","noise_static_public_key":"{key}"}}]"#);
+            assert_eq!(
+                validate_mainnet_bootstrap_peers(valid.as_bytes()).unwrap(),
+                1
+            );
+
+            for invalid in [
+                "[]".to_string(),
+                format!(r#"[{{"address":"192.0.2.1:30333","noise_static_public_key":"{key}"}}]"#),
+                format!(r#"[{{"address":"10.0.0.2:30333","noise_static_public_key":"{key}"}}]"#),
+                format!(r#"[{{"address":"[fe80::1]:30333","noise_static_public_key":"{key}"}}]"#),
+                format!(r#"[{{"address":"localhost:30333","noise_static_public_key":"{key}"}}]"#),
+                format!(
+                    r#"[{{"address":"1.1.1.1:30333","noise_static_public_key":"{}"}}]"#,
+                    "00".repeat(32)
+                ),
+                format!(
+                    r#"[{{"address":"1.1.1.1:30333","noise_static_public_key":"{key}","operator":"unverified"}}]"#
+                ),
+            ] {
+                assert!(
+                    validate_mainnet_bootstrap_peers(invalid.as_bytes()).is_err(),
+                    "{invalid}"
+                );
+            }
+
+            let duplicate_endpoint = format!(
+                r#"[{{"address":"1.1.1.1:30333","noise_static_public_key":"{key}"}},{{"address":"1.1.1.1:30333","noise_static_public_key":"{}"}}]"#,
+                "22".repeat(32)
+            );
+            assert!(validate_mainnet_bootstrap_peers(duplicate_endpoint.as_bytes()).is_err());
+
+            let duplicate_key = format!(
+                r#"[{{"address":"1.1.1.1:30333","noise_static_public_key":"{key}"}},{{"address":"8.8.8.8:30333","noise_static_public_key":"{key}"}}]"#
+            );
+            assert!(validate_mainnet_bootstrap_peers(duplicate_key.as_bytes()).is_err());
+        }
+
+        #[test]
+        fn mainnet_peer_ip_filter_accepts_global_ipv4_ipv6_and_rejects_special_ranges() {
+            for address in [
+                "1.1.1.1",
+                "8.8.8.8",
+                "2606:4700:4700::1111",
+                "::ffff:8.8.8.8",
+            ] {
+                assert!(
+                    is_publicly_routable_mainnet_peer(address.parse().unwrap()),
+                    "{address}"
+                );
+            }
+            for address in [
+                "0.1.2.3",
+                "100.64.0.1",
+                "127.0.0.1",
+                "169.254.1.2",
+                "192.0.2.1",
+                "198.18.0.1",
+                "198.51.100.1",
+                "203.0.113.1",
+                "224.0.0.1",
+                "240.0.0.1",
+                "::",
+                "::1",
+                "::ffff:10.0.0.1",
+                "fc00::1",
+                "fe80::1",
+                "ff02::1",
+                "2001:db8::1",
+                "2001:2::1",
+                "2001:10::1",
+                "2001:20::1",
+                "2002::1",
+                "3fff::1",
+            ] {
+                assert!(
+                    !is_publicly_routable_mainnet_peer(address.parse().unwrap()),
+                    "{address}"
+                );
+            }
+        }
+
+        fn test_descriptor() -> QRunV06GenesisDescriptor {
+            QRunV06GenesisDescriptor::new(
+                [0x11; 32], [0x22; 32], [0x33; 32], 1, [0x44; 32], [0x55; 32],
+            )
+            .unwrap()
+        }
+
+        fn test_mainnet_runtime(
+            descriptor: &QRunV06GenesisDescriptor,
+        ) -> serde_json::Map<String, serde_json::Value> {
+            serde_json::json!({
+                "mode": MAINNET_NATIVE_MODE,
+                "allow_candidate_runtime": true,
+                "allow_public_listener": true,
+                "mainnet_native_acknowledgement": MAINNET_NATIVE_ACK,
+                "public_inbound_security_acknowledgement": MAINNET_NATIVE_INBOUND_ACK,
+                "node_role": "seed",
+                "listen_address": "0.0.0.0:30333",
+                "bootstrap_peers_path": "mainnet-bootstrap-peers.json",
+                "bootstrap_peers_sha256": hex(&[0x66; 32]),
+                "producer_account": hex(&descriptor.founder_account()),
+                "q6gd_descriptor_path": "genesis-descriptor.q6gd",
+                "q6gd_descriptor_sha256": hex(&[0x77; 32]),
+                "q6cp_profile_path": "consensus-profile.q6cp",
+                "q6cp_profile_sha256": hex(&[0x88; 32]),
+                "q6pn_profile_pin_path": "q6pn-profile.q6pn",
+                "q6pn_profile_pin_sha256": hex(&[0x99; 32]),
+                "q6pn_profile_pin_commitment": hex(&[0x9a; 32]),
+                "genesis_snapshot_path": "genesis-snapshot.q6sn",
+                "genesis_snapshot_sha256": hex(&[0xaa; 32]),
+                "mainnet_native_authorization_path": "mainnet-native-authorization.q6ga"
+            })
+            .as_object()
+            .unwrap()
+            .clone()
+        }
+
+        #[test]
+        fn mainnet_runtime_profile_rejects_scope_transport_and_artifact_changes() {
+            let descriptor = test_descriptor();
+            let q6gd = [0x77; 32];
+            let q6cp = [0x88; 32];
+            let q6pn = [0x99; 32];
+            let q6pn_commitment = [0x9a; 32];
+            let genesis = [0xaa; 32];
+            let peers = [0x66; 32];
+            let good = test_mainnet_runtime(&descriptor);
+            assert!(validate_mainnet_runtime_config(
+                &good,
+                &descriptor,
+                &q6gd,
+                &q6cp,
+                &q6pn,
+                &q6pn_commitment,
+                &genesis,
+                &peers
+            )
+            .is_ok());
+
+            let mut changed = good.clone();
+            changed.insert(
+                "public_testnet_acknowledgement".into(),
+                serde_json::json!("ZERO_VALUE_PUBLIC_TESTNET_NO_MAINNET_NO_MARKET"),
+            );
+            assert!(validate_mainnet_runtime_config(
+                &changed,
+                &descriptor,
+                &q6gd,
+                &q6cp,
+                &q6pn,
+                &q6pn_commitment,
+                &genesis,
+                &peers
+            )
+            .is_err());
+
+            let mut changed = good.clone();
+            changed.insert(
+                "public_inbound_security_acknowledgement".into(),
+                serde_json::json!("ANONYMOUS_NOISE_XX_UNAUTHENTICATED"),
+            );
+            assert!(validate_mainnet_runtime_config(
+                &changed,
+                &descriptor,
+                &q6gd,
+                &q6cp,
+                &q6pn,
+                &q6pn_commitment,
+                &genesis,
+                &peers
+            )
+            .is_err());
+
+            let mut changed = good.clone();
+            changed.insert(
+                "q6pn_profile_pin_commitment".into(),
+                serde_json::json!(hex(&[0xfa; 32])),
+            );
+            assert!(validate_mainnet_runtime_config(
+                &changed,
+                &descriptor,
+                &q6gd,
+                &q6cp,
+                &q6pn,
+                &q6pn_commitment,
+                &genesis,
+                &peers
+            )
+            .is_err());
+
+            let mut changed = good.clone();
+            changed.insert(
+                "bootstrap_peers_sha256".into(),
+                serde_json::json!(hex(&[0xfe; 32])),
+            );
+            assert!(validate_mainnet_runtime_config(
+                &changed,
+                &descriptor,
+                &q6gd,
+                &q6cp,
+                &q6pn,
+                &q6pn_commitment,
+                &genesis,
+                &peers
+            )
+            .is_err());
+
+            let mut changed = good.clone();
+            changed.insert(
+                "listen_address".into(),
+                serde_json::json!("192.168.1.10:30333"),
+            );
+            assert!(validate_mainnet_runtime_config(
+                &changed,
+                &descriptor,
+                &q6gd,
+                &q6cp,
+                &q6pn,
+                &q6pn_commitment,
+                &genesis,
+                &peers
+            )
+            .is_err());
+
+            let mut changed = good.clone();
+            changed.insert(
+                "mainnet_native_authorization_sha256".into(),
+                serde_json::json!(hex(&[0xab; 32])),
+            );
+            assert!(validate_mainnet_runtime_config(
+                &changed,
+                &descriptor,
+                &q6gd,
+                &q6cp,
+                &q6pn,
+                &q6pn_commitment,
+                &genesis,
+                &peers
+            )
+            .is_err());
+        }
+
+        #[test]
+        fn mainnet_manifest_must_bind_all_exact_hashes_and_keep_market_disabled() {
+            let descriptor = test_descriptor();
+            let hashes = [[0x77; 32], [0x88; 32], [0x99; 32], [0xaa; 32], [0x66; 32]];
+            let config = b"{\\\"permissionless_runtime\\\":{}}";
+            let config_hash: [u8; 32] = Sha256::digest(config).into();
+            let manifest = serde_json::json!({
+                "schema": "qfp6-mainnet-native-package/v1",
+                "scope": "MAINNET_NATIVE_VALUE_ONLY",
+                "mainnet_authorized": false,
+                "public_testnet_authorized": false,
+                "market_authorized": false,
+                "owner_genesis_signature_present": false,
+                "q6gd_sha256": hex(&hashes[0]),
+                "q6cp_sha256": hex(&hashes[1]),
+                "q6pn_sha256": hex(&hashes[2]),
+                "genesis_snapshot_sha256": hex(&hashes[3]),
+                "bootstrap_peers_sha256": hex(&hashes[4]),
+                "network_id_hex": hex(&descriptor.network_id()),
+                "profile_id_hex": hex(&descriptor.profile_id()),
+                "owner_account_id_hex": hex(&descriptor.founder_account()),
+                "genesis_descriptor_commitment_hex": hex(&descriptor.commitment()),
+                "bootstrap_peer_count": 1,
+                "genesis_owner_allocation_qzxb": "1000000000",
+                "gross_supply_ceiling_qzxb": "7000000000",
+                "block_subsidy_qzxb": "0",
+                "six_accounting_labels_are_spendable": false,
+                "permissionless_config_sha256": hex(&config_hash)
+            });
+            assert!(validate_mainnet_manifest(&manifest, &descriptor, &hashes, 1, config).is_ok());
+
+            let mut changed = manifest.clone();
+            changed["market_authorized"] = serde_json::json!(true);
+            assert!(validate_mainnet_manifest(&changed, &descriptor, &hashes, 1, config).is_err());
+
+            let mut changed = manifest.clone();
+            changed["bootstrap_peers_sha256"] = serde_json::json!(hex(&[0xfd; 32]));
+            assert!(validate_mainnet_manifest(&changed, &descriptor, &hashes, 1, config).is_err());
+
+            assert!(validate_mainnet_manifest(&manifest, &descriptor, &hashes, 2, config).is_err());
+            assert!(validate_mainnet_manifest(&manifest, &descriptor, &hashes, 1, b"{}").is_err());
+        }
 
         #[test]
         fn local_genesis_approval_rejects_non_loopback_or_peer_enabled_profiles() {
