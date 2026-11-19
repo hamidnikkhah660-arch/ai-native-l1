@@ -165,3 +165,40 @@ Preserved boundaries:
 - No private key/seed/plaintext DPAPI material was read.
 
 Next: independent second-node cross-check of these read surfaces; then account inclusion proof or reproducible replay verification design, plus historical archive indexing if explorer history must survive checkpoint rollover. Only later, after exact config review, may a fresh manual QZKW2 authorization be requested. Public bind remains off.
+
+
+## CP-0786 - independent read API comparison tooling (2026-11-19)
+
+Current continuation:
+- Branch: feat/q6ga-v3-mainnet-scope-20261119.
+- Base: CP-0785 / 125e170088b52bbe612187ac07a85777da28e832.
+- Checkpoint: docs/CP-0786_INDEPENDENT_READ_API_COMPARISON_TOOL_2026-11-19.md.
+
+Added:
+- tools/qfp6_independent_read_api_compare.py
+- tools/test_qfp6_independent_read_api_compare.py
+- HTTPS-only remote endpoint policy, distinct hostname rule, no credentials, GET-only requests, redirect rejection (no redirect is followed), bounded responses/timeouts.
+- Compares canonical status, supply, requested accounts, blocks and transaction receipts; cross-links a selected receipt to its selected block body.
+- Explicitly reports operator_independence=NOT_VERIFIED_BY_API_COMPARISON. Same-host/loopback tests never count as an independent operator result.
+
+Validation:
+- Python py_compile: PASS.
+- Comparator tests: 13/13 PASS (includes real local GET transport and redirect rejection).
+- CLI --help smoke test: PASS.
+- Tests use synthetic fixtures only; no real second-node API request was made.
+
+External comparison remains NOT RUN / BLOCKED:
+- Only heymed is online in the current Desktop Commander inventory.
+- NetBird management and signal are disconnected; no usable independent peer was found.
+- Unified bootstrap-peers.json contains zero peers.
+- No approved independent endpoint pair is attached to the unified package.
+- Read API listener remains disabled. Current launcher allows non-loopback bind only in Mainnet mode with explicit allow_public_read_api=true; no policy/config change or bypass was made.
+- PID 20244 remains untouched.
+
+Preserved:
+- Gate 2 and Gate 8 were not retested or reclassified; owner-reported previous qualifications are not being repeated.
+- No independent receipt or endpoint is fabricated.
+- No owner signature, Mainnet config, listener, wallet, DPAPI plaintext or private key was touched.
+- No Public Testnet/Mainnet launch or public API availability is claimed.
+
+Next: attach/bind the already-approved external Seed/Joining endpoint and operator receipts from the prior qualification record, then run the comparator from the independent operator's own host through an expressly authorized read-only gateway. Do not use Mainnet-only public binding to work around the current zero-value Testnet authorization boundary.
