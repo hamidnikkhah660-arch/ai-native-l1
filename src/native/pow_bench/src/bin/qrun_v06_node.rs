@@ -922,11 +922,12 @@ Usage:
   qrun_v06_node --run --config <path> --config-sha256 <64-hex>
   qrun_v06_node --permissionless-run --config <path> --config-sha256 <64-hex>
   qrun_v06_node --public-testnet-run --config <path> --config-sha256 <64-hex>
+  qrun_v06_node --mainnet-run --config <path> --config-sha256 <64-hex>
   qrun_v06_node --help
 --run: private-candidate QAP1 mode.
 --permissionless-run: private/overlay Genesis-rooted base runtime candidate.
---public-testnet-run: explicit zero-value candidate mode; requires public listener and security acknowledgements.
-Neither candidate mode authorizes production/Mainnet or value-bearing use."#
+--public-testnet-run: zero-value candidate mode with anonymous public Noise XX ingress.
+--mainnet-run: Mainnet-native value-bearing candidate; requires Q6GA v3, a non-empty hash-bound pinned peer set and authenticated public Noise ingress. Market authorization remains separate; this candidate path is not a claim of independent launch qualification."#
     );
 }
 fn run(args: &[String]) -> Result<(), String> {
@@ -942,15 +943,23 @@ fn run(args: &[String]) -> Result<(), String> {
                 | "--run"
                 | "--permissionless-run"
                 | "--public-testnet-run"
+                | "--mainnet-run"
         )
         || args[1] != "--config"
         || args[3] != "--config-sha256"
     {
-        return Err("expected '--preflight|--probe-qap1|--run|--permissionless-run|--public-testnet-run --config <path> --config-sha256 <64-hex>' (or '--help')".into());
+        return Err("expected '--preflight|--probe-qap1|--run|--permissionless-run|--public-testnet-run|--mainnet-run --config <path> --config-sha256 <64-hex>' (or '--help')".into());
     }
     let expected_config_digest = parse_hex32("config_sha256", &args[4])?;
     if args[0] == "--public-testnet-run" {
         qrun_v06_node_runtime_launch::run_public_testnet_node(
+            Path::new(&args[2]),
+            &expected_config_digest,
+        )?;
+        return Ok(());
+    }
+    if args[0] == "--mainnet-run" {
+        qrun_v06_node_runtime_launch::run_mainnet_native_node(
             Path::new(&args[2]),
             &expected_config_digest,
         )?;

@@ -9,10 +9,10 @@
 //! with cancellable handshakes and joined workers.
 //!
 //! It is a library service candidate, not a node binary, production supervisor, miner,
-//! RPC endpoint, mempool, or Mainnet release. Pinned mode restricts binds to private/overlay/
-//! loopback addresses; explicit anonymous-open mode can serve candidate public binds, but
-//! remains unauthenticated and unqualified for broad Internet exposure. External callbacks
-//! must enforce their own bounded network deadlines.
+//! RPC endpoint, mempool, or Mainnet release. Pinned mode permits private/overlay/loopback binds
+//! and globally routable binds only with a non-empty static-key allow-list. Explicit anonymous-open
+//! mode can serve candidate public binds, but remains unauthenticated and unqualified for broad
+//! Internet exposure. External callbacks must enforce their own bounded network deadlines.
 
 use crate::{
     external_cas_anchor_candidate::ExternalCasProviderTransport,
@@ -37,7 +37,7 @@ use crate::{
 };
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError},
@@ -419,6 +419,106 @@ impl Drop for QRunV06HandshakeWorkerPool {
 fn is_shared_ipv4(ip: Ipv4Addr) -> bool {
     let octets = ip.octets();
     octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
+fn ipv4_in_prefix(address: Ipv4Addr, network: Ipv4Addr, prefix: u32) -> bool {
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    (u32::from(address) & mask) == (u32::from(network) & mask)
+}
+
+fn ipv6_in_prefix(address: Ipv6Addr, network: Ipv6Addr, prefix: u32) -> bool {
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    };
+    (u128::from(address) & mask) == (u128::from(network) & mask)
+}
+
+fn is_publicly_routable_pinned_bind_ip(ip: IpAddr) -> bool {
+    // A wildcard exposes all local interfaces, but only to the non-empty remote-key allow-list.
+    if ip.is_unspecified() {
+        return true;
+    }
+    match ip {
+        IpAddr::V4(address) => {
+            !address.is_loopback()
+                && !address.is_private()
+                && !address.is_link_local()
+                && !address.is_multicast()
+                && !address.is_broadcast()
+                && !ipv4_in_prefix(address, Ipv4Addr::new(0, 0, 0, 0), 8)
+                && !ipv4_in_prefix(address, Ipv4Addr::new(100, 64, 0, 0), 10)
+                && !ipv4_in_prefix(address, Ipv4Addr::new(192, 0, 0, 0), 24)
+                && !ipv4_in_prefix(address, Ipv4Addr::new(192, 0, 2, 0), 24)
+                && !ipv4_in_prefix(address, Ipv4Addr::new(192, 88, 99, 0), 24)
+                && !ipv4_in_prefix(address, Ipv4Addr::new(198, 18, 0, 0), 15)
+                && !ipv4_in_prefix(address, Ipv4Addr::new(198, 51, 100, 0), 24)
+                && !ipv4_in_prefix(address, Ipv4Addr::new(203, 0, 113, 0), 24)
+                && !ipv4_in_prefix(address, Ipv4Addr::new(240, 0, 0, 0), 4)
+        }
+        IpAddr::V6(address) => {
+            let octets = address.octets();
+            let ipv4_mapped = octets[..10].iter().all(|byte| *byte == 0)
+                && octets[10] == 0xff
+                && octets[11] == 0xff;
+            if ipv4_mapped {
+                return is_publicly_routable_pinned_bind_ip(IpAddr::V4(Ipv4Addr::new(
+                    octets[12], octets[13], octets[14], octets[15],
+                )));
+            }
+            let unique_local = octets[0] & 0xfe == 0xfc;
+            let link_local = octets[0] == 0xfe && octets[1] & 0xc0 == 0x80;
+            !address.is_loopback()
+                && !address.is_multicast()
+                && !unique_local
+                && !link_local
+                && !ipv6_in_prefix(
+                    address,
+                    Ipv6Addr::from([0x00, 0x64, 0xff, 0x9b, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    48,
+                )
+                && !ipv6_in_prefix(
+                    address,
+                    Ipv6Addr::from([0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    64,
+                )
+                && !ipv6_in_prefix(
+                    address,
+                    Ipv6Addr::from([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    32,
+                )
+                && !ipv6_in_prefix(
+                    address,
+                    Ipv6Addr::from([0x20, 0x01, 0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    48,
+                )
+                && !ipv6_in_prefix(
+                    address,
+                    Ipv6Addr::from([0x20, 0x01, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    28,
+                )
+                && !ipv6_in_prefix(
+                    address,
+                    Ipv6Addr::from([0x20, 0x01, 0, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    28,
+                )
+                && !ipv6_in_prefix(
+                    address,
+                    Ipv6Addr::from([0x20, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    16,
+                )
+                && !ipv6_in_prefix(
+                    address,
+                    Ipv6Addr::from([0x3f, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                    20,
+                )
+        }
+    }
 }
 
 fn is_safe_private_or_overlay_ip(ip: IpAddr) -> bool {
@@ -1102,7 +1202,9 @@ where
         if bind_ip.is_multicast() {
             return Err(QRunV06PeerListenerError::UnsafeBindAddress(bind_ip));
         }
-    } else if !is_safe_private_or_overlay_ip(bind_ip) {
+    } else if !is_safe_private_or_overlay_ip(bind_ip)
+        && !is_publicly_routable_pinned_bind_ip(bind_ip)
+    {
         return Err(QRunV06PeerListenerError::UnsafeBindAddress(bind_ip));
     }
     listener
@@ -1444,6 +1546,45 @@ mod tests {
 
     const NETWORK: [u8; 32] = [0x91; 32];
     const PROFILE: [u8; 32] = [0x92; 32];
+
+    #[test]
+    fn public_pinned_bind_policy_requires_global_unicast_or_wildcard() {
+        for address in [
+            "0.0.0.0",
+            "8.8.8.8",
+            "2606:4700:4700::1111",
+            "::",
+            "::ffff:8.8.8.8",
+        ] {
+            assert!(
+                is_publicly_routable_pinned_bind_ip(address.parse().unwrap()),
+                "{address}"
+            );
+        }
+        for address in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "100.64.0.1",
+            "169.254.1.1",
+            "224.0.0.1",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
+            "2001:db8::1",
+            "2001:2::1",
+            "2001:10::1",
+            "2001:20::1",
+            "2002::1",
+            "3fff::1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert!(
+                !is_publicly_routable_pinned_bind_ip(address.parse().unwrap()),
+                "{address}"
+            );
+        }
+    }
 
     fn keypair() -> ([u8; 32], [u8; 32]) {
         let params = "Noise_XX_25519_ChaChaPoly_SHA256".parse().unwrap();

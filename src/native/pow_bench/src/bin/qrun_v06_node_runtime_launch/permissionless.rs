@@ -1135,10 +1135,18 @@ fn trusted_manifest_anchor(
 const PUBLIC_TESTNET_MODE: &str = "public-testnet-zero-value-candidate";
 const PUBLIC_TESTNET_ACK: &str = "ZERO_VALUE_PUBLIC_TESTNET_NO_MAINNET_NO_MARKET";
 const PUBLIC_TESTNET_INBOUND_ACK: &str = "ANONYMOUS_NOISE_XX_UNAUTHENTICATED";
+const MAINNET_NATIVE_MODE: &str = "mainnet-native-value-candidate";
+const MAINNET_NATIVE_ACK: &str = "QZXB_MAINNET_NATIVE_VALUE_OWNER_AUTHORIZATION_REQUIRED";
+const MAINNET_NATIVE_INBOUND_ACK: &str = "PINNED_NOISE_STATIC_KEY_ALLOWLIST_REQUIRED";
 
-fn validate_runtime_mode(cfg: &Value, public_testnet: bool) -> Result<(), String> {
+fn validate_runtime_mode(cfg: &Value, public_testnet: bool, mainnet: bool) -> Result<(), String> {
+    if public_testnet && mainnet {
+        return Err("Public Testnet and Mainnet runtime modes are mutually exclusive".into());
+    }
     let expected_mode = if public_testnet {
         PUBLIC_TESTNET_MODE
+    } else if mainnet {
+        MAINNET_NATIVE_MODE
     } else {
         "permissionless-full-history-candidate"
     };
@@ -1173,9 +1181,28 @@ fn validate_runtime_mode(cfg: &Value, public_testnet: bool) -> Result<(), String
                 "permissionless_runtime.node_role must be exactly 'seed' or 'joining'".into(),
             );
         }
+    } else if mainnet {
+        if cfg.get("allow_public_listener").and_then(Value::as_bool) != Some(true) {
+            return Err("Mainnet-native mode requires allow_public_listener=true".into());
+        }
+        if req(cfg, "mainnet_native_acknowledgement")? != MAINNET_NATIVE_ACK {
+            return Err(format!(
+                "mainnet_native_acknowledgement must be exactly '{MAINNET_NATIVE_ACK}'"
+            ));
+        }
+        if req(cfg, "public_inbound_security_acknowledgement")? != MAINNET_NATIVE_INBOUND_ACK {
+            return Err(format!(
+                "public_inbound_security_acknowledgement must be exactly '{MAINNET_NATIVE_INBOUND_ACK}'"
+            ));
+        }
+        if cfg.get("public_testnet_acknowledgement").is_some() {
+            return Err(
+                "Mainnet-native config must not carry a Public Testnet acknowledgement".into(),
+            );
+        }
     } else if cfg.get("allow_public_listener").and_then(Value::as_bool) == Some(true) {
         return Err(
-            "public listener opt-in is accepted only by the explicit --public-testnet-run path"
+            "public listener opt-in is accepted only by an explicit Public Testnet or Mainnet-native path"
                 .into(),
         );
     }
@@ -1353,24 +1380,70 @@ fn validate_public_testnet_topology(
     Ok(())
 }
 
+/// Mainnet-native candidate topology: a publicly reachable listener is permitted only
+/// when every inbound Noise identity is pinned and at least one non-empty bootstrap peer
+/// set is frozen into the signed Q6GA v3 authorization.
+fn validate_mainnet_native_topology(
+    cfg: &Value,
+    listen: SocketAddr,
+    peers: &[QRunV06PinnedBootstrapPeer],
+) -> Result<(), String> {
+    if !requires_public_listener_opt_in(listen.ip()) {
+        return Err(
+            "Mainnet-native mode must bind a public unicast address or explicit wildcard".into(),
+        );
+    }
+    if !listen.ip().is_unspecified() && !is_publicly_routable_peer_ip(listen.ip()) {
+        return Err("Mainnet-native listener address must be globally routable unicast".into());
+    }
+    if peers.is_empty() {
+        return Err(
+            "Mainnet-native mode requires a non-empty, independently pinned bootstrap peer set"
+                .into(),
+        );
+    }
+    validate_qfp6_pinned_bootstrap_peers(peers)
+        .map_err(|error| format!("Mainnet-native bootstrap peer pins invalid: {error:?}"))?;
+    if peers
+        .iter()
+        .any(|peer| !is_publicly_routable_peer_ip(peer.address.ip()))
+    {
+        return Err(
+            "Mainnet-native bootstrap peers must use globally routable unicast IP addresses".into(),
+        );
+    }
+    if cfg.get("allow_public_listener").and_then(Value::as_bool) != Some(true) {
+        return Err("Mainnet-native topology requires allow_public_listener=true".into());
+    }
+    Ok(())
+}
+
 pub fn run_permissionless_node(
     config_path: &Path,
     expected_config_sha: &[u8; 32],
 ) -> Result<(), String> {
-    run_permissionless_node_with_visibility(config_path, expected_config_sha, false)
+    run_permissionless_node_with_visibility(config_path, expected_config_sha, false, false)
 }
 
 pub fn run_public_testnet_node(
     config_path: &Path,
     expected_config_sha: &[u8; 32],
 ) -> Result<(), String> {
-    run_permissionless_node_with_visibility(config_path, expected_config_sha, true)
+    run_permissionless_node_with_visibility(config_path, expected_config_sha, true, false)
+}
+
+pub fn run_mainnet_native_node(
+    config_path: &Path,
+    expected_config_sha: &[u8; 32],
+) -> Result<(), String> {
+    run_permissionless_node_with_visibility(config_path, expected_config_sha, false, true)
 }
 
 fn run_permissionless_node_with_visibility(
     config_path: &Path,
     expected_config_sha: &[u8; 32],
     public_testnet: bool,
+    mainnet: bool,
 ) -> Result<(), String> {
     let bytes = read_bounded(config_path, MAX_CONFIG_BYTES, "permissionless config")?;
     let actual: [u8; 32] = Sha256::digest(&bytes).into();
@@ -1384,7 +1457,7 @@ fn run_permissionless_node_with_visibility(
     let cfg = root
         .get("permissionless_runtime")
         .ok_or("permissionless_runtime section missing")?;
-    validate_runtime_mode(cfg, public_testnet)?;
+    validate_runtime_mode(cfg, public_testnet, mainnet)?;
     let base = config_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -1432,7 +1505,7 @@ fn run_permissionless_node_with_visibility(
         req(cfg, "bootstrap_peers_sha256")?,
     )?;
     let peers = load_peers(&peer_path, peer_sha)?;
-    if !public_testnet {
+    if !public_testnet && !mainnet {
         validate_q6ga_local_devnet_scope(cfg, false, peers.len())?;
     }
     let q6cp_path = path(base, cfg, "q6cp_profile_path")?;
@@ -1461,6 +1534,15 @@ fn run_permissionless_node_with_visibility(
                 req(cfg, "public_testnet_authorization_sha256")?,
             )?,
             "Q6GA public-testnet authorization",
+        )
+    } else if mainnet {
+        (
+            path(base, cfg, "mainnet_native_authorization_path")?,
+            parse_hex32(
+                "mainnet_native_authorization_sha256",
+                req(cfg, "mainnet_native_authorization_sha256")?,
+            )?,
+            "Q6GA v3 Mainnet-native authorization",
         )
     } else {
         (
@@ -1496,6 +1578,24 @@ fn run_permissionless_node_with_visibility(
         println!("owner_genesis_approval_scope=ZERO_VALUE_PUBLIC_TESTNET_ONLY");
         println!("mainnet_authorization=NOT_GRANTED");
         println!("market_authorization=NOT_GRANTED");
+    } else if mainnet {
+        owner_approval
+            .verify_mainnet_native_bindings(
+                descriptor,
+                &q6gd_sha,
+                &q6cp_sha,
+                &q6pn_sha,
+                &genesis_sha,
+                &peer_sha,
+            )
+            .map_err(|error| {
+                format!("Q6GA v3 Mainnet-native owner/artifact/peer-set binding failed: {error:?}")
+            })?;
+        println!("owner_genesis_approval=Q6GA_ED25519_MLDSA65_VERIFIED");
+        println!("owner_genesis_approval_scope=MAINNET_NATIVE_VALUE_ONLY");
+        println!("mainnet_native_authorization=VERIFIED");
+        println!("market_authorization=NOT_GRANTED_BY_Q6GA_V3");
+        println!("public_mining_subsidy=NOT_AUTHORIZED_ZERO_BY_CP0651");
     } else {
         owner_approval
             .verify_bindings(
@@ -1670,6 +1770,8 @@ fn run_permissionless_node_with_visibility(
     )?;
     if public_testnet {
         validate_public_testnet_topology(cfg, listen, &supervisor_peers)?;
+    } else if mainnet {
+        validate_mainnet_native_topology(cfg, listen, &supervisor_peers)?;
     } else {
         validate_public_listener_opt_in(cfg, listen)?;
     }
@@ -1868,6 +1970,12 @@ fn run_permissionless_node_with_visibility(
         println!("public_inbound_noise=ANONYMOUS_UNAUTHENTICATED_XX");
         println!("remote_static_key_is_identity=FALSE");
         println!("automatic_peer_discovery=NOT_IMPLEMENTED");
+    } else if mainnet {
+        println!("mainnet_native_mode=VALUE_BEARING_CANDIDATE");
+        println!("mainnet_inbound_noise=NOISE_XX_STATIC_KEY_ALLOWLIST_REQUIRED");
+        println!("mainnet_bootstrap_peer_count={}", supervisor_peers.len());
+        println!("mainnet_peer_discovery=OPERATOR_PINNED_ONLY");
+        println!("mainnet_market_authorization=SEPARATE_NOT_GRANTED_BY_Q6GA_V3");
     }
     if trust_authorized_pin.is_some() && quote_authorizer.is_some() {
         println!("Q6TS=DUAL_SIGNATURE_AUTHORIZED; Q6TS_FLOOR=INDEPENDENT_READ_ONLY; Q6QA=FRESH_HEIGHT_BOUND");
@@ -2038,8 +2146,13 @@ fn run_permissionless_node_with_visibility(
     let final_status = runtime
         .status()
         .map_err(|error| format!("cannot read final QFP6 runtime/vault status: {error}"))?;
-    println!("permissionless_inbound_peer_policy=ANONYMOUS_UNAUTHENTICATED_NOISE_XX");
-    println!("bootstrap_peer_authentication=PINNED_OUTBOUND_ONLY");
+    if mainnet {
+        println!("permissionless_inbound_peer_policy=PINNED_NOISE_STATIC_KEY_ALLOWLIST");
+        println!("bootstrap_peer_authentication=PINNED_OUTBOUND_AND_INBOUND");
+    } else {
+        println!("permissionless_inbound_peer_policy=ANONYMOUS_UNAUTHENTICATED_NOISE_XX");
+        println!("bootstrap_peer_authentication=PINNED_OUTBOUND_ONLY");
+    }
     println!(
         "blocks_committed={}",
         supervisor_report.blocks_durably_committed
@@ -2093,10 +2206,10 @@ mod tests {
         is_publicly_routable_peer_ip, load_peers, max_approved_peer_sync_attempts,
         q6ar_candidate_address_book_enabled, q6ar_trust_domains_rotation_authorized,
         read_regular_bounded, select_approved_bootstrap_peers,
-        validate_anchor_vault_path_separation, validate_permissionless_cp0651_genesis,
-        validate_public_listener_opt_in, validate_public_testnet_topology,
-        validate_q6ga_local_devnet_scope, validate_runtime_mode, BootstrapTrustDomainPolicy,
-        QRunV06PinnedBootstrapPeer,
+        validate_anchor_vault_path_separation, validate_mainnet_native_topology,
+        validate_permissionless_cp0651_genesis, validate_public_listener_opt_in,
+        validate_public_testnet_topology, validate_q6ga_local_devnet_scope, validate_runtime_mode,
+        BootstrapTrustDomainPolicy, QRunV06PinnedBootstrapPeer,
     };
     use sha2::{Digest, Sha256};
 
@@ -2500,45 +2613,122 @@ mod tests {
     #[test]
     fn public_testnet_mode_requires_exact_flags_acknowledgements_and_role() {
         let good = public_testnet_cfg("seed");
-        assert!(validate_runtime_mode(&good, true).is_ok());
-        assert!(validate_runtime_mode(&good, false).is_err());
+        assert!(validate_runtime_mode(&good, true, false).is_ok());
+        assert!(validate_runtime_mode(&good, false, false).is_err());
+        assert!(validate_runtime_mode(&good, false, true).is_err());
 
         let mut wrong_mode = good.clone();
         wrong_mode["mode"] = serde_json::json!("permissionless-full-history-candidate");
-        assert!(validate_runtime_mode(&wrong_mode, true).is_err());
+        assert!(validate_runtime_mode(&wrong_mode, true, false).is_err());
 
         let mut missing_candidate = good.clone();
         missing_candidate["allow_candidate_runtime"] = serde_json::json!(false);
-        assert!(validate_runtime_mode(&missing_candidate, true).is_err());
+        assert!(validate_runtime_mode(&missing_candidate, true, false).is_err());
 
         let mut missing_listener = good.clone();
         missing_listener["allow_public_listener"] = serde_json::json!(false);
-        assert!(validate_runtime_mode(&missing_listener, true).is_err());
+        assert!(validate_runtime_mode(&missing_listener, true, false).is_err());
 
         let mut missing_ack = good.clone();
         missing_ack["public_testnet_acknowledgement"] = serde_json::json!("yes");
-        assert!(validate_runtime_mode(&missing_ack, true).is_err());
+        assert!(validate_runtime_mode(&missing_ack, true, false).is_err());
 
         let mut missing_security_ack = good.clone();
         missing_security_ack["public_inbound_security_acknowledgement"] =
             serde_json::json!("pinned");
-        assert!(validate_runtime_mode(&missing_security_ack, true).is_err());
+        assert!(validate_runtime_mode(&missing_security_ack, true, false).is_err());
 
         let mut wrong_role = good;
         wrong_role["node_role"] = serde_json::json!("validator");
-        assert!(validate_runtime_mode(&wrong_role, true).is_err());
+        assert!(validate_runtime_mode(&wrong_role, true, false).is_err());
 
         let private_mode = serde_json::json!({
             "mode": "permissionless-full-history-candidate",
             "allow_candidate_runtime": true
         });
-        assert!(validate_runtime_mode(&private_mode, false).is_ok());
+        assert!(validate_runtime_mode(&private_mode, false, false).is_ok());
         let public_opt_in_on_private_cli = serde_json::json!({
             "mode": "permissionless-full-history-candidate",
             "allow_candidate_runtime": true,
             "allow_public_listener": true
         });
-        assert!(validate_runtime_mode(&public_opt_in_on_private_cli, false).is_err());
+        assert!(validate_runtime_mode(&public_opt_in_on_private_cli, false, false).is_err());
+    }
+
+    fn mainnet_native_cfg() -> serde_json::Value {
+        serde_json::json!({
+            "mode": "mainnet-native-value-candidate",
+            "allow_candidate_runtime": true,
+            "allow_public_listener": true,
+            "mainnet_native_acknowledgement": "QZXB_MAINNET_NATIVE_VALUE_OWNER_AUTHORIZATION_REQUIRED",
+            "public_inbound_security_acknowledgement": "PINNED_NOISE_STATIC_KEY_ALLOWLIST_REQUIRED"
+        })
+    }
+
+    #[test]
+    fn mainnet_native_mode_requires_explicit_v3_scope_and_pinned_inbound_policy() {
+        let good = mainnet_native_cfg();
+        assert!(validate_runtime_mode(&good, false, true).is_ok());
+        assert!(validate_runtime_mode(&good, true, false).is_err());
+        assert!(validate_runtime_mode(&good, true, true).is_err());
+
+        let mut wrong_mode = good.clone();
+        wrong_mode["mode"] = serde_json::json!("public-testnet-zero-value-candidate");
+        assert!(validate_runtime_mode(&wrong_mode, false, true).is_err());
+
+        let mut missing_ack = good.clone();
+        missing_ack["mainnet_native_acknowledgement"] = serde_json::json!("yes");
+        assert!(validate_runtime_mode(&missing_ack, false, true).is_err());
+
+        let mut anonymous_inbound = good.clone();
+        anonymous_inbound["public_inbound_security_acknowledgement"] =
+            serde_json::json!("ANONYMOUS_NOISE_XX_UNAUTHENTICATED");
+        assert!(validate_runtime_mode(&anonymous_inbound, false, true).is_err());
+
+        let mut mixed_testnet_scope = good.clone();
+        mixed_testnet_scope["public_testnet_acknowledgement"] =
+            serde_json::json!("ZERO_VALUE_PUBLIC_TESTNET_NO_MAINNET_NO_MARKET");
+        assert!(validate_runtime_mode(&mixed_testnet_scope, false, true).is_err());
+    }
+
+    #[test]
+    fn mainnet_native_topology_requires_nonempty_publicly_routable_pinned_peers() {
+        use serde_json::json;
+        use std::net::SocketAddr;
+
+        let cfg = mainnet_native_cfg();
+        let wildcard: SocketAddr = "0.0.0.0:30333".parse().unwrap();
+        let peer = QRunV06PinnedBootstrapPeer {
+            address: "1.1.1.1:30333".parse().unwrap(),
+            noise_static_public_key: [0x79; 32],
+        };
+        assert!(
+            validate_mainnet_native_topology(&cfg, wildcard, std::slice::from_ref(&peer)).is_ok()
+        );
+        assert!(validate_mainnet_native_topology(&cfg, wildcard, &[]).is_err());
+
+        let private_peer = QRunV06PinnedBootstrapPeer {
+            address: "10.0.0.2:30333".parse().unwrap(),
+            noise_static_public_key: [0x7A; 32],
+        };
+        assert!(validate_mainnet_native_topology(&cfg, wildcard, &[private_peer]).is_err());
+
+        let private_listener: SocketAddr = "192.168.1.20:30333".parse().unwrap();
+        assert!(validate_mainnet_native_topology(
+            &cfg,
+            private_listener,
+            std::slice::from_ref(&peer)
+        )
+        .is_err());
+
+        let mut no_public_opt_in = cfg.clone();
+        no_public_opt_in["allow_public_listener"] = json!(false);
+        assert!(validate_mainnet_native_topology(
+            &no_public_opt_in,
+            wildcard,
+            std::slice::from_ref(&peer)
+        )
+        .is_err());
     }
 
     #[test]

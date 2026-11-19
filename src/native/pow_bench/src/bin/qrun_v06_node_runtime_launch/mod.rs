@@ -1139,4 +1139,6 @@ mod tests {
 }
 
 mod permissionless;
-pub(super) use permissionless::{run_permissionless_node, run_public_testnet_node};
+pub(super) use permissionless::{
+    run_mainnet_native_node, run_permissionless_node, run_public_testnet_node,
+};
