@@ -76,6 +76,36 @@ pub struct QRunV06PermissionlessRuntimeStatus {
     pub consensus_fingerprint: [u8; 32],
 }
 
+/// Immutable canonical account read bound to one exact QFP6 tip and execution root.
+/// Missing accounts are represented as None, never as a fabricated funded balance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QRunV06CanonicalAccountRead {
+    pub network_id: [u8; 32],
+    pub profile_id: [u8; 32],
+    pub native_asset_id: [u8; 32],
+    pub account_id: [u8; 32],
+    pub balance_atoms: Option<u64>,
+    pub nonce: Option<u64>,
+    pub height: u64,
+    pub tip: [u8; 32],
+    pub state_root: [u8; 32],
+}
+/// Canonical CP-0651 supply facts from one exact execution snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QRunV06CanonicalSupplyRead {
+    pub network_id: [u8; 32],
+    pub profile_id: [u8; 32],
+    pub native_asset_id: [u8; 32],
+    pub ledger_total_atoms: u128,
+    pub owner_genesis_atoms: u128,
+    pub maximum_supply_atoms: u128,
+    pub block_subsidy_atoms: u128,
+    pub accounting_labels_total_atoms: u128,
+    pub policy_fingerprint: [u8; 32],
+    pub height: u64,
+    pub tip: [u8; 32],
+    pub state_root: [u8; 32],
+}
 pub const QRUN_V06_HISTORY_SYNC_MAX_BATCH_BLOCKS: usize = 128;
 pub const QRUN_V06_HISTORY_SYNC_MAX_BATCH_BYTES: usize = 16 * 1024 * 1024;
 
@@ -1243,6 +1273,82 @@ impl QRunV06PermissionlessNodeRuntime {
         Ok(self.store.graph()?.clone())
     }
 
+    /// Read a native account from the selected canonical execution state.
+    /// The global state root commits this value but is not itself an account inclusion proof.
+    pub fn canonical_account_read(
+        &self,
+        account_id: &[u8; 32],
+    ) -> Result<QRunV06CanonicalAccountRead, QRunV06PermissionlessRuntimeError> {
+        let status = self.status()?;
+        let graph = self.store.graph()?;
+        let state = graph.canonical_state();
+        let computed_root = state
+            .state_root()
+            .map_err(|error| QRunV06PermissionlessRuntimeError::Store(format!("{error:?}")))?;
+        if state.height() != status.height
+            || state.tip_hash() != status.tip
+            || computed_root != status.state_root
+        {
+            return Err(QRunV06PermissionlessRuntimeError::Store(
+                "canonical account read changed across its status/root snapshot".into(),
+            ));
+        }
+        let account = state.unified().ledger().account(account_id);
+        Ok(QRunV06CanonicalAccountRead {
+            network_id: status.network_id,
+            profile_id: status.profile_id,
+            native_asset_id: state.unified().native_asset_id(),
+            account_id: *account_id,
+            balance_atoms: account.map(|value| value.balance),
+            nonce: account.map(|value| value.nonce),
+            height: status.height,
+            tip: status.tip,
+            state_root: status.state_root,
+        })
+    }
+    /// Read fixed-supply accounting directly from the selected canonical execution state.
+    pub fn canonical_supply_read(
+        &self,
+    ) -> Result<QRunV06CanonicalSupplyRead, QRunV06PermissionlessRuntimeError> {
+        let status = self.status()?;
+        let graph = self.store.graph()?;
+        let state = graph.canonical_state();
+        let computed_root = state
+            .state_root()
+            .map_err(|error| QRunV06PermissionlessRuntimeError::Store(format!("{error:?}")))?;
+        if state.height() != status.height
+            || state.tip_hash() != status.tip
+            || computed_root != status.state_root
+        {
+            return Err(QRunV06PermissionlessRuntimeError::Store(
+                "canonical supply read changed across its status/root snapshot".into(),
+            ));
+        }
+        let policy = state.cp0651_supply().ok_or_else(|| {
+            QRunV06PermissionlessRuntimeError::Store(
+                "CP-0651 fixed-supply policy is absent from canonical state".into(),
+            )
+        })?;
+        let ledger_total_atoms = state
+            .unified()
+            .ledger()
+            .total_value()
+            .map_err(|error| QRunV06PermissionlessRuntimeError::Store(format!("{error:?}")))?;
+        Ok(QRunV06CanonicalSupplyRead {
+            network_id: status.network_id,
+            profile_id: status.profile_id,
+            native_asset_id: state.unified().native_asset_id(),
+            ledger_total_atoms,
+            owner_genesis_atoms: policy.owner_genesis_atoms(),
+            maximum_supply_atoms: policy.maximum_supply_atoms(),
+            block_subsidy_atoms: policy.block_subsidy_atoms(),
+            accounting_labels_total_atoms: policy.accounting_labels_total_atoms(),
+            policy_fingerprint: policy.policy_fingerprint(),
+            height: status.height,
+            tip: status.tip,
+            state_root: status.state_root,
+        })
+    }
     pub fn status(
         &self,
     ) -> Result<QRunV06PermissionlessRuntimeStatus, QRunV06PermissionlessRuntimeError> {
@@ -1277,6 +1383,186 @@ mod tests {
     }
 
     #[test]
+    fn cp0651_canonical_account_read_reports_exact_genesis_atoms_and_survives_restart() {
+        use crate::{
+            consensus::{ConsensusParameters, Uint256},
+            external_cas_anchor_candidate::ExternalCasPin,
+            qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint,
+            qrun_v06_cp0651_supply_candidate::{Cp0651FixedSupply, CP0651_OWNER_GENESIS_ATOMS},
+            qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
+            qrun_v06_profile_pin_candidate::{
+                QRunV06ProfilePinCandidate, QRunV06VerifiedProfilePin,
+            },
+            v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES,
+        };
+
+        const NETWORK: [u8; 32] = [0x71; 32];
+        const PROFILE: [u8; 32] = [0x72; 32];
+        const OWNER: [u8; 32] = [0x73; 32];
+        let mut params = ConsensusParameters::qrun_v06_cp0651_fee_only_candidate().unwrap();
+        params.target_block_time_secs = 30;
+        params.difficulty_window_blocks = 2;
+        params.difficulty_min_ratio_divisor = 4;
+        params.difficulty_max_ratio = 4;
+        params.initial_target = Uint256::from_be_bytes([0x7F; 32]);
+        params.pow_limit = Uint256::MAX;
+        params.validate().unwrap();
+
+        let policy = Cp0651FixedSupply::genesis(NETWORK, OWNER).unwrap();
+        let descriptor = QRunV06GenesisDescriptor::new(
+            NETWORK,
+            PROFILE,
+            OWNER,
+            1,
+            qrun_v06_consensus_fingerprint(&params).unwrap(),
+            policy.policy_fingerprint(),
+        )
+        .unwrap();
+        let genesis =
+            QRunV06CanonicalExecutionState::cp0651_genesis_candidate_with_descriptor(descriptor)
+                .unwrap();
+        assert_eq!(
+            genesis.unified().ledger().account(&OWNER).unwrap().balance as u128,
+            CP0651_OWNER_GENESIS_ATOMS
+        );
+
+        let bundle = QRunV06ProfilePinCandidate::new(
+            descriptor,
+            ExternalCasPin {
+                provider_id: [0x74; 32],
+                network_id: NETWORK,
+                genesis_digest: [0x75; 32],
+                receipt_key_id: [0x76; 32],
+                receipt_public_key: [0x77; ML_DSA_65_PUBLIC_KEY_BYTES],
+            },
+        )
+        .unwrap();
+        let pin_bytes = bundle.encode().unwrap();
+        let pin_commitment = bundle.commitment().unwrap();
+        let verified_pin = QRunV06VerifiedProfilePin::decode(&pin_bytes, pin_commitment).unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("qfp6-cp0651-account-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let authenticator = RejectAllTransactions;
+        let runtime = QRunV06PermissionlessNodeRuntime::open(
+            &directory,
+            genesis.clone(),
+            params.clone(),
+            &authenticator,
+            None,
+            &verified_pin,
+        )
+        .unwrap();
+        let status = runtime.status().unwrap();
+        let owner_read = runtime.canonical_account_read(&OWNER).unwrap();
+        assert_eq!(owner_read.network_id, NETWORK);
+        assert_eq!(owner_read.profile_id, PROFILE);
+        assert_eq!(owner_read.account_id, OWNER);
+        assert_eq!(
+            owner_read.balance_atoms,
+            Some(CP0651_OWNER_GENESIS_ATOMS as u64)
+        );
+        assert_eq!(owner_read.height, 0);
+        assert_eq!(owner_read.tip, status.tip);
+        assert_eq!(owner_read.state_root, status.state_root);
+        assert_eq!(owner_read.nonce, Some(0));
+        let account_hex = OWNER
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let (status_code, account_json) =
+            crate::qrun_v06_node_supervisor_candidate::qfp6_read_api_response(
+                "GET",
+                &format!("/v1/account/{account_hex}"),
+                &runtime,
+            );
+        assert_eq!(status_code, 200);
+        let account_value: serde_json::Value = serde_json::from_slice(&account_json).unwrap();
+        assert_eq!(
+            account_value["balance_atoms"].as_str(),
+            Some("100000000000000000")
+        );
+        assert_eq!(account_value["height"].as_str(), Some("0"));
+        assert_eq!(account_value["proof_type"], "global_state_root_only");
+        let (supply_status, supply_json) =
+            crate::qrun_v06_node_supervisor_candidate::qfp6_read_api_response(
+                "GET",
+                "/v1/supply",
+                &runtime,
+            );
+        assert_eq!(supply_status, 200);
+        let supply_value: serde_json::Value = serde_json::from_slice(&supply_json).unwrap();
+        assert_eq!(
+            supply_value["ledger_total_atoms"].as_str(),
+            Some("100000000000000000")
+        );
+        assert_eq!(
+            supply_value["owner_genesis_atoms"].as_str(),
+            Some("100000000000000000")
+        );
+        assert_eq!(
+            supply_value["maximum_supply_atoms"].as_str(),
+            Some("700000000000000000")
+        );
+        assert_eq!(supply_value["block_subsidy_atoms"].as_str(), Some("0"));
+        assert_eq!(
+            supply_value["accounting_labels_total_atoms"].as_str(),
+            Some("600000000000000000")
+        );
+        assert_eq!(supply_value["accounting_labels_are_minted"], false);
+        let supply_snapshot = runtime.canonical_supply_read().unwrap();
+        assert!(account_value["account_inclusion_proof"].is_null());
+        let (post_status, _) = crate::qrun_v06_node_supervisor_candidate::qfp6_read_api_response(
+            "POST",
+            "/v1/status",
+            &runtime,
+        );
+        assert_eq!(post_status, 405);
+
+        let http_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut http_client =
+            std::net::TcpStream::connect(http_listener.local_addr().unwrap()).unwrap();
+        let request = format!("GET /v1/account/{account_hex} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        std::io::Write::write_all(&mut http_client, request.as_bytes()).unwrap();
+        crate::qrun_v06_node_supervisor_candidate::serve_qfp6_read_api_once(
+            &http_listener,
+            &runtime,
+        )
+        .unwrap();
+        let mut http_response = Vec::new();
+        std::io::Read::read_to_end(&mut http_client, &mut http_response).unwrap();
+        let http_response = String::from_utf8(http_response).unwrap();
+        assert!(http_response.starts_with("HTTP/1.1 200 OK\r\n"));
+        let (_, response_body) = http_response.split_once("\r\n\r\n").unwrap();
+        let http_value: serde_json::Value = serde_json::from_str(response_body).unwrap();
+        assert_eq!(
+            http_value["balance_atoms"].as_str(),
+            Some("100000000000000000")
+        );
+        let absent = runtime.canonical_account_read(&[0x78; 32]).unwrap();
+        assert_eq!(absent.balance_atoms, None);
+        assert_eq!(absent.nonce, None);
+        assert_eq!(absent.state_root, status.state_root);
+        drop(runtime);
+
+        let recovered = QRunV06PermissionlessNodeRuntime::open(
+            &directory,
+            genesis,
+            params,
+            &authenticator,
+            Some(status.manifest_anchor),
+            &verified_pin,
+        )
+        .unwrap();
+        assert_eq!(
+            recovered.canonical_account_read(&OWNER).unwrap(),
+            owner_read
+        );
+        assert_eq!(recovered.canonical_supply_read().unwrap(), supply_snapshot);
+        drop(recovered);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+    #[test]
     fn cp0604_permissionless_runtime_bootstraps_and_recovers_verified_genesis_store() {
         use crate::{
             consensus::{ConsensusParameters, Uint256},
@@ -1294,7 +1580,7 @@ mod tests {
         const NETWORK: [u8; 32] = [0xA1; 32];
         const PROFILE: [u8; 32] = [0xB2; 32];
         const FOUNDER: [u8; 32] = [0xC3; 32];
-        let mut params = ConsensusParameters::qrun_v06_sha256d_candidate().unwrap();
+        let mut params = ConsensusParameters::qrun_v06_cp0651_fee_only_candidate().unwrap();
         params.target_block_time_secs = 30;
         params.difficulty_window_blocks = 2;
         params.difficulty_min_ratio_divisor = 4;
@@ -1446,7 +1732,7 @@ mod tests {
         const PROFILE: [u8; 32] = [0x92; 32];
         const FOUNDER: [u8; 32] = [0x93; 32];
         const PRODUCER: [u8; 32] = [0x94; 32];
-        let mut params = ConsensusParameters::qrun_v06_sha256d_candidate().unwrap();
+        let mut params = ConsensusParameters::qrun_v06_cp0651_fee_only_candidate().unwrap();
         params.target_block_time_secs = 30;
         params.difficulty_window_blocks = 2;
         params.difficulty_min_ratio_divisor = 4;
@@ -1643,7 +1929,7 @@ mod tests {
         const FOUNDER: [u8; 32] = [0x63; 32];
         const PRODUCER: [u8; 32] = [0x64; 32];
 
-        let mut params = ConsensusParameters::qrun_v06_sha256d_candidate().unwrap();
+        let mut params = ConsensusParameters::qrun_v06_cp0651_fee_only_candidate().unwrap();
         params.target_block_time_secs = 30;
         params.difficulty_window_blocks = 2;
         params.difficulty_min_ratio_divisor = 4;
@@ -1883,7 +2169,7 @@ mod tests {
         const FOUNDER: [u8; 32] = [0xC3; 32];
         const PRODUCER: [u8; 32] = [0xD5; 32];
 
-        let mut params = ConsensusParameters::qrun_v06_sha256d_candidate().unwrap();
+        let mut params = ConsensusParameters::qrun_v06_cp0651_fee_only_candidate().unwrap();
         params.target_block_time_secs = 30;
         params.difficulty_window_blocks = 2;
         params.difficulty_min_ratio_divisor = 4;

@@ -1,4 +1,4 @@
-# QFP6 Unified Integration Handoff — 2026-11-18
+# QFP6 Unified Integration Handoff â€” 2026-11-18
 
 ## Purpose and source preservation
 
@@ -64,7 +64,7 @@ No production keys were read or rotated. No external AWS/NetBird services were c
 This handoff records a unified candidate and attached owner-authorized zero-value Testnet Genesis inputs, not a claim that the multi-peer Public Testnet is already live or that Mainnet/trading is ready.
 
 
-## CP-0780 — phased Testnet, economy/market and MiCA readiness update (2026-11-19)
+## CP-0780 â€” phased Testnet, economy/market and MiCA readiness update (2026-11-19)
 See: docs/CP-0780_PHASED_PUBLIC_TESTNET_ECONOMIC_MARKET_AND_MICA_READINESS_2026-11-19.md
 
 Owner-approved programme:
@@ -100,3 +100,34 @@ Focused Phase 2 regressions run on the unified candidate (not Gate 2/8):
 - Q6MO durable listener/service lifecycle through canonical block commit: 1/1 PASS.
 - CP-0651 native OrderBook supply/snapshot regression: 1/1 PASS.
 - Combined: 12 passed / 0 failed. All are local candidate tests; the Q6MO end-to-end lifecycle uses a local Noise session and does not establish a public market or independent Internet deployment.
+
+## CP-0784 - canonical monetary read API (2026-11-19)
+
+Current continuation point:
+- Branch: `feat/q6ga-v3-mainnet-scope-20261119`.
+- Worktree: `D:\Temp\ASUS\QRUN_QFP6_UNIFIED_20261118`.
+- Base: CP-0783 commit `373ed0b449bade4297358136c59df58db33343ee`.
+- Checkpoint document: `docs/CP-0784_PUBLICLY_VERIFIABLE_MONETARY_READ_API_2026-11-19.md`.
+
+Implemented:
+- Runtime-owned canonical account read with height/tip/state-root consistency checks.
+- Canonical CP-0651 supply read; actual ledger total is separate from accounting-label budgets.
+- Optional GET-only `/v1/status`, `/v1/account/{id}` and `/v1/supply` HTTP routes on a separate listener, serviced in the runtime-owning supervisor loop.
+- Read API disabled by default. Non-loopback bind requires Mainnet mode plus `allow_public_read_api=true`; address must not alias P2P or a pinned outbound peer.
+- Account responses expose the global state root but explicitly do not claim an account inclusion proof.
+- Atom amounts and large counters are decimal strings in JSON to avoid JavaScript precision loss.
+
+Validation:
+- CP-0651 canonical account/supply/HTTP/restart test: 1/1 PASS.
+- QFP6 supervisor regression module: 19/19 PASS.
+- `cargo check --bin qrun_v06_node --locked --offline`: PASS.
+- `cargo fmt --check` and `git diff --check`: PASS.
+
+Important boundaries:
+- No listener was activated; no public endpoint or network launch is claimed.
+- No new Q6GA signature was produced. Because read API settings change the configuration bytes covered by Q6GA v3, any such settings in the Mainnet package require a fresh local QZKW2 approval over the exact new config digest. CP-0783 must not be reused for changed config bytes.
+- Transaction/block API, Merkle account proofs and independent second-node cross-check remain outstanding.
+- Gate 2 and Gate 8 were not re-tested or reclassified.
+- PID 20244 / TCP 30333 and its data remain untouched; no private wallet/key material was accessed.
+
+Next: finish transaction/block receipts and independent proof path; then prepare the exact Mainnet config and obtain local owner authorization only after the bind policy and peer set are reviewed. Public bind remains opt-in.

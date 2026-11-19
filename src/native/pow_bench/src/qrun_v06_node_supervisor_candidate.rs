@@ -67,6 +67,7 @@ use crate::{
 };
 use std::{
     collections::HashSet,
+    io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener},
     sync::atomic::{AtomicBool, Ordering},
     thread,
@@ -1264,6 +1265,7 @@ pub fn run_qfp6_permissionless_mining_supervisor<T: TransactionAuthenticator>(
         mempool,
         None,
         None,
+        None,
     )
 }
 
@@ -1301,6 +1303,7 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_quote_asset_authorization<
         mempool,
         None,
         Some(quote_authorizer),
+        None,
     )
 }
 
@@ -1355,6 +1358,7 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_q6ar_candidate<
             q6ar_relay_static_public_key_pins.to_vec(),
             trust_domains,
         )),
+        None,
         None,
     )
 }
@@ -1414,6 +1418,7 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_q6ar_candidate_and_quote_a
                 trust_domains,
             )),
             Some(quote_authorizer),
+            None,
         )?;
         total.listener_rounds = total
             .listener_rounds
@@ -1445,6 +1450,173 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_q6ar_candidate_and_quote_a
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Read-only QFP6 HTTP API. Account values are tied to the exact canonical state root and tip.
+/// This is not an account inclusion proof; independent verification requires full-node replay.
+pub(crate) fn qfp6_read_api_response(
+    method: &str,
+    path: &str,
+    runtime: &QRunV06PermissionlessNodeRuntime,
+) -> (u16, Vec<u8>) {
+    let (status, body) = if method != "GET" {
+        (
+            405,
+            serde_json::json!({"error":"method_not_allowed","allowed_methods":["GET"]}),
+        )
+    } else if path == "/v1/status" {
+        match runtime.status() {
+            Ok(s) => (
+                200,
+                serde_json::json!({
+                    "api_version":1,
+                    "network_id":s.network_id.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                    "profile_id":s.profile_id.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                    "height":s.height.to_string(),
+                    "tip":s.tip.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                    "state_root":s.state_root.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                    "manifest_generation":s.manifest_generation.to_string(),
+                    "consensus_fingerprint":s.consensus_fingerprint.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                    "verification":"canonical_full_node_replay_required",
+                    "account_inclusion_proofs":false
+                }),
+            ),
+            Err(_) => (
+                503,
+                serde_json::json!({"error":"canonical_state_unavailable"}),
+            ),
+        }
+    } else if path == "/v1/supply" {
+        match runtime.canonical_supply_read() {
+            Ok(s) => (
+                200,
+                serde_json::json!({
+                    "api_version":1,
+                    "network_id":s.network_id.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                    "profile_id":s.profile_id.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                    "native_asset_id":s.native_asset_id.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                    "ledger_total_atoms":s.ledger_total_atoms.to_string(),
+                    "owner_genesis_atoms":s.owner_genesis_atoms.to_string(),
+                    "maximum_supply_atoms":s.maximum_supply_atoms.to_string(),
+                    "block_subsidy_atoms":s.block_subsidy_atoms.to_string(),
+                    "accounting_labels_total_atoms":s.accounting_labels_total_atoms.to_string(),
+                    "accounting_labels_are_minted":false,
+                    "issuance_policy":"fee_only_no_subsidy",
+                    "policy_fingerprint":s.policy_fingerprint.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                    "height":s.height.to_string(),
+                    "tip":s.tip.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                    "state_root":s.state_root.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                    "proof_type":"global_state_root_only",
+                    "verification":"canonical_full_node_replay_required"
+                }),
+            ),
+            Err(_) => (
+                503,
+                serde_json::json!({"error":"canonical_supply_unavailable"}),
+            ),
+        }
+    } else if let Some(encoded) = path.strip_prefix("/v1/account/") {
+        if encoded.len() != 64 || !encoded.bytes().all(|b| b.is_ascii_hexdigit()) {
+            (
+                400,
+                serde_json::json!({"error":"invalid_account_id","expected":"64 hexadecimal characters"}),
+            )
+        } else {
+            let mut id = [0u8; 32];
+            let decoded = (0..32).try_for_each(|i| {
+                u8::from_str_radix(&encoded[i * 2..i * 2 + 2], 16).map(|v| id[i] = v)
+            });
+            if decoded.is_err() {
+                (400, serde_json::json!({"error":"invalid_account_id"}))
+            } else {
+                match runtime.canonical_account_read(&id) {
+                    Ok(a) => (
+                        200,
+                        serde_json::json!({
+                            "api_version":1,
+                            "network_id":a.network_id.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                            "profile_id":a.profile_id.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                            "native_asset_id":a.native_asset_id.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                            "account_id":a.account_id.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                            "balance_atoms":a.balance_atoms.map(|value| value.to_string()),"nonce":a.nonce.map(|value| value.to_string()),"height":a.height.to_string(),
+                            "tip":a.tip.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                            "state_root":a.state_root.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                            "proof_type":"global_state_root_only","account_inclusion_proof":null,
+                            "verification":"canonical_full_node_replay_required"
+                        }),
+                    ),
+                    Err(_) => (
+                        503,
+                        serde_json::json!({"error":"canonical_state_unavailable"}),
+                    ),
+                }
+            }
+        }
+    } else {
+        (
+            404,
+            serde_json::json!({"error":"not_found","supported_paths":["/v1/status","/v1/account/{64-hex-account-id}","/v1/supply"]}),
+        )
+    };
+    let body = serde_json::to_vec(&body)
+        .unwrap_or_else(|_| b"{\"error\":\"serialization_failure\"}".to_vec());
+    (status, body)
+}
+
+/// Handle one bounded request per supervisor tick on the runtime-owning thread.
+pub(crate) fn serve_qfp6_read_api_once(
+    listener: &TcpListener,
+    runtime: &QRunV06PermissionlessNodeRuntime,
+) -> Result<(), String> {
+    let (mut stream, _) = match listener.accept() {
+        Ok(v) => v,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+        Err(e) => return Err(format!("read-only RPC accept failed: {e}")),
+    };
+    if stream
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .is_err()
+    {
+        return Ok(());
+    }
+    if stream
+        .set_write_timeout(Some(Duration::from_millis(250)))
+        .is_err()
+    {
+        return Ok(());
+    }
+    let mut reader = BufReader::new(&mut stream);
+    let mut request = String::new();
+    let read = match (&mut reader).take(513).read_line(&mut request) {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    drop(reader);
+    let (status, body) = if read == 0 || read > 512 || !request.ends_with("\r\n") {
+        (400, b"{\"error\":\"invalid_request_line\"}".to_vec())
+    } else {
+        let mut fields = request.split_whitespace();
+        let method = fields.next().unwrap_or("");
+        let path = fields.next().unwrap_or("");
+        let version = fields.next().unwrap_or("");
+        if fields.next().is_some() || !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+            (400, b"{\"error\":\"invalid_http_request\"}".to_vec())
+        } else {
+            qfp6_read_api_response(method, path, runtime)
+        }
+    };
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        503 => "Service Unavailable",
+        _ => "Error",
+    };
+    if write!(stream,"HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\r\n",body.len()).is_err() { return Ok(()); }
+    if stream.write_all(&body).is_err() {
+        return Ok(());
+    }
+    Ok(())
+}
 fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
     listener: &TcpListener,
     config: QRunV06PermissionlessMiningSupervisorConfig,
@@ -1463,6 +1635,7 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
         &crate::qrun_v06_bootstrap_trust_domain_candidate::BootstrapTrustDomainPolicy,
     )>,
     mut quote_authorizer: Option<&mut QRunV06QuoteAssetAuthorizationProvider<'_>>,
+    read_api_listener: Option<&TcpListener>,
 ) -> Result<QRunV06PermissionlessMiningSupervisorReport, QRunV06NodeSupervisorError> {
     config.validate()?;
     validate_identity_material(local_static_private_key, network_id, profile_id)?;
@@ -1525,6 +1698,10 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
             let stop_reason;
 
             loop {
+                if let Some(api) = read_api_listener {
+                    serve_qfp6_read_api_once(api, runtime)
+                        .map_err(QRunV06NodeSupervisorError::Listener)?;
+                }
                 if shutdown_requested.load(Ordering::Acquire) {
                     stop_reason = QRunV06NodeSupervisorStopReason::ShutdownRequested;
                     break;
@@ -2117,6 +2294,7 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_bootstrap_and_q6ar_candida
     address_book: &mut crate::qrun_v06_peer_address_manager_candidate::QRunV06PeerAddressBookCandidate,
     trust_domains: &crate::qrun_v06_bootstrap_trust_domain_candidate::BootstrapTrustDomainPolicy,
     mut quote_authorizer: Option<&mut QRunV06QuoteAssetAuthorizationProvider<'_>>,
+    read_api_listener: Option<&TcpListener>,
 ) -> Result<QRunV06PermissionlessLaunchReport, QRunV06NodeSupervisorError> {
     config.validate()?;
     sync_config
@@ -2255,6 +2433,7 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_bootstrap_and_q6ar_candida
         mempool,
         Some((address_book, relay_pins.clone(), trust_domains)),
         quote_authorizer.as_deref_mut(),
+        read_api_listener,
     )?;
     Ok(QRunV06PermissionlessLaunchReport {
         bootstrap_sync,
@@ -2280,6 +2459,7 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_bootstrap<T: TransactionAu
     mempool: &mut QRunV06PermissionlessMempool,
     sync_config: QRunV06HistorySyncClientConfig,
     mut quote_authorizer: Option<&mut QRunV06QuoteAssetAuthorizationProvider<'_>>,
+    read_api_listener: Option<&TcpListener>,
 ) -> Result<QRunV06PermissionlessLaunchReport, QRunV06NodeSupervisorError> {
     config.validate()?;
     sync_config
@@ -2336,6 +2516,7 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_bootstrap<T: TransactionAu
         mempool,
         None,
         quote_authorizer.as_deref_mut(),
+        read_api_listener,
     )?;
     Ok(QRunV06PermissionlessLaunchReport {
         bootstrap_sync,

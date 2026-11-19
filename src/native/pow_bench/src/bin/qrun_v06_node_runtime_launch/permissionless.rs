@@ -1775,6 +1775,33 @@ fn run_permissionless_node_with_visibility(
     } else {
         validate_public_listener_opt_in(cfg, listen)?;
     }
+    let read_api_address = if let Some(value) = cfg.get("read_api_listen_address") {
+        let raw = value
+            .as_str()
+            .ok_or("permissionless_runtime.read_api_listen_address must be a socket address")?;
+        let address: SocketAddr = raw
+            .parse()
+            .map_err(|error| format!("invalid read API listen address: {error}"))?;
+        if address.port() == 0 {
+            return Err("read API listener must use a fixed non-zero port".into());
+        }
+        let public_opt_in = cfg.get("allow_public_read_api").and_then(Value::as_bool) == Some(true);
+        if !address.ip().is_loopback() && (!mainnet || !public_opt_in) {
+            return Err("non-loopback read API binding requires Mainnet mode and allow_public_read_api=true".into());
+        }
+        if address == listen {
+            return Err("read API listener must use a port separate from P2P".into());
+        }
+        if supervisor_peers.iter().any(|peer| peer.address == address) {
+            return Err("read API listener cannot alias a pinned outbound peer".into());
+        }
+        Some(address)
+    } else {
+        if cfg.get("allow_public_read_api").and_then(Value::as_bool) == Some(true) {
+            return Err("allow_public_read_api=true requires read_api_listen_address".into());
+        }
+        None
+    };
     if supervisor_peers.iter().any(|peer| peer.address == listen) {
         return Err("P2P listener cannot alias a pinned outbound peer".into());
     }
@@ -1952,6 +1979,15 @@ fn run_permissionless_node_with_visibility(
         .map_err(|e| format!("permissionless supervisor config invalid: {e:?}"))?;
     let listener = TcpListener::bind(listen)
         .map_err(|e| format!("permissionless P2P listener bind failed: {e}"))?;
+    let read_api_listener = if let Some(address) = read_api_address {
+        let api = TcpListener::bind(address)
+            .map_err(|error| format!("read-only RPC listener bind failed: {error}"))?;
+        api.set_nonblocking(true)
+            .map_err(|error| format!("read-only RPC listener nonblocking setup failed: {error}"))?;
+        Some(api)
+    } else {
+        None
+    };
     let shutdown = AtomicBool::new(false);
     println!("QFP6 PERMISSIONLESS BASE RUNTIME: STARTING (candidate qualification only)");
     println!("network_id={}", super::super::hex(&descriptor.network_id()));
@@ -2010,6 +2046,9 @@ fn run_permissionless_node_with_visibility(
         println!("pinned_outbound_peer_count={}", supervisor_peers.len());
     } else {
         println!("q6ar_candidate_address_book=DISABLED_DEFAULT");
+    }
+    if read_api_listener.is_some() && supervisor_peers.is_empty() {
+        return Err("read-only RPC requires pinned bootstrap peers in this candidate".into());
     }
     let supervisor_report = if supervisor_peers.is_empty() {
         println!("bootstrap_mode=GENESIS_ROOTED_NO_SEED_PEERS");
@@ -2114,6 +2153,7 @@ fn run_permissionless_node_with_visibility(
                     .as_ref()
                     .ok_or("Q6AR address book has no bound trust-domain registry")?,
                 quote_authorizer.as_deref_mut(),
+                read_api_listener.as_ref(),
             )
             .map_err(|e| format!("permissionless bootstrap/Q6AR/Q6QA supervisor stopped: {e}"))?
         } else {
@@ -2131,6 +2171,7 @@ fn run_permissionless_node_with_visibility(
                 &mut mempool,
                 QRunV06HistorySyncClientConfig::default(),
                 quote_authorizer.as_deref_mut(),
+                read_api_listener.as_ref(),
             )
             .map_err(|e| format!("permissionless bootstrap/Q6QA supervisor stopped: {e}"))?
         };
