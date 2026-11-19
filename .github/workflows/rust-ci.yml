@@ -4,7 +4,8 @@ on:
   push:
     branches: [main, "ci/**", "public/**"]
   pull_request:
-    branches: [main]
+    # Include stacked feature/work PR targets so every PFM5 layer receives CI.
+    branches: [main, "feat/**", "work/**"]
   workflow_dispatch:
 
 permissions:
