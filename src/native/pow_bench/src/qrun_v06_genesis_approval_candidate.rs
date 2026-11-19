@@ -2,8 +2,9 @@
 //!
 //! Q6GA is a detached, versioned owner-approval envelope that the local permissionless launcher
 //! can require and verify. It binds the exact Genesis descriptor, consensus profile, network
-//! profile pin and canonical Genesis snapshot hashes plus CP-0651 economics. It is not a Mainnet
-//! authorization or an independent security review.
+//! profile pin and canonical Genesis snapshot hashes plus CP-0651 economics. V1 is local-only,
+//! V2 is zero-value Public Testnet, and V3 is Mainnet-native owner authorization bound to a
+//! non-empty peer-set commitment. No version is an independent security review or market authorization.
 use crate::{
     qrun_v06_cp0651_supply_candidate::{CP0651_MAX_GROSS_ATOMS, CP0651_OWNER_GENESIS_ATOMS},
     qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
@@ -27,9 +28,12 @@ const CORE_BYTES: usize = 8 + 9 * 32 + 8 * 3 + 1 + 7;
 pub const Q6GA_ENCODED_BYTES: usize = CORE_BYTES + Q6GA_SIGNATURE_BYTES;
 const SIGNING_DOMAIN_LOCAL: &[u8] = b"AIN1-QFP6-OWNER-GENESIS-APPROVAL-V1\0";
 const SIGNING_DOMAIN_PUBLIC_TESTNET: &[u8] = b"AIN1-QFP6-OWNER-PUBLIC-TESTNET-AUTHORIZATION-V1\0";
+const SIGNING_DOMAIN_MAINNET_NATIVE: &[u8] = b"AIN1-QFP6-OWNER-MAINNET-NATIVE-AUTHORIZATION-V1";
 pub const Q6GA_PUBLIC_TESTNET_VERSION: u16 = 2;
+pub const Q6GA_MAINNET_VERSION: u16 = 3;
 pub const Q6GA_SCOPE_LOCAL_ONLY: u8 = 1;
 pub const Q6GA_SCOPE_ZERO_VALUE_PUBLIC_TESTNET: u8 = 2;
+pub const Q6GA_SCOPE_MAINNET_NATIVE_VALUE: u8 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Q6gaError {
@@ -124,6 +128,35 @@ impl QRunV06GenesisApproval {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Create a separate owner authorization for native value-bearing Mainnet operation.
+    /// This scope does not authorize a market, exchange, quote asset, custody, or listing.
+    /// The caller must bind a non-empty approved bootstrap-peer set before signing.
+    pub fn sign_mainnet_native(
+        descriptor: &QRunV06GenesisDescriptor,
+        q6gd_sha256: [u8; 32],
+        q6cp_sha256: [u8; 32],
+        q6pn_sha256: [u8; 32],
+        genesis_snapshot_sha256: [u8; 32],
+        bootstrap_peers_sha256: [u8; 32],
+        signer: &QRunV06HybridTransactionSigner,
+    ) -> Result<Self, Q6gaError> {
+        if bootstrap_peers_sha256 == [0; 32] {
+            return Err(Q6gaError::InvalidField("Mainnet bootstrap peers SHA-256"));
+        }
+        Self::sign_scoped(
+            Q6GA_MAINNET_VERSION,
+            Q6GA_SCOPE_MAINNET_NATIVE_VALUE,
+            descriptor,
+            q6gd_sha256,
+            q6cp_sha256,
+            q6pn_sha256,
+            genesis_snapshot_sha256,
+            bootstrap_peers_sha256,
+            signer,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn sign_scoped(
         version: u16,
         scope: u8,
@@ -212,8 +245,11 @@ impl QRunV06GenesisApproval {
         cursor += 8;
         bytes[cursor] = self.producer_compensation;
         cursor += 1;
-        // V1 reserves all seven bytes; V2 uses the first byte as its explicit scope.
-        if self.version == Q6GA_PUBLIC_TESTNET_VERSION {
+        // V1 reserves all seven bytes; V2 and V3 use the first byte as their explicit scope.
+        if matches!(
+            self.version,
+            Q6GA_PUBLIC_TESTNET_VERSION | Q6GA_MAINNET_VERSION
+        ) {
             bytes[cursor] = self.scope;
         }
         debug_assert_eq!(cursor + 7, CORE_BYTES);
@@ -225,6 +261,7 @@ impl QRunV06GenesisApproval {
         let domain = match self.version {
             Q6GA_VERSION => SIGNING_DOMAIN_LOCAL,
             Q6GA_PUBLIC_TESTNET_VERSION => SIGNING_DOMAIN_PUBLIC_TESTNET,
+            Q6GA_MAINNET_VERSION => SIGNING_DOMAIN_MAINNET_NATIVE,
             _ => SIGNING_DOMAIN_LOCAL,
         };
         hash.update(domain);
@@ -235,11 +272,15 @@ impl QRunV06GenesisApproval {
     fn validate_fields(&self) -> Result<(), Q6gaError> {
         match (self.version, self.scope) {
             (Q6GA_VERSION, Q6GA_SCOPE_LOCAL_ONLY)
-            | (Q6GA_PUBLIC_TESTNET_VERSION, Q6GA_SCOPE_ZERO_VALUE_PUBLIC_TESTNET) => {}
+            | (Q6GA_PUBLIC_TESTNET_VERSION, Q6GA_SCOPE_ZERO_VALUE_PUBLIC_TESTNET)
+            | (Q6GA_MAINNET_VERSION, Q6GA_SCOPE_MAINNET_NATIVE_VALUE) => {}
             _ => return Err(Q6gaError::WrongScope),
         }
         if self.version == Q6GA_PUBLIC_TESTNET_VERSION && self.bootstrap_peers_sha256 != [0; 32] {
             return Err(Q6gaError::WrongScope);
+        }
+        if self.version == Q6GA_MAINNET_VERSION && self.bootstrap_peers_sha256 == [0; 32] {
+            return Err(Q6gaError::InvalidField("Mainnet bootstrap peers SHA-256"));
         }
         for (label, bytes) in [
             ("network ID", self.network_id.as_slice()),
@@ -383,6 +424,58 @@ impl QRunV06GenesisApproval {
         Ok(())
     }
 
+    /// Verify the Mainnet-native scope against the exact frozen peer-set bytes.
+    /// A valid result authorizes neither a market nor any external quote asset.
+    pub fn verify_mainnet_native_bindings(
+        &self,
+        descriptor: &QRunV06GenesisDescriptor,
+        q6gd_sha256: &[u8; 32],
+        q6cp_sha256: &[u8; 32],
+        q6pn_sha256: &[u8; 32],
+        genesis_snapshot_sha256: &[u8; 32],
+        bootstrap_peers_sha256: &[u8; 32],
+    ) -> Result<(), Q6gaError> {
+        if self.version != Q6GA_MAINNET_VERSION
+            || self.scope != Q6GA_SCOPE_MAINNET_NATIVE_VALUE
+            || self.bootstrap_peers_sha256 == [0; 32]
+        {
+            return Err(Q6gaError::WrongScope);
+        }
+        self.verify()?;
+        if self.network_id != descriptor.network_id() {
+            return Err(Q6gaError::WrongNetwork);
+        }
+        if self.profile_id != descriptor.profile_id() {
+            return Err(Q6gaError::WrongProfile);
+        }
+        if self.owner_account != descriptor.founder_account() {
+            return Err(Q6gaError::WrongOwner);
+        }
+        if self.descriptor_commitment != descriptor.commitment() {
+            return Err(Q6gaError::WrongDescriptorCommitment);
+        }
+        for (actual, expected, label) in [
+            (&self.q6gd_sha256, q6gd_sha256, "Q6GD"),
+            (&self.q6cp_sha256, q6cp_sha256, "Q6CP"),
+            (&self.q6pn_sha256, q6pn_sha256, "Q6PN"),
+            (
+                &self.genesis_snapshot_sha256,
+                genesis_snapshot_sha256,
+                "Genesis snapshot",
+            ),
+            (
+                &self.bootstrap_peers_sha256,
+                bootstrap_peers_sha256,
+                "bootstrap peers",
+            ),
+        ] {
+            if actual != expected {
+                return Err(Q6gaError::WrongArtifactHash(label));
+            }
+        }
+        Ok(())
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>, Q6gaError> {
         self.verify()?;
         let mut bytes = Vec::with_capacity(Q6GA_ENCODED_BYTES);
@@ -402,7 +495,7 @@ impl QRunV06GenesisApproval {
             || bytes[..4] != Q6GA_MAGIC
             || !matches!(
                 u16::from_be_bytes([bytes[4], bytes[5]]),
-                Q6GA_VERSION | Q6GA_PUBLIC_TESTNET_VERSION
+                Q6GA_VERSION | Q6GA_PUBLIC_TESTNET_VERSION | Q6GA_MAINNET_VERSION
             )
             || u16::from_be_bytes([bytes[6], bytes[7]]) != Q6GA_SUITE_ED25519_MLDSA65
         {
@@ -432,6 +525,11 @@ impl QRunV06GenesisApproval {
                     && reserved[1..] == [0u8; 6] =>
             {
                 Q6GA_SCOPE_ZERO_VALUE_PUBLIC_TESTNET
+            }
+            Q6GA_MAINNET_VERSION
+                if reserved[0] == Q6GA_SCOPE_MAINNET_NATIVE_VALUE && reserved[1..] == [0u8; 6] =>
+            {
+                Q6GA_SCOPE_MAINNET_NATIVE_VALUE
             }
             _ => return Err(Q6gaError::Malformed),
         };
@@ -557,6 +655,104 @@ mod tests {
                 &[0x56; 32],
             )
             .is_err());
+    }
+
+    #[test]
+    fn q6ga_v3_mainnet_native_scope_is_distinct_and_binds_peer_set() {
+        let signer = QRunV06HybridTransactionSigner::from_seeds([0x31; 32], [0x42; 32]).unwrap();
+        let descriptor = QRunV06GenesisDescriptor::new(
+            [0x11; 32],
+            [0x22; 32],
+            signer.account_id(),
+            1_800_000_000,
+            [0x33; 32],
+            [0x44; 32],
+        )
+        .unwrap();
+        let approval = QRunV06GenesisApproval::sign_mainnet_native(
+            &descriptor,
+            [0x51; 32],
+            [0x52; 32],
+            [0x53; 32],
+            [0x54; 32],
+            [0x55; 32],
+            &signer,
+        )
+        .unwrap();
+        let bytes = approval.encode().unwrap();
+        assert_eq!(
+            u16::from_be_bytes([bytes[4], bytes[5]]),
+            Q6GA_MAINNET_VERSION
+        );
+        let decoded = QRunV06GenesisApproval::decode(&bytes).unwrap();
+        decoded
+            .verify_mainnet_native_bindings(
+                &descriptor,
+                &[0x51; 32],
+                &[0x52; 32],
+                &[0x53; 32],
+                &[0x54; 32],
+                &[0x55; 32],
+            )
+            .unwrap();
+        assert_eq!(
+            decoded.verify_mainnet_native_bindings(
+                &descriptor,
+                &[0x51; 32],
+                &[0x52; 32],
+                &[0x53; 32],
+                &[0x54; 32],
+                &[0x56; 32],
+            ),
+            Err(Q6gaError::WrongArtifactHash("bootstrap peers"))
+        );
+        assert_eq!(
+            decoded.verify_public_testnet_bindings(
+                &descriptor,
+                &[0x51; 32],
+                &[0x52; 32],
+                &[0x53; 32],
+                &[0x54; 32],
+            ),
+            Err(Q6gaError::WrongScope)
+        );
+        assert_eq!(
+            decoded.verify_bindings(
+                &descriptor,
+                &[0x51; 32],
+                &[0x52; 32],
+                &[0x53; 32],
+                &[0x54; 32],
+                &[0x55; 32],
+            ),
+            Err(Q6gaError::WrongScope)
+        );
+    }
+
+    #[test]
+    fn q6ga_v3_refuses_missing_bootstrap_peer_commitment() {
+        let signer = QRunV06HybridTransactionSigner::from_seeds([0x31; 32], [0x42; 32]).unwrap();
+        let descriptor = QRunV06GenesisDescriptor::new(
+            [0x11; 32],
+            [0x22; 32],
+            signer.account_id(),
+            1_800_000_000,
+            [0x33; 32],
+            [0x44; 32],
+        )
+        .unwrap();
+        assert_eq!(
+            QRunV06GenesisApproval::sign_mainnet_native(
+                &descriptor,
+                [0x51; 32],
+                [0x52; 32],
+                [0x53; 32],
+                [0x54; 32],
+                [0; 32],
+                &signer,
+            ),
+            Err(Q6gaError::InvalidField("Mainnet bootstrap peers SHA-256"))
+        );
     }
 
     #[test]
