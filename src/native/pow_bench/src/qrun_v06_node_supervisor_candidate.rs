@@ -1513,6 +1513,144 @@ pub(crate) fn qfp6_read_api_response(
                 serde_json::json!({"error":"canonical_supply_unavailable"}),
             ),
         }
+    } else if let Some(encoded_height) = path.strip_prefix("/v1/block/") {
+        let parsed_height = if encoded_height.is_empty()
+            || !encoded_height.bytes().all(|byte| byte.is_ascii_digit())
+            || (encoded_height.len() > 1 && encoded_height.starts_with('0'))
+        {
+            None
+        } else {
+            encoded_height.parse::<u64>().ok()
+        };
+        match parsed_height {
+            None => (
+                400,
+                serde_json::json!({"error":"invalid_block_height","expected":"canonical unsigned decimal height"}),
+            ),
+            Some(height) => match runtime.canonical_block_read(height) {
+                Ok(Some(block)) => {
+                    let operations = block
+                        .operations
+                        .iter()
+                        .map(|operation| {
+                            let mut value = serde_json::json!({
+                                "index": operation.index.to_string(),
+                                "type": operation.kind
+                            });
+                            if let Some(tx) = operation.transaction {
+                                value["transaction"] = serde_json::json!({
+                                    "transaction_id":tx.transaction_id.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                                    "sender":tx.sender.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                                    "recipient":tx.recipient.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                                    "nonce":tx.nonce.to_string(),
+                                    "amount_atoms":tx.amount_atoms.to_string(),
+                                    "fee_atoms":tx.fee_atoms.to_string(),
+                                    "expires_at":tx.expires_at.to_string()
+                                });
+                            }
+                            value
+                        })
+                        .collect::<Vec<_>>();
+                    (
+                        200,
+                        serde_json::json!({
+                            "api_version":1,
+                            "network_id":block.network_id.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                            "profile_id":block.profile_id.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                            "height":block.height.to_string(),
+                            "timestamp":block.timestamp.to_string(),
+                            "parent_execution_hash":block.parent_hash.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                            "execution_block_id":block.execution_block_id.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                            "consensus_tip":block.consensus_tip.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                            "producer":block.producer.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                            "state_root":block.state_root.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                            "operation_count":block.operation_count.to_string(),
+                            "operations":operations,
+                            "canonical":true,
+                            "canonical_height":block.canonical_height.to_string(),
+                            "canonical_tip":block.canonical_tip.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                            "canonical_state_root":block.canonical_state_root.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                            "proof_type":"global_state_root_only",
+                            "verification":"replay_and_recompute_with_trusted_genesis_or_checkpoint"
+                        }),
+                    )
+                }
+                Ok(None) => (
+                    404,
+                    serde_json::json!({
+                        "error":"block_not_available",
+                        "height":height.to_string(),
+                        "reason":"height is outside the retained canonical block-body range"
+                    }),
+                ),
+                Err(_) => (
+                    503,
+                    serde_json::json!({"error":"canonical_block_unavailable"}),
+                ),
+            },
+        }
+    } else if let Some(encoded_id) = path.strip_prefix("/v1/transaction/") {
+        if encoded_id.len() != 64 || !encoded_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            (
+                400,
+                serde_json::json!({"error":"invalid_transaction_id","expected":"64 hexadecimal characters"}),
+            )
+        } else {
+            let mut id = [0u8; 32];
+            let decoded = (0..32).try_for_each(|index| {
+                u8::from_str_radix(&encoded_id[index * 2..index * 2 + 2], 16)
+                    .map(|value| id[index] = value)
+            });
+            if decoded.is_err() {
+                (400, serde_json::json!({"error":"invalid_transaction_id"}))
+            } else {
+                match runtime.canonical_transaction_read(&id) {
+                    Ok(Some(receipt)) => {
+                        let tx = receipt.transaction;
+                        (
+                            200,
+                            serde_json::json!({
+                                "api_version":1,
+                                "transaction_id":tx.transaction_id.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                                "sender":tx.sender.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                                "recipient":tx.recipient.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                                "nonce":tx.nonce.to_string(),
+                                "amount_atoms":tx.amount_atoms.to_string(),
+                                "fee_atoms":tx.fee_atoms.to_string(),
+                                "expires_at":tx.expires_at.to_string(),
+                                "status":receipt.inclusion_status,
+                                "lookup_scope":"retained_fork_archive",
+                                "mempool_checked":false,
+                                "block_height":receipt.block_height.to_string(),
+                                "block_timestamp":receipt.block_timestamp.to_string(),
+                                "execution_block_id":receipt.execution_block_id.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                                "consensus_tip":receipt.consensus_tip.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                                "block_state_root":receipt.block_state_root.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                                "producer":receipt.producer.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                                "confirmations":receipt.confirmations.to_string(),
+                                "finality":"confirmation_depth_only",
+                                "canonical_height":receipt.canonical_height.to_string(),
+                                "canonical_tip":receipt.canonical_tip.iter().map(|b|format!("{b:02x}")).collect::<String>(),
+                                "canonical_state_root":receipt.canonical_state_root.iter().map(|b|format!("{b:02x}")).collect::<String>()
+                            }),
+                        )
+                    }
+                    Ok(None) => (
+                        404,
+                        serde_json::json!({
+                            "error":"transaction_not_found_in_retained_fork_archive",
+                            "transaction_id":encoded_id.to_ascii_lowercase(),
+                            "mempool_checked":false,
+                            "pending_status":"not_available_from_this_endpoint"
+                        }),
+                    ),
+                    Err(_) => (
+                        503,
+                        serde_json::json!({"error":"canonical_transaction_lookup_unavailable"}),
+                    ),
+                }
+            }
+        }
     } else if let Some(encoded) = path.strip_prefix("/v1/account/") {
         if encoded.len() != 64 || !encoded.bytes().all(|b| b.is_ascii_hexdigit()) {
             (
@@ -1553,7 +1691,7 @@ pub(crate) fn qfp6_read_api_response(
     } else {
         (
             404,
-            serde_json::json!({"error":"not_found","supported_paths":["/v1/status","/v1/account/{64-hex-account-id}","/v1/supply"]}),
+            serde_json::json!({"error":"not_found","supported_paths":["/v1/status","/v1/account/{64-hex-account-id}","/v1/supply","/v1/block/{height}","/v1/transaction/{64-hex-transaction-id}"]}),
         )
     };
     let body = serde_json::to_vec(&body)

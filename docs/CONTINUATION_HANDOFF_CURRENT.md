@@ -131,3 +131,37 @@ Important boundaries:
 - PID 20244 / TCP 30333 and its data remain untouched; no private wallet/key material was accessed.
 
 Next: finish transaction/block receipts and independent proof path; then prepare the exact Mainnet config and obtain local owner authorization only after the bind policy and peer set are reviewed. Public bind remains opt-in.
+
+## CP-0785 - canonical block and transaction read API (2026-11-19)
+
+Current continuation point:
+- Branch: feat/q6ga-v3-mainnet-scope-20261119.
+- Base: CP-0784 / 095b61f54dce965594114f9c0a3f829d2236cdfd.
+- Checkpoint: docs/CP-0785_CANONICAL_BLOCK_AND_TRANSACTION_READS_2026-11-19.md.
+
+Implemented:
+- Runtime-owned canonical block lookup from a pinned fork-choice snapshot, with QFB6 execution block ID and QFP6 consensus tip returned separately.
+- Native TXN2 transaction receipt lookup from the retained, validated fork archive.
+- Receipt status distinguishes canonical from reorged; confirmation depth is informational only.
+- New GET-only HTTP routes /v1/block/{height} and /v1/transaction/{64-hex-transaction-id}.
+- Transaction lookup is bounded to 1,024 retained envelopes / 16 MiB and explicitly does not inspect mempool. Archive-limit exhaustion fails closed.
+- Genesis/checkpoint base heights do not expose a block body through the current graph API. Historical segments beyond the active retained graph are not indexed by this endpoint.
+- Fixed QFP6/QFB6 hash-domain confusion in canonical account/supply reads: runtime status tip is the QFP6 consensus digest; execution state's tip_hash()/QFB6 block ID is a separate domain. Reads now compare consensus tip to fork-choice status and recompute the state root.
+
+Validation observed:
+- Expanded CP-0651 runtime/API transfer + block + receipt + reorg + restart + malformed-input test: 1/1 PASS.
+- QFP6 supervisor regression module: 19/19 PASS.
+- cargo check --manifest-path src/native/pow_bench/Cargo.toml --bin qrun_v06_node --locked --offline: PASS.
+- cargo +stable fmt --manifest-path src/native/pow_bench/Cargo.toml --check: PASS.
+- git diff --check: PASS.
+
+Preserved boundaries:
+- API listener remains disabled by default; no public socket enabled.
+- No account inclusion proof is claimed. Global state root still requires independent full-node replay from trusted Genesis/checkpoint inputs.
+- No Mainnet package change, Q6GA digest regeneration, QZKW2 authorization/signature, or wallet access.
+- No public Testnet/Mainnet launch or public endpoint is claimed.
+- PID 20244 / TCP 30333 and its CP-0596 datastore remain untouched.
+- Gate 2 and Gate 8 remain owner-reported complete in this continuation context; this checkpoint did not re-test or reclassify either gate.
+- No private key/seed/plaintext DPAPI material was read.
+
+Next: independent second-node cross-check of these read surfaces; then account inclusion proof or reproducible replay verification design, plus historical archive indexing if explorer history must survive checkpoint rollover. Only later, after exact config review, may a fresh manual QZKW2 authorization be requested. Public bind remains off.
