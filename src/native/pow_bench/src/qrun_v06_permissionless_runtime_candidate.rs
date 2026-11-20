@@ -2083,7 +2083,8 @@ mod tests {
         const NETWORK: [u8; 32] = [0xA1; 32];
         const PROFILE: [u8; 32] = [0xB2; 32];
         const FOUNDER: [u8; 32] = [0xC3; 32];
-        let mut params = ConsensusParameters::qrun_v06_cp0651_fee_only_candidate().unwrap();
+        // CP-0604 Genesis uses the legacy 10B mining schedule, not CP-0651 fee-only economics.
+        let mut params = ConsensusParameters::qrun_v06_sha256d_candidate().unwrap();
         params.target_block_time_secs = 30;
         params.difficulty_window_blocks = 2;
         params.difficulty_min_ratio_divisor = 4;
@@ -2235,7 +2236,8 @@ mod tests {
         const PROFILE: [u8; 32] = [0x92; 32];
         const FOUNDER: [u8; 32] = [0x93; 32];
         const PRODUCER: [u8; 32] = [0x94; 32];
-        let mut params = ConsensusParameters::qrun_v06_cp0651_fee_only_candidate().unwrap();
+        // CP-0604 Genesis uses the legacy 10B mining schedule, not CP-0651 fee-only economics.
+        let mut params = ConsensusParameters::qrun_v06_sha256d_candidate().unwrap();
         params.target_block_time_secs = 30;
         params.difficulty_window_blocks = 2;
         params.difficulty_min_ratio_divisor = 4;
