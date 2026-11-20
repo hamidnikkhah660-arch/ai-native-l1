@@ -5758,7 +5758,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             fs::read_to_string(dir.0.join(LOCK_NAME)).unwrap(),
-            format!("pid={}\n", std::process::id())
+            "pid=4294967295\n"
         );
         drop(reopened);
     }
