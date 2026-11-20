@@ -95,7 +95,7 @@ External reachability probes on the current egress IPv4 did not establish public
 - portchecker.io returned status=false for TCP 30333.
 - MTRXTools returned filtered / no reply (timeout) for TCP 30333.
 - Kordu Probe rejected the target as invalid_target at its Cloudflare vantage; this is not a reachability result.
-- The IPv6 probe did not produce a valid external reachability verdict. A separate TCPData result labeled open with HTTP 403 is not accepted as proof of a live QRun listener.
+- The IPv6 Port.Tools external tester was run against 2a02:4540:ab:f8a9:2de6:2473:2516:224:30333 and returned failed / Resource temporarily unavailable at 2026-11-20 07:45:51 UTC. MTRXTools could not route its own vantage to that IPv6 (EADDRNOTAVAIL). A separate TCPData result labeled open with HTTP 403 is not accepted as proof of a live QRun listener.
 
 Windows Firewall has an inbound Allow rule for TCP 30333, but the external probes show that local firewall configuration alone is insufficient. The cause may be upstream NAT/ISP/VPN routing or mismatch between egress and inbound address; it is not yet isolated. No router, firewall, VPN, or ISP setting was changed in this checkpoint.
 

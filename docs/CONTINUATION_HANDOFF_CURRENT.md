@@ -222,3 +222,10 @@ This section supersedes earlier continuation-point statements in this handoff.
 - Existing Q6GA v2 authorizes only zero-value Public Testnet. Mainnet remains unauthorized; it needs a separate Q6GA v3 and independently pinned/authenticated peer topology.
 - Gate 2 and Gate 8 remain owner-reported complete, not re-tested in CP-0790.
 - Next: attach the previously qualified operator endpoint/pin records to the release package, establish a genuinely reachable stable Seed endpoint, bring up a distinct independently operated Joining node and verify real block transfer/reorg/restart; only then plan a controlled CP-0790 binary replacement with store rollback.
+### CP-0790 external IPv6 probe addendum (2026-11-20)
+
+- Port.Tools IPv6 Port Tester was run against 2a02:4540:ab:f8a9:2de6:2473:2516:224, TCP 30333. Result: failed, reason Resource temporarily unavailable, timestamp 2026-11-20 07:45:51.
+- The host was not independently qualified as an inbound public Seed endpoint.
+- IPv4 egress 103.215.239.163:30333 was independently reported false by PortChecker.io and filtered / timeout by MTRXTools.
+- NetBird service is running but management and signal are disconnected; no peer connection was available.
+- This was a one-off endpoint probe only; it does not repeat or reclassify Gate 2 or Gate 8.
