@@ -26,6 +26,45 @@ const MIN_CIPHERTEXT_BYTES: usize = 16;
 const MAX_CIPHERTEXT_BYTES: usize = MAX_QFP6_NOISE_RECORD_BYTES + 16;
 const MAX_TRUSTED_PEERS: usize = 64;
 
+/// Bidirectional stream used by the QFP6 Noise framing layer.
+///
+/// Implementations must enforce read/write deadlines on the underlying transport.
+/// Direct TCP and TLS-terminated relay streams share the same authenticated Noise layer.
+pub trait QRunV06NoiseIo: Read + Write {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+}
+
+impl QRunV06NoiseIo for TcpStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_write_timeout(self, timeout)
+    }
+}
+
+impl QRunV06NoiseIo for rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.sock.set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.sock.set_write_timeout(timeout)
+    }
+}
+
+impl QRunV06NoiseIo for rustls::StreamOwned<rustls::ServerConnection, TcpStream> {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.sock.set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.sock.set_write_timeout(timeout)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QRunV06NoiseError {
     InvalidNetworkOrProfile,
@@ -92,7 +131,7 @@ impl QRunV06NoiseSession {
 
     /// Initiator verifies the responder static key before exposing the session.
     pub fn connect(
-        stream: &mut TcpStream,
+        stream: &mut dyn QRunV06NoiseIo,
         local_static_private_key: &[u8; 32],
         trusted_remote_static_public_key: &[u8; 32],
         network_id: &[u8; 32],
@@ -148,7 +187,7 @@ impl QRunV06NoiseSession {
 
     /// Responder verifies the initiator static key against an explicit bounded trust set.
     pub fn accept(
-        stream: &mut TcpStream,
+        stream: &mut dyn QRunV06NoiseIo,
         local_static_private_key: &[u8; 32],
         trusted_remote_static_public_keys: &[[u8; 32]],
         network_id: &[u8; 32],
@@ -166,7 +205,7 @@ impl QRunV06NoiseSession {
 
     /// Same pinned handshake, with prompt cancellation for bounded listener workers.
     pub fn accept_with_shutdown(
-        stream: &mut TcpStream,
+        stream: &mut dyn QRunV06NoiseIo,
         local_static_private_key: &[u8; 32],
         trusted_remote_static_public_keys: &[[u8; 32]],
         network_id: &[u8; 32],
@@ -184,7 +223,7 @@ impl QRunV06NoiseSession {
     }
 
     fn accept_with_cancellation(
-        stream: &mut TcpStream,
+        stream: &mut dyn QRunV06NoiseIo,
         local_static_private_key: &[u8; 32],
         trusted_remote_static_public_keys: &[[u8; 32]],
         network_id: &[u8; 32],
@@ -251,7 +290,7 @@ impl QRunV06NoiseSession {
     /// terminate/re-encrypt the session; at best this protects against passive eavesdropping.
     /// It is not an authenticated transport or a post-quantum transport.
     pub fn accept_unpinned(
-        stream: &mut TcpStream,
+        stream: &mut dyn QRunV06NoiseIo,
         local_static_private_key: &[u8; 32],
         network_id: &[u8; 32],
         profile_id: &[u8; 32],
@@ -267,7 +306,7 @@ impl QRunV06NoiseSession {
 
     /// Anonymous responder handshake which is interruptible when the listener is shutting down.
     pub fn accept_unpinned_with_shutdown(
-        stream: &mut TcpStream,
+        stream: &mut dyn QRunV06NoiseIo,
         local_static_private_key: &[u8; 32],
         network_id: &[u8; 32],
         profile_id: &[u8; 32],
@@ -283,7 +322,7 @@ impl QRunV06NoiseSession {
     }
 
     fn accept_unpinned_with_cancellation(
-        stream: &mut TcpStream,
+        stream: &mut dyn QRunV06NoiseIo,
         local_static_private_key: &[u8; 32],
         network_id: &[u8; 32],
         profile_id: &[u8; 32],
@@ -340,7 +379,7 @@ impl QRunV06NoiseSession {
     /// matches an operator-provided allow-list. Nonmatching peers remain accepted but unverified,
     /// so the caller can preserve permissionless ingress without granting trust to advertisements.
     pub fn accept_unpinned_with_optional_pins(
-        stream: &mut TcpStream,
+        stream: &mut dyn QRunV06NoiseIo,
         local_static_private_key: &[u8; 32],
         network_id: &[u8; 32],
         profile_id: &[u8; 32],
@@ -357,7 +396,7 @@ impl QRunV06NoiseSession {
     }
 
     pub fn accept_unpinned_with_optional_pins_and_shutdown(
-        stream: &mut TcpStream,
+        stream: &mut dyn QRunV06NoiseIo,
         local_static_private_key: &[u8; 32],
         network_id: &[u8; 32],
         profile_id: &[u8; 32],
@@ -383,28 +422,31 @@ impl QRunV06NoiseSession {
     /// Encrypt one bounded QFP6 application record with a five-second absolute deadline.
     pub fn write_record(
         &mut self,
-        stream: &mut TcpStream,
+        stream: &mut dyn QRunV06NoiseIo,
         plaintext: &[u8],
     ) -> Result<(), QRunV06NoiseError> {
         self.write_record_with_budget(stream, plaintext, RECORD_BUDGET)
     }
 
     /// Read and authenticate one bounded record with a five-second absolute deadline.
-    pub fn read_record(&mut self, stream: &mut TcpStream) -> Result<Vec<u8>, QRunV06NoiseError> {
+    pub fn read_record(
+        &mut self,
+        stream: &mut dyn QRunV06NoiseIo,
+    ) -> Result<Vec<u8>, QRunV06NoiseError> {
         self.read_record_with_budget(stream, RECORD_BUDGET)
     }
 
     /// Extended bounded read for a peer admission response after PoW and durable admission.
     pub fn read_admission_response(
         &mut self,
-        stream: &mut TcpStream,
+        stream: &mut dyn QRunV06NoiseIo,
     ) -> Result<Vec<u8>, QRunV06NoiseError> {
         self.read_record_with_budget(stream, QFP6_NOISE_RESPONSE_BUDGET)
     }
 
     pub fn write_q6pb_request(
         &mut self,
-        stream: &mut TcpStream,
+        stream: &mut dyn QRunV06NoiseIo,
         frame: &[u8],
     ) -> Result<(), QRunV06NoiseError> {
         crate::qrun_v06_node_runtime_candidate::decode_qrun_v06_peer_block_request(frame)
@@ -414,7 +456,7 @@ impl QRunV06NoiseSession {
 
     pub fn read_q6pa_response(
         &mut self,
-        stream: &mut TcpStream,
+        stream: &mut dyn QRunV06NoiseIo,
         expected_request_id: u64,
     ) -> Result<
         [u8; crate::qrun_v06_node_runtime_candidate::QRUN_V06_PEER_ADMISSION_RESPONSE_BYTES],
@@ -444,7 +486,7 @@ impl QRunV06NoiseSession {
 
     fn write_record_with_budget(
         &mut self,
-        stream: &mut TcpStream,
+        stream: &mut dyn QRunV06NoiseIo,
         plaintext: &[u8],
         budget: Duration,
     ) -> Result<(), QRunV06NoiseError> {
@@ -468,7 +510,7 @@ impl QRunV06NoiseSession {
 
     pub(crate) fn read_record_with_budget(
         &mut self,
-        stream: &mut TcpStream,
+        stream: &mut dyn QRunV06NoiseIo,
         budget: Duration,
     ) -> Result<Vec<u8>, QRunV06NoiseError> {
         let deadline = Instant::now() + budget;
@@ -539,11 +581,14 @@ fn validate_trust_set(keys: &[[u8; 32]]) -> Result<(), QRunV06NoiseError> {
     }
     Ok(())
 }
-fn read_handshake(stream: &mut TcpStream, deadline: Instant) -> Result<Vec<u8>, QRunV06NoiseError> {
+fn read_handshake(
+    stream: &mut dyn QRunV06NoiseIo,
+    deadline: Instant,
+) -> Result<Vec<u8>, QRunV06NoiseError> {
     read_handshake_with_cancellation(stream, deadline, None)
 }
 fn read_handshake_with_cancellation(
-    stream: &mut TcpStream,
+    stream: &mut dyn QRunV06NoiseIo,
     deadline: Instant,
     cancellation: Option<&AtomicBool>,
 ) -> Result<Vec<u8>, QRunV06NoiseError> {
@@ -561,14 +606,14 @@ fn read_handshake_with_cancellation(
     Ok(bytes)
 }
 fn write_handshake(
-    stream: &mut TcpStream,
+    stream: &mut dyn QRunV06NoiseIo,
     bytes: &[u8],
     deadline: Instant,
 ) -> Result<(), QRunV06NoiseError> {
     write_handshake_with_cancellation(stream, bytes, deadline, None)
 }
 fn write_handshake_with_cancellation(
-    stream: &mut TcpStream,
+    stream: &mut dyn QRunV06NoiseIo,
     bytes: &[u8],
     deadline: Instant,
     cancellation: Option<&AtomicBool>,
@@ -586,14 +631,14 @@ fn write_handshake_with_cancellation(
     .map_err(map_handshake_io_error)
 }
 fn read_exact_until(
-    stream: &mut TcpStream,
+    stream: &mut dyn QRunV06NoiseIo,
     output: &mut [u8],
     deadline: Instant,
 ) -> io::Result<()> {
     read_exact_until_with_cancellation(stream, output, deadline, None)
 }
 fn read_exact_until_with_cancellation(
-    stream: &mut TcpStream,
+    stream: &mut dyn QRunV06NoiseIo,
     output: &mut [u8],
     deadline: Instant,
     cancellation: Option<&AtomicBool>,
@@ -630,11 +675,15 @@ fn read_exact_until_with_cancellation(
     check_handshake_cancellation(cancellation)?;
     Ok(())
 }
-fn write_all_until(stream: &mut TcpStream, bytes: &[u8], deadline: Instant) -> io::Result<()> {
+fn write_all_until(
+    stream: &mut dyn QRunV06NoiseIo,
+    bytes: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
     write_all_until_with_cancellation(stream, bytes, deadline, None)
 }
 fn write_all_until_with_cancellation(
-    stream: &mut TcpStream,
+    stream: &mut dyn QRunV06NoiseIo,
     bytes: &[u8],
     deadline: Instant,
     cancellation: Option<&AtomicBool>,

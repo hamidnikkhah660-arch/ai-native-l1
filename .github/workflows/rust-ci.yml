@@ -2,9 +2,9 @@ name: Rust validation
 
 on:
   push:
-    branches: [main, "ci/**", "public/**", "feat/cp0584-q6ti-q6ta-noise-transaction-ingress-20261110", "feat/cp0585-q6ti-supervised-mining-20261110", "feat/cp0586-q6ti-durable-mempool-20261110", "feat/cp0587-q6ti-cross-host-recovery-20261111"]
+    branches: [main, "ci/**", "public/**", "feat/qfp6-public-testnet-dns-relay-20261120", "feat/cp0584-q6ti-q6ta-noise-transaction-ingress-20261110", "feat/cp0585-q6ti-supervised-mining-20261110", "feat/cp0586-q6ti-durable-mempool-20261110", "feat/cp0587-q6ti-cross-host-recovery-20261111"]
   pull_request:
-    branches: [main]
+    branches: [main, "feat/q6ga-v3-mainnet-scope-20261119"]
   workflow_dispatch:
 
 permissions:
@@ -68,6 +68,10 @@ jobs:
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: stable
+
+      - name: Test pinned public Seed endpoint and TCP relay policy
+        shell: pwsh
+        run: ./tools/test-qfp6-public-seed-endpoint.ps1
 
       - name: Test Windows DPAPI offline trust provisioner
         shell: pwsh

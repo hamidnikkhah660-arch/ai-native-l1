@@ -352,6 +352,7 @@ fn load_pinned_bootstrap_peers(path: &Path) -> Result<Vec<QRunV06PinnedBootstrap
         result.push(QRunV06PinnedBootstrapPeer {
             address,
             noise_static_public_key,
+            tls_server_name: None,
         });
     }
     validate_qfp6_pinned_bootstrap_peers(&result)
@@ -1006,6 +1007,7 @@ mod tests {
         let peers = [QRunV06PinnedBootstrapPeer {
             address: "10.10.1.3:30303".parse().unwrap(),
             noise_static_public_key: [7; 32],
+            tls_server_name: None,
         }];
         let listener: SocketAddr = "127.0.0.1:30303".parse().unwrap();
         let provider: SocketAddr = "10.10.1.1:40401".parse().unwrap();
