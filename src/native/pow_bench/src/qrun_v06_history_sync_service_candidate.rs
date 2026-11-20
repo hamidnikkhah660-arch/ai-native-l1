@@ -328,7 +328,7 @@ pub fn make_next_history_request(
 /// already-authenticated Noise session. Every Q6HC chunk is read as a separate bounded record.
 pub fn request_history_page_over_noise(
     noise: &mut QRunV06NoiseSession,
-    stream: &mut TcpStream,
+    stream: &mut dyn QRunV06NoiseIo,
     request: QRunV06HistorySyncRequest,
     params: crate::consensus::ConsensusParameters,
 ) -> Result<QRunV06CanonicalHistoryPage, QRunV06HistorySyncServiceError> {
