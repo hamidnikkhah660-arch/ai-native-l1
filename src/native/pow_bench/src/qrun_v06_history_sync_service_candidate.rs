@@ -20,7 +20,7 @@ use crate::{
     qrun_v06_node_runtime_candidate::{
         QRunV06NodeAdmission, QRunV06NodeRuntime, QRunV06NodeRuntimeError,
     },
-    qrun_v06_noise_transport_candidate::{QRunV06NoiseError, QRunV06NoiseSession},
+    qrun_v06_noise_transport_candidate::{QRunV06NoiseError, QRunV06NoiseIo, QRunV06NoiseSession},
     qrun_v06_permissionless_runtime_candidate::{
         QRunV06HistorySyncError, QRunV06HistorySyncReport, QRunV06PermissionlessNodeRuntime,
         QRunV06PermissionlessRuntimeError,
@@ -35,9 +35,10 @@ use crate::{
     state_machine::TransactionAuthenticator,
     v4_fat1_trust_candidate::MlDsa65Verifier,
 };
+use rustls::{pki_types::ServerName, ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use std::{
     net::{SocketAddr, TcpListener, TcpStream},
-    sync::atomic::AtomicBool,
+    sync::{atomic::AtomicBool, Arc, OnceLock},
     time::Duration,
 };
 
@@ -65,6 +66,58 @@ impl std::fmt::Display for QRunV06HistorySyncServiceError {
     }
 }
 impl std::error::Error for QRunV06HistorySyncServiceError {}
+
+fn public_relay_tls_config() -> Arc<ClientConfig> {
+    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    Arc::clone(CONFIG.get_or_init(|| {
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        )
+    }))
+}
+
+/// Open direct Noise/TCP or a certificate-verified TLS/SNI tunnel to a TCP/443 relay.
+/// Funnel terminates outer TLS and forwards the unchanged inner Noise bytes.
+fn connect_history_sync_stream(
+    address: SocketAddr,
+    tls_server_name: Option<&str>,
+    config: QRunV06HistorySyncClientConfig,
+) -> Result<Box<dyn QRunV06NoiseIo>, QRunV06HistorySyncServiceError> {
+    let tls_config = tls_server_name.map(|_| public_relay_tls_config());
+    connect_history_sync_stream_with_tls_config(address, tls_server_name, config, tls_config)
+}
+
+fn connect_history_sync_stream_with_tls_config(
+    address: SocketAddr,
+    tls_server_name: Option<&str>,
+    config: QRunV06HistorySyncClientConfig,
+    tls_config: Option<Arc<ClientConfig>>,
+) -> Result<Box<dyn QRunV06NoiseIo>, QRunV06HistorySyncServiceError> {
+    let tcp = TcpStream::connect_timeout(&address, config.connect_timeout)
+        .map_err(|error| QRunV06HistorySyncServiceError::Noise(error.to_string()))?;
+    tcp.set_read_timeout(Some(config.io_timeout))
+        .map_err(|error| QRunV06HistorySyncServiceError::Noise(error.to_string()))?;
+    tcp.set_write_timeout(Some(config.io_timeout))
+        .map_err(|error| QRunV06HistorySyncServiceError::Noise(error.to_string()))?;
+    tcp.set_nodelay(true)
+        .map_err(|error| QRunV06HistorySyncServiceError::Noise(error.to_string()))?;
+    match tls_server_name {
+        None => Ok(Box::new(tcp)),
+        Some(host) => {
+            let server_name = ServerName::try_from(host.to_owned())
+                .map_err(|error| QRunV06HistorySyncServiceError::Noise(error.to_string()))?;
+            let tls_config =
+                tls_config.ok_or(QRunV06HistorySyncServiceError::InvalidClientConfig)?;
+            let connection = ClientConnection::new(tls_config, server_name)
+                .map_err(|error| QRunV06HistorySyncServiceError::Noise(error.to_string()))?;
+            Ok(Box::new(StreamOwned::new(connection, tcp)))
+        }
+    }
+}
 
 impl From<Q6HistorySyncWireError> for QRunV06HistorySyncServiceError {
     fn from(value: Q6HistorySyncWireError) -> Self {
@@ -590,6 +643,7 @@ pub fn sync_history_from_pinned_peer<A: TransactionAuthenticator>(
         authenticator,
         config,
         None,
+        None,
     )
 }
 
@@ -601,6 +655,7 @@ pub fn sync_history_from_pinned_peer_with_quote_asset_authorization<A: Transacti
     authenticator: &A,
     config: QRunV06HistorySyncClientConfig,
     mut quote_authorizer: Option<&mut QRunV06QuoteAssetAuthorizationProvider<'_>>,
+    tls_server_name: Option<&str>,
 ) -> Result<QRunV06HistorySyncClientReport, QRunV06HistorySyncServiceError> {
     config.validate()?;
     if local_static_private_key.iter().all(|byte| *byte == 0)
@@ -632,19 +687,9 @@ pub fn sync_history_from_pinned_peer_with_quote_asset_authorization<A: Transacti
         if source_snapshot.is_some_and(|(height, _, _)| next_height > height) {
             break;
         }
-        let mut stream = TcpStream::connect_timeout(&address, config.connect_timeout)
-            .map_err(|error| QRunV06HistorySyncServiceError::Noise(error.to_string()))?;
-        stream
-            .set_read_timeout(Some(config.io_timeout))
-            .map_err(|error| QRunV06HistorySyncServiceError::Noise(error.to_string()))?;
-        stream
-            .set_write_timeout(Some(config.io_timeout))
-            .map_err(|error| QRunV06HistorySyncServiceError::Noise(error.to_string()))?;
-        stream
-            .set_nodelay(true)
-            .map_err(|error| QRunV06HistorySyncServiceError::Noise(error.to_string()))?;
+        let mut stream = connect_history_sync_stream(address, tls_server_name, config)?;
         let mut noise = QRunV06NoiseSession::connect(
-            &mut stream,
+            stream.as_mut(),
             local_static_private_key,
             remote_static_public_key,
             &local_start.network_id,
@@ -655,8 +700,8 @@ pub fn sync_history_from_pinned_peer_with_quote_asset_authorization<A: Transacti
             network_id: local_start.network_id,
             profile_id: local_start.profile_id,
         };
-        noise.write_record(&mut stream, &info_request.encode()?)?;
-        let info_frame = noise.read_record(&mut stream)?;
+        noise.write_record(stream.as_mut(), &info_request.encode()?)?;
+        let info_frame = noise.read_record(stream.as_mut())?;
         let source = decode_q6hr_status(&info_frame, &info_request)?;
         let observed = (source.height, source.consensus_tip, source.execution_tip);
         if let Some(previous) = source_snapshot {
@@ -689,7 +734,7 @@ pub fn sync_history_from_pinned_peer_with_quote_asset_authorization<A: Transacti
                 empty_request.validate()?;
                 let empty_page = request_history_page_over_noise(
                     &mut noise,
-                    &mut stream,
+                    stream.as_mut(),
                     empty_request,
                     runtime
                         .fork_choice_snapshot()?
@@ -732,7 +777,7 @@ pub fn sync_history_from_pinned_peer_with_quote_asset_authorization<A: Transacti
                 .clone();
             let page = request_history_page_over_noise(
                 &mut noise,
-                &mut stream,
+                stream.as_mut(),
                 request.clone(),
                 params.clone(),
             )?;
@@ -820,6 +865,7 @@ pub fn sync_history_from_pinned_peer_with_qap1<A, P, PV, AV, Q, T>(
     quote_authorizer: &mut QRunV06QuoteAssetAuthorizationProvider<'_>,
     coordinator: &mut QRunV06Qap1ExternalCoordinator<P, PV, AV, Q>,
     config: QRunV06HistorySyncClientConfig,
+    tls_server_name: Option<&str>,
 ) -> Result<QRunV06HistorySyncClientReport, QRunV06HistorySyncServiceError>
 where
     A: crate::qrun_v06_node_runtime_candidate::QRunV06NodeAnchorGate,
@@ -856,19 +902,9 @@ where
     {
         return Err(QRunV06HistorySyncServiceError::SnapshotMismatch);
     }
-    let mut stream = TcpStream::connect_timeout(&address, config.connect_timeout)
-        .map_err(|error| QRunV06HistorySyncServiceError::Noise(error.to_string()))?;
-    stream
-        .set_read_timeout(Some(config.io_timeout))
-        .map_err(|error| QRunV06HistorySyncServiceError::Noise(error.to_string()))?;
-    stream
-        .set_write_timeout(Some(config.io_timeout))
-        .map_err(|error| QRunV06HistorySyncServiceError::Noise(error.to_string()))?;
-    stream
-        .set_nodelay(true)
-        .map_err(|error| QRunV06HistorySyncServiceError::Noise(error.to_string()))?;
+    let mut stream = connect_history_sync_stream(address, tls_server_name, config)?;
     let mut noise = QRunV06NoiseSession::connect(
-        &mut stream,
+        stream.as_mut(),
         local_static_private_key,
         remote_static_public_key,
         &network_id,
@@ -879,8 +915,8 @@ where
         network_id,
         profile_id,
     };
-    noise.write_record(&mut stream, &info_request.encode()?)?;
-    let info_frame = noise.read_record(&mut stream)?;
+    noise.write_record(stream.as_mut(), &info_request.encode()?)?;
+    let info_frame = noise.read_record(stream.as_mut())?;
     let source = decode_q6hr_status(&info_frame, &info_request)?;
     if source.height < local_height {
         return Err(QRunV06HistorySyncServiceError::SourceBehind);
@@ -934,7 +970,7 @@ where
         request.validate()?;
         let page = request_history_page_over_noise(
             &mut noise,
-            &mut stream,
+            stream.as_mut(),
             request,
             graph.consensus_parameters().clone(),
         )?;
@@ -1010,6 +1046,7 @@ pub fn sync_history_from_pinned_peer_until_complete_with_qap1<A, P, PV, AV, Q, T
     quote_authorizer: &mut QRunV06QuoteAssetAuthorizationProvider<'_>,
     coordinator: &mut QRunV06Qap1ExternalCoordinator<P, PV, AV, Q>,
     config: QRunV06HistorySyncClientConfig,
+    tls_server_name: Option<&str>,
 ) -> Result<QRunV06HistorySyncClientReport, QRunV06HistorySyncServiceError>
 where
     A: crate::qrun_v06_node_runtime_candidate::QRunV06NodeAnchorGate,
@@ -1032,6 +1069,7 @@ where
             quote_authorizer,
             coordinator,
             config,
+            tls_server_name,
         )?;
         total_pages = total_pages
             .checked_add(report.pages_imported)
@@ -1067,6 +1105,7 @@ pub fn sync_history_from_pinned_peer_until_complete<A: TransactionAuthenticator>
         authenticator,
         config,
         None,
+        None,
     )
 }
 
@@ -1080,6 +1119,7 @@ pub fn sync_history_from_pinned_peer_until_complete_with_quote_asset_authorizati
     authenticator: &A,
     config: QRunV06HistorySyncClientConfig,
     mut quote_authorizer: Option<&mut QRunV06QuoteAssetAuthorizationProvider<'_>>,
+    tls_server_name: Option<&str>,
 ) -> Result<QRunV06HistorySyncClientReport, QRunV06HistorySyncServiceError> {
     config.validate()?;
     let mut total_pages = 0u32;
@@ -1093,6 +1133,7 @@ pub fn sync_history_from_pinned_peer_until_complete_with_quote_asset_authorizati
             authenticator,
             config,
             quote_authorizer.as_deref_mut(),
+            tls_server_name,
         )?;
         total_pages = total_pages
             .checked_add(report.pages_imported)
@@ -1139,6 +1180,144 @@ mod tests {
         thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
+
+    fn qfp6_test_tls_configs() -> (Arc<rustls::ClientConfig>, Arc<rustls::ServerConfig>) {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(
+                include_bytes!("../tests/fixtures/qfp6_tls/test-root.der").to_vec(),
+            ))
+            .unwrap();
+        let client = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let server = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![CertificateDer::from(
+                        include_bytes!("../tests/fixtures/qfp6_tls/test-server.der").to_vec(),
+                    )],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                        include_bytes!("../tests/fixtures/qfp6_tls/test-server-key.pk8.der")
+                            .to_vec(),
+                    )),
+                )
+                .unwrap(),
+        );
+        (client, server)
+    }
+
+    fn qfp6_test_noise_keypair() -> ([u8; 32], [u8; 32]) {
+        let params = "Noise_XX_25519_ChaChaPoly_SHA256".parse().unwrap();
+        let pair = snow::Builder::new(params).generate_keypair().unwrap();
+        (
+            pair.private.as_slice().try_into().unwrap(),
+            pair.public.as_slice().try_into().unwrap(),
+        )
+    }
+
+    fn spawn_qfp6_tls_noise_server(
+        listener: TcpListener,
+        tls_config: Arc<rustls::ServerConfig>,
+        server_private: [u8; 32],
+        trusted_client_public: [u8; 32],
+        expected_sni: Option<&'static str>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let mut tls =
+                rustls::StreamOwned::new(rustls::ServerConnection::new(tls_config).unwrap(), tcp);
+            let session = QRunV06NoiseSession::accept(
+                &mut tls,
+                &server_private,
+                &[trusted_client_public],
+                &[0xC1; 32],
+                &[0xC2; 32],
+            );
+            match expected_sni {
+                Some(expected) => {
+                    let mut noise = session.expect("verified TLS/SNI then pinned Noise handshake");
+                    assert_eq!(tls.conn.server_name(), Some(expected));
+                    let request = noise.read_record(&mut tls).unwrap();
+                    noise.write_record(&mut tls, &request).unwrap();
+                }
+                None => assert!(
+                    session.is_err(),
+                    "a certificate for seed.tailnet.ts.net must not authenticate a different SNI"
+                ),
+            }
+        })
+    }
+
+    #[test]
+    fn public_relay_tls_verifies_sni_and_carries_pinned_noise_records() {
+        let (client_tls, server_tls) = qfp6_test_tls_configs();
+        let (server_private, server_public) = qfp6_test_noise_keypair();
+        let (client_private, client_public) = qfp6_test_noise_keypair();
+        let config = QRunV06HistorySyncClientConfig {
+            connect_timeout: Duration::from_secs(3),
+            io_timeout: Duration::from_secs(5),
+            ..QRunV06HistorySyncClientConfig::default()
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = spawn_qfp6_tls_noise_server(
+            listener,
+            Arc::clone(&server_tls),
+            server_private,
+            client_public,
+            Some("seed.tailnet.ts.net"),
+        );
+        let mut stream = connect_history_sync_stream_with_tls_config(
+            address,
+            Some("seed.tailnet.ts.net"),
+            config,
+            Some(Arc::clone(&client_tls)),
+        )
+        .unwrap();
+        let mut noise = QRunV06NoiseSession::connect(
+            stream.as_mut(),
+            &client_private,
+            &server_public,
+            &[0xC1; 32],
+            &[0xC2; 32],
+        )
+        .unwrap();
+        assert_eq!(noise.remote_static_public_key(), &server_public);
+        let request = b"QFP6_TLS_SNI_NOISE_INTEGRATION";
+        noise.write_record(stream.as_mut(), request).unwrap();
+        assert_eq!(noise.read_record(stream.as_mut()).unwrap(), request);
+        server.join().unwrap();
+
+        // The same trusted CA must not allow a valid certificate to be reused under
+        // an attacker-controlled hostname; TLS verification fails before Noise is exposed.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server =
+            spawn_qfp6_tls_noise_server(listener, server_tls, server_private, client_public, None);
+        let mut stream = connect_history_sync_stream_with_tls_config(
+            address,
+            Some("attacker.tailnet.ts.net"),
+            config,
+            Some(client_tls),
+        )
+        .unwrap();
+        assert!(QRunV06NoiseSession::connect(
+            stream.as_mut(),
+            &client_private,
+            &server_public,
+            &[0xC1; 32],
+            &[0xC2; 32],
+        )
+        .is_err());
+        server.join().unwrap();
+    }
 
     #[test]
     fn pinned_noise_sync_imports_a_heavier_competing_branch_and_recovers_after_restart() {

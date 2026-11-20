@@ -25,6 +25,9 @@ serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 # Noise framework prototype; pinned to the local Rust 1.82-compatible line.
 snow = "=0.9.6"
+# TLS client layer for explicitly opted-in public Testnet Funnel relays; Noise remains pinned inside it.
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "=1.0.11"
 # Explicit non-optimizable clearing of in-memory secret key buffers.
 zeroize = "=1.8.1"
 # FIPS 204 ML-DSA-65 implementation; its arithmetic/NTT/serialization components are formally verified, but deployment still requires an external review.

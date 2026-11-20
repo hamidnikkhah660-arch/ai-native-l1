@@ -565,13 +565,13 @@ fn resolve_bootstrap_endpoint_with<F>(
     text: &str,
     allow_dns_relay: bool,
     mut resolve: F,
-) -> Result<SocketAddr, String>
+) -> Result<(SocketAddr, Option<String>), String>
 where
     F: FnMut(&str, u16) -> Result<Vec<SocketAddr>, String>,
 {
     // Preserve the existing numeric SocketAddr behavior, including local-only test fixtures.
     if let Ok(address) = endpoint(name, text, false) {
-        return Ok(address);
+        return Ok((address, None));
     }
     if !allow_dns_relay {
         return Err(format!(
@@ -618,7 +618,7 @@ where
             "{name} DNS relay must resolve only to globally routable unicast addresses"
         ));
     }
-    Ok(addresses[0])
+    Ok((addresses[0], Some(host.to_ascii_lowercase())))
 }
 
 fn load_peers(
@@ -660,7 +660,7 @@ where
     }
     let mut peers = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
-        let address = resolve_bootstrap_endpoint_with(
+        let (address, tls_server_name) = resolve_bootstrap_endpoint_with(
             &format!("bootstrap peer {i}"),
             row.get("address")
                 .and_then(Value::as_str)
@@ -675,6 +675,7 @@ where
         peers.push(QRunV06PinnedBootstrapPeer {
             address,
             noise_static_public_key: parse_hex32("bootstrap peer Noise key", key)?,
+            tls_server_name,
         });
     }
     if !peers.is_empty() {
@@ -832,6 +833,7 @@ fn approved_peer_outbound_sync_enabled(cfg: &Value) -> Result<bool, String> {
 
 fn select_approved_bootstrap_peers(
     candidates: &[(SocketAddr, [u8; 32])],
+    configured_bootstrap_peers: &[QRunV06PinnedBootstrapPeer],
     policy: &BootstrapTrustDomainPolicy,
     max_attempts: usize,
 ) -> Result<Vec<QRunV06PinnedBootstrapPeer>, String> {
@@ -844,11 +846,25 @@ fn select_approved_bootstrap_peers(
     let domain_order_input: Vec<([u8; 32], QRunV06PinnedBootstrapPeer)> = candidates
         .iter()
         .map(|(address, noise_static_public_key)| {
+            // If the approved Noise identity is one of the hash-pinned configured DNS
+            // relays, keep its current launch-time DNS answer and TLS SNI. Q6AR stores
+            // numeric SocketAddr pins only, so rebuilding from that book alone would
+            // otherwise silently strip the SNI and break TLS-terminated Funnel relays.
+            let configured = configured_bootstrap_peers
+                .iter()
+                .find(|peer| peer.noise_static_public_key == *noise_static_public_key);
+            let (selected_address, tls_server_name) = match configured {
+                Some(peer) if peer.tls_server_name.is_some() => {
+                    (peer.address, peer.tls_server_name.clone())
+                }
+                _ => (*address, None),
+            };
             (
                 *noise_static_public_key,
                 QRunV06PinnedBootstrapPeer {
-                    address: *address,
+                    address: selected_address,
                     noise_static_public_key: *noise_static_public_key,
+                    tls_server_name,
                 },
             )
         })
@@ -1524,10 +1540,9 @@ fn validate_mainnet_native_topology(
     }
     validate_qfp6_pinned_bootstrap_peers(peers)
         .map_err(|error| format!("Mainnet-native bootstrap peer pins invalid: {error:?}"))?;
-    if peers
-        .iter()
-        .any(|peer| !is_publicly_routable_peer_ip(peer.address.ip()))
-    {
+    if peers.iter().any(|peer| {
+        peer.tls_server_name.is_some() || !is_publicly_routable_peer_ip(peer.address.ip())
+    }) {
         return Err(
             "Mainnet-native bootstrap peers must use globally routable unicast IP addresses".into(),
         );
@@ -1831,8 +1846,12 @@ fn run_permissionless_node_with_visibility(
             .map(|(_, noise_static_public_key)| *noise_static_public_key)
             .collect();
         let policy = load_q6ar_trust_domain_registry(base, cfg, &candidate_relay_pins)?;
-        supervisor_peers =
-            select_approved_bootstrap_peers(&approved_candidates, &policy, max_approved_attempts)?;
+        supervisor_peers = select_approved_bootstrap_peers(
+            &approved_candidates,
+            &peers,
+            &policy,
+            max_approved_attempts,
+        )?;
         bootstrap_trust_domains = Some(policy);
     }
     let q6ar_relay_pins: Vec<[u8; 32]> = if enable_q6ar_candidate {
@@ -2520,7 +2539,7 @@ mod tests {
         )
         .unwrap();
 
-        let selected = select_approved_bootstrap_peers(&candidates, &policy, 4).unwrap();
+        let selected = select_approved_bootstrap_peers(&candidates, &[], &policy, 4).unwrap();
         assert_eq!(
             selected
                 .iter()
@@ -2529,13 +2548,26 @@ mod tests {
             vec![[1; 32], [3; 32], [5; 32], [2; 32]]
         );
 
-        let limited = select_approved_bootstrap_peers(&candidates, &policy, 2).unwrap();
+        let limited = select_approved_bootstrap_peers(&candidates, &[], &policy, 2).unwrap();
         assert_eq!(
             limited
                 .iter()
                 .map(|peer| peer.noise_static_public_key)
                 .collect::<Vec<_>>(),
             vec![[1; 32], [3; 32]]
+        );
+
+        let configured_relay = QRunV06PinnedBootstrapPeer {
+            address: "1.1.1.1:443".parse().unwrap(),
+            noise_static_public_key: [1; 32],
+            tls_server_name: Some("seed.tailnet.ts.net".to_owned()),
+        };
+        let relay_selection =
+            select_approved_bootstrap_peers(&candidates, &[configured_relay], &policy, 1).unwrap();
+        assert_eq!(relay_selection[0].address, "1.1.1.1:443".parse().unwrap());
+        assert_eq!(
+            relay_selection[0].tls_server_name.as_deref(),
+            Some("seed.tailnet.ts.net")
         );
     }
 
@@ -2776,7 +2808,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(resolved, "1.1.1.1:443".parse().unwrap());
+        assert_eq!(resolved.0, "1.1.1.1:443".parse().unwrap());
+        assert_eq!(resolved.1.as_deref(), Some("seed.example.net"));
 
         assert!(resolve_bootstrap_endpoint_with(
             "bootstrap peer",
@@ -2844,6 +2877,10 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].address, "1.1.1.1:443".parse().unwrap());
         assert_eq!(loaded[0].noise_static_public_key, [0x11; 32]);
+        assert_eq!(
+            loaded[0].tls_server_name.as_deref(),
+            Some("seed.example.net")
+        );
 
         assert!(load_peers_with_resolver(&path, digest, false, |_, _| {
             panic!("DNS must remain disabled outside Public Testnet")
@@ -2955,15 +2992,26 @@ mod tests {
         let peer = QRunV06PinnedBootstrapPeer {
             address: "1.1.1.1:30333".parse().unwrap(),
             noise_static_public_key: [0x79; 32],
+            tls_server_name: None,
         };
         assert!(
             validate_mainnet_native_topology(&cfg, wildcard, std::slice::from_ref(&peer)).is_ok()
+        );
+        let relay_peer = QRunV06PinnedBootstrapPeer {
+            address: "1.1.1.1:443".parse().unwrap(),
+            noise_static_public_key: [0x7B; 32],
+            tls_server_name: Some("seed.tailnet.ts.net".to_owned()),
+        };
+        assert!(
+            validate_mainnet_native_topology(&cfg, wildcard, &[relay_peer]).is_err(),
+            "Mainnet-native topology must reject the Public Testnet TLS/SNI relay path"
         );
         assert!(validate_mainnet_native_topology(&cfg, wildcard, &[]).is_err());
 
         let private_peer = QRunV06PinnedBootstrapPeer {
             address: "10.0.0.2:30333".parse().unwrap(),
             noise_static_public_key: [0x7A; 32],
+            tls_server_name: None,
         };
         assert!(validate_mainnet_native_topology(&cfg, wildcard, &[private_peer]).is_err());
 
@@ -3049,6 +3097,7 @@ mod tests {
         let valid_peer = QRunV06PinnedBootstrapPeer {
             address: "1.1.1.1:30333".parse().unwrap(),
             noise_static_public_key: [0x71; 32],
+            tls_server_name: None,
         };
         assert!(validate_public_testnet_topology(
             &json!({"node_role": "seed"}),
@@ -3070,6 +3119,7 @@ mod tests {
         let private_peer = QRunV06PinnedBootstrapPeer {
             address: "100.64.0.2:30333".parse().unwrap(),
             noise_static_public_key: [0x72; 32],
+            tls_server_name: None,
         };
         assert!(validate_public_testnet_topology(
             &json!({"node_role": "joining"}),
