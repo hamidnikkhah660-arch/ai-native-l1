@@ -1,5 +1,7 @@
 # CP-0349 - Reproducible Candidate Halving Visualization
 
+> **Historical simulation notice (2026-11-17):** This report and its 3B mining/security halving curve document an earlier 10B candidate model. That model was superseded by CP-0651, which has a 7B accounting ceiling, a 1B owner Genesis allocation, six non-circulating 1B labels and zero block subsidy. The 3B curve is not a current miner reserve or active QZXB emission schedule.
+
 Date: 2026-10-21
 Parent public docs baseline: v0.4.0-docs / commit 446c609
 Change type: Documentation, chart rendering and arithmetic validation only; no consensus/runtime source changes.
