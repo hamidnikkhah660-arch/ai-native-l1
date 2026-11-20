@@ -8,7 +8,7 @@
 
 ## Professional summary
 
-Hamid Nikkhah is an AI researcher and systems builder whose work spans machine learning, intelligent-system architecture, quantum and quantum-inspired computation, fuzzy/evolutionary optimisation, and research into post-quantum blockchain security. He completed a **Ph.D. in Artificial Intelligence in 2024**. He is developing QuantumZXB, an independently developed native Layer-1 and programmable-ecosystem research project.
+Hamid Nikkhah is an independent AI researcher and systems developer whose work spans machine learning, intelligent-system architecture, quantum and quantum-inspired computation, fuzzy/evolutionary optimisation, and research into post-quantum blockchain security. He holds an **M.Sc. in Computer Engineering – Artificial Intelligence** and a **B.Sc. in Computer Software Technology Engineering**. He is developing QuantumZXB, an independently developed native Layer-1 and programmable-ecosystem research project.
 
 The engineering programme includes Rust-based ledger and state-transition candidates, proof-of-work and difficulty-adjustment research, monetary policy and issuance models, persistence/recovery work, ML-DSA-65 verification experiments, hybrid-identity candidates, and an isolated EVM/revm smart-contract laboratory. The long-term product direction is an AI-native ecosystem for developer applications and verifiable AI/compute services.
 
@@ -16,11 +16,10 @@ LLM-enabled application architecture, agent identity/payment workflows, and meas
 
 ## Education
 
-- **Ph.D. in Artificial Intelligence** — completed 2024. The institution is intentionally omitted from this public profile.
-- **M.Sc. in Artificial Intelligence**, Islamic Azad University, North Tehran Branch, Iran (2020). Thesis: *Predicting the Risk of Alzheimer's Disease Using IoT-Based Methods*.
-- **B.Sc. in Computer Science**, Islamic Azad University, Firuzkuh, Iran (2015).
+- **M.Sc. in Computer Engineering – Artificial Intelligence**, Islamic Azad University, North Tehran Branch, Iran (9 February 2020; GPA: 16.16/20). Thesis: *Predicting the Risk of Alzheimer's Disease Using IoT-Based Methods*.
+- **B.Sc. in Computer Software Technology Engineering**, Islamic Azad University, Firouzkuh Branch, Iran (20 January 2015; GPA: 18.17/20).
 
-The Ph.D. credential and completion year reflect the founder's explicit confirmation for this profile. The earlier degrees and thesis title are listed in the supplied CV.
+Doctoral studies were not completed and are therefore not listed as an earned degree.
 
 ## Technical and research areas
 
