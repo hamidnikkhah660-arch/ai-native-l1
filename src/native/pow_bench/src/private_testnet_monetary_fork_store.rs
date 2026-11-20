@@ -1189,7 +1189,7 @@ mod tests {
         ));
 
         // The lock pathname may survive an abrupt process exit. The OS lock, not stale PID
-        // text or file existence, decides ownership and allows safe reuse after the owner exits.
+        // text or file existence, decides ownership; stale diagnostic bytes remain untouched.
         fs::write(directory.path().join(LOCK_NAME), b"pid=stale\n").unwrap();
         let reopened = PrivateTestnetMonetaryForkStore::open(
             directory.path(),
@@ -1201,7 +1201,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             fs::read_to_string(directory.path().join(LOCK_NAME)).unwrap(),
-            format!("pid={}\n", process::id())
+            "pid=stale\n"
         );
         drop(reopened);
     }

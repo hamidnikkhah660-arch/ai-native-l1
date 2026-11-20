@@ -2083,7 +2083,8 @@ mod tests {
         const NETWORK: [u8; 32] = [0xA1; 32];
         const PROFILE: [u8; 32] = [0xB2; 32];
         const FOUNDER: [u8; 32] = [0xC3; 32];
-        let mut params = ConsensusParameters::qrun_v06_cp0651_fee_only_candidate().unwrap();
+        // CP-0604 Genesis uses the legacy 10B mining schedule, not CP-0651 fee-only economics.
+        let mut params = ConsensusParameters::qrun_v06_sha256d_candidate().unwrap();
         params.target_block_time_secs = 30;
         params.difficulty_window_blocks = 2;
         params.difficulty_min_ratio_divisor = 4;
@@ -2235,7 +2236,8 @@ mod tests {
         const PROFILE: [u8; 32] = [0x92; 32];
         const FOUNDER: [u8; 32] = [0x93; 32];
         const PRODUCER: [u8; 32] = [0x94; 32];
-        let mut params = ConsensusParameters::qrun_v06_cp0651_fee_only_candidate().unwrap();
+        // CP-0604 Genesis uses the legacy 10B mining schedule, not CP-0651 fee-only economics.
+        let mut params = ConsensusParameters::qrun_v06_sha256d_candidate().unwrap();
         params.target_block_time_secs = 30;
         params.difficulty_window_blocks = 2;
         params.difficulty_min_ratio_divisor = 4;
@@ -2411,10 +2413,11 @@ mod tests {
         use crate::{
             consensus::{ConsensusParameters, Uint256},
             external_cas_anchor_candidate::ExternalCasPin,
+            qrun_v06_canonical_execution_candidate::QRunV06CanonicalExecutionState,
             qrun_v06_checkpoint_candidate::{
                 qrun_v06_consensus_fingerprint, QRunV06CheckpointCandidate,
             },
-            qrun_v06_cp0604_supply_candidate::Cp0604FounderControlledSupply,
+            qrun_v06_cp0651_supply_candidate::Cp0651FixedSupply,
             qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
             qrun_v06_local_anchor_vault_candidate::QRunV06LocalAnchorVault,
             qrun_v06_miner_candidate::mine_qfp6_block_on_tip_from_nonce,
@@ -2422,7 +2425,6 @@ mod tests {
             qrun_v06_profile_pin_candidate::{
                 QRunV06ProfilePinCandidate, QRunV06VerifiedProfilePin,
             },
-            qrun_v06_tokenomics_candidate::QRunV06MiningScheduleCandidate,
             v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES,
         };
         use std::{fs, sync::atomic::AtomicBool};
@@ -2441,8 +2443,7 @@ mod tests {
         params.pow_limit = Uint256::MAX;
         params.validate().unwrap();
 
-        let schedule = QRunV06MiningScheduleCandidate::cp0422_research_candidate();
-        let policy = Cp0604FounderControlledSupply::genesis(NETWORK, FOUNDER, schedule).unwrap();
+        let policy = Cp0651FixedSupply::genesis(NETWORK, FOUNDER).unwrap();
         let descriptor = QRunV06GenesisDescriptor::new(
             NETWORK,
             PROFILE,
@@ -2452,8 +2453,8 @@ mod tests {
             policy.policy_fingerprint(),
         )
         .unwrap();
-        let genesis = QRunV06CanonicalExecutionState::cp0604_genesis_candidate_with_descriptor(
-            descriptor, schedule,
+        let genesis = QRunV06CanonicalExecutionState::cp0651_genesis_candidate_with_descriptor(
+            descriptor.clone(),
         )
         .unwrap();
         let bundle = QRunV06ProfilePinCandidate::new(
@@ -2653,8 +2654,9 @@ mod tests {
         use crate::{
             consensus::{ConsensusParameters, Uint256},
             external_cas_anchor_candidate::ExternalCasPin,
+            qrun_v06_canonical_execution_candidate::QRunV06CanonicalExecutionState,
             qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint,
-            qrun_v06_cp0604_supply_candidate::Cp0604FounderControlledSupply,
+            qrun_v06_cp0651_supply_candidate::Cp0651FixedSupply,
             qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
             qrun_v06_local_anchor_vault_candidate::QRunV06LocalAnchorVault,
             qrun_v06_miner_candidate::mine_qfp6_block_on_tip_from_nonce,
@@ -2662,7 +2664,6 @@ mod tests {
             qrun_v06_profile_pin_candidate::{
                 QRunV06ProfilePinCandidate, QRunV06VerifiedProfilePin,
             },
-            qrun_v06_tokenomics_candidate::QRunV06MiningScheduleCandidate,
             v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES,
         };
         use std::{fs, sync::atomic::AtomicBool};
@@ -2681,8 +2682,7 @@ mod tests {
         params.pow_limit = Uint256::MAX;
         params.validate().unwrap();
 
-        let schedule = QRunV06MiningScheduleCandidate::cp0422_research_candidate();
-        let policy = Cp0604FounderControlledSupply::genesis(NETWORK, FOUNDER, schedule).unwrap();
+        let policy = Cp0651FixedSupply::genesis(NETWORK, FOUNDER).unwrap();
         let descriptor = QRunV06GenesisDescriptor::new(
             NETWORK,
             PROFILE,
@@ -2692,8 +2692,8 @@ mod tests {
             policy.policy_fingerprint(),
         )
         .unwrap();
-        let genesis = QRunV06CanonicalExecutionState::cp0604_genesis_candidate_with_descriptor(
-            descriptor, schedule,
+        let genesis = QRunV06CanonicalExecutionState::cp0651_genesis_candidate_with_descriptor(
+            descriptor.clone(),
         )
         .unwrap();
         let bundle = QRunV06ProfilePinCandidate::new(
