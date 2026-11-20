@@ -14,6 +14,8 @@ The source repository and project website are public, and we are actively inviti
 - **Public outreach kit:** [English-only project description and platform-specific drafts](docs/QRUN_PUBLIC_OUTREACH_KIT_2026-10-29.md).
 - **Public community announcement:** [QRun contributor discussion](https://github.com/hamidnikkhah660-arch/ai-native-l1/discussions/77).
 - **Independent zero-value Devnet onboarding:** [operator packet](docs/QZXB_ZERO_VALUE_DEVNET_OPERATOR_ONBOARDING_V01_2026-10-27.md).
+- **AI-NATIVE L1 independent zero-value Public Testnet operator brief (2026-11-16):** [operator requirements and safety boundaries](docs/AI_NATIVE_L1_INDEPENDENT_ZERO_VALUE_SEED_OPERATOR_BRIEF_2026-11-16.md).
+- **Independent operator qualification:** [staged intake, independence checks, cryptographic gates and acceptance matrix](docs/AI_NATIVE_L1_INDEPENDENT_OPERATOR_INTAKE_AND_ACCEPTANCE_MATRIX_2026-11-16.md).
 - **Global project site:** https://hamidnikkhah660-arch.github.io/ai-native-l1/
 - **Technology guide:** [Rust Layer-1 architecture and implementation boundaries](technology.html).
 - **Cryptography guide:** [ML-DSA-65, the selected 53-case fixture, hybrid-signature limits](cryptography.html).
