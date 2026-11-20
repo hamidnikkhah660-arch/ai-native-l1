@@ -45,7 +45,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs},
     path::{Component, Path, PathBuf},
     sync::atomic::AtomicBool,
     time::{SystemTime, UNIX_EPOCH},
@@ -520,10 +520,129 @@ fn validate_public_listener_opt_in(runtime: &Value, listen: SocketAddr) -> Resul
     }
     Ok(())
 }
+fn is_valid_public_dns_name(host: &str) -> bool {
+    if host.is_empty()
+        || host.len() > 253
+        || host.ends_with('.')
+        || host.parse::<IpAddr>().is_ok()
+        || host
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return false;
+    }
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost"
+        || [
+            ".localhost",
+            ".local",
+            ".internal",
+            ".test",
+            ".invalid",
+            ".example",
+        ]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+    {
+        return false;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    labels.len() >= 2
+        && labels.iter().all(|label| {
+            let bytes = label.as_bytes();
+            !bytes.is_empty()
+                && bytes.len() <= 63
+                && bytes[0].is_ascii_alphanumeric()
+                && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+                && bytes
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        })
+}
+
+fn resolve_bootstrap_endpoint_with<F>(
+    name: &str,
+    text: &str,
+    allow_dns_relay: bool,
+    mut resolve: F,
+) -> Result<SocketAddr, String>
+where
+    F: FnMut(&str, u16) -> Result<Vec<SocketAddr>, String>,
+{
+    // Preserve the existing numeric SocketAddr behavior, including local-only test fixtures.
+    if let Ok(address) = endpoint(name, text, false) {
+        return Ok(address);
+    }
+    if !allow_dns_relay {
+        return Err(format!(
+            "{name} must be a numeric SocketAddr; DNS relay endpoints are allowed only for zero-value Public Testnet"
+        ));
+    }
+
+    // DNS names are deliberately limited to FQDN:443. The hostname is retained in the
+    // hash-pinned bootstrap file; the resolved numeric address is fixed for this process run.
+    let (host, port_text) = text
+        .rsplit_once(':')
+        .ok_or_else(|| format!("{name} must be an FQDN:443 relay endpoint"))?;
+    if host.contains(':') || host.starts_with('[') || host.ends_with(']') {
+        return Err(format!(
+            "{name} DNS relay endpoint must use an unbracketed FQDN"
+        ));
+    }
+    let port = port_text
+        .parse::<u16>()
+        .map_err(|_| format!("{name} DNS relay port is invalid"))?;
+    if port != 443 {
+        return Err(format!("{name} DNS relay endpoint must use TCP port 443"));
+    }
+    if !is_valid_public_dns_name(host) {
+        return Err(format!(
+            "{name} DNS relay hostname is not a valid public FQDN"
+        ));
+    }
+
+    let mut addresses = resolve(host, port)
+        .map_err(|error| format!("{name} DNS resolution failed for {host}: {error}"))?;
+    if addresses.is_empty() || addresses.len() > 16 {
+        return Err(format!(
+            "{name} DNS resolution must return between 1 and 16 addresses"
+        ));
+    }
+    addresses.sort_unstable();
+    addresses.dedup();
+    if addresses
+        .iter()
+        .any(|address| address.port() != port || !is_publicly_routable_peer_ip(address.ip()))
+    {
+        return Err(format!(
+            "{name} DNS relay must resolve only to globally routable unicast addresses"
+        ));
+    }
+    Ok(addresses[0])
+}
+
 fn load_peers(
     path: &Path,
     expected_sha: [u8; 32],
+    allow_dns_relay: bool,
 ) -> Result<Vec<QRunV06PinnedBootstrapPeer>, String> {
+    load_peers_with_resolver(path, expected_sha, allow_dns_relay, |host, port| {
+        (host, port)
+            .to_socket_addrs()
+            .map(|addresses| addresses.collect())
+            .map_err(|error| error.to_string())
+    })
+}
+
+fn load_peers_with_resolver<F>(
+    path: &Path,
+    expected_sha: [u8; 32],
+    allow_dns_relay: bool,
+    mut resolve: F,
+) -> Result<Vec<QRunV06PinnedBootstrapPeer>, String>
+where
+    F: FnMut(&str, u16) -> Result<Vec<SocketAddr>, String>,
+{
     let bytes = read_bounded(path, MAX_PEERS_BYTES, "permissionless bootstrap peer set")?;
     let digest: [u8; 32] = Sha256::digest(&bytes).into();
     if digest != expected_sha {
@@ -541,12 +660,13 @@ fn load_peers(
     }
     let mut peers = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
-        let address = endpoint(
+        let address = resolve_bootstrap_endpoint_with(
             &format!("bootstrap peer {i}"),
             row.get("address")
                 .and_then(Value::as_str)
                 .ok_or("bootstrap peer address missing")?,
-            false,
+            allow_dns_relay,
+            |host, port| resolve(host, port),
         )?;
         let key = row
             .get("noise_static_public_key")
@@ -1504,7 +1624,7 @@ fn run_permissionless_node_with_visibility(
         "bootstrap_peers_sha256",
         req(cfg, "bootstrap_peers_sha256")?,
     )?;
-    let peers = load_peers(&peer_path, peer_sha)?;
+    let peers = load_peers(&peer_path, peer_sha, public_testnet)?;
     if !public_testnet && !mainnet {
         validate_q6ga_local_devnet_scope(cfg, false, peers.len())?;
     }
@@ -2244,13 +2364,14 @@ fn run_permissionless_node_with_visibility(
 mod tests {
     use super::{
         approved_peer_outbound_sync_enabled, decode_q6ar_trust_domain_registry, endpoint,
-        is_publicly_routable_peer_ip, load_peers, max_approved_peer_sync_attempts,
-        q6ar_candidate_address_book_enabled, q6ar_trust_domains_rotation_authorized,
-        read_regular_bounded, select_approved_bootstrap_peers,
-        validate_anchor_vault_path_separation, validate_mainnet_native_topology,
-        validate_permissionless_cp0651_genesis, validate_public_listener_opt_in,
-        validate_public_testnet_topology, validate_q6ga_local_devnet_scope, validate_runtime_mode,
-        BootstrapTrustDomainPolicy, QRunV06PinnedBootstrapPeer,
+        is_publicly_routable_peer_ip, load_peers, load_peers_with_resolver,
+        max_approved_peer_sync_attempts, q6ar_candidate_address_book_enabled,
+        q6ar_trust_domains_rotation_authorized, read_regular_bounded,
+        select_approved_bootstrap_peers, validate_anchor_vault_path_separation,
+        validate_mainnet_native_topology, validate_permissionless_cp0651_genesis,
+        validate_public_listener_opt_in, validate_public_testnet_topology,
+        validate_q6ga_local_devnet_scope, validate_runtime_mode, BootstrapTrustDomainPolicy,
+        QRunV06PinnedBootstrapPeer,
     };
     use sha2::{Digest, Sha256};
 
@@ -2635,8 +2756,100 @@ mod tests {
             std::env::temp_dir().join(format!("qfp6-empty-seeds-{}.json", std::process::id()));
         fs::write(&path, b"[]").unwrap();
         let digest: [u8; 32] = Sha256::digest(b"[]").into();
-        assert!(load_peers(&path, digest).unwrap().is_empty());
-        assert!(load_peers(&path, [0xA5; 32]).is_err());
+        assert!(load_peers(&path, digest, false).unwrap().is_empty());
+        assert!(load_peers(&path, [0xA5; 32], false).is_err());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn public_testnet_dns_relay_requires_fqdn_port_443_and_public_addresses() {
+        use super::resolve_bootstrap_endpoint_with;
+
+        let resolved = resolve_bootstrap_endpoint_with(
+            "bootstrap peer",
+            "seed.example.net:443",
+            true,
+            |host, port| {
+                assert_eq!(host, "seed.example.net");
+                assert_eq!(port, 443);
+                Ok(vec!["1.1.1.1:443".parse().unwrap()])
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved, "1.1.1.1:443".parse().unwrap());
+
+        assert!(resolve_bootstrap_endpoint_with(
+            "bootstrap peer",
+            "seed.example.net:8443",
+            true,
+            |_, _| panic!("resolver must not run for a disallowed relay port"),
+        )
+        .is_err());
+        assert!(resolve_bootstrap_endpoint_with(
+            "bootstrap peer",
+            "localhost:443",
+            true,
+            |_, _| panic!("resolver must not run for localhost"),
+        )
+        .is_err());
+        assert!(resolve_bootstrap_endpoint_with(
+            "bootstrap peer",
+            "seed.example.net:443",
+            false,
+            |_, _| panic!("DNS must remain disabled outside Public Testnet"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn public_testnet_dns_relay_rejects_private_or_mixed_dns_answers() {
+        use super::resolve_bootstrap_endpoint_with;
+
+        for answers in [
+            vec!["10.0.0.8:443".parse().unwrap()],
+            vec![
+                "1.1.1.1:443".parse().unwrap(),
+                "192.168.1.20:443".parse().unwrap(),
+            ],
+        ] {
+            assert!(resolve_bootstrap_endpoint_with(
+                "bootstrap peer",
+                "seed.example.net:443",
+                true,
+                |_, _| Ok(answers.clone()),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn hash_pinned_bootstrap_file_loads_dns_relay_with_noise_pin() {
+        use std::{fs, path::PathBuf};
+
+        let key = "11".repeat(32);
+        let bytes =
+            format!(r#"[{{"address":"seed.example.net:443","noise_static_public_key":"{key}"}}]"#)
+                .into_bytes();
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        let path: PathBuf =
+            std::env::temp_dir().join(format!("qfp6-dns-relay-peers-{}.json", std::process::id()));
+        fs::write(&path, &bytes).unwrap();
+
+        let loaded = load_peers_with_resolver(&path, digest, true, |host, port| {
+            assert_eq!(host, "seed.example.net");
+            assert_eq!(port, 443);
+            Ok(vec!["1.1.1.1:443".parse().unwrap()])
+        })
+        .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].address, "1.1.1.1:443".parse().unwrap());
+        assert_eq!(loaded[0].noise_static_public_key, [0x11; 32]);
+
+        assert!(load_peers_with_resolver(&path, digest, false, |_, _| {
+            panic!("DNS must remain disabled outside Public Testnet")
+        })
+        .is_err());
+
         fs::remove_file(path).unwrap();
     }
 

@@ -69,6 +69,10 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Test pinned public Seed endpoint and TCP relay policy
+        shell: pwsh
+        run: ./tools/test-qfp6-public-seed-endpoint.ps1
+
       - name: Test Windows DPAPI offline trust provisioner
         shell: pwsh
         run: cargo test --manifest-path src/native/pow_bench/Cargo.toml --bin devnet_trust_provisioner --locked -- --test-threads=1
