@@ -202,3 +202,23 @@ Preserved:
 - No Public Testnet/Mainnet launch or public API availability is claimed.
 
 Next: attach/bind the already-approved external Seed/Joining endpoint and operator receipts from the prior qualification record, then run the comparator from the independent operator's own host through an expressly authorized read-only gateway. Do not use Mainnet-only public binding to work around the current zero-value Testnet authorization boundary.
+
+## CP-0790 - latest authoritative continuation state (2026-11-20)
+
+This section supersedes earlier continuation-point statements in this handoff.
+
+- Unified branch: feat/q6ga-v3-mainnet-scope-20261119.
+- Unified HEAD and origin HEAD: 0b522b045f14a3de1bd8c041a025eabc1ddb8dde.
+- CP-0788 and CP-0789 are merged through PR #200. Post-merge GitHub Actions run 44693600570 is green across Rust, Windows and EVM. Rust totals: 2,001 passed, 0 failed, 2 ignored across 110 test binaries.
+- CP-0790 report: docs/CP-0790_QFP6_UNIFIED_MERGE_AND_OPERATIONAL_STATUS_2026-11-20.md.
+- Release executables built from the merge commit:
+  - qrun_v06_node.exe SHA-256 121C5468746F0EDA81EB9AF3156FE64185E7AB2C5F18C40CAFF76452FBE69EA1
+  - qzxb_wallet.exe SHA-256 85FC5FBDF88E849298876A73D0F72136D3687979EE22D68BB83281EFB9701366
+- Six core Q6GA/Q6GD/Q6CP/Q6PN/Genesis/bootstrap artifacts match the active CP-0596 package byte-for-byte.
+- The live Seed remains PID 20244, the older CP-0596 binary, listening on 0.0.0.0:30333. It has an empty bootstrap set, outbound sync disabled and anonymous inbound Noise XX. It was not restarted or modified.
+- External TCP checks against the host's current egress IPv4 did not establish public reachability (one checker returned false; another returned filtered/timeout). A successful local listener is not proof of internet reachability.
+- Candidate package self-test passes; package validator remains INCOMPLETE because public peer discovery, authenticated inbound peer identity and an attested public endpoint are not qualified in this package.
+- New Unified binary successfully verified the existing Q6GA v2 signature/artifact bindings in a disposable preflight and correctly refused an intentionally loopback public-listener config. No node or listener was started by that test.
+- Existing Q6GA v2 authorizes only zero-value Public Testnet. Mainnet remains unauthorized; it needs a separate Q6GA v3 and independently pinned/authenticated peer topology.
+- Gate 2 and Gate 8 remain owner-reported complete, not re-tested in CP-0790.
+- Next: attach the previously qualified operator endpoint/pin records to the release package, establish a genuinely reachable stable Seed endpoint, bring up a distinct independently operated Joining node and verify real block transfer/reorg/restart; only then plan a controlled CP-0790 binary replacement with store rollback.
