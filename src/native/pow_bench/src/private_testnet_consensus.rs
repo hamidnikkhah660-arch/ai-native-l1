@@ -23,6 +23,10 @@ pub enum PrivateConsensusError {
     InvalidRetargetTimestampRange,
     LegacyBlockOnMonetaryChain,
     MonetaryBlockOnLegacyChain,
+    FeeOnlyBlockOnLegacyChain,
+    FeeOnlyBlockOnMonetaryChain,
+    LegacyBlockOnFeeOnlyChain,
+    MonetaryBlockOnFeeOnlyChain,
 }
 
 impl std::fmt::Display for PrivateConsensusError {
@@ -47,6 +51,21 @@ impl std::fmt::Display for PrivateConsensusError {
             }
             Self::MonetaryBlockOnLegacyChain => {
                 write!(f, "MBK3 monetary block is forbidden on a legacy chain")
+            }
+            Self::FeeOnlyBlockOnLegacyChain => {
+                write!(f, "QFB5 fee-only block is forbidden on a legacy chain")
+            }
+            Self::FeeOnlyBlockOnMonetaryChain => {
+                write!(f, "QFB5 fee-only block is forbidden on a monetary chain")
+            }
+            Self::LegacyBlockOnFeeOnlyChain => {
+                write!(f, "legacy BLK2 block is forbidden on a QRun fee-only chain")
+            }
+            Self::MonetaryBlockOnFeeOnlyChain => {
+                write!(
+                    f,
+                    "MBK3 monetary block is forbidden on a QRun fee-only chain"
+                )
             }
         }
     }

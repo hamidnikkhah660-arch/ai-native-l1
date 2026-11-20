@@ -2,7 +2,7 @@ name: Rust validation
 
 on:
   push:
-    branches: [main, "ci/**", "public/**"]
+    branches: [main, "ci/**", "public/**", "feat/cp0584-q6ti-q6ta-noise-transaction-ingress-20261110", "feat/cp0585-q6ti-supervised-mining-20261110", "feat/cp0586-q6ti-durable-mempool-20261110", "feat/cp0587-q6ti-cross-host-recovery-20261111"]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -39,6 +39,12 @@ jobs:
       - name: Verify independent candidate issuance schedule oracle
         run: python3 ../../../simulations/cp0366_monetary_issuance_oracle_candidate.py --check
 
+      - name: Verify independent QFP6 SHA-256d header and PoW vectors
+        run: python3 ../../../simulations/qfp6_sha256d_reference.py
+
+      - name: Verify independent QFP6 branch-local MTP vectors
+        run: python3 ../../../simulations/qfp6_mtp_reference.py
+
       - name: Check formatting
         run: cargo +stable fmt --all -- --check
 
@@ -62,6 +68,14 @@ jobs:
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: stable
+
+      - name: Test Windows DPAPI offline trust provisioner
+        shell: pwsh
+        run: cargo test --manifest-path src/native/pow_bench/Cargo.toml --bin devnet_trust_provisioner --locked -- --test-threads=1
+
+      - name: Test QZKW2 Windows DPAPI hybrid wallet and Q6HA transaction signing
+        shell: pwsh
+        run: cargo test --manifest-path src/native/pow_bench/Cargo.toml --bin qzxb_wallet --locked -- --test-threads=1
 
       - name: Run signed TXN4 submit, invalid-signature rejection, peer propagation and replay
         shell: pwsh

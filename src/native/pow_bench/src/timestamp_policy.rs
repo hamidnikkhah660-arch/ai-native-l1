@@ -5,21 +5,44 @@
 //! 120-second testnet window is provisional, not a mainnet/consensus parameter.
 
 pub const MAX_FUTURE_DRIFT_TESTNET_SECS: u64 = 120;
+// QRun v0.5 candidate mining uses 64 MiB Argon2id and may take materially longer than
+// 120 seconds on modest hosts. CP-0503 raises only the local live-admission past bound;
+// future-drift remains 120 seconds. This is not a frozen consensus or Mainnet parameter.
+pub const MAX_PAST_DRIFT_QRUN_V05_LIVE_SECS: u64 = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimestampPolicy {
     pub max_future_drift_secs: u64,
+    /// Optional lower freshness bound relative to the caller's reference clock.
+    /// None preserves explicit future-only compatibility for legacy fixtures.
+    pub max_past_drift_secs: Option<u64>,
 }
 
 impl TimestampPolicy {
+    /// Construct the future-only compatibility policy used by legacy testnet paths.
     pub const fn new(max_future_drift_secs: u64) -> Self {
         Self {
             max_future_drift_secs,
+            max_past_drift_secs: None,
         }
     }
 
+    pub const fn with_max_past_drift_secs(mut self, max_past_drift_secs: u64) -> Self {
+        self.max_past_drift_secs = Some(max_past_drift_secs);
+        self
+    }
+
+    /// Existing generic testnet policy: inclusive future bound only.
     pub const fn testnet() -> Self {
         Self::new(MAX_FUTURE_DRIFT_TESTNET_SECS)
+    }
+
+    /// QRun v0.5 live-only local freshness policy. The past allowance accommodates
+    /// measured 64 MiB Argon2id mining/propagation latency; future drift remains narrow.
+    /// Historical replay must not use it against the present-day wall clock.
+    pub const fn qrun_v05_live() -> Self {
+        Self::new(MAX_FUTURE_DRIFT_TESTNET_SECS)
+            .with_max_past_drift_secs(MAX_PAST_DRIFT_QRUN_V05_LIVE_SECS)
     }
 }
 
@@ -27,6 +50,7 @@ impl TimestampPolicy {
 pub enum TimestampPolicyError {
     ZeroTimestamp,
     NotIncreasing { previous: u64, actual: u64 },
+    TooFarInPast { earliest_allowed: u64, actual: u64 },
     TooFarInFuture { latest_allowed: u64, actual: u64 },
 }
 
@@ -35,6 +59,7 @@ impl TimestampPolicyError {
         match self {
             Self::ZeroTimestamp => "ZeroTimestamp",
             Self::NotIncreasing { .. } => "TimestampNotIncreasing",
+            Self::TooFarInPast { .. } => "TimestampTooFarInPast",
             Self::TooFarInFuture { .. } => "TimestampTooFarInFuture",
         }
     }
@@ -42,10 +67,11 @@ impl TimestampPolicyError {
 
 /// Validate a candidate block timestamp without consulting wall-clock globals.
 ///
-/// Ordering matters: zero is invalid even for the first block; otherwise the
-/// timestamp must strictly exceed the parent timestamp. The upper bound is
-/// inclusive (reference_time + max_future_drift_secs) and saturates at u64::MAX
-/// rather than wrapping on arithmetic overflow.
+/// Ordering matters: zero and non-increasing timestamps are rejected first. When configured,
+/// the lower freshness bound is inclusive (reference_time - max_past_drift_secs), saturating at
+/// zero. The upper bound is inclusive (reference_time + max_future_drift_secs), saturating at
+/// u64::MAX. These local-clock freshness checks apply to live admission only; historical replay
+/// must use trusted history/checkpoint provenance rather than the current wall clock.
 pub fn validate_block_timestamp(
     previous_timestamp: u64,
     candidate_timestamp: u64,
@@ -60,6 +86,15 @@ pub fn validate_block_timestamp(
             previous: previous_timestamp,
             actual: candidate_timestamp,
         });
+    }
+    if let Some(max_past_drift_secs) = policy.max_past_drift_secs {
+        let earliest_allowed = reference_time.saturating_sub(max_past_drift_secs);
+        if candidate_timestamp < earliest_allowed {
+            return Err(TimestampPolicyError::TooFarInPast {
+                earliest_allowed,
+                actual: candidate_timestamp,
+            });
+        }
     }
     let latest_allowed = reference_time.saturating_add(policy.max_future_drift_secs);
     if candidate_timestamp > latest_allowed {
@@ -126,16 +161,55 @@ mod tests {
     }
 
     #[test]
-    fn testnet_timestamp_window_is_explicit_and_overflow_safe() {
-        assert_eq!(TimestampPolicy::testnet().max_future_drift_secs, 120);
+    fn qrun_v05_live_timestamp_window_bounds_mining_latency_and_keeps_future_guard_strict() {
         assert_eq!(
-            validate_block_timestamp(
-                u64::MAX - 1,
-                u64::MAX,
-                u64::MAX - 50,
-                TimestampPolicy::testnet()
-            ),
+            TimestampPolicy::testnet().max_past_drift_secs,
+            None,
+            "legacy generic testnet policy remains future-only"
+        );
+        let policy = TimestampPolicy::qrun_v05_live();
+        assert_eq!(policy.max_future_drift_secs, 120);
+        assert_eq!(policy.max_past_drift_secs, Some(300));
+
+        assert_eq!(
+            validate_block_timestamp(699, 700, 1_000, policy),
+            Ok(()),
+            "the inclusive 300-second mining-latency boundary is accepted"
+        );
+        assert_eq!(
+            validate_block_timestamp(698, 699, 1_000, policy),
+            Err(TimestampPolicyError::TooFarInPast {
+                earliest_allowed: 700,
+                actual: 699
+            })
+        );
+        assert_eq!(
+            validate_block_timestamp(0, 849, 1_000, policy),
+            Ok(()),
+            "a block mined 151 seconds after its timestamp remains admissible"
+        );
+        assert_eq!(
+            validate_block_timestamp(999, 1_120, 1_000, policy),
+            Ok(()),
+            "the inclusive future boundary remains accepted"
+        );
+        assert_eq!(
+            validate_block_timestamp(999, 1_121, 1_000, policy),
+            Err(TimestampPolicyError::TooFarInFuture {
+                latest_allowed: 1_120,
+                actual: 1_121
+            })
+        );
+
+        // Both arithmetic bounds saturate instead of wrapping near u64 limits.
+        assert_eq!(
+            validate_block_timestamp(u64::MAX - 1, u64::MAX, u64::MAX - 50, policy),
             Ok(())
+        );
+        assert_eq!(
+            validate_block_timestamp(0, 1, 50, policy),
+            Ok(()),
+            "the past lower bound saturates at zero"
         );
         assert_eq!(
             validate_block_timestamp(
@@ -147,7 +221,8 @@ mod tests {
             Err(TimestampPolicyError::TooFarInFuture {
                 latest_allowed: u64::MAX - 1,
                 actual: u64::MAX
-            })
+            }),
+            "legacy future-only policy remains explicit"
         );
     }
 }

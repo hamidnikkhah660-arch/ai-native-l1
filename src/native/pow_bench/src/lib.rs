@@ -1,6 +1,14 @@
 //! Research-grade wire framing primitives for protocol experiments.
 //! This is not production networking or cryptographic code.
 
+pub mod peer_identity_reconciliation;
+pub mod peer_identity_scope_v2;
+pub mod peer_identity_successor_proof;
+pub mod windows_store_path_qualifier;
+
+#[cfg(test)]
+mod windows_store_adapter_contract;
+
 /// Research-only MTP and branch-bound ASERT anchor policy; not wired to canonical consensus.
 pub mod asert_anchor_policy_candidate;
 pub mod asset_operation_auth_candidate;
@@ -18,6 +26,8 @@ pub mod chain_admission;
 pub mod chain_import;
 pub mod chain_view;
 pub mod consensus;
+/// CP-0428 fail-closed recovery classification for the QZBE candidate node; not a Mainnet activation gate.
+pub mod consensus_native_recovery_gate_candidate;
 pub mod credential_binding;
 /// Candidate-only bounded Noise XX transport pinned to an explicit peer trust set.
 pub mod devnet_noise_transport_candidate;
@@ -29,6 +39,29 @@ pub mod devnet_signed_peer_identity_candidate;
 pub mod difficulty_adjustment_candidates;
 /// CP-0313 canonical external append-only CAS record and ML-DSA receipt candidate; no provider runtime or consensus callsite.
 pub mod external_cas_anchor_candidate;
+/// AWS KMS-backed ML-DSA-65 receipt signer; deployment adapter candidate.
+pub mod external_cas_aws_kms_signer_candidate;
+/// CP-0768 fixed-width QBTB1 bundle joining ECR1/QBT1 to an independently pinned Q6PN commitment.
+pub mod external_cas_bootstrap_trust_bundle_candidate;
+/// CP-0761 versioned dual-attested bootstrap trust receipt; pure verifier, no real enrollment.
+pub mod external_cas_bootstrap_trust_candidate;
+pub mod external_cas_disk_provider_candidate;
+pub mod external_cas_floor_store_candidate;
+pub mod external_cas_noise_transport_candidate;
+/// CP-0483 AWS DynamoDB strongly-consistent, conditional-PutItem adapter candidate; no provisioned cloud resources.
+pub mod external_cas_offhost_anchor_aws_dynamodb_candidate;
+/// CP-0763 read-only AWS account/role/table and recovery-configuration qualification candidate.
+pub mod external_cas_offhost_anchor_aws_qualification_candidate;
+/// CP-0481 service-side validation of Provider ECR1/ECS1 proofs for a future off-host Anchor; no storage or runtime callsite.
+pub mod external_cas_offhost_anchor_candidate;
+/// CP-0563 local durable Q6EA development adapter; not an independent production anchor.
+pub mod external_cas_offhost_anchor_file_store_candidate;
+/// Candidate-only authenticated Noise/TCP transport for off-host Anchor Read/CAS; not yet a deployed daemon.
+pub mod external_cas_offhost_anchor_noise_transport_candidate;
+/// CP-0767 separately versioned QAR2/QBT1-bound Noise transport and QAP1 adapter; candidate runtime integration.
+pub mod external_cas_offhost_anchor_noise_v2_candidate;
+/// CP-0482 challenge-bound signed Anchor protocol and injectable storage model; no production runtime callsite.
+pub mod external_cas_offhost_anchor_protocol_candidate;
 pub mod governance_root_chain;
 pub mod identity_generation_store;
 pub mod identity_policy;
@@ -43,14 +76,37 @@ pub mod ingress_queue_candidate;
 pub mod ingress_worker_candidate;
 pub mod issuance_schedule;
 pub mod key_provider;
+/// CP-0391 candidate accounting for the owner-directed v0.4 eight-bucket supply budgets; not runtime-wired.
+pub mod monetary_allocation_v04_candidate;
+/// CP-0392 candidate canonical Genesis manifest bound to the v0.4 allocation policy; not wired into node runtime.
+pub mod monetary_genesis_v04_candidate;
+/// CP-0397 explicit, parameterized v0.4 mining-schedule contract; no approved default or runtime callsite.
+pub mod monetary_issuance_v04_candidate;
+/// CP-0393 candidate bridge from the v0.4 manifest to the deterministic ledger substrate; no runtime integration.
+pub mod monetary_ledger_v04_candidate;
 /// CP-0213 policy arithmetic candidate; not wired into canonical consensus or block import.
 pub mod monetary_policy_v3_candidate;
+/// CP-0405 candidate QZBE PoW envelope, branch-local QZB4 v2 replay and cumulative-work fork choice; not a persistent branch store or canonical-node integration.
+pub mod monetary_pow_v04_candidate;
+/// CP-0419 candidate QZBE checkpoint codec binding monetary snapshots, chainwork and bounded target history; not yet store-integrated.
+pub mod monetary_pow_v04_checkpoint_candidate;
+/// CP-0421 local durable QZBE checkpoint-base suffix store; caller-supplied checkpoint trust only, no production CAS.
+pub mod monetary_pow_v04_checkpoint_store_candidate;
+/// CP-0406 local persistent QZBE branch archive with replay validation; not externally anchored or node-wired.
+pub mod monetary_pow_v04_store_candidate;
+/// CP-0404 candidate QZB4 v2 profile dispatcher, durable snapshot recovery and external-anchor contract; not canonical-node or PoW/fork-choice wired.
+pub mod monetary_runtime_v04_candidate;
+/// CP-0398/CP-0403 profile-bound v0.4 transitions (QZB4 v1 mining-only, v2 transaction-bearing); not node-wired.
+pub mod monetary_transition_v04_candidate;
 pub mod noise_deployment_config;
+pub mod noise_identity_rotation_authorization;
 pub mod noise_issuer_registry;
 pub mod noise_key_provisioning;
 /// Windows CurrentUser-DPAPI storage for role- and network-bound offline signing seeds.
 pub mod offline_signing_key_store;
 pub mod p2p_contract;
+pub mod peer_identity_anchor_v2;
+pub mod peer_identity_anchor_vault;
 pub mod peer_policy;
 /// Research-only in-process generation lease for archive commits racing a canonical reorg.
 pub mod private_testnet_archive_generation_coordinator_candidate;
@@ -89,12 +145,100 @@ pub mod private_testnet_v4_hybrid_fork_store_candidate;
 /// Candidate-only PTB2 envelope for linked PoW headers + canonical block-body transport.
 pub mod private_testnet_wire;
 pub mod protocol_profile;
+/// Candidate-only QRA1 preservation of every branch named by an old QRun v0.5 PFS2 manifest; no provider CAS or manifest rebase.
+pub mod qrun_v05_history_archive_candidate;
+/// M2c candidate for network-bound signed asset metadata and issuer supply policy.
+pub mod qrun_v06_asset_registry_candidate;
+/// M2d candidate QFB6 canonical codec and atomic replay for native, AMM and issuer operations.
+pub mod qrun_v06_canonical_execution_candidate;
+/// M2i QFP6 full-state checkpoints binding QFB6 snapshots, target history, consensus work and an external anchor.
+pub mod qrun_v06_checkpoint_candidate;
+/// CP-0575 canonical full Q6CP consensus parameters bound to Q6GD/Q6PN; candidate-only, not Mainnet approval.
+pub mod qrun_v06_consensus_profile_candidate;
+/// CP-0527 QFP6 bridge from durable segment state to signed external monotonic CAS anchors.
+pub mod qrun_v06_external_anchor_candidate;
+/// CP-0675 versioned dual-signature owner approval for exact local QFP6 Genesis package bytes.
+pub mod qrun_v06_genesis_approval_candidate;
+/// Immutable QFP6 Genesis descriptor binding timestamp, profile, consensus and versioned policy (CP-0604 for permissionless QFP6).
+pub mod qrun_v06_genesis_descriptor_candidate;
+/// CP-0546 append-only historical Q6TS/Q6PN/Q6QA trust-history and pinned checkpoint verifier candidate.
+pub mod qrun_v06_historical_trust_candidate;
+/// CP-0597 Noise-session history responder and verified page downloader/import bridge.
+pub mod qrun_v06_history_sync_service_candidate;
+/// CP-0596 bounded Q6HS request and chunked Q6HC/Q6HP canonical-history response codec.
+pub mod qrun_v06_history_sync_wire_candidate;
+/// CP-0580 candidate QFP6 self-contained Ed25519 + ML-DSA-65 transaction authentication; not runtime activated.
+pub mod qrun_v06_hybrid_auth_candidate;
+/// Bitcoin-inspired local two-hour future-time guard for live peer admission only; never for replay.
+pub mod qrun_v06_live_timestamp_policy_candidate;
+/// CP-0659 bounded Q6MO/Q6MA market-operation submission protocol.
+pub mod qrun_v06_market_ingress_candidate;
+/// CP-0659 Q6MM immutable journal for pending signed AMM/OrderBook operations.
+pub mod qrun_v06_market_journal_candidate;
+/// CP-0659 process-local bounded market mempool with combined Q6TI/Q6MO canonical preview.
+pub mod qrun_v06_market_mempool_candidate;
+/// CP-0569 branch-local QFP6 block-template construction and bounded Argon2id nonce search; caller performs durable QAP1 admission.
+pub mod qrun_v06_miner_candidate;
+/// CP-0547/0550/0551 QFP6 admission, bounded peer ingress/ACK and per-session replay guard; no production listener wiring yet.
+pub mod qrun_v06_node_runtime_candidate;
+/// CP-0568 supervised QFP6 QAP1 peer-service lifecycle; injected resources only, no public Mainnet activation.
+pub mod qrun_v06_node_supervisor_candidate;
+/// CP-0552 domain-separated pinned Noise XX transport for QFP6 peer sessions; candidate-only.
+pub mod qrun_v06_noise_transport_candidate;
+/// Isolated deterministic v0.6 LOB state candidate; not wired into QFP5/QFB5 consensus.
+pub mod qrun_v06_orderbook_candidate;
+/// CP-0555 bounded private/overlay QFP6 Noise listener lifecycle; serial candidate service, not production node-wired.
+pub mod qrun_v06_peer_listener_candidate;
+/// Isolated QFP6 branch graph with branch-local QFB6 execution and cumulative-work selection.
+pub mod qrun_v06_pow_fork_choice_candidate;
+/// Bounded QFP6 durable branch archive with immutable manifests and Genesis replay recovery; not node-wired.
+pub mod qrun_v06_pow_fork_store_candidate;
+/// Candidate QFP6 PoW envelope binding QFB6 v2 execution state to the PoW header; not node-wired.
+pub mod qrun_v06_pow_wire_candidate;
+/// Canonical QFP6 trust bundle; refuses decode without an independently supplied profile-pin commitment.
+pub mod qrun_v06_profile_pin_candidate;
+/// CP-0539 dual-signed Q6PN trust records and an independently monotonic anti-rollback floor contract.
+pub mod qrun_v06_profile_trust_candidate;
+/// CP-0548 candidate AWS DynamoDB monotonic Q6TS floor adapter with a node read-only wrapper; not provisioned or deployed.
+pub mod qrun_v06_profile_trust_dynamodb_floor_candidate;
+/// CP-0559 orchestration of QAP1 with the signed Provider and authenticated Q6EA Noise transport.
+pub mod qrun_v06_qap1_coordinator_candidate;
+/// CP-0558 append-only QAP1 intent journal for exact QFP6/Provider/Q6EA crash recovery.
+pub mod qrun_v06_qap1_journal_candidate;
+/// CP-0569/0568 bounded QFP6 block production through recovered QAP1 durable admission.
+pub mod qrun_v06_qap1_mining_loop_candidate;
+/// CP-0542 signed Q6QA external quote-asset qualification; required by QFB6 candidate market execution, not reserve proof.
+pub mod qrun_v06_quote_asset_qualification_candidate;
+/// CP-0590 deterministic QFP6 branch-local MTP policy; no wall-clock dependency.
+pub mod qrun_v06_time_consensus_candidate;
+/// CP-0528 QFP6 eight-bucket monetary state, 1B-Founder Genesis and candidate mining schedule.
+pub mod qrun_v06_tokenomics_candidate;
+/// CP-0584 Q6TI/Q6TA bounded QFP6 native-transfer submission over an authenticated Noise application session.
+pub mod qrun_v06_transaction_ingress_candidate;
+/// CP-0586 bounded durable snapshots for pending QFP6 NativeTransfer transactions.
+pub mod qrun_v06_transaction_journal_candidate;
+/// CP-0583 bounded process-local QFP6 NativeTransfer mempool with the versioned Q6HA 8 KiB signature codec; not node-wired.
+pub mod qrun_v06_transaction_mempool_candidate;
+/// M2b/M2c candidate joining native ledger, AMM projection and asset metadata registry.
+pub mod qrun_v06_unified_asset_candidate;
+/// Bounded QZAS/1 framing for canonical signed QAX1 operations; candidate-node ingress only.
+pub mod qzbe_amm_ingress_candidate;
+/// CP-0441 candidate: Genesis-rooted QZBE canonical replay across bounded in-memory segments; durable archive integration remains open.
+pub mod qzbe_history_replay_candidate;
+pub mod qzbe_tx_ingress_candidate;
+/// Candidate native AMM with QZB4 v3 transition and QZP4/QAMS snapshot integration; not Mainnet-approved.
+pub mod qzxb_amm_candidate;
+/// Read-only, fail-closed loader for Windows CurrentUser-DPAPI QZKW1 wallets; local custody only.
+pub mod qzxb_wallet_store_candidate;
 pub mod recovery;
 pub mod reference_time;
+pub mod reference_time_authority;
 pub mod reference_time_store;
 pub mod reference_time_tcp;
 /// Research-only durable file wrapper for reward-pool snapshots; not canonical persistence.
 pub mod reward_pool_durable_store;
+/// CP-0752 pure STB1 signer-registry codec/verifier; no enrollment store or runtime caller.
+pub mod signer_trust_bundle;
 pub mod store_writer_lock;
 /// CP-0217 isolated V3 state-root/snapshot candidate; not consensus-wired.
 pub mod v3_state_candidate;
@@ -392,3 +536,71 @@ mod tests {
 }
 
 pub mod token_forge;
+
+/// CP-0487 opt-in node owner for an already spawned off-host Anchor daemon; disabled by default.
+pub mod external_cas_offhost_anchor_node_lifecycle_candidate;
+/// CP-0488 candidate process-signal bridge for graceful QRun node event-loop shutdown.
+pub mod qrun_node_shutdown_signal_candidate;
+/// QRun canonical checkpoint codec with profile binding and external anti-rollback anchor checks.
+pub mod qrun_v05_checkpoint_candidate;
+/// Candidate-only canonical QRM1 journal codec for live External-CAS checkpoint re-rooting; no migration runtime or provider write callsite.
+pub mod qrun_v05_checkpoint_migration_candidate;
+
+/// Explicit candidate QRM1 provider/QCF1/PFS2 crash-recovery engine; not enabled by ordinary startup.
+pub mod qrun_v05_checkpoint_migration_recovery_candidate;
+/// Candidate QRun fee-only PoW envelope; payload commitment is not yet wired into fork choice.
+pub mod qrun_v05_fee_pow_wire_candidate;
+pub mod qrun_v05_genesis_candidate;
+/// Candidate-only, QRun-domain-separated Noise XX transport; not yet wired into the node or approved for public value-bearing traffic.
+pub mod qrun_v05_noise_transport_candidate;
+/// Candidate adapter joining QRun Genesis to persistent PoW fork choice; not a public node yet.
+pub mod qrun_v05_pow_fork_runtime_candidate;
+/// Candidate immutable QRun v0.5 network/owner identity; not Mainnet activation.
+pub mod qrun_v05_profile_identity_candidate;
+/// QRun v0.5 Genesis-bound transfer execution and snapshot candidate; not yet node/P2P wired.
+pub mod qrun_v05_runtime_candidate;
+
+/// Explicit bounded worker/queue daemon candidate for the off-host Anchor Noise transport; not node startup wiring.
+pub mod external_cas_offhost_anchor_noise_daemon_candidate;
+
+/// CP-0603 owner-directed Founder Treasury arithmetic candidate; not yet Genesis/runtime wired.
+pub mod qrun_v06_founder_treasury_policy_candidate;
+/// CP-0590 Genesis-pinned permissionless full-history base admission runtime; no mandatory Q6EA/QAP1 anchor, not yet a public node launcher.
+/// CP-0682 local single-owner dual-disk anchor vault.
+pub mod qrun_v06_local_anchor_vault_candidate;
+pub mod qrun_v06_permissionless_runtime_candidate;
+/// CP-0592 permissionless Q6TI journal, native mempool and bounded PoW-to-durable-commit service adapter.
+pub mod qrun_v06_permissionless_service_candidate;
+
+/// CP-0604 legacy 7B founder Genesis / 3B mining-only supply policy; retained for compatibility.
+pub mod qrun_v06_cp0604_supply_candidate;
+
+/// CP-0651 7B fixed cap, 1B owner Genesis, six accounting labels and fee-only mining policy.
+pub mod qrun_v06_cp0651_supply_candidate;
+
+/// Candidate-only bounded, profile-bound durable peer address book; not runtime-wired.
+pub mod qrun_v06_peer_address_manager_candidate;
+
+/// Candidate-only Q6AR network/profile-bound address relay codec; not runtime-wired.
+pub mod qrun_v06_peer_address_relay_candidate;
+
+/// CP-0639 operator-provisioned bootstrap trust-domain quotas; policy-only, not runtime-wired.
+pub mod qrun_v06_bootstrap_trust_domain_candidate;
+pub mod windows_store_handle_probe;
+
+#[cfg(all(windows, test))]
+mod windows_relative_open_experiment;
+
+#[cfg(all(windows, test))]
+mod windows_handle_relative_replace_experiment;
+
+#[cfg(all(windows, test))]
+pub(crate) mod windows_acl_snapshot_probe;
+
+#[cfg(all(windows, test))]
+mod windows_volume_identity_probe;
+
+#[cfg(all(windows, test))]
+mod windows_store_adapter_harness;
+
+pub mod external_cas_offhost_anchor_protocol_v2_candidate;

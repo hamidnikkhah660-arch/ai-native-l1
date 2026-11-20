@@ -1,13 +1,15 @@
 # Mining, Halving, Throughput and Performance Evidence - v0.1
 
+> **Historical research notice (2026-11-17):** The 10B cap, 3B mining/security envelope, initial subsidy and halving schedule described in this report are archived candidate research only. They were superseded for current candidate economics by CP-0651: 7B maximum accounting ceiling, 1B owner Genesis allocation, six non-circulating 1B labels, zero block subsidy and fee-only producer compensation. Do not use the historical 3B figure or halving curve as a current miner allocation or active emission schedule. The PoW performance measurements below remain historical measurements of the stated test setups, not evidence of current production mining or profitability.
+
 Date: 2026-10-20
-Status: Candidate-profile and benchmark record. This is not a frozen production consensus specification.
+Status: Historical candidate-profile and benchmark record. Its monetary schedule is superseded by CP-0651 and is not a current production consensus specification.
 
-## 1. Current monetary design
+## 1. Historical monetary design (superseded)
 
-The current public direction is a 10,000,000,000 native-coin lifetime design cap with the following allocation envelopes:
+Earlier research recorded a 10,000,000,000 native-coin design cap with the following 4B / 3B / 3B allocation envelopes. This table is historical and does not describe current CP-0651 candidate economics:
 
-| Envelope | Amount | Share of total cap | Current meaning |
+| Envelope | Amount | Share of historical total cap | Historical meaning |
 |---|---:|---:|---|
 | Founder | 4,000,000,000 | 40% | Founder-controlled; no protocol lock or time vesting under current owner direction |
 | Mining / network security | 3,000,000,000 | 30% | Maximum design budget envelope, not a statement that these coins are already mined or issued |
@@ -16,11 +18,11 @@ The current public direction is a 10,000,000,000 native-coin lifetime design cap
 
 The sponsor proposal of up to 1B coins and the contributor/professional pool of 0.1B-1B are carved from the founder's existing 4B envelope. They do not increase the cap. No sponsor award or coin transfer under that proposal is established.
 
-## 2. Existing candidate mining and halving profile
+## 2. Historical mining and halving profile (not active under CP-0651)
 
-CP-0338 and the current working-tree checkpoints record an internally shared monetary-policy candidate that reconciles the proposed 10B total cap and 4/3/3 allocation envelopes at the arithmetic level:
+CP-0338 and dated working-tree checkpoints recorded an earlier monetary-policy candidate that reconciled the proposed 10B total cap and 4/3/3 allocation envelopes at the arithmetic level. These values are retained only to explain historical simulations:
 
-| Parameter | Current candidate value | Status / caveat |
+| Parameter | Historical candidate value | Status / caveat |
 |---|---|---|
 | Coin precision | 8 decimal places (100,000,000 atomic units per coin) | Candidate profile; confirm in canonical production schema |
 | Total maximum supply | 10,000,000,000 coins | High-level design direction; not yet an active production mint rule |
@@ -86,12 +88,12 @@ Before numeric mining economics can be called production rules, freeze a version
 2. Exact header bytes hashed by PoW, digest/algorithm parameters, target encoding and canonical integer comparisons.
 3. Timestamp bounds, future-time checks, retarget formula, window size, clamp, minimum difficulty and rules for missing/abnormal timestamps.
 4. Initial subsidy in atomic units, halving interval in block height, rounding, terminal/tail-emission decision, beneficiary binding and fee distribution.
-5. One canonical rule for founder, miner/security and public-goods buckets, including how sponsor/contributor awards remain within the founder envelope.
-6. A lifetime 10B supply invariant enforced through every value-creation path: block producer, validator/importer, fork-choice/reorg, persistence, restart/replay, snapshot restore and state root.
-7. Independent cross-language vectors for Genesis, every halving boundary, integer truncation, zero subsidy, overflow, cap-minus-one, exact cap, cap-plus-one, wrong network, replay, reorg and restart.
+5. Under CP-0651, define no implied sponsor/contributor token awards from accounting labels; any future distribution requires a new explicit owner-authorized policy, release conditions and canonical implementation.
+6. The active CP-0651 candidate accounting invariant: 7B maximum accounting ceiling, 1B intended owner Genesis allocation, six non-circulating 1B accounting labels and zero block subsidy; enforce its canonical rules through producer, validator/importer, fork-choice/reorg, persistence, restart/replay, snapshot restore and state root.
+7. Independent cross-language vectors for CP-0651 Genesis/accounting boundaries, fee-only producer compensation, zero subsidy, overflow, ceiling-minus-one, exact ceiling, ceiling-plus-one, wrong network, replay, reorg and restart; preserve old halving vectors as historical-only fixtures.
 8. Independently built clients that derive identical balances, issuance counters, canonical tip and state roots from the same chain.
 
-Every accepted block's subsidy must be computed inside the canonical validator from the frozen schedule. Do not trust a peer-supplied reward. The 3B mining/security envelope must not be interpreted as a claim that all 3B coins exist at Genesis.
+Under the historical models in this report, any proposed subsidy would have required canonical validation and could never be trusted from a peer-supplied reward. Under current candidate policy CP-0651, block subsidy is zero and there is no 3B mining/security envelope. The historical 3B value must not be interpreted as a current reward reserve or as coins issued at Genesis.
 
 ## 8. Performance, accuracy and scale methodology
 
@@ -112,7 +114,7 @@ Separate single-node microbenchmarks, localhost tests, multi-process tests, mult
 
 ## 9. Halving options and economic modelling
 
-A four-year macro-halving is the current arithmetic candidate in CP-0338, but it remains unratified for production. Shorter bootstrap halvings, smooth emission and other profiles have been studied as alternatives in older research. Older internal research also contains incompatible caps, founder splits and initial subsidies that are superseded by the current 10B / 4B-3B-3B design direction. Do not combine values from those older profiles or describe them as simultaneously active.
+The four-year macro-halving and related 3B mining-envelope curve described in this report are historical arithmetic candidates from earlier policy generations; they are not ratified for production and are superseded by CP-0651 for current candidate economics. Shorter bootstrap halvings, smooth emission and other profiles are also archival research. Do not combine values from those older profiles or describe any of them as simultaneously active.
 
 Before selecting the production curve, simulate and publish:
 - cumulative issuance by month, year and exact boundary height;

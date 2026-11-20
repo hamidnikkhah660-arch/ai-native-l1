@@ -1,6 +1,8 @@
 # QuantumZXB - AI-Native L1 Native Coin and Ecosystem White Paper
 
-> **Historical allocation note (2026-10-24):** This v0.2 document describes the former 4B / 3B / 3B proposal. For current allocation terms see [white paper v0.3](QUANTUMZXB_NATIVE_COIN_WHITEPAPER_V03.md) and [tokenomics policy v0.4](FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V04_2026-10-24.md). Other engineering-status statements retain their cited review dates.
+> **Historical version notice (2026-11-17):** This earlier white paper predates current monetary-policy decisions and is retained for document history only. Its 10B / 4B-founder / 3B-mining / 3B-public-goods proposal is not current. CP-0651 is the current candidate policy: 7B maximum accounting ceiling, 1B intended owner Genesis allocation, six non-circulating 1B labels and zero block subsidy with fee-only producer compensation. See [current economics](../economics.html).
+
+
 
 ## Version 0.2 - Public Technical Engineering White Paper
 
@@ -11,7 +13,7 @@ Document status: Public engineering white paper describing architecture, test ev
 
 QuantumZXB is the current working identity for an independently developed native Layer-1 project. Its engineering programme combines a Rust-based native ledger and proof-of-work research, deterministic state and chain-selection candidates, authenticated peer transport, durable-storage and recovery experiments, a post-quantum signature research path, and a separate EVM-compatibility laboratory for smart-contract execution.
 
-The native asset is intended to be a **coin of its own network**, not the Ethereum Sepolia ERC-20 experiment. The current monetary design targets a maximum of 10,000,000,000 native coins with a proposed 40% founder allocation, 30% mining/network-security budget and 30% public-goods/ecosystem budget. Those figures define the design envelope; the production Genesis, monetary issuance path and all-bucket state invariants must be frozen and integrated before they can be treated as active Mainnet rules.
+The native asset is intended to be a **coin of its own network**, not the Ethereum Sepolia ERC-20 experiment. This earlier version recorded a proposed 10,000,000,000-native-coin design with a 40% founder allocation, 30% mining/network-security budget and 30% public-goods/ecosystem budget. These are historical proposal terms only and were superseded by the later v0.4 / CP-0566D model, CP-0437 and the current CP-0651 candidate policy. They are not active Mainnet rules.
 
 The project has substantial code and testing infrastructure. The maintainer's complete working checkout passed a full Rust regression with 736 library tests and no failures; the locked/offline all-target build check and format check also passed. The full working checkout is larger than this curated public tree, so this test count is tied to that review scope. The separate EVM launch-asset package's local test suite also passed. These are reproducible engineering signals, not substitutes for production-network qualification or an independent protocol audit.
 
@@ -21,7 +23,7 @@ The long-term goal is to build an open, CPU-accessible, verifiable network in wh
 
 The name "AI-Native" expresses the project's intended product direction. It does not mean a production inference marketplace, model-training market or proof-of-useful-AI reward mechanism is already running. Those capabilities require their own interfaces, verification rules, economics and operational testing.
 
-## 2. Native coin identity and supply design
+## 2. Historical native coin identity and supply design (superseded)
 
 - **Network/project identity:** QuantumZXB is the current working brand.
 - **Proposed native coin ticker:** QZXB; it remains a proposal rather than a frozen production network identifier or verified listing symbol.

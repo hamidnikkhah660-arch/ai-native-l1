@@ -8,7 +8,7 @@ The source repository and website are public. The running node remains **experim
 
 ## What is concrete today
 
-The latest owner-directed supply target in CP-0437 is exactly 10,000,000,000 QZXB at Genesis to one owner account, with zero post-Genesis minting and zero block subsidy. Older v0.4 percentage allocations and the 3B mining/halving model are historical and superseded for this target. Fee-only block-production economics is still an open release gate; this target is not a live or publicly spendable balance.
+The active candidate monetary policy is CP-0651: a 7,000,000,000 QZXB maximum accounting ceiling, with 1,000,000,000 QZXB intended for the owner Genesis allocation and six additional 1B non-circulating accounting labels. Block subsidy is zero; candidate producers receive canonical transaction fees only. The earlier 10B / 3B-mining and halving schedule, v0.4 / CP-0566D eight-bucket proposal, CP-0437 and CP-0604 are historical/superseded. No native QZXB balance is live or publicly spendable, and fee-only PoW security economics remains an open release gate.
 
 The active experimental branch is separate from the public curated main baseline. Test counts must always include their branch and date: the older curated baseline recorded 735/735 library tests; the newer working branch lists 1,187 tests across Cargo targets, while test execution results are documented separately in the release-gate record.
 
@@ -101,7 +101,7 @@ The project is a Rust-first Layer-1 research programme. Its source includes proo
 
 One lesson from this work is that a passing local test is not the same as a live public network. A process binding to an all-interface port does not prove that a router or ISP allows inbound traffic. A local Genesis balance is not a publicly transferable balance. A market indexer is not a market, and a token with a familiar ticker is not an authentic quote asset. Those distinctions are reflected in the release documents.
 
-QRun's current node is experimental public-alpha. Production Mainnet, external multi-operator convergence, an independent protocol/security review, a public explorer, and genuine QZXB/USDT liquidity are not claimed as live. The selected candidate economic direction is 10 billion QZXB at Genesis, all assigned to the owner, with no further minting and no block subsidy; this is a candidate protocol direction, not proof that public funds are available. Fee-only block production needs explicit analysis of incentives and security economics.
+QRun's current node is experimental public-alpha. Production Mainnet, external multi-operator convergence, an independent protocol/security review, a public explorer, and genuine QZXB/USDT liquidity are not claimed as live. The active candidate economic direction is CP-0651: a 7 billion QZXB maximum accounting ceiling, a 1 billion owner Genesis allocation, six non-circulating 1 billion accounting labels, and zero block subsidy with fee-only producer compensation. The old 3 billion mining allocation is historical, not a current reserve or reward schedule. This is not proof that public funds are issued or spendable. Fee-only PoW incentives and security economics still require explicit analysis.
 
 I would welcome contributions from Rust protocol engineers, independent operators, security/cryptography reviewers, EVM developers, and AI/ML researchers. The highest-value next steps are independent multi-host tests for network identity, synchronization, restart/recovery and matching state roots; reproducible builds; and review of consensus and rollback assumptions.
 

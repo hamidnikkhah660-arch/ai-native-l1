@@ -82,6 +82,7 @@ pub enum IssuerRegistryError {
     StateMissing,
     StateMalformed,
     StateIdentityMismatch,
+    StateNotCurrent,
     Persistence,
     Locked,
     InvalidPath,
@@ -486,6 +487,37 @@ impl IssuerRegistryStateStore {
             }
         }
         next_verified.active_key(selected_issuer_id)
+    }
+
+    /// Read-only exact-current check. Re-verifies persisted IRG1 using its historical
+    /// Governance key from this store's already-verified root chain.
+    pub fn matches_current_registry(
+        &self,
+        expected: &VerifiedIssuerRegistry,
+        expected_root_chain: &VerifiedGovernanceRootChain,
+    ) -> Result<(), IssuerRegistryError> {
+        if expected_root_chain != &self.root_chain
+            || expected.network_id != *self.root_chain.network_id()
+            || self.governance_public_key != *expected_root_chain.current_key()
+        {
+            return Err(IssuerRegistryError::StateIdentityMismatch);
+        }
+        let current = self
+            .state
+            .lock()
+            .map_err(|_| IssuerRegistryError::Persistence)?;
+        if current.wire.is_empty() {
+            return Err(IssuerRegistryError::StateMissing);
+        }
+        let key = self
+            .root_chain
+            .key_for_fingerprint(&current.governance_fingerprint)
+            .ok_or(IssuerRegistryError::StateIdentityMismatch)?;
+        let accepted = verify_signed_registry(&current.wire, &current.network_id, &key)?;
+        if accepted.sequence != expected.sequence || accepted.digest != expected.digest {
+            return Err(IssuerRegistryError::StateNotCurrent);
+        }
+        Ok(())
     }
 
     fn state_network_id(&self) -> Result<[u8; 32], IssuerRegistryError> {

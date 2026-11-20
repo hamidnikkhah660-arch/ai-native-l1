@@ -3,9 +3,11 @@
 //! DPC1 binds the Network ID, deployment-config sequence, registry governance root, original root
 //! anchor, offline recovery public key, minimum root epoch, minimum registry sequence and complete
 //! signed root-chain wire bytes under a distinct deployment-authority Ed25519 signature.
-//! DCS1 persists the highest accepted DPC1 sequence/digest behind a stable writer lock.
+//! DCS1 v2 persists the highest accepted DPC1 sequence/digest and GRC1 root epoch behind a
+//! stable writer lock. Version-1 state can be upgraded only by presenting the exact currently
+//! persisted signed manifest; a newer manifest cannot bootstrap an unknown prior root epoch.
 //!
-//! This detects manifest rollback while the local DCS1 state and lock sibling are intact. The
+//! This detects manifest/root-epoch rollback while the local DCS1 state and lock sibling are intact. The
 //! deployment signing key and minimum config sequence must still be supplied by a trusted launch
 //! path; an attacker able to roll back that launch configuration and the local state directory is
 //! outside this local-filesystem anti-rollback claim.
@@ -35,9 +37,12 @@ const MANIFEST_HEADER_LEN: usize = 162;
 const MANIFEST_SIGNATURE_LEN: usize = 64;
 pub const MAX_SIGNED_DEPLOYMENT_CONFIG_LEN: usize =
     MANIFEST_HEADER_LEN + MAX_ROOT_CHAIN_WIRE_LEN + MANIFEST_SIGNATURE_LEN;
-const STATE_CORE_LEN: usize = 110;
 const STATE_CHECKSUM_LEN: usize = 32;
+const STATE_V1_CORE_LEN: usize = 110;
+const STATE_V1_LEN: usize = STATE_V1_CORE_LEN + STATE_CHECKSUM_LEN;
+const STATE_CORE_LEN: usize = 118;
 const STATE_LEN: usize = STATE_CORE_LEN + STATE_CHECKSUM_LEN;
+const STATE_VERSION: u16 = 2;
 const SIGNING_DOMAIN: &[u8] = b"AIN1-NOISE-DEPLOYMENT-CONFIG-V1\0";
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -50,13 +55,18 @@ pub enum DeploymentConfigError {
     InvalidSignature,
     InvalidGovernanceConfig,
     InvalidMinimumSequence,
+    InvalidMinimumRootEpoch,
     SequenceBelowMinimum,
+    RootEpochBelowMinimum,
     SequenceRollback,
     SequenceDiscontinuity,
     SameSequenceConflict,
     StateMissing,
     StateMalformed,
     StateIdentityMismatch,
+    StateNotCurrent,
+    StateMigrationRequired,
+    RootEpochRollback,
     Persistence,
     Locked,
     InvalidPath,
@@ -78,9 +88,17 @@ impl std::fmt::Display for DeploymentConfigError {
                 f,
                 "minimum deployment config sequence must be greater than zero"
             ),
+            Self::InvalidMinimumRootEpoch => write!(
+                f,
+                "minimum governance root epoch must be greater than zero"
+            ),
             Self::SequenceBelowMinimum => write!(
                 f,
                 "deployment config sequence is below the independently configured minimum"
+            ),
+            Self::RootEpochBelowMinimum => write!(
+                f,
+                "governance root epoch or DPC1 root floor is below the independently configured minimum"
             ),
             Self::SequenceRollback => write!(f, "deployment config sequence rollback rejected"),
             Self::SequenceDiscontinuity => write!(
@@ -96,6 +114,18 @@ impl std::fmt::Display for DeploymentConfigError {
             Self::StateIdentityMismatch => write!(
                 f,
                 "deployment config state belongs to a different network or deployment authority"
+            ),
+            Self::StateNotCurrent => write!(
+                f,
+                "deployment config is not the exact current durable snapshot"
+            ),
+            Self::StateMigrationRequired => write!(
+                f,
+                "legacy DCS1 state must be upgraded using its exact current signed deployment manifest before accepting a successor"
+            ),
+            Self::RootEpochRollback => write!(
+                f,
+                "governance root epoch rollback rejected by durable DCS1 high-water state"
             ),
             Self::Persistence => write!(f, "deployment config state persistence failed"),
             Self::Locked => write!(f, "deployment config state writer lock is busy"),
@@ -118,9 +148,13 @@ pub struct VerifiedDeploymentConfig {
     pub root_chain: VerifiedGovernanceRootChain,
     pub digest: [u8; 32],
     deployment_authority_fingerprint: [u8; 32],
+    // Set only by the strict verifier; legacy compatibility verification leaves this unset.
+    pub(crate) verified_external_minimum_root_epoch: Option<u64>,
 }
 
-/// Verify a complete DPC1 manifest using an out-of-band deployment-authority public key.
+/// Compatibility verifier: validates the root epoch floor carried inside DPC1.
+/// Callers requiring an independently configured rollback floor must use
+/// `verify_signed_deployment_config_with_floors`.
 /// DPC1 fields are signed together with the complete GRC1 root chain (no path indirection).
 pub fn verify_signed_deployment_config(
     wire: &[u8],
@@ -239,7 +273,39 @@ pub fn verify_signed_deployment_config(
         root_chain,
         digest,
         deployment_authority_fingerprint,
+        verified_external_minimum_root_epoch: None,
     })
+}
+
+/// Strict verifier that applies both independently supplied rollback floors.
+///
+/// The deployment-authority key, minimum config sequence, and minimum root epoch must come
+/// from trusted launch configuration, not from the writable DPC1/DCS1 directory. The signed
+/// DPC1 root floor must acknowledge at least the external root-epoch floor, and the verified
+/// GRC1 tip must meet that floor as well.
+pub fn verify_signed_deployment_config_with_floors(
+    wire: &[u8],
+    expected_network_id: &[u8; 32],
+    deployment_authority_public_key: &[u8; 32],
+    minimum_sequence: u64,
+    minimum_root_epoch: u64,
+) -> Result<VerifiedDeploymentConfig, DeploymentConfigError> {
+    if minimum_root_epoch == 0 {
+        return Err(DeploymentConfigError::InvalidMinimumRootEpoch);
+    }
+    let mut verified = verify_signed_deployment_config(
+        wire,
+        expected_network_id,
+        deployment_authority_public_key,
+        minimum_sequence,
+    )?;
+    if verified.minimum_root_epoch < minimum_root_epoch
+        || verified.root_chain.current_epoch() < minimum_root_epoch
+    {
+        return Err(DeploymentConfigError::RootEpochBelowMinimum);
+    }
+    verified.verified_external_minimum_root_epoch = Some(minimum_root_epoch);
+    Ok(verified)
 }
 
 /// Build and locally verify a DPC1 manifest using the canonical wire format. The signing key must
@@ -294,30 +360,35 @@ pub fn encode_signed_deployment_config(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PersistedDeploymentState {
+    format_version: u16,
     network_id: [u8; 32],
     authority_fingerprint: [u8; 32],
     highest_sequence: u64,
     manifest_digest: [u8; 32],
+    highest_root_epoch: u64,
 }
 
 impl PersistedDeploymentState {
     fn empty(network_id: [u8; 32], authority_fingerprint: [u8; 32]) -> Self {
         Self {
+            format_version: STATE_VERSION,
             network_id,
             authority_fingerprint,
             highest_sequence: 0,
             manifest_digest: [0; 32],
+            highest_root_epoch: 0,
         }
     }
 
     fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(STATE_LEN);
         bytes.extend_from_slice(STATE_MAGIC);
-        bytes.extend_from_slice(&VERSION.to_be_bytes());
+        bytes.extend_from_slice(&STATE_VERSION.to_be_bytes());
         bytes.extend_from_slice(&self.network_id);
         bytes.extend_from_slice(&self.authority_fingerprint);
         bytes.extend_from_slice(&self.highest_sequence.to_be_bytes());
         bytes.extend_from_slice(&self.manifest_digest);
+        bytes.extend_from_slice(&self.highest_root_epoch.to_be_bytes());
         let checksum: [u8; 32] = Sha256::digest(&bytes).into();
         bytes.extend_from_slice(&checksum);
         bytes
@@ -328,18 +399,24 @@ impl PersistedDeploymentState {
         expected_network: &[u8; 32],
         expected_authority_fingerprint: &[u8; 32],
     ) -> Result<Self, DeploymentConfigError> {
-        if bytes.len() != STATE_LEN
-            || &bytes[..4] != STATE_MAGIC
-            || u16::from_be_bytes(
-                bytes[4..6]
-                    .try_into()
-                    .map_err(|_| DeploymentConfigError::StateMalformed)?,
-            ) != VERSION
-        {
+        if bytes.len() < 6 || &bytes[..4] != STATE_MAGIC {
             return Err(DeploymentConfigError::StateMalformed);
         }
-        let checksum: [u8; 32] = Sha256::digest(&bytes[..STATE_CORE_LEN]).into();
-        if checksum.as_slice() != &bytes[STATE_CORE_LEN..] {
+        let version = u16::from_be_bytes(
+            bytes[4..6]
+                .try_into()
+                .map_err(|_| DeploymentConfigError::StateMalformed)?,
+        );
+        let (core_len, expected_len) = match version {
+            1 => (STATE_V1_CORE_LEN, STATE_V1_LEN),
+            STATE_VERSION => (STATE_CORE_LEN, STATE_LEN),
+            _ => return Err(DeploymentConfigError::StateMalformed),
+        };
+        if bytes.len() != expected_len {
+            return Err(DeploymentConfigError::StateMalformed);
+        }
+        let checksum: [u8; 32] = Sha256::digest(&bytes[..core_len]).into();
+        if checksum.as_slice() != &bytes[core_len..] {
             return Err(DeploymentConfigError::StateMalformed);
         }
         let network_id: [u8; 32] = bytes[6..38]
@@ -353,17 +430,37 @@ impl PersistedDeploymentState {
         {
             return Err(DeploymentConfigError::StateIdentityMismatch);
         }
-        Ok(Self {
-            network_id,
-            authority_fingerprint,
-            highest_sequence: u64::from_be_bytes(
-                bytes[70..78]
-                    .try_into()
-                    .map_err(|_| DeploymentConfigError::StateMalformed)?,
-            ),
-            manifest_digest: bytes[78..110]
+        let highest_sequence = u64::from_be_bytes(
+            bytes[70..78]
                 .try_into()
                 .map_err(|_| DeploymentConfigError::StateMalformed)?,
+        );
+        let manifest_digest: [u8; 32] = bytes[78..110]
+            .try_into()
+            .map_err(|_| DeploymentConfigError::StateMalformed)?;
+        let highest_root_epoch = if version == STATE_VERSION {
+            u64::from_be_bytes(
+                bytes[110..118]
+                    .try_into()
+                    .map_err(|_| DeploymentConfigError::StateMalformed)?,
+            )
+        } else {
+            0
+        };
+        if version == STATE_VERSION
+            && ((highest_sequence == 0 && (manifest_digest != [0; 32] || highest_root_epoch != 0))
+                || (highest_sequence != 0
+                    && (manifest_digest == [0; 32] || highest_root_epoch == 0)))
+        {
+            return Err(DeploymentConfigError::StateMalformed);
+        }
+        Ok(Self {
+            format_version: version,
+            network_id,
+            authority_fingerprint,
+            highest_sequence,
+            manifest_digest,
+            highest_root_epoch,
         })
     }
 }
@@ -404,11 +501,11 @@ impl DeploymentConfigStateStore {
                 fs::symlink_metadata(&path).map_err(|_| DeploymentConfigError::Persistence)?;
             if metadata.file_type().is_symlink()
                 || !metadata.is_file()
-                || metadata.len() != STATE_LEN as u64
+                || (metadata.len() != STATE_V1_LEN as u64 && metadata.len() != STATE_LEN as u64)
             {
                 return Err(DeploymentConfigError::StateMalformed);
             }
-            let mut bytes = Vec::with_capacity(STATE_LEN);
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
             File::open(&path)
                 .map_err(|_| DeploymentConfigError::Persistence)?
                 .read_to_end(&mut bytes)
@@ -450,12 +547,45 @@ impl DeploymentConfigStateStore {
             .state
             .lock()
             .map_err(|_| DeploymentConfigError::Persistence)?;
+        let manifest_root_epoch = manifest.root_chain.current_epoch();
+        if manifest_root_epoch == 0 {
+            return Err(DeploymentConfigError::InvalidGovernanceConfig);
+        }
+
+        // DCS1 v1 did not retain the accepted GRC1 tip epoch. Upgrade it only when the caller
+        // presents the exact current signed DPC1 whose digest is already in that legacy state.
+        // A successor cannot establish the unknown predecessor epoch and therefore fails closed.
+        if current.format_version == 1 && current.highest_sequence != 0 {
+            if manifest.sequence < current.highest_sequence {
+                return Err(DeploymentConfigError::SequenceRollback);
+            }
+            if manifest.sequence == current.highest_sequence {
+                if manifest.digest != current.manifest_digest {
+                    return Err(DeploymentConfigError::SameSequenceConflict);
+                }
+                let next = PersistedDeploymentState {
+                    format_version: STATE_VERSION,
+                    network_id: current.network_id,
+                    authority_fingerprint: current.authority_fingerprint,
+                    highest_sequence: current.highest_sequence,
+                    manifest_digest: current.manifest_digest,
+                    highest_root_epoch: manifest_root_epoch,
+                };
+                persist_atomic(&self.path, &next.encode())?;
+                *current = next;
+                return Ok(());
+            }
+            return Err(DeploymentConfigError::StateMigrationRequired);
+        }
+
         if current.highest_sequence == 0 {
             let next = PersistedDeploymentState {
+                format_version: STATE_VERSION,
                 network_id: current.network_id,
                 authority_fingerprint: current.authority_fingerprint,
                 highest_sequence: manifest.sequence,
                 manifest_digest: manifest.digest,
+                highest_root_epoch: manifest_root_epoch,
             };
             persist_atomic(&self.path, &next.encode())?;
             *current = next;
@@ -465,10 +595,13 @@ impl DeploymentConfigStateStore {
             return Err(DeploymentConfigError::SequenceRollback);
         }
         if manifest.sequence == current.highest_sequence {
-            return if manifest.digest == current.manifest_digest {
+            if manifest.digest != current.manifest_digest {
+                return Err(DeploymentConfigError::SameSequenceConflict);
+            }
+            return if manifest_root_epoch == current.highest_root_epoch {
                 Ok(())
             } else {
-                Err(DeploymentConfigError::SameSequenceConflict)
+                Err(DeploymentConfigError::StateMalformed)
             };
         }
         let expected = current
@@ -478,14 +611,48 @@ impl DeploymentConfigStateStore {
         if manifest.sequence != expected {
             return Err(DeploymentConfigError::SequenceDiscontinuity);
         }
+        if manifest_root_epoch < current.highest_root_epoch {
+            return Err(DeploymentConfigError::RootEpochRollback);
+        }
         let next = PersistedDeploymentState {
+            format_version: STATE_VERSION,
             network_id: current.network_id,
             authority_fingerprint: current.authority_fingerprint,
             highest_sequence: manifest.sequence,
             manifest_digest: manifest.digest,
+            highest_root_epoch: manifest_root_epoch,
         };
         persist_atomic(&self.path, &next.encode())?;
         *current = next;
+        Ok(())
+    }
+
+    /// Read-only exact-current check against an already-open, initialized DCS1 store.
+    pub fn matches_current(
+        &self,
+        manifest: &VerifiedDeploymentConfig,
+    ) -> Result<(), DeploymentConfigError> {
+        if manifest.network_id != self.network_id
+            || manifest.deployment_authority_fingerprint != self.authority_fingerprint
+        {
+            return Err(DeploymentConfigError::StateIdentityMismatch);
+        }
+        let current = self
+            .state
+            .lock()
+            .map_err(|_| DeploymentConfigError::Persistence)?;
+        if current.format_version != STATE_VERSION {
+            return Err(DeploymentConfigError::StateMigrationRequired);
+        }
+        if current.highest_sequence == 0 {
+            return Err(DeploymentConfigError::StateMissing);
+        }
+        if current.highest_sequence != manifest.sequence
+            || current.manifest_digest != manifest.digest
+            || current.highest_root_epoch != manifest.root_chain.current_epoch()
+        {
+            return Err(DeploymentConfigError::StateNotCurrent);
+        }
         Ok(())
     }
 
@@ -495,6 +662,17 @@ impl DeploymentConfigStateStore {
             .lock()
             .map_err(|_| DeploymentConfigError::Persistence)?
             .highest_sequence)
+    }
+
+    pub fn highest_root_epoch(&self) -> Result<u64, DeploymentConfigError> {
+        let current = self
+            .state
+            .lock()
+            .map_err(|_| DeploymentConfigError::Persistence)?;
+        if current.format_version != STATE_VERSION {
+            return Err(DeploymentConfigError::StateMigrationRequired);
+        }
+        Ok(current.highest_root_epoch)
     }
 }
 
@@ -592,6 +770,26 @@ mod tests {
         ))
     }
 
+    fn encode_legacy_state_v1(
+        network: [u8; 32],
+        authority_public_key: &[u8; 32],
+        sequence: u64,
+        manifest_digest: [u8; 32],
+    ) -> Vec<u8> {
+        let authority_fingerprint: [u8; 32] = Sha256::digest(authority_public_key).into();
+        let mut bytes = Vec::with_capacity(STATE_V1_LEN);
+        bytes.extend_from_slice(STATE_MAGIC);
+        bytes.extend_from_slice(&1u16.to_be_bytes());
+        bytes.extend_from_slice(&network);
+        bytes.extend_from_slice(&authority_fingerprint);
+        bytes.extend_from_slice(&sequence.to_be_bytes());
+        bytes.extend_from_slice(&manifest_digest);
+        let checksum: [u8; 32] = Sha256::digest(&bytes).into();
+        bytes.extend_from_slice(&checksum);
+        assert_eq!(bytes.len(), STATE_V1_LEN);
+        bytes
+    }
+
     fn make_root_chain(network: [u8; 32], root: &SigningKey) -> Vec<u8> {
         let mut wire = b"GRC1".to_vec();
         wire.extend_from_slice(&1u16.to_be_bytes());
@@ -599,6 +797,30 @@ mod tests {
         wire.extend_from_slice(&0u16.to_be_bytes());
         assert_eq!(wire.len(), 40);
         let _ = root;
+        wire
+    }
+
+    fn make_root_chain_with_successor(
+        network: [u8; 32],
+        anchor: &SigningKey,
+        current: &SigningKey,
+    ) -> Vec<u8> {
+        let mut wire = b"GRC1".to_vec();
+        wire.extend_from_slice(&1u16.to_be_bytes());
+        wire.extend_from_slice(&network);
+        wire.extend_from_slice(&1u16.to_be_bytes());
+
+        let mut core = Vec::with_capacity(72);
+        core.extend_from_slice(&2u64.to_be_bytes());
+        core.extend_from_slice(&anchor.verifying_key().to_bytes());
+        core.extend_from_slice(&current.verifying_key().to_bytes());
+
+        let mut preimage = b"AIN1-NOISE-GOVERNANCE-ROOT-ROTATION-V1\0".to_vec();
+        preimage.extend_from_slice(&network);
+        preimage.extend_from_slice(&core);
+        wire.extend_from_slice(&core);
+        wire.extend_from_slice(&anchor.sign(&preimage).to_bytes());
+        wire.extend_from_slice(&current.sign(&preimage).to_bytes());
         wire
     }
 
@@ -709,6 +931,62 @@ mod tests {
     }
 
     #[test]
+    fn strict_verifier_enforces_independent_governance_root_epoch_floor() {
+        let deployment = SigningKey::from_bytes(&[0xf1; 32]);
+        let anchor = SigningKey::from_bytes(&[0xf2; 32]);
+        let next_root = SigningKey::from_bytes(&[0xf3; 32]);
+        let recovery = SigningKey::from_bytes(&[0xf4; 32]);
+        let network = [0xf5; 32];
+        let signer = deployment.verifying_key().to_bytes();
+
+        let epoch_one_chain = make_root_chain(network, &anchor);
+        let epoch_one = encode_manifest(
+            network,
+            1,
+            &anchor,
+            &anchor,
+            &recovery,
+            1,
+            1,
+            &epoch_one_chain,
+            &deployment,
+        );
+
+        // The compatibility parser accepts the signed embedded floor, but the strict API
+        // rejects this otherwise-valid manifest when the independently trusted floor is 2.
+        assert!(verify_signed_deployment_config(&epoch_one, &network, &signer, 1).is_ok());
+        assert_eq!(
+            verify_signed_deployment_config_with_floors(&epoch_one, &network, &signer, 1, 2,)
+                .unwrap_err(),
+            DeploymentConfigError::RootEpochBelowMinimum
+        );
+
+        let epoch_two_chain = make_root_chain_with_successor(network, &anchor, &next_root);
+        let epoch_two = encode_manifest(
+            network,
+            2,
+            &next_root,
+            &anchor,
+            &recovery,
+            2,
+            1,
+            &epoch_two_chain,
+            &deployment,
+        );
+        let verified =
+            verify_signed_deployment_config_with_floors(&epoch_two, &network, &signer, 2, 2)
+                .unwrap();
+        assert_eq!(verified.minimum_root_epoch, 2);
+        assert_eq!(verified.root_chain.current_epoch(), 2);
+
+        assert_eq!(
+            verify_signed_deployment_config_with_floors(&epoch_two, &network, &signer, 2, 0,)
+                .unwrap_err(),
+            DeploymentConfigError::InvalidMinimumRootEpoch
+        );
+    }
+
+    #[test]
     fn deployment_state_persists_highwater_and_rejects_replay_conflict_and_missing_state() {
         let path = temp_path("highwater");
         let deployment = SigningKey::from_bytes(&[0xd4; 32]);
@@ -751,6 +1029,8 @@ mod tests {
             store.observe(&one).unwrap(); // exact same signed config is idempotent on restart
             store.observe(&two).unwrap();
             assert_eq!(store.highest_sequence().unwrap(), 2);
+            assert_eq!(store.highest_root_epoch().unwrap(), 1);
+            store.matches_current(&two).unwrap();
             assert_eq!(
                 store.observe(&one),
                 Err(DeploymentConfigError::SequenceRollback)
@@ -783,6 +1063,146 @@ mod tests {
             Err(DeploymentConfigError::StateMissing)
         ));
         let _ = fs::remove_file(path);
+        let _ = fs::remove_file(lock_path);
+    }
+
+    #[test]
+    fn deployment_state_v2_persists_root_epoch_and_rejects_epoch_rollback() {
+        let path = temp_path("root-epoch-highwater");
+        let deployment = SigningKey::from_bytes(&[0xa1; 32]);
+        let anchor = SigningKey::from_bytes(&[0xa2; 32]);
+        let next_root = SigningKey::from_bytes(&[0xa3; 32]);
+        let recovery = SigningKey::from_bytes(&[0xa4; 32]);
+        let network = [0xa5; 32];
+        let signer = deployment.verifying_key().to_bytes();
+
+        let epoch_two_chain = make_root_chain_with_successor(network, &anchor, &next_root);
+        let current_wire = encode_manifest(
+            network,
+            1,
+            &next_root,
+            &anchor,
+            &recovery,
+            2,
+            1,
+            &epoch_two_chain,
+            &deployment,
+        );
+        let current =
+            verify_signed_deployment_config_with_floors(&current_wire, &network, &signer, 1, 2)
+                .unwrap();
+
+        // A newer DPC1 sequence with an older but otherwise valid GRC1 chain must be rejected.
+        let epoch_one_chain = make_root_chain(network, &anchor);
+        let rollback_wire = encode_manifest(
+            network,
+            2,
+            &anchor,
+            &anchor,
+            &recovery,
+            1,
+            1,
+            &epoch_one_chain,
+            &deployment,
+        );
+        let rollback =
+            verify_signed_deployment_config_with_floors(&rollback_wire, &network, &signer, 2, 1)
+                .unwrap();
+
+        {
+            let store = DeploymentConfigStateStore::open(&path, &network, &signer, 1).unwrap();
+            store.observe(&current).unwrap();
+            assert_eq!(store.highest_sequence().unwrap(), 1);
+            assert_eq!(store.highest_root_epoch().unwrap(), 2);
+            store.matches_current(&current).unwrap();
+            assert_eq!(
+                store.observe(&rollback),
+                Err(DeploymentConfigError::RootEpochRollback)
+            );
+            assert_eq!(store.highest_sequence().unwrap(), 1);
+            assert_eq!(store.highest_root_epoch().unwrap(), 2);
+        }
+        let lock_path = path.with_file_name(format!(
+            "{}.writer.lock",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(lock_path);
+    }
+
+    #[test]
+    fn legacy_dcs1_v1_requires_exact_current_manifest_for_root_epoch_upgrade() {
+        let path = temp_path("legacy-v1-upgrade");
+        let deployment = SigningKey::from_bytes(&[0xb1; 32]);
+        let anchor = SigningKey::from_bytes(&[0xb2; 32]);
+        let next_root = SigningKey::from_bytes(&[0xb3; 32]);
+        let recovery = SigningKey::from_bytes(&[0xb4; 32]);
+        let network = [0xb5; 32];
+        let signer = deployment.verifying_key().to_bytes();
+
+        let epoch_two_chain = make_root_chain_with_successor(network, &anchor, &next_root);
+        let current_wire = encode_manifest(
+            network,
+            1,
+            &next_root,
+            &anchor,
+            &recovery,
+            2,
+            1,
+            &epoch_two_chain,
+            &deployment,
+        );
+        let current =
+            verify_signed_deployment_config_with_floors(&current_wire, &network, &signer, 1, 2)
+                .unwrap();
+        fs::write(
+            &path,
+            encode_legacy_state_v1(network, &signer, current.sequence, current.digest),
+        )
+        .unwrap();
+
+        let epoch_one_chain = make_root_chain(network, &anchor);
+        let successor_wire = encode_manifest(
+            network,
+            2,
+            &anchor,
+            &anchor,
+            &recovery,
+            1,
+            1,
+            &epoch_one_chain,
+            &deployment,
+        );
+        let successor =
+            verify_signed_deployment_config_with_floors(&successor_wire, &network, &signer, 2, 1)
+                .unwrap();
+
+        {
+            let store = DeploymentConfigStateStore::open(&path, &network, &signer, 1).unwrap();
+            assert_eq!(
+                store.observe(&successor),
+                Err(DeploymentConfigError::StateMigrationRequired)
+            );
+            // Only the exact manifest already committed in the v1 state can establish its epoch.
+            store.observe(&current).unwrap();
+            assert_eq!(store.highest_sequence().unwrap(), 1);
+            assert_eq!(store.highest_root_epoch().unwrap(), 2);
+            let upgraded = fs::read(&path).unwrap();
+            assert_eq!(upgraded.len(), STATE_LEN);
+            assert_eq!(
+                u16::from_be_bytes([upgraded[4], upgraded[5]]),
+                STATE_VERSION
+            );
+            assert_eq!(
+                store.observe(&successor),
+                Err(DeploymentConfigError::RootEpochRollback)
+            );
+        }
+        let lock_path = path.with_file_name(format!(
+            "{}.writer.lock",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let _ = fs::remove_file(&path);
         let _ = fs::remove_file(lock_path);
     }
 

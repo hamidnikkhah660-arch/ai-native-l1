@@ -178,6 +178,60 @@ impl ReferenceTimeStateStore {
         Ok(())
     }
 
+    /// Atomically reserve a contiguous range of authority response sequences.
+    ///
+    /// The returned inclusive range is backed by a durable high-water update. A caller may
+    /// allocate values from the range in memory without an fsync per response. If the process
+    /// crashes, unused values are intentionally skipped; the next reservation begins strictly
+    /// above the persisted high-water, so no sequence can ever be reused.
+    pub fn reserve_authority_sequence_range(
+        &self,
+        count: u64,
+    ) -> Result<(u64, u64), ReferenceTimeError> {
+        if count == 0 {
+            return Err(ReferenceTimeError::SequenceRollback);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ReferenceTimeError::StatePersistence)?;
+        let first = state
+            .authority_sequence
+            .checked_add(1)
+            .filter(|value| *value != 0)
+            .ok_or(ReferenceTimeError::SequenceRollback)?;
+        let high_water = state
+            .authority_sequence
+            .checked_add(count)
+            .filter(|value| *value != 0)
+            .ok_or(ReferenceTimeError::SequenceRollback)?;
+        let mut next = state.clone();
+        next.authority_sequence = high_water;
+        persist_atomic(&self.path, &next.encode())?;
+        *state = next;
+        Ok((first, high_water))
+    }
+
+    /// Atomically allocate and durably persist one authority response sequence.
+    /// Kept for single-allocation consumers and migration compatibility. The Authority service
+    /// uses range reservation to avoid doing a durable file replacement for every response.
+    pub fn allocate_next_authority_sequence(&self) -> Result<u64, ReferenceTimeError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ReferenceTimeError::StatePersistence)?;
+        let sequence = state
+            .authority_sequence
+            .checked_add(1)
+            .filter(|value| *value != 0)
+            .ok_or(ReferenceTimeError::SequenceRollback)?;
+        let mut next = state.clone();
+        next.authority_sequence = sequence;
+        persist_atomic(&self.path, &next.encode())?;
+        *state = next;
+        Ok(sequence)
+    }
+
     /// Advance the per-network authority sequence only after signature/challenge validation.
     /// Sequence numbers are global across key rotations for this network, preventing an old
     /// authority key from resetting the rollback floor when it is re-authorized later.
@@ -377,6 +431,32 @@ mod tests {
                 ),
                 Err(ReferenceTimeError::PolicyRollback)
             );
+        }
+        remove_store(&path);
+    }
+
+    #[test]
+    fn authority_sequence_ranges_are_durable_nonoverlapping_and_reject_zero_count() {
+        let path = unique_path();
+        {
+            let store = ReferenceTimeStateStore::open(&path, &NETWORK).unwrap();
+            assert_eq!(
+                store.reserve_authority_sequence_range(0),
+                Err(ReferenceTimeError::SequenceRollback)
+            );
+            assert_eq!(store.reserve_authority_sequence_range(4), Ok((1, 4)));
+            assert_eq!(store.last_accepted_sequence().unwrap(), 4);
+        }
+        {
+            // Reopening after a crash intentionally skips the unused prior lease suffix.
+            let store = ReferenceTimeStateStore::open(&path, &NETWORK).unwrap();
+            assert_eq!(store.reserve_authority_sequence_range(4), Ok((5, 8)));
+            assert_eq!(store.last_accepted_sequence().unwrap(), 8);
+        }
+        {
+            let store = ReferenceTimeStateStore::open(&path, &NETWORK).unwrap();
+            assert_eq!(store.reserve_authority_sequence_range(2), Ok((9, 10)));
+            assert_eq!(store.last_accepted_sequence().unwrap(), 10);
         }
         remove_store(&path);
     }
