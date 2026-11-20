@@ -106,7 +106,7 @@ These are planned allocations, not active Genesis issuance, circulating supply, 
 - **Historical allocation proposal, superseded by CP-0437:** [Tokenomics and Distribution Policy v0.4](docs/FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V04_2026-10-24.md)
 - **Historical white paper:** [QuantumZXB Native Coin White Paper v0.3](docs/QUANTUMZXB_NATIVE_COIN_WHITEPAPER_V03.md) (read alongside the later CP-0437 and CP-0465 release decisions)
 - **Current engineering roadmap:** [QuantumZXB Engineering & Ecosystem Roadmap v0.3](docs/QUANTUMZXB_MASTER_ROADMAP_V03.md)
-- **Production gate status:** Gate 2 and Gate 8 remain open; native QZXB mainnet and a liquid native-coin market are not launched.
+- **Historical production-gate status (2026-10-29 / v0.4 context):** Gate 2 and Gate 8 were recorded as open at that point. The later CP-0780 update (2026-11-19) records the owner report as COMPLETE / NOT RETESTED; no Gate test is repeated by this note. This owner report does not mean the Public Testnet is live: the unified package still has an empty bootstrap peer set and requires reconciliation of the prior approved endpoint/operator/Noise receipts. Mainnet and market activity remain unauthorized.
 
 Both the former 4B founder / 3B mining / 3B public-goods proposal, the v0.4 percentage-bucket proposal, and the later CP-0437 10B owner-only target are historical. CP-0651 is the active candidate policy: a 7B gross accounting ceiling, a 1B owner Genesis allocation, six non-circulating accounting ceilings and zero block subsidy. The separate QX ERC-20 deployment on Ethereum Sepolia is a test asset, not the native QZXB coin or a production market.
 
