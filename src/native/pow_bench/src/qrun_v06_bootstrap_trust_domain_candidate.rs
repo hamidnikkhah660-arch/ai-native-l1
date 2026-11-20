@@ -77,7 +77,7 @@ impl BootstrapTrustDomainPolicy {
     ///
     /// With a bounded attempt budget, one relay from each configured domain is considered
     /// before a second relay from any domain. Domain IDs remain local operator metadata.
-    pub fn order_relays_by_domain<T: Copy>(
+    pub fn order_relays_by_domain<T: Clone>(
         &self,
         relays: &[(RelayStaticKey, T)],
     ) -> Result<Vec<T>, TrustDomainPolicyError> {
@@ -88,7 +88,7 @@ impl BootstrapTrustDomainPolicy {
                 return Err(TrustDomainPolicyError::DuplicateRelayKey);
             }
             let domain_id = self.domain_for(relay_key)?;
-            grouped.entry(domain_id).or_default().push(*value);
+            grouped.entry(domain_id).or_default().push(value.clone());
         }
 
         let max_domain_width = grouped.values().map(Vec::len).max().unwrap_or(0);
@@ -96,7 +96,7 @@ impl BootstrapTrustDomainPolicy {
         for index in 0..max_domain_width {
             for domain_relays in grouped.values() {
                 if let Some(value) = domain_relays.get(index) {
-                    ordered.push(*value);
+                    ordered.push(value.clone());
                 }
             }
         }
