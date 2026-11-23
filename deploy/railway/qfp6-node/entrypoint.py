@@ -95,10 +95,17 @@ def build_config(role: str) -> tuple[dict, bytes]:
     BOOTSTRAP.write_bytes(bootstrap_bytes)
     bootstrap_sha = hashlib.sha256(bootstrap_bytes).hexdigest()
 
-    (DATA / "node-data").mkdir(parents=True, exist_ok=True)
-    (DATA / "mempool").mkdir(parents=True, exist_ok=True)
-    (DATA / "q6pd").mkdir(parents=True, exist_ok=True)
-    (DATA / "anchor-vault").mkdir(parents=True, exist_ok=True)
+    # Keep each logical node's durable state isolated. Versioned paths also
+    # prevent an interrupted, pre-listener validation attempt from poisoning the
+    # next clean Genesis bootstrap on the same persistent Railway volume.
+    node_data = DATA / f"node-data-{role}-v2"
+    mempool_data = DATA / f"mempool-{role}-v2"
+    q6pd_data = DATA / f"q6pd-{role}-v2"
+    anchor_vault = DATA / f"anchor-vault-{role}-v2"
+    (node_data).mkdir(parents=True, exist_ok=True)
+    (mempool_data).mkdir(parents=True, exist_ok=True)
+    (q6pd_data).mkdir(parents=True, exist_ok=True)
+    (anchor_vault).mkdir(parents=True, exist_ok=True)
     (DATA / "keys").mkdir(parents=True, exist_ok=True)
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -108,8 +115,8 @@ def build_config(role: str) -> tuple[dict, bytes]:
         "allow_public_listener": True,
         "listen_address": "0.0.0.0:31000" if is_public else "127.0.0.1:31000",
         "node_role": "seed" if is_seed else "joining",
-        "data_directory": "/data/node-data",
-        "mempool_directory": "/data/mempool",
+        "data_directory": str(node_data),
+        "mempool_directory": str(mempool_data),
         "bootstrap_peers_path": str(BOOTSTRAP),
         "bootstrap_peers_sha256": bootstrap_sha,
         "genesis_snapshot_path": artifact("genesis-snapshot.q6sn"),
@@ -126,13 +133,12 @@ def build_config(role: str) -> tuple[dict, bytes]:
         "public_testnet_acknowledgement": "ZERO_VALUE_PUBLIC_TESTNET_NO_MAINNET_NO_MARKET",
         "public_inbound_security_acknowledgement": "ANONYMOUS_NOISE_XX_UNAUTHENTICATED",
         "node_noise_private_key_path": "/data/keys/noise.npk",
-        "producer_account": "00" * 32,
-        "trusted_manifest_anchor_vault_path": "/data/anchor-vault",
+        "trusted_manifest_anchor_vault_path": str(anchor_vault),
         "require_device_root_binding": False,
         "enable_q6pd_peer_discovery": True,
         "enable_q6pd_peer_pull": True,
         "enable_q6pd_self_announcement": is_public,
-        "q6pd_peer_record_store_path": "/data/q6pd/peer-record-store.json",
+        "q6pd_peer_record_store_path": str(q6pd_data / "peer-record-store.json"),
         "enable_q6ar_candidate_address_book": False,
         "enable_q6ar_candidate_pull": False,
         "enable_peer_address_book": False,
