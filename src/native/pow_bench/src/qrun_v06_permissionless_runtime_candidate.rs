@@ -2361,6 +2361,7 @@ mod tests {
         assert_eq!(genesis_status.height, 0);
         assert_eq!(genesis_status.manifest_generation, 0);
         let genesis_anchor = genesis_status.manifest_anchor;
+        assert_eq!(genesis_anchor, expected_genesis_anchor);
         assert_eq!(
             runtime.local_anchor_vault_tip().unwrap().manifest_anchor,
             genesis_anchor
