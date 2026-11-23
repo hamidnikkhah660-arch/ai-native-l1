@@ -2347,15 +2347,15 @@ mod tests {
         let expected_genesis_anchor = expected_store.manifest_anchor().unwrap();
         drop(expected_store);
         fs::remove_dir_all(&expected_genesis_dir).unwrap();
-        let mut runtime = QRunV06PermissionlessNodeRuntime::open_with_fresh_genesis_anchor_vault(
-            &data_dir,
-            genesis.clone(),
-            params.clone(),
-            &authenticator,
-            &verified_pin,
-            expected_genesis_anchor,
-            &vault_dir,
-        )
+        let mut runtime =
+            QRunV06PermissionlessNodeRuntime::open_with_verified_genesis_fresh_anchor_vault(
+                &data_dir,
+                genesis.clone(),
+                params.clone(),
+                &authenticator,
+                &verified_pin,
+                &vault_dir,
+            )
         .unwrap();
         let genesis_status = runtime.status().unwrap();
         assert_eq!(genesis_status.height, 0);
