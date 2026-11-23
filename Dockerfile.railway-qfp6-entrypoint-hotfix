@@ -1,0 +1,7 @@
+# Minimal hotfix layer: preserve the verified QFP6 Linux binary and replace only
+# the Railway bootstrap logic. The base image contains the CP-0850 software-key
+# custody gate and the producer-account-from-Genesis fix.
+FROM ghcr.io/hamidnikkhah660-arch/qfp6-railway-node:5d95809d60da
+USER root
+COPY deploy/railway/qfp6-node/entrypoint.py /app/entrypoint.py
+RUN chmod 0644 /app/entrypoint.py && chown root:root /app/entrypoint.py
