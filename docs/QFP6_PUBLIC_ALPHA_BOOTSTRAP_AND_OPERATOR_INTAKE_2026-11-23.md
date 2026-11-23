@@ -8,7 +8,7 @@
 
 - Peer file: [qfp6-public-testnet-bootstrap-peers-v1.json](../assets/qfp6-public-testnet-bootstrap-peers-v1.json)
 - Manifest: [qfp6-public-testnet-bootstrap-v1.json](../assets/qfp6-public-testnet-bootstrap-v1.json)
-- Peer-file SHA-256: `d61c0237d3f8117cb9181b301a3ca6166446b8f7d9ce152582f832228ff1ce3d`
+- Peer-file SHA-256: `2305ca15acda495960f1e84f4f3f2a7d5b20e279a58953bbc6328e9b16b15e07`
 - Seed endpoint: `heymed.tail2a756d.ts.net:443`
 - TLS SNI: `heymed.tail2a756d.ts.net`
 - Seed Noise static public-key pin: `9899d6d17d1659df8befcca2bf3ebe19ebe106a8c3d9bd0a4f06d141db3af508`
