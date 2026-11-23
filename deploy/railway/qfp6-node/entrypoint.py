@@ -107,7 +107,8 @@ def build_config(role: str) -> tuple[dict, bytes]:
     q6pd_data.mkdir(parents=True, exist_ok=True)
     # Do NOT pre-create the anchor-vault directory. A fresh Joining node must
     # see it as absent so the runtime can provision the Genesis-rooted vault
-    # atomically. An existing empty vault is correctly rejected as corruption.
+    # only after validating the pinned Genesis trust material. An empty vault
+    # directory is treated as corruption and must never be pre-created here.
     (DATA / "keys").mkdir(parents=True, exist_ok=True)
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
