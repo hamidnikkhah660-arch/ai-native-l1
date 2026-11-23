@@ -1,0 +1,64 @@
+name: QFP6 Railway Docker image
+
+on:
+  push:
+    branches: [release/qfp6-railway-node-image-v2]
+    paths:
+      - "src/native/pow_bench/**"
+      - "release/qfp6-candidate/artifacts/**"
+      - "deploy/railway/qfp6-node/**"
+      - "Dockerfile.railway-qfp6"
+      - ".github/workflows/qfp6-railway-docker-image.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: qfp6-railway-docker-image
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact source revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Build Linux x86_64 QFP6 image
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA:0:12}"
+          image="ghcr.io/hamidnikkhah660-arch/qfp6-railway-node"
+          echo "QFP6_IMAGE_REF=${image}:${short_sha}" >> "${GITHUB_OUTPUT}"
+          docker build --pull --platform linux/amd64 \
+            --file Dockerfile.railway-qfp6 \
+            --label "org.opencontainers.image.source=https://github.com/hamidnikkhah660-arch/ai-native-l1" \
+            --label "org.opencontainers.image.description=QFP6 zero-value public testnet node; no Mainnet authority" \
+            --tag "${image}:${short_sha}" .
+
+      - name: Login and publish to GitHub Container Registry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/hamidnikkhah660-arch/qfp6-railway-node"
+          tag="${GITHUB_SHA:0:12}"
+          printf '%s' "${GH_TOKEN}" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+          docker push "${image}:${tag}"
+
+          # A package linked to this public repository inherits its visibility.
+          # Try to make that intent explicit when the token has package-admin rights.
+          if ! gh api --method PATCH \
+            "/users/hamidnikkhah660-arch/packages/container/qfp6-railway-node/visibility" \
+            --field visibility=public >/dev/null; then
+            echo "Package visibility API did not accept the update; verifying anonymous pull next."
+          fi
+
+          docker logout ghcr.io
+          docker manifest inspect "${image}:${tag}" >/dev/null
+          echo "QFP6_PUBLIC_IMAGE=${image}:${tag}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "QFP6_GHCR_ANONYMOUS_PULL=PASS" >> "${GITHUB_STEP_SUMMARY}"
