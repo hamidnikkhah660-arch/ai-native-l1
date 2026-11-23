@@ -1,0 +1,24 @@
+# QFP6 zero-value Public Testnet node image.
+# The testnet service keys are injected by Railway secrets at runtime; never bake keys into this image.
+FROM rust:1-bookworm AS builder
+WORKDIR /src
+COPY . .
+WORKDIR /src/src/native/pow_bench
+RUN cargo build --release --locked --bin qrun_v06_node
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates python3 \
+    && rm -rf /var/lib/apt/lists/*
+RUN useradd --system --uid 10001 --home-dir /data --create-home qfp6 \
+    && mkdir -p /app/assets /data \
+    && chown -R qfp6:qfp6 /data
+COPY --from=builder /src/src/native/pow_bench/target/release/qrun_v06_node /usr/local/bin/qrun_v06_node
+COPY release/qfp6-candidate/artifacts/ /app/assets/
+COPY deploy/railway/qfp6-node/entrypoint.py /app/entrypoint.py
+RUN chmod 0755 /usr/local/bin/qrun_v06_node /app/entrypoint.py \
+    && chown -R root:root /app
+USER qfp6
+WORKDIR /app
+EXPOSE 31000/tcp
+ENTRYPOINT ["python3", "/app/entrypoint.py"]
