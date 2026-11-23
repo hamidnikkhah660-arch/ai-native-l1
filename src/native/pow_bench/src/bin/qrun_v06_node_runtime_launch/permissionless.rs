@@ -1432,7 +1432,7 @@ fn software_testnet_key_custody_enabled(
         None | Some(Value::Bool(false)) => {
             if cfg.get("software_testnet_key_custody_acknowledgement").is_some() {
                 return Err(
-                    "software_testnet_keys_acknowledgement is forbidden unless software testnet key custody are enabled"
+                    "software_testnet_key_custody_acknowledgement is forbidden unless software testnet key custody is enabled"
                         .into(),
                 );
             }
@@ -1445,11 +1445,11 @@ fn software_testnet_key_custody_enabled(
                         .into(),
                 );
             }
-            if req(cfg, "software_testnet_keys_acknowledgement")?
+            if req(cfg, "software_testnet_key_custody_acknowledgement")?
                 != PUBLIC_TESTNET_SOFTWARE_KEYS_ACK
             {
                 return Err(format!(
-                    "software_testnet_keys_acknowledgement must be exactly '{PUBLIC_TESTNET_SOFTWARE_KEYS_ACK}'"
+                    "software_testnet_key_custody_acknowledgement must be exactly '{PUBLIC_TESTNET_SOFTWARE_KEYS_ACK}'"
                 ));
             }
             if cfg.get("require_device_root_binding").and_then(Value::as_bool) == Some(true) {
@@ -4507,7 +4507,7 @@ mod software_testnet_ephemeral_key_policy_tests {
     fn software_ephemeral_keys_require_explicit_zero_value_testnet_acknowledgement() {
         let cfg = json!({
             "allow_software_testnet_key_custody": true,
-            "software_testnet_keys_acknowledgement": PUBLIC_TESTNET_SOFTWARE_KEYS_ACK
+            "software_testnet_key_custody_acknowledgement": PUBLIC_TESTNET_SOFTWARE_KEYS_ACK
         });
         assert_eq!(software_testnet_key_custody_enabled(&cfg, true), Ok(true));
         assert!(software_testnet_key_custody_enabled(&cfg, false).is_err());
@@ -4520,14 +4520,14 @@ mod software_testnet_ephemeral_key_policy_tests {
 
         let mixed = json!({
             "allow_software_testnet_key_custody": true,
-            "software_testnet_keys_acknowledgement": PUBLIC_TESTNET_SOFTWARE_KEYS_ACK,
+            "software_testnet_key_custody_acknowledgement": PUBLIC_TESTNET_SOFTWARE_KEYS_ACK,
             "device_root_metadata_path": "/run/not-used/device-root.json"
         });
         assert!(software_testnet_key_custody_enabled(&mixed, true).is_err());
 
         let disabled_with_ack = json!({
             "allow_software_testnet_key_custody": false,
-            "software_testnet_keys_acknowledgement": PUBLIC_TESTNET_SOFTWARE_KEYS_ACK
+            "software_testnet_key_custody_acknowledgement": PUBLIC_TESTNET_SOFTWARE_KEYS_ACK
         });
         assert!(software_testnet_key_custody_enabled(&disabled_with_ack, true).is_err());
     }
