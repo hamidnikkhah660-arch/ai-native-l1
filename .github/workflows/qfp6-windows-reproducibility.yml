@@ -1,0 +1,185 @@
+name: QFP6 Windows x64 reproducible build comparison
+
+on:
+  push:
+    branches:
+      - "review/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qfp6-windows-repro-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build_a:
+    name: Clean Windows build A
+    runs-on: windows-2022
+    timeout-minutes: 60
+    outputs:
+      commit: ${{ steps.build.outputs.commit }}
+      sha256: ${{ steps.build.outputs.sha256 }}
+      size: ${{ steps.build.outputs.size }}
+      rustc: ${{ steps.build.outputs.rustc }}
+      cargo: ${{ steps.build.outputs.cargo }}
+      linker: ${{ steps.build.outputs.linker }}
+      lock_sha256: ${{ steps.build.outputs.lock_sha256 }}
+    steps:
+      - name: Checkout exact pushed revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust 1.82.0
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.82.0
+
+      - name: Record toolchain and build qrun_v06_node Release
+        id: build
+        shell: pwsh
+        working-directory: src/native/pow_bench
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $commit = '${{ github.sha }}'
+          $rustc = (rustc --version).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'rustc version query failed.' }
+          $cargo = (cargo --version).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'cargo version query failed.' }
+          $linkCommand = Get-Command link.exe -ErrorAction Stop
+          $linker = (Get-Item $linkCommand.Source).VersionInfo.FileVersion
+          if ([string]::IsNullOrWhiteSpace($linker)) { throw 'MSVC linker version could not be established.' }
+          if (-not (Test-Path 'Cargo.lock')) { throw 'Cargo.lock is missing from the build root.' }
+          $lockHash = (Get-FileHash 'Cargo.lock' -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "BUILD_COMMIT=$commit"
+          Write-Host "RUSTC=$rustc"
+          Write-Host "CARGO=$cargo"
+          Write-Host "MSVC_LINKER_FILE_VERSION=$linker"
+          Write-Host "CARGO_LOCK_SHA256=$lockHash"
+          cargo build --locked --release --bin qrun_v06_node -j 1
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed.' }
+          $binary = 'target\release\qrun_v06_node.exe'
+          if (-not (Test-Path $binary)) { throw 'Expected Release executable was not produced.' }
+          $hash = (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant()
+          $size = (Get-Item $binary).Length
+          Write-Host "QFP6_RELEASE_EXE_SHA256=$hash"
+          Write-Host "QFP6_RELEASE_EXE_SIZE=$size"
+          "commit=$commit" >> $env:GITHUB_OUTPUT
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+          "size=$size" >> $env:GITHUB_OUTPUT
+          "rustc=$rustc" >> $env:GITHUB_OUTPUT
+          "cargo=$cargo" >> $env:GITHUB_OUTPUT
+          "linker=$linker" >> $env:GITHUB_OUTPUT
+          "lock_sha256=$lockHash" >> $env:GITHUB_OUTPUT
+
+  build_b:
+    name: Clean Windows build B (separate hosted VM)
+    runs-on: windows-2022
+    timeout-minutes: 60
+    outputs:
+      commit: ${{ steps.build.outputs.commit }}
+      sha256: ${{ steps.build.outputs.sha256 }}
+      size: ${{ steps.build.outputs.size }}
+      rustc: ${{ steps.build.outputs.rustc }}
+      cargo: ${{ steps.build.outputs.cargo }}
+      linker: ${{ steps.build.outputs.linker }}
+      lock_sha256: ${{ steps.build.outputs.lock_sha256 }}
+    steps:
+      - name: Checkout exact pushed revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust 1.82.0
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.82.0
+
+      - name: Record toolchain and build qrun_v06_node Release
+        id: build
+        shell: pwsh
+        working-directory: src/native/pow_bench
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $commit = '${{ github.sha }}'
+          $rustc = (rustc --version).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'rustc version query failed.' }
+          $cargo = (cargo --version).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'cargo version query failed.' }
+          $linkCommand = Get-Command link.exe -ErrorAction Stop
+          $linker = (Get-Item $linkCommand.Source).VersionInfo.FileVersion
+          if ([string]::IsNullOrWhiteSpace($linker)) { throw 'MSVC linker version could not be established.' }
+          if (-not (Test-Path 'Cargo.lock')) { throw 'Cargo.lock is missing from the build root.' }
+          $lockHash = (Get-FileHash 'Cargo.lock' -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "BUILD_COMMIT=$commit"
+          Write-Host "RUSTC=$rustc"
+          Write-Host "CARGO=$cargo"
+          Write-Host "MSVC_LINKER_FILE_VERSION=$linker"
+          Write-Host "CARGO_LOCK_SHA256=$lockHash"
+          cargo build --locked --release --bin qrun_v06_node -j 1
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed.' }
+          $binary = 'target\release\qrun_v06_node.exe'
+          if (-not (Test-Path $binary)) { throw 'Expected Release executable was not produced.' }
+          $hash = (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant()
+          $size = (Get-Item $binary).Length
+          Write-Host "QFP6_RELEASE_EXE_SHA256=$hash"
+          Write-Host "QFP6_RELEASE_EXE_SIZE=$size"
+          "commit=$commit" >> $env:GITHUB_OUTPUT
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+          "size=$size" >> $env:GITHUB_OUTPUT
+          "rustc=$rustc" >> $env:GITHUB_OUTPUT
+          "cargo=$cargo" >> $env:GITHUB_OUTPUT
+          "linker=$linker" >> $env:GITHUB_OUTPUT
+          "lock_sha256=$lockHash" >> $env:GITHUB_OUTPUT
+
+  compare:
+    name: Compare independent Windows outputs
+    runs-on: ubuntu-latest
+    needs: [build_a, build_b]
+    if: always()
+    steps:
+      - name: Report reproducibility evidence
+        shell: bash
+        env:
+          COMMIT_A: ${{ needs.build_a.outputs.commit }}
+          COMMIT_B: ${{ needs.build_b.outputs.commit }}
+          HASH_A: ${{ needs.build_a.outputs.sha256 }}
+          HASH_B: ${{ needs.build_b.outputs.sha256 }}
+          SIZE_A: ${{ needs.build_a.outputs.size }}
+          SIZE_B: ${{ needs.build_b.outputs.size }}
+          RUSTC_A: ${{ needs.build_a.outputs.rustc }}
+          RUSTC_B: ${{ needs.build_b.outputs.rustc }}
+          CARGO_A: ${{ needs.build_a.outputs.cargo }}
+          CARGO_B: ${{ needs.build_b.outputs.cargo }}
+          LINKER_A: ${{ needs.build_a.outputs.linker }}
+          LINKER_B: ${{ needs.build_b.outputs.linker }}
+          LOCK_A: ${{ needs.build_a.outputs.lock_sha256 }}
+          LOCK_B: ${{ needs.build_b.outputs.lock_sha256 }}
+        run: |
+          set -euo pipefail
+          {
+            echo '## QFP6 independent Windows Release build comparison'
+            echo
+            echo "- Commit A: \`${COMMIT_A:-missing}\`"
+            echo "- Commit B: \`${COMMIT_B:-missing}\`"
+            echo "- Build A SHA-256: \`${HASH_A:-missing}\` (size: ${SIZE_A:-missing})"
+            echo "- Build B SHA-256: \`${HASH_B:-missing}\` (size: ${SIZE_B:-missing})"
+            echo "- Rust: \`${RUSTC_A:-missing}\` / \`${RUSTC_B:-missing}\`"
+            echo "- Cargo: \`${CARGO_A:-missing}\` / \`${CARGO_B:-missing}\`"
+            echo "- MSVC linker: \`${LINKER_A:-missing}\` / \`${LINKER_B:-missing}\`"
+            echo "- Cargo.lock SHA-256: \`${LOCK_A:-missing}\` / \`${LOCK_B:-missing}\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ -z "$HASH_A" || -z "$HASH_B" ]]; then
+            echo 'RESULT=BUILD_OR_OUTPUT_MISSING' | tee -a "$GITHUB_STEP_SUMMARY"
+          elif [[ "$COMMIT_A" != "$COMMIT_B" || "$LOCK_A" != "$LOCK_B" || "$RUSTC_A" != "$RUSTC_B" || "$CARGO_A" != "$CARGO_B" || "$LINKER_A" != "$LINKER_B" ]]; then
+            echo 'RESULT=INCONCLUSIVE_ENVIRONMENT_MISMATCH' | tee -a "$GITHUB_STEP_SUMMARY"
+          elif [[ "$HASH_A" == "$HASH_B" && "$SIZE_A" == "$SIZE_B" ]]; then
+            echo 'RESULT=WHOLE_FILE_IDENTICAL_ACROSS_TWO_HOSTED_WINDOWS_BUILDS' | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'RESULT=WHOLE_FILE_DIFFERENT_ACROSS_TWO_HOSTED_WINDOWS_BUILDS' | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          echo 'This diagnostic reports the comparison result; a green workflow is not, by itself, a reproducibility approval.'
