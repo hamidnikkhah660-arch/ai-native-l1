@@ -24,6 +24,8 @@ jobs:
       rustc: ${{ steps.build.outputs.rustc }}
       cargo: ${{ steps.build.outputs.cargo }}
       linker: ${{ steps.build.outputs.linker }}
+      lib_sha256: ${{ steps.build.outputs.lib_sha256 }}
+      windows_sdk: ${{ steps.build.outputs.windows_sdk }}
       lock_sha256: ${{ steps.build.outputs.lock_sha256 }}
     steps:
       - name: Checkout exact pushed revision
@@ -49,14 +51,30 @@ jobs:
           $cargo = (cargo --version).Trim()
           if ($LASTEXITCODE -ne 0) { throw 'cargo version query failed.' }
           $linkCommand = Get-Command link.exe -ErrorAction Stop
-          $linker = (Get-Item $linkCommand.Source).VersionInfo.FileVersion
-          if ([string]::IsNullOrWhiteSpace($linker)) { throw 'MSVC linker version could not be established.' }
+          $linkerPath = $linkCommand.Source
+          if (-not (Test-Path $linkerPath)) { throw 'MSVC linker executable path is unavailable.' }
+          $linker = (Get-FileHash $linkerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $libPath = Join-Path (Split-Path $linkerPath -Parent) 'lib.exe'
+          if (-not (Test-Path $libPath)) { throw 'MSVC librarian executable is missing beside link.exe.' }
+          $libHash = (Get-FileHash $libPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $windowsSdk = ([string]$env:WindowsSDKVersion).TrimEnd('\')
+          if ([string]::IsNullOrWhiteSpace($windowsSdk)) {
+            $sdkLibRoot = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Windows Kits\10\Lib'
+            if (Test-Path $sdkLibRoot) {
+              $sdkDir = Get-ChildItem $sdkLibRoot -Directory | Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+              if ($sdkDir) { $windowsSdk = $sdkDir.Name }
+            }
+          }
+          if ([string]::IsNullOrWhiteSpace($windowsSdk)) { throw 'Windows SDK version could not be established.' }
           if (-not (Test-Path 'Cargo.lock')) { throw 'Cargo.lock is missing from the build root.' }
           $lockHash = (Get-FileHash 'Cargo.lock' -Algorithm SHA256).Hash.ToLowerInvariant()
           Write-Host "BUILD_COMMIT=$commit"
           Write-Host "RUSTC=$rustc"
           Write-Host "CARGO=$cargo"
-          Write-Host "MSVC_LINKER_FILE_VERSION=$linker"
+          Write-Host "MSVC_LINKER_PATH=$linkerPath"
+          Write-Host "MSVC_LINKER_SHA256=$linker"
+          Write-Host "MSVC_LIB_SHA256=$libHash"
+          Write-Host "WINDOWS_SDK_VERSION=$windowsSdk"
           Write-Host "CARGO_LOCK_SHA256=$lockHash"
           cargo build --locked --release --bin qrun_v06_node -j 1
           if ($LASTEXITCODE -ne 0) { throw 'Release build failed.' }
@@ -72,6 +90,8 @@ jobs:
           "rustc=$rustc" >> $env:GITHUB_OUTPUT
           "cargo=$cargo" >> $env:GITHUB_OUTPUT
           "linker=$linker" >> $env:GITHUB_OUTPUT
+          "lib_sha256=$libHash" >> $env:GITHUB_OUTPUT
+          "windows_sdk=$windowsSdk" >> $env:GITHUB_OUTPUT
           "lock_sha256=$lockHash" >> $env:GITHUB_OUTPUT
 
   build_b:
@@ -85,6 +105,8 @@ jobs:
       rustc: ${{ steps.build.outputs.rustc }}
       cargo: ${{ steps.build.outputs.cargo }}
       linker: ${{ steps.build.outputs.linker }}
+      lib_sha256: ${{ steps.build.outputs.lib_sha256 }}
+      windows_sdk: ${{ steps.build.outputs.windows_sdk }}
       lock_sha256: ${{ steps.build.outputs.lock_sha256 }}
     steps:
       - name: Checkout exact pushed revision
@@ -110,14 +132,30 @@ jobs:
           $cargo = (cargo --version).Trim()
           if ($LASTEXITCODE -ne 0) { throw 'cargo version query failed.' }
           $linkCommand = Get-Command link.exe -ErrorAction Stop
-          $linker = (Get-Item $linkCommand.Source).VersionInfo.FileVersion
-          if ([string]::IsNullOrWhiteSpace($linker)) { throw 'MSVC linker version could not be established.' }
+          $linkerPath = $linkCommand.Source
+          if (-not (Test-Path $linkerPath)) { throw 'MSVC linker executable path is unavailable.' }
+          $linker = (Get-FileHash $linkerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $libPath = Join-Path (Split-Path $linkerPath -Parent) 'lib.exe'
+          if (-not (Test-Path $libPath)) { throw 'MSVC librarian executable is missing beside link.exe.' }
+          $libHash = (Get-FileHash $libPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $windowsSdk = ([string]$env:WindowsSDKVersion).TrimEnd('\')
+          if ([string]::IsNullOrWhiteSpace($windowsSdk)) {
+            $sdkLibRoot = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Windows Kits\10\Lib'
+            if (Test-Path $sdkLibRoot) {
+              $sdkDir = Get-ChildItem $sdkLibRoot -Directory | Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+              if ($sdkDir) { $windowsSdk = $sdkDir.Name }
+            }
+          }
+          if ([string]::IsNullOrWhiteSpace($windowsSdk)) { throw 'Windows SDK version could not be established.' }
           if (-not (Test-Path 'Cargo.lock')) { throw 'Cargo.lock is missing from the build root.' }
           $lockHash = (Get-FileHash 'Cargo.lock' -Algorithm SHA256).Hash.ToLowerInvariant()
           Write-Host "BUILD_COMMIT=$commit"
           Write-Host "RUSTC=$rustc"
           Write-Host "CARGO=$cargo"
-          Write-Host "MSVC_LINKER_FILE_VERSION=$linker"
+          Write-Host "MSVC_LINKER_PATH=$linkerPath"
+          Write-Host "MSVC_LINKER_SHA256=$linker"
+          Write-Host "MSVC_LIB_SHA256=$libHash"
+          Write-Host "WINDOWS_SDK_VERSION=$windowsSdk"
           Write-Host "CARGO_LOCK_SHA256=$lockHash"
           cargo build --locked --release --bin qrun_v06_node -j 1
           if ($LASTEXITCODE -ne 0) { throw 'Release build failed.' }
@@ -133,6 +171,8 @@ jobs:
           "rustc=$rustc" >> $env:GITHUB_OUTPUT
           "cargo=$cargo" >> $env:GITHUB_OUTPUT
           "linker=$linker" >> $env:GITHUB_OUTPUT
+          "lib_sha256=$libHash" >> $env:GITHUB_OUTPUT
+          "windows_sdk=$windowsSdk" >> $env:GITHUB_OUTPUT
           "lock_sha256=$lockHash" >> $env:GITHUB_OUTPUT
 
   compare:
@@ -156,6 +196,10 @@ jobs:
           CARGO_B: ${{ needs.build_b.outputs.cargo }}
           LINKER_A: ${{ needs.build_a.outputs.linker }}
           LINKER_B: ${{ needs.build_b.outputs.linker }}
+          LIB_A: ${{ needs.build_a.outputs.lib_sha256 }}
+          LIB_B: ${{ needs.build_b.outputs.lib_sha256 }}
+          SDK_A: ${{ needs.build_a.outputs.windows_sdk }}
+          SDK_B: ${{ needs.build_b.outputs.windows_sdk }}
           LOCK_A: ${{ needs.build_a.outputs.lock_sha256 }}
           LOCK_B: ${{ needs.build_b.outputs.lock_sha256 }}
         run: |
@@ -169,13 +213,15 @@ jobs:
             echo "- Build B SHA-256: \`${HASH_B:-missing}\` (size: ${SIZE_B:-missing})"
             echo "- Rust: \`${RUSTC_A:-missing}\` / \`${RUSTC_B:-missing}\`"
             echo "- Cargo: \`${CARGO_A:-missing}\` / \`${CARGO_B:-missing}\`"
-            echo "- MSVC linker: \`${LINKER_A:-missing}\` / \`${LINKER_B:-missing}\`"
+            echo "- MSVC linker SHA-256: \`${LINKER_A:-missing}\` / \`${LINKER_B:-missing}\`"
+            echo "- MSVC librarian SHA-256: \`${LIB_A:-missing}\` / \`${LIB_B:-missing}\`"
+            echo "- Windows SDK: \`${SDK_A:-missing}\` / \`${SDK_B:-missing}\`"
             echo "- Cargo.lock SHA-256: \`${LOCK_A:-missing}\` / \`${LOCK_B:-missing}\`"
             echo
           } >> "$GITHUB_STEP_SUMMARY"
           if [[ -z "$HASH_A" || -z "$HASH_B" ]]; then
             echo 'RESULT=BUILD_OR_OUTPUT_MISSING' | tee -a "$GITHUB_STEP_SUMMARY"
-          elif [[ "$COMMIT_A" != "$COMMIT_B" || "$LOCK_A" != "$LOCK_B" || "$RUSTC_A" != "$RUSTC_B" || "$CARGO_A" != "$CARGO_B" || "$LINKER_A" != "$LINKER_B" ]]; then
+          elif [[ "$COMMIT_A" != "$COMMIT_B" || "$LOCK_A" != "$LOCK_B" || "$RUSTC_A" != "$RUSTC_B" || "$CARGO_A" != "$CARGO_B" || "$LINKER_A" != "$LINKER_B" || "$LIB_A" != "$LIB_B" || "$SDK_A" != "$SDK_B" ]]; then
             echo 'RESULT=INCONCLUSIVE_ENVIRONMENT_MISMATCH' | tee -a "$GITHUB_STEP_SUMMARY"
           elif [[ "$HASH_A" == "$HASH_B" && "$SIZE_A" == "$SIZE_B" ]]; then
             echo 'RESULT=WHOLE_FILE_IDENTICAL_ACROSS_TWO_HOSTED_WINDOWS_BUILDS' | tee -a "$GITHUB_STEP_SUMMARY"
