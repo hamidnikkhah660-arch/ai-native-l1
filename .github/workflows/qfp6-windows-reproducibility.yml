@@ -54,9 +54,14 @@ jobs:
           $linkerPath = $linkCommand.Source
           if (-not (Test-Path $linkerPath)) { throw 'MSVC linker executable path is unavailable.' }
           $linker = (Get-FileHash $linkerPath -Algorithm SHA256).Hash.ToLowerInvariant()
-          $libPath = Join-Path (Split-Path $linkerPath -Parent) 'lib.exe'
-          if (-not (Test-Path $libPath)) { throw 'MSVC librarian executable is missing beside link.exe.' }
-          $libHash = (Get-FileHash $libPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $libCommand = Get-Command lib.exe -ErrorAction SilentlyContinue
+          if ($libCommand -and (Test-Path $libCommand.Source)) {
+            $libPath = $libCommand.Source
+            $libHash = (Get-FileHash $libPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          } else {
+            $libPath = 'NOT_FOUND_IN_PATH'
+            $libHash = 'NOT_FOUND_IN_PATH'
+          }
           $windowsSdk = ([string]$env:WindowsSDKVersion).TrimEnd('\')
           if ([string]::IsNullOrWhiteSpace($windowsSdk)) {
             $sdkLibRoot = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Windows Kits\10\Lib'
@@ -72,6 +77,7 @@ jobs:
           Write-Host "RUSTC=$rustc"
           Write-Host "CARGO=$cargo"
           Write-Host "MSVC_LINKER_PATH=$linkerPath"
+          Write-Host "MSVC_LIB_PATH=$libPath"
           Write-Host "MSVC_LINKER_SHA256=$linker"
           Write-Host "MSVC_LIB_SHA256=$libHash"
           Write-Host "WINDOWS_SDK_VERSION=$windowsSdk"
@@ -135,9 +141,14 @@ jobs:
           $linkerPath = $linkCommand.Source
           if (-not (Test-Path $linkerPath)) { throw 'MSVC linker executable path is unavailable.' }
           $linker = (Get-FileHash $linkerPath -Algorithm SHA256).Hash.ToLowerInvariant()
-          $libPath = Join-Path (Split-Path $linkerPath -Parent) 'lib.exe'
-          if (-not (Test-Path $libPath)) { throw 'MSVC librarian executable is missing beside link.exe.' }
-          $libHash = (Get-FileHash $libPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $libCommand = Get-Command lib.exe -ErrorAction SilentlyContinue
+          if ($libCommand -and (Test-Path $libCommand.Source)) {
+            $libPath = $libCommand.Source
+            $libHash = (Get-FileHash $libPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          } else {
+            $libPath = 'NOT_FOUND_IN_PATH'
+            $libHash = 'NOT_FOUND_IN_PATH'
+          }
           $windowsSdk = ([string]$env:WindowsSDKVersion).TrimEnd('\')
           if ([string]::IsNullOrWhiteSpace($windowsSdk)) {
             $sdkLibRoot = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Windows Kits\10\Lib'
@@ -153,6 +164,7 @@ jobs:
           Write-Host "RUSTC=$rustc"
           Write-Host "CARGO=$cargo"
           Write-Host "MSVC_LINKER_PATH=$linkerPath"
+          Write-Host "MSVC_LIB_PATH=$libPath"
           Write-Host "MSVC_LINKER_SHA256=$linker"
           Write-Host "MSVC_LIB_SHA256=$libHash"
           Write-Host "WINDOWS_SDK_VERSION=$windowsSdk"
