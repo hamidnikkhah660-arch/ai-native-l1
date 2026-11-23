@@ -37,7 +37,7 @@ use crate::{
 };
 use rustls::{pki_types::ServerName, ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use std::{
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     sync::{atomic::AtomicBool, Arc, OnceLock},
     time::Duration,
 };
@@ -58,6 +58,7 @@ pub enum QRunV06HistorySyncServiceError {
     SnapshotMismatch,
     NoProgress,
     PageBudgetExceeded,
+    PeerDiscovery(String),
 }
 
 impl std::fmt::Display for QRunV06HistorySyncServiceError {
@@ -97,7 +98,7 @@ fn connect_history_sync_stream_with_tls_config(
     config: QRunV06HistorySyncClientConfig,
     tls_config: Option<Arc<ClientConfig>>,
 ) -> Result<Box<dyn QRunV06NoiseIo>, QRunV06HistorySyncServiceError> {
-    let tcp = TcpStream::connect_timeout(&address, config.connect_timeout)
+    let mut tcp = TcpStream::connect_timeout(&address, config.connect_timeout)
         .map_err(|error| QRunV06HistorySyncServiceError::Noise(error.to_string()))?;
     tcp.set_read_timeout(Some(config.io_timeout))
         .map_err(|error| QRunV06HistorySyncServiceError::Noise(error.to_string()))?;
@@ -112,11 +113,183 @@ fn connect_history_sync_stream_with_tls_config(
                 .map_err(|error| QRunV06HistorySyncServiceError::Noise(error.to_string()))?;
             let tls_config =
                 tls_config.ok_or(QRunV06HistorySyncServiceError::InvalidClientConfig)?;
-            let connection = ClientConnection::new(tls_config, server_name)
+            let mut connection = ClientConnection::new(tls_config, server_name)
                 .map_err(|error| QRunV06HistorySyncServiceError::Noise(error.to_string()))?;
+            // Complete the authenticated outer TLS/SNI tunnel before starting the inner
+            // eight-second Noise XX handshake budget. Funnel terminates TLS and forwards
+            // only the inner Noise byte stream to the Seed; keeping these phases separate
+            // makes relay/TLS failures distinguishable from Noise handshake failures.
+            let tls_started = std::time::Instant::now();
+            while connection.is_handshaking() {
+                connection.complete_io(&mut tcp).map_err(|error| {
+                    QRunV06HistorySyncServiceError::Noise(format!(
+                        "TLS relay handshake failed for {host}: {error}"
+                    ))
+                })?;
+            }
+            eprintln!(
+                "QFP6_SYNC_DIAG tls_relay_handshake_established server_name={} elapsed_ms={}",
+                host,
+                tls_started.elapsed().as_millis()
+            );
             Ok(Box::new(StreamOwned::new(connection, tcp)))
         }
     }
+}
+
+// Retry only a transient Noise handshake timeout. The public Seed listener is served in
+// finite rounds; a Funnel connection arriving at a round boundary can be accepted too late
+// for the 8-second Noise handshake budget. Trust, domain, and malformed-handshake failures
+// remain immediate fail-closed errors.
+const QFP6_HISTORY_SYNC_MAX_NOISE_HANDSHAKE_ATTEMPTS: usize = 8;
+
+fn is_retryable_history_sync_noise_io_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("peer closed connection without sending tls close_notify")
+        || message.contains("connection reset by peer")
+        || message.contains("broken pipe")
+        || message.contains("unexpected eof")
+}
+
+fn is_retryable_history_sync_handshake_error(error: &QRunV06NoiseError) -> bool {
+    match error {
+        QRunV06NoiseError::HandshakeTimeout => true,
+        QRunV06NoiseError::Io(message) => is_retryable_history_sync_noise_io_message(message),
+        _ => false,
+    }
+}
+
+const QFP6_HISTORY_SYNC_MAX_TRANSIENT_TRANSPORT_RETRIES: usize = 8;
+
+fn is_retryable_history_sync_transport_error(error: &QRunV06HistorySyncServiceError) -> bool {
+    match error {
+        QRunV06HistorySyncServiceError::Noise(message) => {
+            is_retryable_history_sync_noise_io_message(message)
+        }
+        _ => false,
+    }
+}
+
+fn history_sync_transport_retry_backoff(attempt: usize) -> Duration {
+    match attempt {
+        0 => Duration::from_millis(250),
+        1 => Duration::from_millis(500),
+        2 => Duration::from_secs(1),
+        3 => Duration::from_secs(2),
+        4 => Duration::from_secs(4),
+        5 => Duration::from_secs(8),
+        _ => Duration::from_secs(15),
+    }
+}
+
+pub(crate) fn connect_history_sync_noise_session_with_bounded_retry(
+    address: SocketAddr,
+    tls_server_name: Option<&str>,
+    config: QRunV06HistorySyncClientConfig,
+    local_static_private_key: &[u8; 32],
+    remote_static_public_key: &[u8; 32],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+) -> Result<(Box<dyn QRunV06NoiseIo>, QRunV06NoiseSession), QRunV06HistorySyncServiceError> {
+    for attempt in 0..QFP6_HISTORY_SYNC_MAX_NOISE_HANDSHAKE_ATTEMPTS {
+        eprintln!(
+            "QFP6_SYNC_DIAG noise_handshake_attempt address={} attempt={} max_attempts={}",
+            address,
+            attempt + 1,
+            QFP6_HISTORY_SYNC_MAX_NOISE_HANDSHAKE_ATTEMPTS
+        );
+        let mut stream = match connect_history_sync_stream(address, tls_server_name, config) {
+            Ok(stream) => stream,
+            Err(error)
+                if is_retryable_history_sync_transport_error(&error)
+                    && attempt + 1 < QFP6_HISTORY_SYNC_MAX_NOISE_HANDSHAKE_ATTEMPTS =>
+            {
+                let backoff = history_sync_transport_retry_backoff(attempt);
+                eprintln!(
+                    "QFP6_SYNC_DIAG noise_handshake_connect_retry address={} attempt={} retry_backoff_ms={} error={error:?}",
+                    address,
+                    attempt + 1,
+                    backoff.as_millis()
+                );
+                std::thread::sleep(backoff);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        match QRunV06NoiseSession::connect(
+            stream.as_mut(),
+            local_static_private_key,
+            remote_static_public_key,
+            network_id,
+            profile_id,
+        ) {
+            Ok(noise) => {
+                eprintln!(
+                    "QFP6_SYNC_DIAG noise_handshake_established address={} attempt={}",
+                    address,
+                    attempt + 1
+                );
+                return Ok((stream, noise));
+            }
+            Err(error)
+                if is_retryable_history_sync_handshake_error(&error)
+                    && attempt + 1 < QFP6_HISTORY_SYNC_MAX_NOISE_HANDSHAKE_ATTEMPTS =>
+            {
+                let backoff = history_sync_transport_retry_backoff(attempt);
+                eprintln!(
+                    "QFP6_SYNC_DIAG noise_handshake_retry address={} attempt={} retry_backoff_ms={} error={error:?}",
+                    address,
+                    attempt + 1,
+                    backoff.as_millis()
+                );
+                std::thread::sleep(backoff);
+            }
+            Err(error) => {
+                eprintln!(
+                    "QFP6_SYNC_DIAG noise_handshake_failed address={} attempt={} error={error:?}",
+                    address,
+                    attempt + 1
+                );
+                return Err(error.into());
+            }
+        }
+    }
+
+    Err(QRunV06HistorySyncServiceError::Noise(
+        "Noise handshake timed out after bounded retries".into(),
+    ))
+}
+
+/// Bitcoin-style feeler: open one short-lived transport and complete the exact pinned Noise
+/// handshake, then close without requesting history or changing the local chain state.
+pub fn probe_q6pd_pinned_peer(
+    address: SocketAddr,
+    local_static_private_key: &[u8; 32],
+    remote_static_public_key: &[u8; 32],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    tls_server_name: Option<&str>,
+    config: QRunV06HistorySyncClientConfig,
+) -> Result<(), QRunV06HistorySyncServiceError> {
+    config.validate()?;
+    let mut stream = connect_history_sync_stream(address, tls_server_name, config)?;
+    let noise = crate::qrun_v06_noise_transport_candidate::QRunV06NoiseSession::connect(
+        stream.as_mut(),
+        local_static_private_key,
+        remote_static_public_key,
+        network_id,
+        profile_id,
+    )?;
+    if !noise.remote_static_key_pinned()
+        || noise.remote_static_public_key() != remote_static_public_key
+    {
+        return Err(QRunV06HistorySyncServiceError::PeerDiscovery(
+            "Q6PD feeler did not authenticate the expected Noise peer pin".into(),
+        ));
+    }
+    drop(noise);
+    drop(stream);
+    Ok(())
 }
 
 impl From<Q6HistorySyncWireError> for QRunV06HistorySyncServiceError {
@@ -145,6 +318,9 @@ pub struct QRunV06HistorySnapshotInfo {
     pub height: u64,
     pub consensus_tip: [u8; 32],
     pub execution_tip: [u8; 32],
+    pub base_height: u64,
+    pub base_consensus_tip: [u8; 32],
+    pub base_execution_tip: [u8; 32],
 }
 
 /// One-peer responder state. At most one immutable fork-choice snapshot is retained.
@@ -166,10 +342,17 @@ impl QRunV06HistorySyncResponder {
         // A new mining block must not silently change Q6HR while a client is paging the old tip.
         if let Some(snapshot) = self.snapshot.as_ref() {
             let tip = snapshot.canonical_tip();
+            let base_consensus_tip = snapshot.base_tip();
+            let base_state = snapshot
+                .state_for_tip(&base_consensus_tip)
+                .ok_or(QRunV06HistorySyncServiceError::SnapshotUnavailable)?;
             return Ok(QRunV06HistorySnapshotInfo {
                 height: tip.height,
                 consensus_tip: tip.tip_hash,
                 execution_tip: snapshot.canonical_state().tip_hash(),
+                base_height: base_state.height(),
+                base_consensus_tip,
+                base_execution_tip: base_state.tip_hash(),
             });
         }
         let status = runtime.status()?;
@@ -178,12 +361,21 @@ impl QRunV06HistorySyncResponder {
         if consensus_tip != status.tip {
             return Err(QRunV06HistorySyncServiceError::SnapshotUnavailable);
         }
+        let base_consensus_tip = snapshot.base_tip();
+        let base_state = snapshot
+            .state_for_tip(&base_consensus_tip)
+            .ok_or(QRunV06HistorySyncServiceError::SnapshotUnavailable)?;
+        let base_height = base_state.height();
+        let base_execution_tip = base_state.tip_hash();
         let execution_tip = snapshot.canonical_state().tip_hash();
         self.snapshot = Some(snapshot);
         Ok(QRunV06HistorySnapshotInfo {
             height: status.height,
             consensus_tip,
             execution_tip,
+            base_height,
+            base_consensus_tip,
+            base_execution_tip,
         })
     }
 
@@ -279,6 +471,9 @@ pub fn serve_permissionless_history_sync_listener(
                     snapshot.height,
                     snapshot.consensus_tip,
                     snapshot.execution_tip,
+                    snapshot.base_height,
+                    snapshot.base_consensus_tip,
+                    snapshot.base_execution_tip,
                 )
                 .map_err(|error| format!("cannot encode Q6HR status: {error}"))?;
                 Ok(vec![status.to_vec()])
@@ -332,15 +527,81 @@ pub fn request_history_page_over_noise(
     request: QRunV06HistorySyncRequest,
     params: crate::consensus::ConsensusParameters,
 ) -> Result<QRunV06CanonicalHistoryPage, QRunV06HistorySyncServiceError> {
+    let request_id = request.request_id;
+    let start_height = request.start_height;
+    let max_blocks = request.max_blocks;
     let encoded = request.encode()?;
-    noise.write_record(stream, &encoded)?;
+    eprintln!(
+        "QFP6_SYNC_DIAG history_request_send request_id={} start_height={} max_blocks={} max_bytes={}",
+        request_id,
+        start_height,
+        max_blocks,
+        request.max_bytes
+    );
+    if let Err(error) = noise.write_record(stream, &encoded) {
+        eprintln!(
+            "QFP6_SYNC_DIAG history_request_write_failed request_id={} error={error:?}",
+            request_id
+        );
+        return Err(error.into());
+    }
+    eprintln!(
+        "QFP6_SYNC_DIAG history_request_sent request_id={} start_height={}",
+        request_id, start_height
+    );
     let mut assembler = QRunV06HistoryPageChunkAssembler::new(request, params)?;
+    let mut received_chunks = 0usize;
     for _ in 0..crate::qrun_v06_history_sync_wire_candidate::Q6_HISTORY_SYNC_MAX_CHUNKS {
-        let frame = noise.read_record(stream)?;
-        if let Some(page) = assembler.push(&frame)? {
-            return Ok(page);
+        let frame = match noise.read_record(stream) {
+            Ok(frame) => frame,
+            Err(error) => {
+                eprintln!(
+                    "QFP6_SYNC_DIAG history_chunk_read_failed request_id={} received_chunks={} error={error:?}",
+                    request_id,
+                    received_chunks
+                );
+                return Err(error.into());
+            }
+        };
+        let frame_bytes = frame.len();
+        eprintln!(
+            "QFP6_SYNC_DIAG history_chunk_received request_id={} chunk_index={} bytes={} magic={:02x?}",
+            request_id,
+            received_chunks,
+            frame_bytes,
+            frame.get(..4).unwrap_or_default()
+        );
+        match assembler.push(&frame) {
+            Ok(Some(page)) => {
+                received_chunks += 1;
+                eprintln!(
+                    "QFP6_SYNC_DIAG history_page_verified request_id={} chunks={} start_height={} next_height={} snapshot_height={} blocks={} complete={}",
+                    request_id,
+                    received_chunks,
+                    page.start_height,
+                    page.next_height,
+                    page.snapshot_height,
+                    page.envelopes.len(),
+                    page.complete
+                );
+                return Ok(page);
+            }
+            Ok(None) => received_chunks += 1,
+            Err(error) => {
+                eprintln!(
+                    "QFP6_SYNC_DIAG history_chunk_rejected request_id={} chunk_index={} bytes={} error={error:?}",
+                    request_id,
+                    received_chunks,
+                    frame_bytes
+                );
+                return Err(error.into());
+            }
         }
     }
+    eprintln!(
+        "QFP6_SYNC_DIAG history_chunk_budget_exhausted request_id={} received_chunks={}",
+        request_id, received_chunks
+    );
     Err(QRunV06HistorySyncServiceError::Wire(
         "Q6HC chunk budget exhausted before a complete page arrived".into(),
     ))
@@ -624,6 +885,482 @@ pub struct QRunV06HistorySyncClientReport {
     pub complete: bool,
 }
 
+/// Pull one bounded peer-candidate inventory from an operator-pinned relay. The relay's
+/// static key is verified by the Noise handshake and the address-book policy independently
+/// enforces its assigned trust domain, replay protection, TTL and quotas. Advertised peer
+/// keys remain untrusted candidates; this function never approves or connects them.
+pub fn pull_q6ar_candidates_from_pinned_peer(
+    address: SocketAddr,
+    local_static_private_key: &[u8; 32],
+    remote_static_public_key: &[u8; 32],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    config: QRunV06HistorySyncClientConfig,
+    tls_server_name: Option<&str>,
+    address_book: &mut crate::qrun_v06_peer_address_manager_candidate::QRunV06PeerAddressBookCandidate,
+    trust_domains: &crate::qrun_v06_bootstrap_trust_domain_candidate::BootstrapTrustDomainPolicy,
+) -> Result<usize, QRunV06HistorySyncServiceError> {
+    use crate::qrun_v06_peer_address_relay_candidate::{
+        decode_q6ar_pull_response, encode_q6ar_pull_request, Q6arPullRequest,
+        Q6arReceivedAdvertisement, Q6arRelayOrigin, Q6AR_MAX_ADDRESSES,
+    };
+    if local_static_private_key == &[0; 32]
+        || remote_static_public_key == &[0; 32]
+        || network_id == &[0; 32]
+        || profile_id == &[0; 32]
+    {
+        return Err(QRunV06HistorySyncServiceError::InvalidClientConfig);
+    }
+    config.validate()?;
+    let (mut stream, mut noise) = connect_history_sync_noise_session_with_bounded_retry(
+        address,
+        tls_server_name,
+        config,
+        local_static_private_key,
+        remote_static_public_key,
+        network_id,
+        profile_id,
+    )?;
+    if !noise.remote_static_key_pinned()
+        || noise.remote_static_public_key() != remote_static_public_key
+    {
+        return Err(QRunV06HistorySyncServiceError::PeerDiscovery(
+            "Noise session did not authenticate the configured relay pin".into(),
+        ));
+    }
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| {
+            QRunV06HistorySyncServiceError::PeerDiscovery(format!(
+                "system clock invalid for Q6AR: {error}"
+            ))
+        })?
+        .as_millis()
+        .try_into()
+        .map_err(|_| {
+            QRunV06HistorySyncServiceError::PeerDiscovery(
+                "system clock exceeds Q6AR millisecond range".into(),
+            )
+        })?;
+    let request = Q6arPullRequest {
+        request_id: now_ms.max(1),
+        network_id: *network_id,
+        profile_id: *profile_id,
+        max_addresses: Q6AR_MAX_ADDRESSES as u16,
+    };
+    let encoded = encode_q6ar_pull_request(&request)
+        .map_err(|error| QRunV06HistorySyncServiceError::PeerDiscovery(error.to_string()))?;
+    noise.write_record(stream.as_mut(), &encoded)?;
+    let response_frame = noise.read_record(stream.as_mut())?;
+    let response = decode_q6ar_pull_response(&response_frame, &request, now_ms / 1_000)
+        .map_err(|error| QRunV06HistorySyncServiceError::PeerDiscovery(error.to_string()))?;
+    let Some(advertisement) = response.advertisement else {
+        eprintln!(
+            "QFP6_DISCOVERY pinned_relay={} candidates_received=0 candidates_persisted=0",
+            address
+        );
+        return Ok(0);
+    };
+    let received = Q6arReceivedAdvertisement {
+        advertisement,
+        relay_origin: Q6arRelayOrigin {
+            relay_static_public_key: *noise.remote_static_public_key(),
+            relay_static_key_pinned: noise.remote_static_key_pinned(),
+        },
+    };
+    let accepted = address_book
+        .ingest_pinned_q6ar_with_trust_domains(&received, now_ms, trust_domains)
+        .map_err(|error| {
+            QRunV06HistorySyncServiceError::PeerDiscovery(format!(
+                "candidate address-book admission failed: {error}"
+            ))
+        })?;
+    eprintln!(
+        "QFP6_DISCOVERY pinned_relay={} candidates_received={} candidates_persisted={}",
+        address,
+        received.advertisement.addresses.len(),
+        accepted
+    );
+    Ok(accepted)
+}
+
+/// Bounded peer-record exchange with one operator-pinned QFP6 peer over an authenticated Noise
+/// session. Every signed record is checked against the exact network/profile and persisted using
+/// the local Q6PD sequence-watermark store. Gossip never grants operator approval or dial rights.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Q6pdPeerDiscoveryReport {
+    pub records_received: usize,
+    pub records_inserted: usize,
+    pub records_updated: usize,
+    pub records_duplicate: usize,
+    pub records_rejected: usize,
+    /// Verified records actually accepted by the durable store, for source-aware AddrMan ingest.
+    pub accepted_records: Vec<crate::qrun_v06_peer_discovery_candidate::VerifiedQ6pdPeerRecord>,
+}
+
+pub fn pull_q6pd_peer_records_from_pinned_peer(
+    address: SocketAddr,
+    local_static_private_key: &[u8; 32],
+    remote_static_public_key: &[u8; 32],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    config: QRunV06HistorySyncClientConfig,
+    tls_server_name: Option<&str>,
+    max_records: u16,
+    store: &mut crate::qrun_v06_peer_discovery_store_candidate::Q6pdPeerRecordStore,
+) -> Result<Q6pdPeerDiscoveryReport, QRunV06HistorySyncServiceError> {
+    pull_q6pd_peer_records_from_pinned_peer_with_announcement(
+        address,
+        local_static_private_key,
+        remote_static_public_key,
+        network_id,
+        profile_id,
+        config,
+        tls_server_name,
+        max_records,
+        None,
+        store,
+    )
+}
+
+pub fn pull_q6pd_peer_records_from_pinned_peer_with_announcement(
+    address: SocketAddr,
+    local_static_private_key: &[u8; 32],
+    remote_static_public_key: &[u8; 32],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    config: QRunV06HistorySyncClientConfig,
+    tls_server_name: Option<&str>,
+    max_records: u16,
+    announce_record: Option<&[u8]>,
+    store: &mut crate::qrun_v06_peer_discovery_store_candidate::Q6pdPeerRecordStore,
+) -> Result<Q6pdPeerDiscoveryReport, QRunV06HistorySyncServiceError> {
+    use crate::qrun_v06_peer_discovery_candidate::{
+        decode_q6pd_announce_response, decode_q6pd_pull_response, encode_q6pd_announce_request,
+        encode_q6pd_pull_request, verify_q6pd_peer_record, Q6pdPullRequest,
+        Q6PD_MAX_RECORDS_PER_FRAME,
+    };
+    use crate::qrun_v06_peer_discovery_store_candidate::{Q6pdIngestResult, Q6pdStoreError};
+
+    if local_static_private_key == &[0; 32]
+        || remote_static_public_key == &[0; 32]
+        || network_id == &[0; 32]
+        || profile_id == &[0; 32]
+        || max_records == 0
+        || max_records as usize > Q6PD_MAX_RECORDS_PER_FRAME
+    {
+        return Err(QRunV06HistorySyncServiceError::InvalidClientConfig);
+    }
+    config.validate()?;
+    let (mut stream, mut noise) = connect_history_sync_noise_session_with_bounded_retry(
+        address,
+        tls_server_name,
+        config,
+        local_static_private_key,
+        remote_static_public_key,
+        network_id,
+        profile_id,
+    )?;
+    if !noise.remote_static_key_pinned()
+        || noise.remote_static_public_key() != remote_static_public_key
+    {
+        return Err(QRunV06HistorySyncServiceError::PeerDiscovery(
+            "Q6PD Noise session did not authenticate the configured peer pin".into(),
+        ));
+    }
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| {
+            QRunV06HistorySyncServiceError::PeerDiscovery(format!(
+                "system clock invalid for Q6PD: {error}"
+            ))
+        })?
+        .as_millis()
+        .try_into()
+        .map_err(|_| {
+            QRunV06HistorySyncServiceError::PeerDiscovery(
+                "system clock exceeds Q6PD millisecond range".into(),
+            )
+        })?;
+    if let Some(record_wire) = announce_record {
+        let local_record =
+            verify_q6pd_peer_record(record_wire, network_id, profile_id, now_ms / 1_000).map_err(
+                |error| {
+                    QRunV06HistorySyncServiceError::PeerDiscovery(format!(
+                        "local Q6PD self-announcement is invalid: {error}"
+                    ))
+                },
+            )?;
+        let announce_frame = encode_q6pd_announce_request(record_wire)
+            .map_err(|error| QRunV06HistorySyncServiceError::PeerDiscovery(error.to_string()))?;
+        noise.write_record(stream.as_mut(), &announce_frame)?;
+        let announce_ack = noise.read_record(stream.as_mut())?;
+        decode_q6pd_announce_response(&announce_ack).map_err(|error| {
+            QRunV06HistorySyncServiceError::PeerDiscovery(format!(
+                "Q6PD peer rejected local announcement: {error}"
+            ))
+        })?;
+        eprintln!(
+            "QFP6_Q6PD_SELF_RECORD_ANNOUNCED peer={} peer_id_prefix={:02x?}",
+            address,
+            &local_record.peer_id[..4]
+        );
+    }
+
+    let request = Q6pdPullRequest {
+        request_id: now_ms.max(1),
+        network_id: *network_id,
+        profile_id: *profile_id,
+        max_records,
+    };
+    let request_frame = encode_q6pd_pull_request(&request)
+        .map_err(|error| QRunV06HistorySyncServiceError::PeerDiscovery(error.to_string()))?;
+    noise.write_record(stream.as_mut(), &request_frame)?;
+    let response_frame = noise.read_record(stream.as_mut())?;
+    let response = decode_q6pd_pull_response(&response_frame, &request, now_ms / 1000)
+        .map_err(|error| QRunV06HistorySyncServiceError::PeerDiscovery(error.to_string()))?;
+
+    let mut report = Q6pdPeerDiscoveryReport {
+        records_received: response.record_wires.len(),
+        ..Q6pdPeerDiscoveryReport::default()
+    };
+    for (record, wire) in response.records.iter().zip(&response.record_wires) {
+        match store.ingest(wire, now_ms) {
+            Ok(Q6pdIngestResult::Inserted) => {
+                report.records_inserted += 1;
+                report.accepted_records.push(record.clone());
+            }
+            Ok(Q6pdIngestResult::Updated) => {
+                report.records_updated += 1;
+                report.accepted_records.push(record.clone());
+            }
+            Ok(Q6pdIngestResult::Duplicate) => {
+                report.records_duplicate += 1;
+                report.accepted_records.push(record.clone());
+            }
+            Err(Q6pdStoreError::Replay)
+            | Err(Q6pdStoreError::InvalidRecord(
+                crate::qrun_v06_peer_discovery_candidate::Q6pdError::Expired,
+            )) => {
+                report.records_rejected += 1;
+            }
+            Err(error) => {
+                return Err(QRunV06HistorySyncServiceError::PeerDiscovery(format!(
+                    "Q6PD candidate persistence failed: {error}"
+                )));
+            }
+        }
+    }
+
+    // After pulling the remote inventory, push our own bounded inventory over the same
+    // exact-key-pinned Noise session. Older peers may not know Q6PX yet; that is a
+    // peer-local capability miss and does not discard the successful pull above.
+    let gossip_wires = store.gossip_record_wires(
+        now_ms,
+        crate::qrun_v06_peer_discovery_candidate::Q6PD_MAX_RECORDS_PER_FRAME,
+    );
+    if !gossip_wires.is_empty() {
+        if let Some(gossip_request_id) = request.request_id.checked_add(1) {
+            match crate::qrun_v06_peer_discovery_candidate::encode_q6pd_gossip_push_request(
+                gossip_request_id,
+                network_id,
+                profile_id,
+                &gossip_wires,
+                now_ms / 1_000,
+            ) {
+                Ok(gossip_frame) => {
+                    if let Err(error) = noise.write_record(stream.as_mut(), &gossip_frame) {
+                        eprintln!(
+                            "QFP6_Q6PD_GOSSIP_PUSH_UNAVAILABLE peer={} stage=write error={error:?}",
+                            address
+                        );
+                    } else {
+                        match noise.read_record(stream.as_mut()) {
+                            Ok(ack_frame) => {
+                                let request = crate::qrun_v06_peer_discovery_candidate::decode_q6pd_gossip_push_request(
+                                    &gossip_frame,
+                                    network_id,
+                                    profile_id,
+                                    now_ms / 1_000,
+                                )
+                                .map_err(|error| QRunV06HistorySyncServiceError::PeerDiscovery(
+                                    format!("locally generated Q6PD Gossip frame invalid: {error}")
+                                ))?;
+                                match crate::qrun_v06_peer_discovery_candidate::decode_q6pd_gossip_push_response(
+                                    &ack_frame,
+                                    &request,
+                                ) {
+                                    Ok(counts) => eprintln!(
+                                        "QFP6_Q6PD_GOSSIP_PUSH peer={} sent={} inserted={} updated={} duplicate={} rejected={}",
+                                        address,
+                                        gossip_wires.len(),
+                                        counts.inserted,
+                                        counts.updated,
+                                        counts.duplicate,
+                                        counts.rejected
+                                    ),
+                                    Err(error) => eprintln!(
+                                        "QFP6_Q6PD_GOSSIP_PUSH_UNAVAILABLE peer={} stage=ack error={error:?}",
+                                        address
+                                    ),
+                                }
+                            }
+                            Err(error) => eprintln!(
+                                "QFP6_Q6PD_GOSSIP_PUSH_UNAVAILABLE peer={} stage=read error={error:?}",
+                                address
+                            ),
+                        }
+                    }
+                }
+                Err(error) => eprintln!(
+                    "QFP6_Q6PD_GOSSIP_PUSH_SKIPPED peer={} reason=local_encode error={error:?}",
+                    address
+                ),
+            }
+        }
+    }
+
+    eprintln!(
+        "QFP6_Q6PD_PULL peer={} received={} inserted={} updated={} duplicate={} rejected={}",
+        address,
+        report.records_received,
+        report.records_inserted,
+        report.records_updated,
+        report.records_duplicate,
+        report.records_rejected,
+    );
+    Ok(report)
+}
+
+const Q6PD_DNS_SEED_MAX_ADDRESSES: usize = 16;
+
+fn is_valid_q6pd_dns_seed_name(hostname: &str) -> bool {
+    if hostname.is_empty()
+        || hostname.len() > 253
+        || !hostname.is_ascii()
+        || hostname.bytes().any(|byte| byte.is_ascii_uppercase())
+        || hostname.ends_with('.')
+    {
+        return false;
+    }
+    let labels: Vec<&str> = hostname.split('.').collect();
+    labels.len() >= 2
+        && !hostname.eq_ignore_ascii_case("localhost")
+        && !hostname.ends_with(".localhost")
+        && !hostname.ends_with(".local")
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label.as_bytes()[0].is_ascii_alphanumeric()
+                && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+}
+
+fn resolve_q6pd_dns_seed_addresses_with<F>(
+    hostname: &str,
+    port: u16,
+    mut resolve: F,
+) -> Result<Vec<SocketAddr>, String>
+where
+    F: FnMut(&str, u16) -> Result<Vec<SocketAddr>, String>,
+{
+    if port != 443 || !is_valid_q6pd_dns_seed_name(hostname) {
+        return Err("Q6PD DNS seed must be a public FQDN on TCP port 443".into());
+    }
+    let mut addresses = resolve(hostname, port)
+        .map_err(|error| format!("Q6PD DNS seed resolution failed: {error}"))?;
+    if addresses.is_empty() || addresses.len() > Q6PD_DNS_SEED_MAX_ADDRESSES {
+        return Err(format!(
+            "Q6PD DNS seed must resolve to 1..={Q6PD_DNS_SEED_MAX_ADDRESSES} addresses"
+        ));
+    }
+    // Preserve the resolver's route preference (Windows/Linux apply their
+    // source-address policy, typically preferring a reachable IPv6 path). A global
+    // SocketAddr sort forced IPv4 first and could make a Funnel seed time out before
+    // its working IPv6 route was even attempted. Deduplicate without reordering.
+    let mut seen_routes = std::collections::BTreeSet::new();
+    addresses.retain(|address| seen_routes.insert(*address));
+    if addresses.iter().any(|address| {
+        address.port() != port
+            || !crate::qrun_v06_peer_discovery_candidate::is_public_q6pd_endpoint(*address)
+    }) {
+        return Err("Q6PD DNS seed returned a non-public or wrong-port address".into());
+    }
+    Ok(addresses)
+}
+
+/// Bootstrap through one DNS seed with multiple public A/AAAA routes. Every route uses the
+/// same out-of-band pinned Noise key and TLS SNI; DNS never supplies peer identity or trust.
+/// Only a successful Noise handshake with the exact pin can deliver signed Q6PD records.
+pub fn pull_q6pd_peer_records_from_dns_seed_with_announcement(
+    hostname: &str,
+    port: u16,
+    local_static_private_key: &[u8; 32],
+    remote_static_public_key: &[u8; 32],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    config: QRunV06HistorySyncClientConfig,
+    max_records: u16,
+    announce_record: Option<&[u8]>,
+    store: &mut crate::qrun_v06_peer_discovery_store_candidate::Q6pdPeerRecordStore,
+) -> Result<Q6pdPeerDiscoveryReport, QRunV06HistorySyncServiceError> {
+    let addresses = resolve_q6pd_dns_seed_addresses_with(hostname, port, |host, port| {
+        (host, port)
+            .to_socket_addrs()
+            .map(|items| items.collect())
+            .map_err(|error| error.to_string())
+    })
+    .map_err(QRunV06HistorySyncServiceError::PeerDiscovery)?;
+    eprintln!(
+        "QFP6_Q6PD_DNS_SEED_RESOLVED hostname={} port={} public_routes={}",
+        hostname,
+        port,
+        addresses.len()
+    );
+    let mut failures = Vec::new();
+    for address in addresses {
+        eprintln!(
+            "QFP6_Q6PD_DNS_SEED_ROUTE_TRY hostname={} address={}",
+            hostname, address
+        );
+        match pull_q6pd_peer_records_from_pinned_peer_with_announcement(
+            address,
+            local_static_private_key,
+            remote_static_public_key,
+            network_id,
+            profile_id,
+            config,
+            Some(hostname),
+            max_records,
+            announce_record,
+            store,
+        ) {
+            Ok(report) => {
+                eprintln!(
+                    "QFP6_Q6PD_DNS_SEED_ROUTE_OK hostname={} address={} records_received={}",
+                    hostname, address, report.records_received
+                );
+                return Ok(report);
+            }
+            Err(error) => {
+                eprintln!(
+                    "QFP6_Q6PD_DNS_SEED_ROUTE_FAIL hostname={} address={} error={}",
+                    hostname, address, error
+                );
+                failures.push(format!("{address}: {error}"));
+            }
+        }
+    }
+    Err(QRunV06HistorySyncServiceError::PeerDiscovery(format!(
+        "all {} routes for pinned DNS seed {hostname} failed: {}",
+        failures.len(),
+        failures.join(" | ")
+    )))
+}
+
 /// Connect to one statically pinned QFP6 peer, authenticate its Q6HR status over Noise,
 /// download canonical pages on the same session, and import each page through CP-0594's
 /// durable PoW/consensus/execution validator. No peer discovery or key trust is inferred.
@@ -654,8 +1391,39 @@ pub fn sync_history_from_pinned_peer_with_quote_asset_authorization<A: Transacti
     runtime: &mut QRunV06PermissionlessNodeRuntime,
     authenticator: &A,
     config: QRunV06HistorySyncClientConfig,
+    quote_authorizer: Option<&mut QRunV06QuoteAssetAuthorizationProvider<'_>>,
+    tls_server_name: Option<&str>,
+) -> Result<QRunV06HistorySyncClientReport, QRunV06HistorySyncServiceError> {
+    sync_history_from_pinned_peer_with_verified_session_callback(
+        address,
+        local_static_private_key,
+        remote_static_public_key,
+        runtime,
+        authenticator,
+        config,
+        quote_authorizer,
+        tls_server_name,
+        |_| Ok(()),
+    )
+}
+
+/// Same pinned history sync, with a callback after the Q6HR status proves that a live,
+/// operator-pinned Noise session is carrying the expected network/profile. The callback is
+/// invoked while that exact stream/session is still open; callers must remove ephemeral session
+/// state when this function returns.
+pub fn sync_history_from_pinned_peer_with_verified_session_callback<
+    A: TransactionAuthenticator,
+    F: FnMut(&QRunV06NoiseSession) -> Result<(), String>,
+>(
+    address: SocketAddr,
+    local_static_private_key: &[u8; 32],
+    remote_static_public_key: &[u8; 32],
+    runtime: &mut QRunV06PermissionlessNodeRuntime,
+    authenticator: &A,
+    config: QRunV06HistorySyncClientConfig,
     mut quote_authorizer: Option<&mut QRunV06QuoteAssetAuthorizationProvider<'_>>,
     tls_server_name: Option<&str>,
+    mut on_verified_session: F,
 ) -> Result<QRunV06HistorySyncClientReport, QRunV06HistorySyncServiceError> {
     config.validate()?;
     if local_static_private_key.iter().all(|byte| *byte == 0)
@@ -666,98 +1434,341 @@ pub fn sync_history_from_pinned_peer_with_quote_asset_authorization<A: Transacti
 
     let local_start = runtime.status()?;
     let base_graph = runtime.fork_choice_snapshot()?;
-    let base_tip = base_graph.base_tip();
-    let base_state = base_graph
-        .state_for_tip(&base_tip)
+    let local_base_tip = base_graph.base_tip();
+    let local_base_state = base_graph
+        .state_for_tip(&local_base_tip)
         .ok_or(QRunV06HistorySyncServiceError::SnapshotUnavailable)?;
-    let base_height = base_state.height();
-    let base_execution_tip = base_state.tip_hash();
+    let mut base_tip = local_base_tip;
+    let mut base_height = local_base_state.height();
+    let mut base_execution_tip = local_base_state.tip_hash();
     let mut next_height = base_height
         .checked_add(1)
         .ok_or(QRunV06HistorySyncServiceError::PageBudgetExceeded)?;
     let mut parent_consensus = base_tip;
     let mut parent_execution = base_execution_tip;
-    let mut source_snapshot: Option<(u64, [u8; 32], [u8; 32])> = None;
+    // Pin both ends of the source snapshot and its compacted checkpoint base across
+    // reconnects. The base tuple is authenticated by Noise and must be present locally
+    // before requesting any history from a compacted source.
+    let mut source_snapshot: Option<(u64, [u8; 32], [u8; 32], u64, [u8; 32], [u8; 32])> = None;
     let mut pages_imported = 0u32;
     let mut blocks_imported = 0u64;
 
     // Bounded reconnect windows resume the same source branch even when it is not canonical
     // locally. The durable fork-choice graph, not remote height, selects the canonical tip.
-    for _round in 0..config.max_rounds {
-        if source_snapshot.is_some_and(|(height, _, _)| next_height > height) {
+    let mut transient_transport_retries = 0usize;
+    'sync_rounds: for _round in 0..config.max_rounds {
+        if source_snapshot.is_some_and(|(height, _, _, _, _, _)| next_height > height) {
             break;
         }
-        let mut stream = connect_history_sync_stream(address, tls_server_name, config)?;
-        let mut noise = QRunV06NoiseSession::connect(
-            stream.as_mut(),
-            local_static_private_key,
-            remote_static_public_key,
-            &local_start.network_id,
-            &local_start.profile_id,
-        )?;
         let info_request = QRunV06HistoryInfoRequest {
             request_id: 1,
             network_id: local_start.network_id,
             profile_id: local_start.profile_id,
         };
-        noise.write_record(stream.as_mut(), &info_request.encode()?)?;
-        let info_frame = noise.read_record(stream.as_mut())?;
-        let source = decode_q6hr_status(&info_frame, &info_request)?;
-        let observed = (source.height, source.consensus_tip, source.execution_tip);
+        let (mut stream, mut noise, source) = loop {
+            let (mut stream, mut noise) = connect_history_sync_noise_session_with_bounded_retry(
+                address,
+                tls_server_name,
+                config,
+                local_static_private_key,
+                remote_static_public_key,
+                &local_start.network_id,
+                &local_start.profile_id,
+            )?;
+            let status_result: Result<_, QRunV06HistorySyncServiceError> = (|| {
+                let encoded = info_request.encode()?;
+                noise
+                    .write_record(stream.as_mut(), &encoded)
+                    .map_err(QRunV06HistorySyncServiceError::from)?;
+                eprintln!(
+                    "QFP6_SYNC_DIAG history_info_request_sent address={} request_id=1",
+                    address
+                );
+                let info_frame = noise
+                    .read_record(stream.as_mut())
+                    .map_err(QRunV06HistorySyncServiceError::from)?;
+                decode_q6hr_status(&info_frame, &info_request)
+                    .map_err(QRunV06HistorySyncServiceError::from)
+            })();
+            match status_result {
+                Ok(source) => {
+                    on_verified_session(&noise)
+                        .map_err(QRunV06HistorySyncServiceError::PeerDiscovery)?;
+                    eprintln!(
+                        "QFP6_SYNC_DIAG history_info_status_received address={} source_height={} base_height={}",
+                        address, source.height, source.base_height
+                    );
+                    break (stream, noise, source);
+                }
+                Err(error)
+                    if is_retryable_history_sync_transport_error(&error)
+                        && transient_transport_retries
+                            < QFP6_HISTORY_SYNC_MAX_TRANSIENT_TRANSPORT_RETRIES =>
+                {
+                    let backoff = history_sync_transport_retry_backoff(transient_transport_retries);
+                    transient_transport_retries += 1;
+                    eprintln!(
+                        "QFP6_SYNC_DIAG history_info_transport_retry address={} retry={} max_retries={} backoff_ms={} error={error:?}",
+                        address,
+                        transient_transport_retries,
+                        QFP6_HISTORY_SYNC_MAX_TRANSIENT_TRANSPORT_RETRIES,
+                        backoff.as_millis()
+                    );
+                    drop(noise);
+                    drop(stream);
+                    std::thread::sleep(backoff);
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let observed = (
+            source.height,
+            source.consensus_tip,
+            source.execution_tip,
+            source.base_height,
+            source.base_consensus_tip,
+            source.base_execution_tip,
+        );
+        let mut pending_resume_page: Option<QRunV06CanonicalHistoryPage> = None;
         if let Some(previous) = source_snapshot {
             if observed != previous {
                 return Err(QRunV06HistorySyncServiceError::SnapshotMismatch);
             }
         } else {
-            if source.height < base_height {
-                return Err(QRunV06HistorySyncServiceError::SourceBehind);
+            // A compacted source can only export blocks after its own checkpoint base.
+            // Accept that base only when the exact consensus and execution state is already
+            // present in the local fork-choice graph. This lets a Joiner resume at a shared
+            // newer checkpoint while preserving discovery/import of heavier competing branches
+            // from a common older base; it never trusts height alone.
+            let source_base_state = base_graph
+                .state_for_tip(&source.base_consensus_tip)
+                .ok_or(QRunV06HistorySyncServiceError::SnapshotMismatch)?;
+            if source_base_state.height() != source.base_height
+                || source_base_state.tip_hash() != source.base_execution_tip
+            {
+                return Err(QRunV06HistorySyncServiceError::SnapshotMismatch);
             }
-            source_snapshot = Some(observed);
-            if source.height == base_height {
-                if source.consensus_tip != base_tip || source.execution_tip != base_execution_tip {
-                    return Err(QRunV06HistorySyncServiceError::SnapshotMismatch);
+
+            // Fast-resume only when this exact consensus tip is already in our validated
+            // fork graph AND its execution state/height match the peer's authenticated Q6HR.
+            // Unknown tips, mismatched execution hashes and competing branches continue through
+            // the full common-base history path below.
+            let known_source_tip = base_graph
+                .tip_for_hash(&source.consensus_tip)
+                .zip(base_graph.state_for_tip(&source.consensus_tip));
+            if let Some((known_tip, known_state)) = known_source_tip {
+                if known_tip.height == source.height
+                    && known_state.height() == source.height
+                    && known_state.tip_hash() == source.execution_tip
+                {
+                    let resume_height = source
+                        .height
+                        .checked_add(1)
+                        .ok_or(QRunV06HistorySyncServiceError::PageBudgetExceeded)?;
+                    let empty_request = QRunV06HistorySyncRequest {
+                        request_id: 2,
+                        network_id: local_start.network_id,
+                        profile_id: local_start.profile_id,
+                        snapshot_tip: source.consensus_tip,
+                        expected_parent_consensus_hash: source.consensus_tip,
+                        expected_parent_execution_hash: source.execution_tip,
+                        start_height: resume_height,
+                        max_blocks: config.max_blocks_per_page,
+                        max_bytes: config.max_bytes_per_page,
+                    };
+                    empty_request.validate()?;
+                    let empty_page = match request_history_page_over_noise(
+                        &mut noise,
+                        stream.as_mut(),
+                        empty_request,
+                        base_graph.consensus_parameters().clone(),
+                    ) {
+                        Ok(page) => page,
+                        Err(error)
+                            if is_retryable_history_sync_transport_error(&error)
+                                && transient_transport_retries
+                                    < QFP6_HISTORY_SYNC_MAX_TRANSIENT_TRANSPORT_RETRIES =>
+                        {
+                            let backoff =
+                                history_sync_transport_retry_backoff(transient_transport_retries);
+                            transient_transport_retries += 1;
+                            eprintln!(
+                                "QFP6_SYNC_DIAG history_fast_resume_release_retry address={} retry={} backoff_ms={} error={error:?}",
+                                address,
+                                transient_transport_retries,
+                                backoff.as_millis()
+                            );
+                            std::thread::sleep(backoff);
+                            continue 'sync_rounds;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if !empty_page.envelopes.is_empty()
+                        || !empty_page.complete
+                        || empty_page.start_height != resume_height
+                        || empty_page.next_height != resume_height
+                        || empty_page.snapshot_height != source.height
+                        || empty_page.snapshot_tip != source.consensus_tip
+                    {
+                        return Err(QRunV06HistorySyncServiceError::PageDoesNotMatchSnapshot);
+                    }
+                    eprintln!(
+                        "QFP6_SYNC_DIAG history_fast_resume_known_tip address={} source_height={} consensus_tip={:02x?} execution_tip={:02x?} replayed_prefix_blocks=0",
+                        address,
+                        source.height,
+                        source.consensus_tip,
+                        source.execution_tip
+                    );
+                    source_snapshot = Some(observed);
+                    next_height = resume_height;
+                    break 'sync_rounds;
                 }
-                // Complete an empty Q6HS page at height tip+1 so the responder releases its
-                // retained snapshot. Without this sentinel, an already-current node would leave
-                // a stale snapshot pinned forever and miss later source-chain growth.
-                let empty_request = QRunV06HistorySyncRequest {
+            }
+
+            // If the peer has extended the exact canonical tip already held locally, request
+            // the next page from that validated parent instead of replaying the shared checkpoint
+            // prefix on every periodic poll. Both consensus and execution parent hashes must match.
+            let local_canonical_tip = base_graph.canonical_tip();
+            let local_canonical_state = base_graph.canonical_state();
+            if local_canonical_tip.height > source.base_height
+                && local_canonical_tip.height < source.height
+            {
+                let resume_height = local_canonical_tip
+                    .height
+                    .checked_add(1)
+                    .ok_or(QRunV06HistorySyncServiceError::PageBudgetExceeded)?;
+                let resume_request = QRunV06HistorySyncRequest {
                     request_id: 2,
                     network_id: local_start.network_id,
                     profile_id: local_start.profile_id,
                     snapshot_tip: source.consensus_tip,
-                    expected_parent_consensus_hash: base_tip,
-                    expected_parent_execution_hash: base_execution_tip,
-                    start_height: next_height,
+                    expected_parent_consensus_hash: local_canonical_tip.tip_hash,
+                    expected_parent_execution_hash: local_canonical_state.tip_hash(),
+                    start_height: resume_height,
                     max_blocks: config.max_blocks_per_page,
                     max_bytes: config.max_bytes_per_page,
                 };
-                empty_request.validate()?;
-                let empty_page = request_history_page_over_noise(
+                resume_request.validate()?;
+                let resume_page = request_history_page_over_noise(
                     &mut noise,
                     stream.as_mut(),
-                    empty_request,
-                    runtime
-                        .fork_choice_snapshot()?
-                        .consensus_parameters()
-                        .clone(),
+                    resume_request,
+                    base_graph.consensus_parameters().clone(),
                 )?;
-                if !empty_page.envelopes.is_empty()
-                    || !empty_page.complete
-                    || empty_page.start_height != next_height
-                    || empty_page.next_height != next_height
-                    || empty_page.snapshot_height != source.height
-                    || empty_page.snapshot_tip != source.consensus_tip
+                let first_block = resume_page
+                    .envelopes
+                    .first()
+                    .map(|encoded| decode_qrun_v06_pow_block(encoded))
+                    .transpose()
+                    .map_err(|error| QRunV06HistorySyncServiceError::Wire(error.to_string()))?;
+                let extends_local_tip = first_block.as_ref().is_some_and(|block| {
+                    block.header.height == resume_height
+                        && block.header.previous_consensus_hash == local_canonical_tip.tip_hash
+                        && block.header.parent_hash == local_canonical_state.tip_hash()
+                });
+                if extends_local_tip
+                    && resume_page.start_height == resume_height
+                    && resume_page.snapshot_height == source.height
+                    && resume_page.snapshot_tip == source.consensus_tip
                 {
-                    return Err(QRunV06HistorySyncServiceError::PageDoesNotMatchSnapshot);
+                    eprintln!(
+                        "QFP6_SYNC_DIAG history_incremental_resume address={} local_height={} resume_height={} source_height={}",
+                        address, local_canonical_tip.height, resume_height, source.height
+                    );
+                    parent_consensus = local_canonical_tip.tip_hash;
+                    parent_execution = local_canonical_state.tip_hash();
+                    next_height = resume_height;
+                    source_snapshot = Some(observed);
+                    pending_resume_page = Some(resume_page);
+                } else {
+                    eprintln!(
+                        "QFP6_SYNC_DIAG history_incremental_resume_rejected address={} local_height={} source_height={} fallback=shared_checkpoint",
+                        address, local_canonical_tip.height, source.height
+                    );
                 }
-                break;
+            }
+
+            if pending_resume_page.is_none() {
+                base_height = source.base_height;
+                base_tip = source.base_consensus_tip;
+                base_execution_tip = source.base_execution_tip;
+                next_height = base_height
+                    .checked_add(1)
+                    .ok_or(QRunV06HistorySyncServiceError::PageBudgetExceeded)?;
+                parent_consensus = base_tip;
+                parent_execution = base_execution_tip;
+                if source.height < base_height {
+                    return Err(QRunV06HistorySyncServiceError::SourceBehind);
+                }
+                source_snapshot = Some(observed);
+                if source.height == base_height {
+                    if source.consensus_tip != base_tip
+                        || source.execution_tip != base_execution_tip
+                    {
+                        return Err(QRunV06HistorySyncServiceError::SnapshotMismatch);
+                    }
+                    // Complete an empty Q6HS page at height tip+1 so the responder releases its
+                    // retained snapshot. Without this sentinel, an already-current node would leave
+                    // a stale snapshot pinned forever and miss later source-chain growth.
+                    let empty_request = QRunV06HistorySyncRequest {
+                        request_id: 2,
+                        network_id: local_start.network_id,
+                        profile_id: local_start.profile_id,
+                        snapshot_tip: source.consensus_tip,
+                        expected_parent_consensus_hash: base_tip,
+                        expected_parent_execution_hash: base_execution_tip,
+                        start_height: next_height,
+                        max_blocks: config.max_blocks_per_page,
+                        max_bytes: config.max_bytes_per_page,
+                    };
+                    empty_request.validate()?;
+                    let empty_page = match request_history_page_over_noise(
+                        &mut noise,
+                        stream.as_mut(),
+                        empty_request,
+                        runtime
+                            .fork_choice_snapshot()?
+                            .consensus_parameters()
+                            .clone(),
+                    ) {
+                        Ok(page) => page,
+                        Err(error)
+                            if is_retryable_history_sync_transport_error(&error)
+                                && transient_transport_retries
+                                    < QFP6_HISTORY_SYNC_MAX_TRANSIENT_TRANSPORT_RETRIES =>
+                        {
+                            let backoff =
+                                history_sync_transport_retry_backoff(transient_transport_retries);
+                            transient_transport_retries += 1;
+                            eprintln!(
+                            "QFP6_SYNC_DIAG empty_history_page_transport_retry address={} retry={} backoff_ms={} error={error:?}",
+                            address,
+                            transient_transport_retries,
+                            backoff.as_millis()
+                        );
+                            std::thread::sleep(backoff);
+                            continue 'sync_rounds;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if !empty_page.envelopes.is_empty()
+                        || !empty_page.complete
+                        || empty_page.start_height != next_height
+                        || empty_page.next_height != next_height
+                        || empty_page.snapshot_height != source.height
+                        || empty_page.snapshot_tip != source.consensus_tip
+                    {
+                        return Err(QRunV06HistorySyncServiceError::PageDoesNotMatchSnapshot);
+                    }
+                    break;
+                }
             }
         }
 
         let mut pages_this_session = 0u32;
         let mut request_id = 2u64;
         while pages_this_session < config.max_pages
-            && source_snapshot.is_some_and(|(height, _, _)| next_height <= height)
+            && source_snapshot.is_some_and(|(height, _, _, _, _, _)| next_height <= height)
         {
             let request = QRunV06HistorySyncRequest {
                 request_id,
@@ -775,12 +1786,40 @@ pub fn sync_history_from_pinned_peer_with_quote_asset_authorization<A: Transacti
                 .fork_choice_snapshot()?
                 .consensus_parameters()
                 .clone();
-            let page = request_history_page_over_noise(
-                &mut noise,
-                stream.as_mut(),
-                request.clone(),
-                params.clone(),
-            )?;
+            let page = if let Some(page) = pending_resume_page.take() {
+                page
+            } else {
+                match request_history_page_over_noise(
+                    &mut noise,
+                    stream.as_mut(),
+                    request.clone(),
+                    params.clone(),
+                ) {
+                    Ok(page) => page,
+                    Err(error)
+                        if is_retryable_history_sync_transport_error(&error)
+                            && transient_transport_retries
+                                < QFP6_HISTORY_SYNC_MAX_TRANSIENT_TRANSPORT_RETRIES =>
+                    {
+                        let backoff =
+                            history_sync_transport_retry_backoff(transient_transport_retries);
+                        transient_transport_retries += 1;
+                        eprintln!(
+                        "QFP6_SYNC_DIAG history_page_transport_retry address={} request_id={} start_height={} retry={} backoff_ms={} error={error:?}",
+                        address,
+                        request_id,
+                        next_height,
+                        transient_transport_retries,
+                        backoff.as_millis()
+                    );
+                        std::thread::sleep(backoff);
+                        // No block is imported until a complete Q6HC page verifies. The next
+                        // bounded round re-pins the identical Q6HR snapshot and replays this page.
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
             if page.snapshot_height != source.height || page.snapshot_tip != source.consensus_tip {
                 return Err(QRunV06HistorySyncServiceError::SnapshotMismatch);
             }
@@ -789,13 +1828,23 @@ pub fn sync_history_from_pinned_peer_with_quote_asset_authorization<A: Transacti
             }
             let page_blocks = page.envelopes.len() as u64;
             let complete = page.complete;
-            import_history_branch_page_with_quote_asset_authorization(
+            let import_report = import_history_branch_page_with_quote_asset_authorization(
                 runtime,
                 &request,
                 &page,
                 authenticator,
                 quote_authorizer.as_deref_mut(),
             )?;
+            eprintln!(
+                "QFP6_SYNC_DIAG history_page_imported request_id={} blocks={} start_height={} next_height={} resulting_canonical_height={} resulting_canonical_tip={:02x?} complete={}",
+                request_id,
+                page_blocks,
+                page.start_height,
+                page.next_height,
+                import_report.resulting_height,
+                import_report.resulting_tip,
+                complete
+            );
             let last = decode_qrun_v06_pow_block(page.envelopes.last().unwrap())
                 .map_err(|error| QRunV06HistorySyncServiceError::Wire(error.to_string()))?;
             parent_consensus = pow_digest(&last.header, params.pow)
@@ -822,23 +1871,23 @@ pub fn sync_history_from_pinned_peer_with_quote_asset_authorization<A: Transacti
         }
     }
 
-    let (source_height, source_tip, source_execution_tip) =
+    let (source_height, source_tip, source_execution_tip, _, _, _) =
         source_snapshot.ok_or(QRunV06HistorySyncServiceError::SnapshotUnavailable)?;
-    if next_height <= source_height {
-        return Err(QRunV06HistorySyncServiceError::PageBudgetExceeded);
-    }
+    let complete = next_height > source_height;
     let final_graph = runtime.fork_choice_snapshot()?;
-    let source_chain_tip = final_graph
-        .tip_for_hash(&source_tip)
-        .ok_or(QRunV06HistorySyncServiceError::SnapshotMismatch)?;
-    let source_chain_state = final_graph
-        .state_for_tip(&source_tip)
-        .ok_or(QRunV06HistorySyncServiceError::SnapshotMismatch)?;
-    if source_chain_tip.height != source_height
-        || source_chain_state.tip_hash() != source_execution_tip
-        || final_graph.canonical_tip().cumulative_work < source_chain_tip.cumulative_work
-    {
-        return Err(QRunV06HistorySyncServiceError::SnapshotMismatch);
+    if complete {
+        let source_chain_tip = final_graph
+            .tip_for_hash(&source_tip)
+            .ok_or(QRunV06HistorySyncServiceError::SnapshotMismatch)?;
+        let source_chain_state = final_graph
+            .state_for_tip(&source_tip)
+            .ok_or(QRunV06HistorySyncServiceError::SnapshotMismatch)?;
+        if source_chain_tip.height != source_height
+            || source_chain_state.tip_hash() != source_execution_tip
+            || final_graph.canonical_tip().cumulative_work < source_chain_tip.cumulative_work
+        {
+            return Err(QRunV06HistorySyncServiceError::SnapshotMismatch);
+        }
     }
     let final_status = runtime.status()?;
     Ok(QRunV06HistorySyncClientReport {
@@ -848,7 +1897,7 @@ pub fn sync_history_from_pinned_peer_with_quote_asset_authorization<A: Transacti
         blocks_imported,
         source_tip,
         source_execution_tip,
-        complete: true,
+        complete,
     })
 }
 
@@ -902,9 +1951,10 @@ where
     {
         return Err(QRunV06HistorySyncServiceError::SnapshotMismatch);
     }
-    let mut stream = connect_history_sync_stream(address, tls_server_name, config)?;
-    let mut noise = QRunV06NoiseSession::connect(
-        stream.as_mut(),
+    let (mut stream, mut noise) = connect_history_sync_noise_session_with_bounded_retry(
+        address,
+        tls_server_name,
+        config,
         local_static_private_key,
         remote_static_public_key,
         &network_id,
@@ -1301,21 +2351,16 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server =
             spawn_qfp6_tls_noise_server(listener, server_tls, server_private, client_public, None);
-        let mut stream = connect_history_sync_stream_with_tls_config(
+        let rejected = connect_history_sync_stream_with_tls_config(
             address,
             Some("attacker.tailnet.ts.net"),
             config,
             Some(client_tls),
-        )
-        .unwrap();
-        assert!(QRunV06NoiseSession::connect(
-            stream.as_mut(),
-            &client_private,
-            &server_public,
-            &[0xC1; 32],
-            &[0xC2; 32],
-        )
-        .is_err());
+        );
+        assert!(
+            rejected.is_err(),
+            "a certificate for seed.tailnet.ts.net must be rejected for attacker.tailnet.ts.net before Noise begins"
+        );
         server.join().unwrap();
     }
 
@@ -1560,9 +2605,31 @@ mod tests {
             &authenticator,
             sync_config,
         );
+        let sync_report = sync_result.unwrap();
+
+        // The exact same peer tip is now in the local graph with both authenticated hashes.
+        // Fast-resume must release the responder snapshot without replaying its known prefix.
+        let fast_resume_report = sync_history_from_pinned_peer(
+            address,
+            &client_private,
+            &server_public,
+            &mut destination_runtime,
+            &authenticator,
+            sync_config,
+        )
+        .unwrap();
+        assert!(fast_resume_report.complete);
+        assert_eq!(fast_resume_report.source_tip, sync_report.source_tip);
+        assert_eq!(
+            fast_resume_report.source_execution_tip,
+            sync_report.source_execution_tip
+        );
+        assert_eq!(fast_resume_report.pages_imported, 0);
+        assert_eq!(fast_resume_report.blocks_imported, 0);
+        assert_eq!(fast_resume_report.final_height, sync_report.final_height);
+
         shutdown.store(true, Ordering::Release);
         let server_report = server.join().unwrap().unwrap();
-        let sync_report = sync_result.unwrap();
         assert!(server_report.stats.accepted_connections >= 3);
         assert_eq!(sync_report.source_height, 3);
         assert_eq!(sync_report.pages_imported, 3);
@@ -1850,12 +2917,21 @@ mod tests {
                 report_one.source_execution_tip,
                 report_two.source_execution_tip
             );
+            assert!(
+                report_two.blocks_imported > 0,
+                "an unknown competing source tip must use the full common-base branch path"
+            );
         } else {
             assert_eq!(report_one.source_tip, report_two.source_tip);
             assert_eq!(
                 report_one.source_execution_tip,
                 report_two.source_execution_tip
             );
+            assert_eq!(
+                report_two.blocks_imported, 0,
+                "a previously known consensus+execution tip must use fast-resume"
+            );
+            assert_eq!(report_two.pages_imported, 0);
         }
 
         let graph = destination.fork_choice_snapshot().unwrap();
@@ -1889,5 +2965,508 @@ mod tests {
     #[test]
     fn two_independent_noise_sources_with_divergent_histories_fail_bootstrap_agreement() {
         two_independent_noise_sources_bootstrap_case(60, true);
+    }
+}
+
+#[cfg(test)]
+mod qfp6_history_sync_handshake_retry_tests {
+    use super::*;
+
+    #[test]
+    fn transient_handshake_io_errors_are_retryable_but_trust_and_protocol_errors_fail_closed() {
+        assert!(is_retryable_history_sync_handshake_error(
+            &QRunV06NoiseError::HandshakeTimeout
+        ));
+        for message in [
+            "peer closed connection without sending TLS close_notify",
+            "connection reset by peer",
+            "broken pipe",
+            "unexpected EOF",
+        ] {
+            assert!(
+                is_retryable_history_sync_handshake_error(&QRunV06NoiseError::Io(message.into())),
+                "expected transient I/O error to retry: {message}"
+            );
+        }
+        assert!(!is_retryable_history_sync_handshake_error(
+            &QRunV06NoiseError::Io("permission denied".into())
+        ));
+        assert!(!is_retryable_history_sync_handshake_error(
+            &QRunV06NoiseError::UntrustedPeer
+        ));
+        assert!(!is_retryable_history_sync_handshake_error(
+            &QRunV06NoiseError::MalformedHandshake
+        ));
+        assert!(!is_retryable_history_sync_handshake_error(
+            &QRunV06NoiseError::InvalidNetworkOrProfile
+        ));
+        assert!(!is_retryable_history_sync_handshake_error(
+            &QRunV06NoiseError::Handshake("cryptographic failure".into())
+        ));
+    }
+
+    #[test]
+    fn history_sync_handshake_retry_count_is_finite() {
+        assert_eq!(QFP6_HISTORY_SYNC_MAX_NOISE_HANDSHAKE_ATTEMPTS, 8);
+    }
+
+    #[test]
+    fn only_transient_transport_closures_are_retryable() {
+        assert!(is_retryable_history_sync_transport_error(
+            &QRunV06HistorySyncServiceError::Noise(
+                "Noise(Io(\"peer closed connection without sending TLS close_notify\"))".into()
+            )
+        ));
+        assert!(is_retryable_history_sync_transport_error(
+            &QRunV06HistorySyncServiceError::Noise(
+                "Noise(Io(\"connection reset by peer\"))".into()
+            )
+        ));
+        assert!(!is_retryable_history_sync_transport_error(
+            &QRunV06HistorySyncServiceError::Noise("UntrustedPeer".into())
+        ));
+        assert!(!is_retryable_history_sync_transport_error(
+            &QRunV06HistorySyncServiceError::Wire("malformed Q6HR".into())
+        ));
+        assert!(!is_retryable_history_sync_transport_error(
+            &QRunV06HistorySyncServiceError::SnapshotMismatch
+        ));
+        assert_eq!(QFP6_HISTORY_SYNC_MAX_TRANSIENT_TRANSPORT_RETRIES, 8);
+    }
+}
+
+#[cfg(test)]
+mod q6ar_pull_client_tests {
+    use super::*;
+    use crate::{
+        qrun_v06_bootstrap_trust_domain_candidate::BootstrapTrustDomainPolicy,
+        qrun_v06_noise_transport_candidate::QRunV06NoiseSession,
+        qrun_v06_peer_address_manager_candidate::{
+            PeerAddressSource, QRunV06PeerAddressBookCandidate,
+        },
+        qrun_v06_peer_address_relay_candidate::{
+            decode_q6ar_pull_request, encode_q6ar_pull_response, Q6arAddress, Q6arAdvertisement,
+        },
+    };
+    use std::{
+        fs,
+        net::TcpListener,
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    fn keypair() -> ([u8; 32], [u8; 32]) {
+        let params = "Noise_XX_25519_ChaChaPoly_SHA256".parse().unwrap();
+        let pair = snow::Builder::new(params).generate_keypair().unwrap();
+        (
+            pair.private.as_slice().try_into().unwrap(),
+            pair.public.as_slice().try_into().unwrap(),
+        )
+    }
+
+    #[test]
+    fn pinned_relay_pull_client_persists_only_untrusted_candidate_metadata() {
+        const NETWORK: [u8; 32] = [0xA1; 32];
+        const PROFILE: [u8; 32] = [0xA2; 32];
+        const DOMAIN: [u8; 32] = [0xA3; 32];
+
+        let (server_private, server_public) = keypair();
+        let (client_private, client_public) = keypair();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut noise = QRunV06NoiseSession::accept(
+                &mut stream,
+                &server_private,
+                &[client_public],
+                &NETWORK,
+                &PROFILE,
+            )
+            .unwrap();
+            let request_frame = noise.read_record(&mut stream).unwrap();
+            let request = decode_q6ar_pull_request(&request_frame, &NETWORK, &PROFILE).unwrap();
+            let issued_at_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let advertisement = Q6arAdvertisement {
+                network_id: NETWORK,
+                profile_id: PROFILE,
+                issued_at_secs,
+                ttl_secs: 600,
+                addresses: vec![Q6arAddress {
+                    endpoint: "8.8.8.8:8333".parse().unwrap(),
+                    noise_static_public_key: [0xA4; 32],
+                }],
+            };
+            let response = encode_q6ar_pull_response(&request, Some(&advertisement)).unwrap();
+            noise.write_record(&mut stream, &response).unwrap();
+        });
+
+        let root = std::env::temp_dir().join(format!(
+            "q6ar-pull-client-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let mut book =
+            QRunV06PeerAddressBookCandidate::open(root.join("peers.q6pa"), NETWORK, PROFILE)
+                .unwrap();
+        let trust_domains =
+            BootstrapTrustDomainPolicy::new([(server_public, DOMAIN)], 8, 1).unwrap();
+        let now_ms: u64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .try_into()
+            .unwrap();
+        book.bind_trust_domain_registry(&trust_domains, now_ms)
+            .unwrap();
+
+        let accepted = pull_q6ar_candidates_from_pinned_peer(
+            address,
+            &client_private,
+            &server_public,
+            &NETWORK,
+            &PROFILE,
+            QRunV06HistorySyncClientConfig {
+                connect_timeout: Duration::from_secs(3),
+                io_timeout: Duration::from_secs(5),
+                ..QRunV06HistorySyncClientConfig::default()
+            },
+            None,
+            &mut book,
+            &trust_domains,
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(accepted, 1);
+        assert_eq!(book.records().count(), 1);
+        let candidate = book.records().next().unwrap();
+        assert_eq!(candidate.address, "8.8.8.8:8333");
+        assert_eq!(candidate.source, PeerAddressSource::Gossip);
+        assert_eq!(candidate.advertised_noise_static_key, Some([0xA4; 32]));
+        assert_eq!(candidate.relay_static_public_key, Some(server_public));
+        assert!(candidate.relay_static_key_pinned);
+        assert!(candidate.operator_approved_noise_static_key.is_none());
+        assert!(
+            book.approved_peer_pins(now_ms.saturating_add(1), 8)
+                .is_empty(),
+            "a pulled candidate must not enter the outbound trusted set automatically"
+        );
+
+        drop(book);
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod q6pd_pull_noise_integration_tests {
+    use super::*;
+    use crate::{
+        qrun_v06_peer_discovery_candidate::{sign_q6pd_peer_record, Q6PD_MIN_RECORD_BYTES},
+        qrun_v06_peer_discovery_store_candidate::{Q6pdIngestResult, Q6pdPeerRecordStore},
+    };
+    use ed25519_dalek::SigningKey;
+    use std::{
+        fs,
+        net::TcpListener,
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    const NETWORK: [u8; 32] = [0xB1; 32];
+    const PROFILE: [u8; 32] = [0xB2; 32];
+
+    fn keypair() -> ([u8; 32], [u8; 32]) {
+        let params = "Noise_XX_25519_ChaChaPoly_SHA256".parse().unwrap();
+        let pair = snow::Builder::new(params).generate_keypair().unwrap();
+        (
+            pair.private.as_slice().try_into().unwrap(),
+            pair.public.as_slice().try_into().unwrap(),
+        )
+    }
+
+    #[test]
+    fn q6pd_pull_and_bidirectional_gossip_push_run_over_one_pinned_noise_session() {
+        let (server_private, server_public) = keypair();
+        let (client_private, _) = keypair();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "q6pd-noise-pull-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let now_ms: u64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .try_into()
+            .unwrap();
+        let now_secs = now_ms / 1000;
+        let identity = SigningKey::from_bytes(&[0xB3; 32]);
+        let record_wire = sign_q6pd_peer_record(
+            NETWORK,
+            PROFILE,
+            [0xB4; 32],
+            "8.8.4.4:30336".parse().unwrap(),
+            1,
+            now_secs,
+            600,
+            &identity,
+        )
+        .unwrap();
+        assert_eq!(
+            record_wire.len(),
+            Q6PD_MIN_RECORD_BYTES + 2,
+            "IPv4 Q6PD v2 without SNI must exercise the minimum wire length"
+        );
+        let mut source_store =
+            Q6pdPeerRecordStore::open(root.join("source.q6pd"), NETWORK, PROFILE, now_ms).unwrap();
+        assert_eq!(
+            source_store.ingest(&record_wire, now_ms).unwrap(),
+            Q6pdIngestResult::Inserted
+        );
+
+        // The client also knows a third-party peer C. After it pulls A from the
+        // server, it must push C back over the same exact-key-pinned Noise session.
+        let third_identity = SigningKey::from_bytes(&[0xB5; 32]);
+        let third_wire = sign_q6pd_peer_record(
+            NETWORK,
+            PROFILE,
+            [0xB6; 32],
+            "1.0.0.1:30336".parse().unwrap(),
+            1,
+            now_secs,
+            600,
+            &third_identity,
+        )
+        .unwrap();
+
+        let source_store = std::sync::Arc::new(std::sync::Mutex::new(source_store));
+        let server_source_store = source_store.clone();
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = thread::spawn(move || {
+            let mut listener_config =
+                crate::qrun_v06_peer_listener_candidate::QRunV06PeerListenerConfig::default();
+            listener_config.max_sessions = 1;
+            listener_config.max_requests_per_session = 2;
+            let report = crate::qrun_v06_peer_listener_candidate::serve_qfp6_noise_listener_with_history_and_q6ar_relay_pins(
+                &listener,
+                listener_config,
+                &server_private,
+                &[],
+                &[],
+                &NETWORK,
+                &PROFILE,
+                &server_shutdown,
+                |_advertisement| Ok(()),
+                move |_guard, request_frame| {
+                    if request_frame.get(..4)
+                        == Some(&crate::qrun_v06_peer_discovery_candidate::Q6PD_PULL_REQUEST_MAGIC)
+                    {
+                        let response = server_source_store
+                            .lock()
+                            .map_err(|_| "Q6PD source-store lock poisoned".to_string())?
+                            .respond_to_pull_frame(request_frame, now_secs)
+                            .map_err(|error| error.to_string())?;
+                        return Ok(vec![response]);
+                    }
+                    if request_frame.get(..4)
+                        == Some(&crate::qrun_v06_peer_discovery_candidate::Q6PD_GOSSIP_PUSH_REQUEST_MAGIC)
+                    {
+                        let request = crate::qrun_v06_peer_discovery_candidate::decode_q6pd_gossip_push_request(
+                            request_frame,
+                            &NETWORK,
+                            &PROFILE,
+                            now_secs,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        let mut counts = crate::qrun_v06_peer_discovery_candidate::Q6pdGossipPushCounts {
+                            inserted: 0,
+                            updated: 0,
+                            duplicate: 0,
+                            rejected: 0,
+                        };
+                        let mut source_store = server_source_store
+                            .lock()
+                            .map_err(|_| "Q6PD source-store lock poisoned".to_string())?;
+                        for wire in &request.record_wires {
+                            match source_store.ingest(wire, now_ms) {
+                                Ok(Q6pdIngestResult::Inserted) => {
+                                    counts.inserted = counts.inserted.saturating_add(1)
+                                }
+                                Ok(Q6pdIngestResult::Updated) => {
+                                    counts.updated = counts.updated.saturating_add(1)
+                                }
+                                Ok(Q6pdIngestResult::Duplicate) => {
+                                    counts.duplicate = counts.duplicate.saturating_add(1)
+                                }
+                                Err(_) => counts.rejected = counts.rejected.saturating_add(1),
+                            }
+                        }
+                        let ack = crate::qrun_v06_peer_discovery_candidate::encode_q6pd_gossip_push_response(
+                            &request,
+                            counts,
+                        );
+                        return Ok(vec![ack.to_vec()]);
+                    }
+                    Err("unexpected Q6PD integration-test frame".into())
+                },
+            )
+            .unwrap();
+            (report, source_store)
+        });
+
+        let mut destination_store =
+            Q6pdPeerRecordStore::open(root.join("destination.q6pd"), NETWORK, PROFILE, now_ms)
+                .unwrap();
+        assert_eq!(
+            destination_store.ingest(&third_wire, now_ms).unwrap(),
+            Q6pdIngestResult::Inserted
+        );
+        let report = pull_q6pd_peer_records_from_pinned_peer(
+            address,
+            &client_private,
+            &server_public,
+            &NETWORK,
+            &PROFILE,
+            QRunV06HistorySyncClientConfig {
+                connect_timeout: Duration::from_secs(3),
+                io_timeout: Duration::from_secs(5),
+                ..QRunV06HistorySyncClientConfig::default()
+            },
+            None,
+            8,
+            &mut destination_store,
+        )
+        .unwrap();
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        let (listener_report, relay_store) = server.join().unwrap();
+        assert_eq!(listener_report.stats.requests_received, 2);
+        assert_eq!(listener_report.stats.responses_written, 2);
+        assert_eq!(listener_report.stats.handler_failures, 0);
+
+        assert_eq!(report.records_received, 1);
+        assert_eq!(report.records_inserted, 1);
+        assert_eq!(report.records_rejected, 0);
+        let candidates = destination_store.candidates(now_ms);
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().any(|record| {
+            record.endpoint == "8.8.4.4:30336".parse().unwrap()
+                && record.noise_static_public_key == [0xB4; 32]
+        }));
+        assert!(candidates.iter().any(|record| {
+            record.endpoint == "1.0.0.1:30336".parse().unwrap()
+                && record.noise_static_public_key == [0xB6; 32]
+        }));
+
+        // A has already been on the relay; C came only from the joining client's
+        // inventory. The receiver must mark A duplicate and persist C as a new peer.
+        let relayed_candidates = relay_store.lock().unwrap().candidates(now_ms);
+        assert_eq!(relayed_candidates.len(), 2);
+        assert!(relayed_candidates.iter().any(|record| {
+            record.endpoint == "1.0.0.1:30336".parse().unwrap()
+                && record.noise_static_public_key == [0xB6; 32]
+        }));
+
+        drop(destination_store);
+        drop(relay_store);
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod q6pd_dns_seed_failover_tests {
+    use super::resolve_q6pd_dns_seed_addresses_with;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn dns_seed_preserves_resolver_preference_and_deduplicates_routes() {
+        let preferred_ipv6 = "[2a00:dd80:3a::336]:443".parse::<SocketAddr>().unwrap();
+        let first_ipv4 = "176.58.88.82:443".parse::<SocketAddr>().unwrap();
+        let second_ipv4 = "176.58.92.199:443".parse::<SocketAddr>().unwrap();
+        let resolved = vec![
+            preferred_ipv6,
+            first_ipv4,
+            preferred_ipv6,
+            second_ipv4,
+            first_ipv4,
+        ];
+        let routes = resolve_q6pd_dns_seed_addresses_with(
+            "heymed.tail2a756d.ts.net",
+            443,
+            move |host, port| {
+                assert_eq!(host, "heymed.tail2a756d.ts.net");
+                assert_eq!(port, 443);
+                Ok(resolved.clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(routes.len(), 3);
+        assert_eq!(routes[0], preferred_ipv6);
+        assert_eq!(routes[1], first_ipv4);
+        assert_eq!(routes[2], second_ipv4);
+        assert!(routes.iter().all(|route| route.port() == 443));
+    }
+
+    #[test]
+    fn dns_seed_rejects_private_or_mixed_untrusted_routes() {
+        let resolved = vec![
+            "176.58.88.82:443".parse::<SocketAddr>().unwrap(),
+            "10.0.0.4:443".parse::<SocketAddr>().unwrap(),
+        ];
+        let result = resolve_q6pd_dns_seed_addresses_with("seed.qfp6.example", 443, move |_, _| {
+            Ok(resolved.clone())
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn dns_seed_rejects_empty_oversized_and_non_public_names() {
+        assert!(
+            resolve_q6pd_dns_seed_addresses_with("seed.qfp6.example", 443, |_, _| {
+                Ok(Vec::new())
+            })
+            .is_err()
+        );
+
+        let too_many = vec!["176.58.88.82:443".parse::<SocketAddr>().unwrap(); 17];
+        assert!(
+            resolve_q6pd_dns_seed_addresses_with("seed.qfp6.example", 443, move |_, _| Ok(
+                too_many.clone()
+            ),)
+            .is_err()
+        );
+
+        assert!(
+            resolve_q6pd_dns_seed_addresses_with("seed.qfp6.local", 443, |_, _| {
+                Ok(vec!["176.58.88.82:443".parse().unwrap()])
+            })
+            .is_err()
+        );
+        assert!(
+            resolve_q6pd_dns_seed_addresses_with("seed.qfp6.example", 30336, |_, _| {
+                Ok(vec!["176.58.88.82:30336".parse().unwrap()])
+            })
+            .is_err()
+        );
     }
 }

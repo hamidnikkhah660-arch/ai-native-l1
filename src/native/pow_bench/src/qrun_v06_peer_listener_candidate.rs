@@ -29,6 +29,11 @@ use crate::{
     qrun_v06_noise_transport_candidate::{QRunV06NoiseError, QRunV06NoiseSession},
     qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessNodeRuntime,
     qrun_v06_pow_fork_choice_candidate::QRunV06QuoteAssetAuthorizationProvider,
+    qrun_v06_q6pd_session_candidate::{
+        decode_q6pd_session_open, decode_q6pd_session_open_ack, encode_q6pd_session_open_ack,
+        serve_q6pd_persistent_session, try_reserve_q6pd_persistent_session,
+        Q6PD_SESSION_OPEN_MAGIC,
+    },
     qrun_v06_qap1_coordinator_candidate::{
         QRunV06Qap1AnchorTransport, QRunV06Qap1ExternalCoordinator,
     },
@@ -1123,7 +1128,7 @@ pub fn serve_qfp6_noise_listener_with_history_and_q6ar_relay_pins<F, G>(
     profile_id: &[u8; 32],
     shutdown: &AtomicBool,
     on_q6ar: G,
-    on_application_frame: F,
+    mut on_application_frame: F,
 ) -> Result<QRunV06PeerListenerReport, QRunV06PeerListenerError>
 where
     F: FnMut(&mut QRunV06PeerReplayGuard, &[u8]) -> Result<Vec<Vec<u8>>, String>,
@@ -1142,7 +1147,7 @@ where
         profile_id,
         shutdown,
         on_q6ar,
-        on_application_frame,
+        move |_peer_addr, guard, frame| on_application_frame(guard, frame),
         &mut source_rate_limiter,
     )
 }
@@ -1161,7 +1166,7 @@ pub(crate) fn serve_qfp6_noise_listener_with_history_and_q6ar_relay_pins_with_ra
     source_rate_limiter: &mut QRunV06PeerSourceRateLimiter,
 ) -> Result<QRunV06PeerListenerReport, QRunV06PeerListenerError>
 where
-    F: FnMut(&mut QRunV06PeerReplayGuard, &[u8]) -> Result<Vec<Vec<u8>>, String>,
+    F: FnMut(SocketAddr, &mut QRunV06PeerReplayGuard, &[u8]) -> Result<Vec<Vec<u8>>, String>,
     G: FnMut(
         crate::qrun_v06_peer_address_relay_candidate::Q6arReceivedAdvertisement,
     ) -> Result<(), String>,
@@ -1175,7 +1180,15 @@ where
     };
     use crate::qrun_v06_noise_transport_candidate::MAX_QFP6_NOISE_RECORD_BYTES;
     use crate::qrun_v06_peer_address_relay_candidate::{
-        decode_q6ar_from_session, Q6AR_MAGIC, Q6AR_MAX_FRAME_BYTES,
+        decode_q6ar_from_session, decode_q6ar_pull_request, decode_q6ar_pull_response, Q6AR_MAGIC,
+        Q6AR_MAX_FRAME_BYTES, Q6AR_PULL_MAX_RESPONSE_BYTES, Q6AR_PULL_REQUEST_BYTES,
+        Q6AR_PULL_REQUEST_MAGIC,
+    };
+    use crate::qrun_v06_peer_discovery_candidate::{
+        decode_q6pd_announce_request, decode_q6pd_announce_response, decode_q6pd_pull_request,
+        decode_q6pd_pull_response, verify_q6pd_peer_record, Q6PD_ANNOUNCE_HEADER_BYTES,
+        Q6PD_ANNOUNCE_REQUEST_MAGIC, Q6PD_ANNOUNCE_RESPONSE_BYTES, Q6PD_MAX_PULL_FRAME_BYTES,
+        Q6PD_MAX_RECORD_BYTES, Q6PD_PULL_REQUEST_BYTES, Q6PD_PULL_REQUEST_MAGIC,
     };
     use crate::qrun_v06_transaction_ingress_candidate::{
         decode_q6ti_transaction_request, Q6TI_MAGIC,
@@ -1234,7 +1247,7 @@ where
 
         // Prefer completed handshakes. All application records and canonical callbacks remain
         // on this thread; workers only perform the bounded Noise XX authentication stage.
-        let (mut stream, _peer_addr, mut noise) = loop {
+        let (mut stream, peer_addr, mut noise) = loop {
             if shutdown.load(Ordering::Acquire) {
                 break 'listener QRunV06PeerListenerStopReason::ShutdownRequested;
             }
@@ -1257,7 +1270,8 @@ where
                                 stats.cancelled_handshakes.saturating_add(1);
                             continue;
                         }
-                        Err(_) => {
+                        Err(error) => {
+                            eprintln!("QFP6_DIAG noise_handshake_rejected source={peer_addr} error={error:?}");
                             stats.rejected_handshakes = stats.rejected_handshakes.saturating_add(1);
                             drop(stream);
                             continue;
@@ -1311,6 +1325,11 @@ where
                 }
             }
         };
+        eprintln!(
+            "QFP6_DIAG noise_session_established source={} remote_static_pinned={}",
+            peer_addr,
+            noise.remote_static_key_pinned()
+        );
         if noise.remote_static_key_pinned() {
             stats.authenticated_sessions += 1;
         } else {
@@ -1319,6 +1338,12 @@ where
         let mut replay_guard = QRunV06PeerReplayGuard::new();
         let mut session_history_egress = 0usize;
         let mut q6ar_seen = false;
+        let mut q6ar_pull_seen = false;
+        // A persistent liveness slot is available only after an Ed25519 Q6PD record
+        // proves that its declared Noise key equals the live session's remote static key.
+        let mut q6pd_announcement_matches_noise = false;
+        let mut q6pd_gossip_push_seen = false;
+        let mut q6pd_session_handed_off = false;
         let session_deadline = Instant::now() + QRUN_V06_MAX_APPLICATION_SESSION_DURATION;
         for _ in 0..config.max_requests_per_session {
             if shutdown.load(Ordering::Acquire) {
@@ -1331,8 +1356,19 @@ where
                 };
             let frame = match noise.read_record_with_budget(&mut stream, read_budget) {
                 Ok(frame) => frame,
-                Err(_) => break,
+                Err(error) => {
+                    eprintln!(
+                        "QFP6_DIAG noise_record_read_failed source={peer_addr} error={error:?}"
+                    );
+                    break;
+                }
             };
+            eprintln!(
+                "QFP6_DIAG application_frame source={} magic={:02x?} bytes={}",
+                peer_addr,
+                frame.get(..4).unwrap_or_default(),
+                frame.len()
+            );
             if frame.get(..4) == Some(&Q6AR_MAGIC) {
                 if q6ar_seen || frame.len() > Q6AR_MAX_FRAME_BYTES {
                     stats.q6ar_rejections += 1;
@@ -1361,6 +1397,391 @@ where
                         break;
                     }
                 }
+            }
+            if frame.get(..4) == Some(&Q6AR_PULL_REQUEST_MAGIC) {
+                if q6ar_pull_seen
+                    || frame.len() != Q6AR_PULL_REQUEST_BYTES
+                    || frame.len() > MAX_QFP6_NOISE_RECORD_BYTES
+                {
+                    stats.q6ar_rejections += 1;
+                    break;
+                }
+                q6ar_pull_seen = true;
+                let request = match decode_q6ar_pull_request(&frame, network_id, profile_id) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        stats.q6ar_rejections += 1;
+                        break;
+                    }
+                };
+                if replay_guard.accept(request.request_id).is_err() {
+                    stats.q6ar_rejections += 1;
+                    break;
+                }
+                stats.requests_received += 1;
+                let responses = match on_application_frame(peer_addr, &mut replay_guard, &frame) {
+                    Ok(responses) => responses,
+                    Err(_) => {
+                        stats.q6ar_rejections += 1;
+                        break;
+                    }
+                };
+                let now_secs =
+                    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                        Ok(duration) => duration.as_secs(),
+                        Err(_) => {
+                            stats.handler_failures += 1;
+                            break;
+                        }
+                    };
+                if responses.len() != 1
+                    || responses[0].len() > Q6AR_PULL_MAX_RESPONSE_BYTES
+                    || decode_q6ar_pull_response(&responses[0], &request, now_secs).is_err()
+                {
+                    stats.malformed_responses += 1;
+                    break;
+                }
+                if noise.write_record(&mut stream, &responses[0]).is_err() {
+                    stats.handler_failures += 1;
+                    break;
+                }
+                stats.responses_written += 1;
+                continue;
+            }
+            // Persistent Q6PD liveness is handed to a separately bounded worker after
+            // the Noise session and network/profile-bound open control are accepted. This
+            // releases the serial listener immediately so other peers can be served.
+            if frame.get(..4) == Some(&Q6PD_SESSION_OPEN_MAGIC) {
+                if !q6pd_announcement_matches_noise {
+                    let Some(open) = decode_q6pd_session_open(&frame, network_id, profile_id).ok()
+                    else {
+                        stats.handler_failures = stats.handler_failures.saturating_add(1);
+                        break;
+                    };
+                    let rejected = encode_q6pd_session_open_ack(&open, false);
+                    if noise.write_record(&mut stream, &rejected).is_err() {
+                        stats.handler_failures = stats.handler_failures.saturating_add(1);
+                    } else {
+                        stats.responses_written = stats.responses_written.saturating_add(1);
+                    }
+                    eprintln!(
+                        "QFP6_Q6PD_SESSION_OPEN_REJECTED source={peer_addr} reason=missing_signed_noise_bound_announcement"
+                    );
+                    break;
+                }
+                let open = match decode_q6pd_session_open(&frame, network_id, profile_id) {
+                    Ok(open) => open,
+                    Err(error) => {
+                        eprintln!(
+                            "QFP6_Q6PD_SESSION_OPEN_REJECTED source={peer_addr} error={error:?}"
+                        );
+                        stats.handler_failures = stats.handler_failures.saturating_add(1);
+                        break;
+                    }
+                };
+                if replay_guard.accept(open.request_id).is_err() {
+                    stats.handler_failures = stats.handler_failures.saturating_add(1);
+                    break;
+                }
+                stats.requests_received = stats.requests_received.saturating_add(1);
+
+                let Some(slot) = try_reserve_q6pd_persistent_session() else {
+                    let rejected = encode_q6pd_session_open_ack(&open, false);
+                    if noise.write_record(&mut stream, &rejected).is_err() {
+                        stats.handler_failures = stats.handler_failures.saturating_add(1);
+                    } else {
+                        stats.responses_written = stats.responses_written.saturating_add(1);
+                    }
+                    eprintln!(
+                        "QFP6_Q6PD_SESSION_OPEN_REJECTED source={peer_addr} reason=session_capacity"
+                    );
+                    break;
+                };
+
+                let callback_response = match on_application_frame(
+                    peer_addr,
+                    &mut replay_guard,
+                    &frame,
+                ) {
+                    Ok(responses) => responses,
+                    Err(error) => {
+                        eprintln!(
+                            "QFP6_Q6PD_SESSION_OPEN_REJECTED source={peer_addr} reason=feature_disabled_or_handler error={error}"
+                        );
+                        let rejected = encode_q6pd_session_open_ack(&open, false);
+                        if noise.write_record(&mut stream, &rejected).is_err() {
+                            stats.handler_failures = stats.handler_failures.saturating_add(1);
+                        } else {
+                            stats.responses_written = stats.responses_written.saturating_add(1);
+                        }
+                        break;
+                    }
+                };
+                let accepted = callback_response.len() == 1
+                    && decode_q6pd_session_open_ack(&callback_response[0], &open) == Ok(true);
+                if !accepted {
+                    let rejected = encode_q6pd_session_open_ack(&open, false);
+                    if noise.write_record(&mut stream, &rejected).is_err() {
+                        stats.handler_failures = stats.handler_failures.saturating_add(1);
+                    } else {
+                        stats.responses_written = stats.responses_written.saturating_add(1);
+                    }
+                    break;
+                }
+
+                let accepted_ack = encode_q6pd_session_open_ack(&open, true);
+                if let Err(error) = noise.write_record(&mut stream, &accepted_ack) {
+                    eprintln!(
+                        "QFP6_Q6PD_SESSION_OPEN_WRITE_FAILED source={peer_addr} error={error:?}"
+                    );
+                    stats.handler_failures = stats.handler_failures.saturating_add(1);
+                    break;
+                }
+                stats.responses_written = stats.responses_written.saturating_add(1);
+                let worker_stream = stream;
+                let worker_noise = noise;
+                match thread::Builder::new()
+                    .name("q6pd-persistent-session".into())
+                    .spawn(move || {
+                        serve_q6pd_persistent_session(
+                            worker_stream,
+                            worker_noise,
+                            open,
+                            peer_addr,
+                            slot,
+                        );
+                    }) {
+                    Ok(_) => {
+                        q6pd_session_handed_off = true;
+                        eprintln!(
+                            "QFP6_Q6PD_SESSION_HANDED_OFF source={peer_addr} request_id={} active={}",
+                            open.request_id,
+                            crate::qrun_v06_q6pd_session_candidate::active_q6pd_persistent_session_count()
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "QFP6_Q6PD_SESSION_WORKER_FAILED source={peer_addr} error={error}"
+                        );
+                        stats.handler_failures = stats.handler_failures.saturating_add(1);
+                    }
+                }
+                break;
+            }
+
+            // Q6PD is a first-class Noise application protocol. Route the two signed-record
+            // frames to the supervisor callback before the legacy Peer Block decoder; otherwise
+            // valid Q6PG/Q6PA messages are rejected as malformed peer-block requests.
+            if frame.get(..4) == Some(&Q6PD_ANNOUNCE_REQUEST_MAGIC) {
+                if frame.len() > Q6PD_ANNOUNCE_HEADER_BYTES + Q6PD_MAX_RECORD_BYTES {
+                    stats.handler_failures += 1;
+                    break;
+                }
+                let record_wire = match decode_q6pd_announce_request(&frame) {
+                    Ok(wire) => wire,
+                    Err(error) => {
+                        eprintln!(
+                            "QFP6_Q6PD_ANNOUNCEMENT_REJECTED source={peer_addr} reason=frame_decode error={error:?}"
+                        );
+                        stats.handler_failures += 1;
+                        break;
+                    }
+                };
+                let now_secs =
+                    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                        Ok(duration) => duration.as_secs(),
+                        Err(_) => {
+                            stats.handler_failures += 1;
+                            break;
+                        }
+                    };
+                let verified_record = match verify_q6pd_peer_record(
+                    record_wire,
+                    network_id,
+                    profile_id,
+                    now_secs,
+                ) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        eprintln!(
+                            "QFP6_Q6PD_ANNOUNCEMENT_REJECTED source={peer_addr} reason=signature_or_domain error={error:?}"
+                        );
+                        stats.handler_failures += 1;
+                        break;
+                    }
+                };
+                if verified_record.noise_static_public_key != *noise.remote_static_public_key() {
+                    eprintln!(
+                        "QFP6_Q6PD_ANNOUNCEMENT_REJECTED source={peer_addr} reason=noise_key_mismatch"
+                    );
+                    stats.handler_failures += 1;
+                    break;
+                }
+                let responses = match on_application_frame(peer_addr, &mut replay_guard, &frame) {
+                    Ok(responses) => responses,
+                    Err(_) => {
+                        stats.handler_failures += 1;
+                        break;
+                    }
+                };
+                if responses.len() != 1
+                    || responses[0].len() != Q6PD_ANNOUNCE_RESPONSE_BYTES
+                    || decode_q6pd_announce_response(&responses[0]).is_err()
+                {
+                    stats.malformed_responses += 1;
+                    break;
+                }
+                stats.requests_received += 1;
+                if noise.write_record(&mut stream, &responses[0]).is_err() {
+                    stats.handler_failures += 1;
+                    break;
+                }
+                stats.responses_written += 1;
+                q6pd_announcement_matches_noise = true;
+                continue;
+            }
+            if frame.get(..4) == Some(&Q6PD_PULL_REQUEST_MAGIC) {
+                if frame.len() != Q6PD_PULL_REQUEST_BYTES
+                    || frame.len() > MAX_QFP6_NOISE_RECORD_BYTES
+                {
+                    eprintln!("QFP6_DIAG q6pd_pull_rejected source={peer_addr} reason=invalid_frame_length bytes={}", frame.len());
+                    stats.handler_failures += 1;
+                    break;
+                }
+                let request = match decode_q6pd_pull_request(&frame, network_id, profile_id) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        eprintln!("QFP6_DIAG q6pd_pull_rejected source={peer_addr} reason=request_decode error={error:?}");
+                        stats.handler_failures += 1;
+                        break;
+                    }
+                };
+                if let Err(error) = replay_guard.accept(request.request_id) {
+                    eprintln!("QFP6_DIAG q6pd_pull_rejected source={peer_addr} reason=replay request_id={} error={error:?}", request.request_id);
+                    stats.handler_failures += 1;
+                    break;
+                }
+                let responses = match on_application_frame(peer_addr, &mut replay_guard, &frame) {
+                    Ok(responses) => responses,
+                    Err(error) => {
+                        eprintln!("QFP6_DIAG q6pd_pull_handler_failed source={peer_addr} request_id={} error={error}", request.request_id);
+                        stats.handler_failures += 1;
+                        break;
+                    }
+                };
+                let now_secs = match std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                {
+                    Ok(duration) => duration.as_secs(),
+                    Err(error) => {
+                        eprintln!("QFP6_DIAG q6pd_pull_rejected source={peer_addr} reason=system_clock error={error}");
+                        stats.handler_failures += 1;
+                        break;
+                    }
+                };
+                if responses.len() != 1 {
+                    eprintln!("QFP6_DIAG q6pd_pull_response_rejected source={peer_addr} request_id={} reason=response_count count={}", request.request_id, responses.len());
+                    stats.malformed_responses += 1;
+                    break;
+                }
+                if responses[0].len() > Q6PD_MAX_PULL_FRAME_BYTES {
+                    eprintln!("QFP6_DIAG q6pd_pull_response_rejected source={peer_addr} request_id={} reason=oversized bytes={}", request.request_id, responses[0].len());
+                    stats.malformed_responses += 1;
+                    break;
+                }
+                if let Err(error) = decode_q6pd_pull_response(&responses[0], &request, now_secs) {
+                    eprintln!("QFP6_DIAG q6pd_pull_response_rejected source={peer_addr} request_id={} reason=response_decode error={error:?}", request.request_id);
+                    stats.malformed_responses += 1;
+                    break;
+                }
+                stats.requests_received += 1;
+                if let Err(error) = noise.write_record(&mut stream, &responses[0]) {
+                    eprintln!("QFP6_DIAG q6pd_pull_response_write_failed source={peer_addr} request_id={} error={error:?}", request.request_id);
+                    stats.handler_failures += 1;
+                    break;
+                }
+                eprintln!(
+                    "QFP6_DIAG q6pd_pull_response_sent source={peer_addr} request_id={} records={}",
+                    request.request_id,
+                    responses[0].len()
+                );
+                stats.responses_written += 1;
+                continue;
+            }
+            // Third-party Q6PD records are untrusted address hints. Each Ed25519
+            // signature/domain/TTL is checked before ingestion; one bounded batch per
+            // Noise session prevents anonymous peers from flooding the candidate store.
+            if frame.get(..4)
+                == Some(&crate::qrun_v06_peer_discovery_candidate::Q6PD_GOSSIP_PUSH_REQUEST_MAGIC)
+            {
+                if q6pd_gossip_push_seen
+                    || frame.len()
+                        > crate::qrun_v06_peer_discovery_candidate::Q6PD_MAX_GOSSIP_PUSH_FRAME_BYTES
+                {
+                    stats.handler_failures += 1;
+                    break;
+                }
+                let now_secs =
+                    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                        Ok(duration) => duration.as_secs(),
+                        Err(_) => {
+                            stats.handler_failures += 1;
+                            break;
+                        }
+                    };
+                let request =
+                    match crate::qrun_v06_peer_discovery_candidate::decode_q6pd_gossip_push_request(
+                        &frame, network_id, profile_id, now_secs,
+                    ) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            eprintln!(
+                                "QFP6_Q6PD_GOSSIP_PUSH_REJECTED source={peer_addr} error={error:?}"
+                            );
+                            stats.handler_failures += 1;
+                            break;
+                        }
+                    };
+                if replay_guard.accept(request.request_id).is_err() {
+                    eprintln!(
+                        "QFP6_Q6PD_GOSSIP_PUSH_REJECTED source={peer_addr} reason=replay request_id={}",
+                        request.request_id
+                    );
+                    stats.handler_failures += 1;
+                    break;
+                }
+                q6pd_gossip_push_seen = true;
+                let responses = match on_application_frame(peer_addr, &mut replay_guard, &frame) {
+                    Ok(responses) => responses,
+                    Err(error) => {
+                        eprintln!(
+                            "QFP6_Q6PD_GOSSIP_PUSH_HANDLER_FAILED source={peer_addr} error={error}"
+                        );
+                        stats.handler_failures += 1;
+                        break;
+                    }
+                };
+                if responses.len() != 1
+                    || crate::qrun_v06_peer_discovery_candidate::decode_q6pd_gossip_push_response(
+                        &responses[0],
+                        &request,
+                    )
+                    .is_err()
+                {
+                    stats.malformed_responses += 1;
+                    break;
+                }
+                if noise.write_record(&mut stream, &responses[0]).is_err() {
+                    stats.handler_failures += 1;
+                    break;
+                }
+                stats.requests_received += 1;
+                stats.responses_written += 1;
+                eprintln!(
+                    "QFP6_Q6PD_GOSSIP_PUSH_ACCEPTED source={peer_addr} records={}",
+                    request.records.len()
+                );
+                continue;
             }
             let (request_id, is_history, is_info, is_market) =
                 if frame.get(..4) == Some(&Q6HI_REQUEST_MAGIC) {
@@ -1419,23 +1840,27 @@ where
                 stats.handler_failures += 1;
                 break;
             }
-            let responses = match on_application_frame(&mut replay_guard, &frame) {
+            let responses = match on_application_frame(peer_addr, &mut replay_guard, &frame) {
                 Ok(responses) => responses,
-                Err(_) => {
+                Err(error) => {
+                    eprintln!(
+                        "QFP6_DIAG application_handler_failed source={peer_addr} error={error}"
+                    );
                     stats.handler_failures += 1;
                     break;
                 }
             };
             if is_history {
-                if validate_q6hc_response_sequence(
+                if let Err(error) = validate_q6hc_response_sequence(
                     &responses,
                     request_id,
                     &decode_q6hs_request(&frame)
                         .map_err(|_| QRunV06PeerListenerError::InvalidConfiguration)?
                         .snapshot_tip,
-                )
-                .is_err()
-                {
+                ) {
+                    eprintln!(
+                        "QFP6_DIAG history_response_invalid source={peer_addr} error={error:?}"
+                    );
                     stats.malformed_responses += 1;
                     break;
                 }
@@ -1466,32 +1891,88 @@ where
                 stats.malformed_responses += 1;
                 break;
             }
+            if is_history {
+                let response_bytes = responses.iter().map(Vec::len).sum::<usize>();
+                eprintln!(
+                    "QFP6_DIAG history_response_ready source={} request_id={} chunks={} bytes={}",
+                    peer_addr,
+                    request_id,
+                    responses.len(),
+                    response_bytes
+                );
+            }
             let mut write_failed = false;
-            for response in &responses {
+            for (response_index, response) in responses.iter().enumerate() {
                 if response.len() > MAX_QFP6_NOISE_RECORD_BYTES {
+                    eprintln!(
+                        "QFP6_DIAG history_response_record_oversized source={} request_id={} chunk_index={} bytes={}",
+                        peer_addr,
+                        request_id,
+                        response_index,
+                        response.len()
+                    );
                     write_failed = true;
                     break;
                 }
                 if is_history {
                     let next = session_history_egress.checked_add(response.len());
                     if next.is_none_or(|bytes| bytes > MAX_HISTORY_SESSION_EGRESS_BYTES) {
+                        eprintln!(
+                            "QFP6_DIAG history_response_egress_budget_exceeded source={} request_id={} chunk_index={} bytes={}",
+                            peer_addr,
+                            request_id,
+                            response_index,
+                            response.len()
+                        );
                         write_failed = true;
                         break;
                     }
                     session_history_egress = next.expect("history egress checked before write");
                 }
-                if noise.write_record(&mut stream, response).is_err() {
+                if let Err(error) = noise.write_record(&mut stream, response) {
+                    eprintln!(
+                        "QFP6_DIAG noise_record_write_failed source={peer_addr} error={error:?}"
+                    );
+                    if is_history {
+                        eprintln!(
+                            "QFP6_DIAG history_chunk_write_failed source={} request_id={} chunk_index={} bytes={} error={error:?}",
+                            peer_addr,
+                            request_id,
+                            response_index,
+                            response.len()
+                        );
+                    }
                     write_failed = true;
                     break;
                 }
                 stats.responses_written += 1;
+                if is_history {
+                    eprintln!(
+                        "QFP6_DIAG history_chunk_written source={} request_id={} chunk_index={} chunks={} bytes={}",
+                        peer_addr,
+                        request_id,
+                        response_index,
+                        responses.len(),
+                        response.len()
+                    );
+                }
+            }
+            if is_history && !write_failed {
+                eprintln!(
+                    "QFP6_DIAG history_response_sent source={} request_id={} chunks={}",
+                    peer_addr,
+                    request_id,
+                    responses.len()
+                );
             }
             if write_failed {
                 stats.handler_failures += 1;
                 break;
             }
         }
-        stats.sessions_closed += 1;
+        if !q6pd_session_handed_off {
+            stats.sessions_closed += 1;
+        }
     };
     Ok(QRunV06PeerListenerReport { stats, stop_reason })
 }
@@ -1541,7 +2022,7 @@ mod tests {
         net::{Ipv6Addr, SocketAddr, TcpStream},
         sync::{atomic::AtomicBool, Arc},
         thread,
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     const NETWORK: [u8; 32] = [0x91; 32];
@@ -1619,6 +2100,152 @@ mod tests {
                 Err(error) => panic!("listener did not accept local test connection: {error}"),
             }
         }
+    }
+
+    #[test]
+    fn q6pd_persistent_session_is_handed_off_and_survives_listener_round() {
+        use crate::qrun_v06_peer_discovery_candidate::{
+            decode_q6pd_announce_request, decode_q6pd_announce_response,
+            encode_q6pd_announce_request, encode_q6pd_announce_response, sign_q6pd_peer_record,
+            Q6PD_ANNOUNCE_REQUEST_MAGIC,
+        };
+        use crate::qrun_v06_q6pd_session_candidate::{
+            active_q6pd_persistent_session_count, decode_q6pd_session_open,
+            decode_q6pd_session_pong, encode_q6pd_session_open_ack, encode_q6pd_session_ping,
+            Q6pdSessionControl,
+        };
+        use ed25519_dalek::SigningKey;
+
+        let (server_private, server_public) = keypair();
+        let (client_private, client_public) = keypair();
+        let identity_signing_key = SigningKey::from_bytes(&[0x55; 32]);
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signed_record = sign_q6pd_peer_record(
+            NETWORK,
+            PROFILE,
+            client_public,
+            "8.8.8.8:30336".parse().unwrap(),
+            1,
+            now_secs,
+            600,
+            &identity_signing_key,
+        )
+        .unwrap();
+        let announce_frame = encode_q6pd_announce_request(&signed_record).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = AtomicBool::new(false);
+        let mut config = QRunV06PeerListenerConfig::default();
+        config.max_sessions = 1;
+        config.max_requests_per_session = 2;
+
+        let server = thread::spawn(move || {
+            serve_qfp6_noise_listener_with_history_and_q6ar_relay_pins(
+                &listener,
+                config,
+                &server_private,
+                &[],
+                &[],
+                &NETWORK,
+                &PROFILE,
+                &shutdown,
+                |_received| Ok(()),
+                |_guard, frame| {
+                    if frame.get(..4) == Some(&Q6PD_ANNOUNCE_REQUEST_MAGIC) {
+                        decode_q6pd_announce_request(frame).map_err(|error| error.to_string())?;
+                        Ok(vec![encode_q6pd_announce_response(true).to_vec()])
+                    } else {
+                        let open = decode_q6pd_session_open(frame, &NETWORK, &PROFILE)
+                            .map_err(|error| error.to_string())?;
+                        Ok(vec![encode_q6pd_session_open_ack(&open, true)])
+                    }
+                },
+            )
+            .unwrap()
+        });
+
+        let mut stream = connect_until(address);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut noise = QRunV06NoiseSession::connect(
+            &mut stream,
+            &client_private,
+            &server_public,
+            &NETWORK,
+            &PROFILE,
+        )
+        .unwrap();
+        noise.write_record(&mut stream, &announce_frame).unwrap();
+        let announce_ack = noise.read_record(&mut stream).unwrap();
+        decode_q6pd_announce_response(&announce_ack).unwrap();
+
+        let open = Q6pdSessionControl {
+            request_id: 10,
+            network_id: NETWORK,
+            profile_id: PROFILE,
+        };
+        noise
+            .write_record(
+                &mut stream,
+                &crate::qrun_v06_q6pd_session_candidate::encode_q6pd_session_open(&open),
+            )
+            .unwrap();
+        let ack = noise.read_record(&mut stream).unwrap();
+        assert_eq!(
+            crate::qrun_v06_q6pd_session_candidate::decode_q6pd_session_open_ack(&ack, &open),
+            Ok(true)
+        );
+
+        let report = server.join().unwrap();
+        assert_eq!(
+            report.stop_reason,
+            QRunV06PeerListenerStopReason::SessionLimitReached
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while active_q6pd_persistent_session_count() != 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(active_q6pd_persistent_session_count(), 1);
+
+        for request_id in 11..=13 {
+            let ping = Q6pdSessionControl {
+                request_id,
+                network_id: NETWORK,
+                profile_id: PROFILE,
+            };
+            noise
+                .write_record(&mut stream, &encode_q6pd_session_ping(&ping))
+                .unwrap();
+            let pong = noise.read_record(&mut stream).unwrap();
+            assert_eq!(decode_q6pd_session_pong(&pong, &ping), Ok(()));
+        }
+
+        let close = Q6pdSessionControl {
+            request_id: 14,
+            network_id: NETWORK,
+            profile_id: PROFILE,
+        };
+        noise
+            .write_record(
+                &mut stream,
+                &crate::qrun_v06_q6pd_session_candidate::encode_q6pd_session_close(&close),
+            )
+            .unwrap();
+        drop(noise);
+        drop(stream);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while active_q6pd_persistent_session_count() != 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(active_q6pd_persistent_session_count(), 0);
     }
 
     #[test]
@@ -2390,8 +3017,10 @@ mod tests {
                     {
                         let request =
                             decode_q6hi_request(frame).map_err(|error| error.to_string())?;
-                        let status = encode_q6hr_status(&request, 0, [0x77; 32], [0x56; 32])
-                            .map_err(|error| error.to_string())?;
+                        let status = encode_q6hr_status(
+                            &request, 0, [0x77; 32], [0x56; 32], 0, [0x77; 32], [0x56; 32],
+                        )
+                        .map_err(|error| error.to_string())?;
                         Ok(vec![status.to_vec()])
                     } else {
                         let request =
@@ -2560,6 +3189,109 @@ mod tests {
         );
         assert_eq!(report.stats.requests_received, 1);
         assert_eq!(report.stats.q6ar_rejections, 1);
+        assert_eq!(report.stats.handler_failures, 0);
+    }
+
+    #[test]
+    fn qfp6_listener_answers_q6ar_pull_only_inside_pinned_noise_session() {
+        use crate::qrun_v06_noise_transport_candidate::QRunV06NoiseSession;
+        use crate::qrun_v06_peer_address_relay_candidate::{
+            decode_q6ar_pull_response, encode_q6ar_pull_request, encode_q6ar_pull_response,
+            Q6arAddress, Q6arAdvertisement, Q6arPullRequest, Q6AR_PULL_REQUEST_MAGIC,
+        };
+        let (server_private, server_public) = keypair();
+        let (client_private, client_public) = keypair();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server = thread::spawn(move || {
+            let mut config = QRunV06PeerListenerConfig::default();
+            config.max_sessions = 1;
+            config.max_requests_per_session = 1;
+            serve_qfp6_noise_listener_with_history_and_q6ar_relay_pins(
+                &listener,
+                config,
+                &server_private,
+                &[],
+                &[client_public],
+                &NETWORK,
+                &PROFILE,
+                &server_shutdown,
+                |_advertisement| Ok(()),
+                move |_guard, frame| {
+                    if frame.get(..4) != Some(&Q6AR_PULL_REQUEST_MAGIC) {
+                        return Err("unexpected non-Q6AR pull frame".into());
+                    }
+                    let request =
+                        crate::qrun_v06_peer_address_relay_candidate::decode_q6ar_pull_request(
+                            frame, &NETWORK, &PROFILE,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|error| error.to_string())?
+                        .as_secs();
+                    let advertisement = Q6arAdvertisement {
+                        network_id: NETWORK,
+                        profile_id: PROFILE,
+                        issued_at_secs: now,
+                        ttl_secs: 120,
+                        addresses: vec![Q6arAddress {
+                            endpoint: "8.8.8.8:8333".parse().unwrap(),
+                            noise_static_public_key: [0x44; 32],
+                        }],
+                    };
+                    let response = encode_q6ar_pull_response(&request, Some(&advertisement))
+                        .map_err(|error| error.to_string())?;
+                    Ok(vec![response])
+                },
+            )
+            .unwrap()
+        });
+
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream.set_nodelay(true).unwrap();
+        let mut noise = QRunV06NoiseSession::connect(
+            &mut stream,
+            &client_private,
+            &server_public,
+            &NETWORK,
+            &PROFILE,
+        )
+        .unwrap();
+        let request = Q6arPullRequest {
+            request_id: 91,
+            network_id: NETWORK,
+            profile_id: PROFILE,
+            max_addresses: 1,
+        };
+        let request_frame = encode_q6ar_pull_request(&request).unwrap();
+        noise.write_record(&mut stream, &request_frame).unwrap();
+        let response_frame = noise.read_record(&mut stream).unwrap();
+        let response = decode_q6ar_pull_response(
+            &response_frame,
+            &request,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        let advertisement = response.advertisement.unwrap();
+        assert_eq!(advertisement.addresses.len(), 1);
+        assert_eq!(
+            advertisement.addresses[0].noise_static_public_key,
+            [0x44; 32]
+        );
+
+        drop(stream);
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+        let report = server.join().unwrap();
+        assert_eq!(report.stats.authenticated_sessions, 1);
+        assert_eq!(report.stats.requests_received, 1);
+        assert_eq!(report.stats.responses_written, 1);
+        assert_eq!(report.stats.q6ar_rejections, 0);
         assert_eq!(report.stats.handler_failures, 0);
     }
 

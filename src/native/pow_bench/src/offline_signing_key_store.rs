@@ -27,6 +27,7 @@ pub enum SigningKeyRole {
     PeerIssuer = 4,
     ReferenceTimeAuthority = 5,
     ReferenceTimePolicyAdmin = 6,
+    PeerNodeIdentity = 7,
 }
 
 impl SigningKeyRole {
@@ -38,6 +39,7 @@ impl SigningKeyRole {
             Self::PeerIssuer => "peer-issuer",
             Self::ReferenceTimeAuthority => "reference-time-authority",
             Self::ReferenceTimePolicyAdmin => "reference-time-policy-admin",
+            Self::PeerNodeIdentity => "peer-node-identity",
         }
     }
 
@@ -49,6 +51,7 @@ impl SigningKeyRole {
             "peer-issuer" => Ok(Self::PeerIssuer),
             "reference-time-authority" => Ok(Self::ReferenceTimeAuthority),
             "reference-time-policy-admin" => Ok(Self::ReferenceTimePolicyAdmin),
+            "peer-node-identity" => Ok(Self::PeerNodeIdentity),
             _ => Err("unknown signing-key role".into()),
         }
     }
@@ -61,6 +64,7 @@ impl SigningKeyRole {
             4 => Ok(Self::PeerIssuer),
             5 => Ok(Self::ReferenceTimeAuthority),
             6 => Ok(Self::ReferenceTimePolicyAdmin),
+            7 => Ok(Self::PeerNodeIdentity),
             _ => Err("protected signing-key role is invalid".into()),
         }
     }
@@ -394,6 +398,19 @@ mod tests {
             SigningKeyRole::parse("reference-time-policy-admin").unwrap(),
             SigningKeyRole::ReferenceTimePolicyAdmin
         );
+        assert_eq!(
+            SigningKeyRole::parse("peer-node-identity").unwrap(),
+            SigningKeyRole::PeerNodeIdentity
+        );
+        assert_eq!(
+            SigningKeyRole::PeerNodeIdentity.as_str(),
+            "peer-node-identity"
+        );
+        assert_eq!(
+            SigningKeyRole::from_byte(7).unwrap(),
+            SigningKeyRole::PeerNodeIdentity
+        );
+        assert!(SigningKeyRole::from_byte(8).is_err());
         assert!(SigningKeyRole::parse("admin").is_err());
     }
 

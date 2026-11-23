@@ -16,6 +16,32 @@ pub const Q6AR_MAX_TTL_SECS: u32 = 24 * 60 * 60;
 pub const Q6AR_MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
 pub const Q6AR_MAX_FRAME_BYTES: usize = Q6AR_HEADER_BYTES + Q6AR_MAX_ADDRESSES * 51;
 
+// One bounded request/response exchange lets a node pull a candidate snapshot from a
+// statically pinned relay. It never makes an advertised key trusted or auto-connectable.
+pub const Q6AR_PULL_REQUEST_MAGIC: [u8; 4] = *b"Q6PQ";
+pub const Q6AR_PULL_RESPONSE_MAGIC: [u8; 4] = *b"Q6PL";
+pub const Q6AR_PULL_VERSION: u16 = 1;
+pub const Q6AR_PULL_REQUEST_BYTES: usize = 80;
+pub const Q6AR_PULL_RESPONSE_HEADER_BYTES: usize = 82;
+pub const Q6AR_PULL_MAX_RESPONSE_BYTES: usize =
+    Q6AR_PULL_RESPONSE_HEADER_BYTES + Q6AR_MAX_FRAME_BYTES;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q6arPullRequest {
+    pub request_id: u64,
+    pub network_id: [u8; 32],
+    pub profile_id: [u8; 32],
+    pub max_addresses: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q6arPullResponse {
+    pub request_id: u64,
+    pub network_id: [u8; 32],
+    pub profile_id: [u8; 32],
+    pub advertisement: Option<Q6arAdvertisement>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Q6arAddress {
     pub endpoint: SocketAddr,
@@ -56,6 +82,8 @@ pub enum Q6arError {
     DuplicateAddress,
     NonCanonical,
     Oversized,
+    InvalidPullRequest,
+    PullResponseMismatch,
 }
 impl std::fmt::Display for Q6arError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -296,6 +324,155 @@ pub fn decode_q6ar(
     Ok(value)
 }
 
+/// Encode one bounded Q6AR candidate-pull request for a single Noise session.
+pub fn encode_q6ar_pull_request(request: &Q6arPullRequest) -> Result<Vec<u8>, Q6arError> {
+    if request.request_id == 0
+        || request.network_id == [0; 32]
+        || request.profile_id == [0; 32]
+        || request.max_addresses == 0
+        || request.max_addresses as usize > Q6AR_MAX_ADDRESSES
+    {
+        return Err(Q6arError::InvalidPullRequest);
+    }
+    let mut out = Vec::with_capacity(Q6AR_PULL_REQUEST_BYTES);
+    out.extend_from_slice(&Q6AR_PULL_REQUEST_MAGIC);
+    out.extend_from_slice(&Q6AR_PULL_VERSION.to_be_bytes());
+    out.extend_from_slice(&request.network_id);
+    out.extend_from_slice(&request.profile_id);
+    out.extend_from_slice(&request.request_id.to_be_bytes());
+    out.extend_from_slice(&request.max_addresses.to_be_bytes());
+    Ok(out)
+}
+
+/// Decode and bind a Q6AR pull request to the local network/profile.
+pub fn decode_q6ar_pull_request(
+    bytes: &[u8],
+    expected_network_id: &[u8; 32],
+    expected_profile_id: &[u8; 32],
+) -> Result<Q6arPullRequest, Q6arError> {
+    if bytes.len() != Q6AR_PULL_REQUEST_BYTES || bytes[..4] != Q6AR_PULL_REQUEST_MAGIC {
+        return Err(Q6arError::Malformed);
+    }
+    if u16::from_be_bytes(bytes[4..6].try_into().map_err(|_| Q6arError::Malformed)?)
+        != Q6AR_PULL_VERSION
+    {
+        return Err(Q6arError::Malformed);
+    }
+    let network_id: [u8; 32] = bytes[6..38].try_into().map_err(|_| Q6arError::Malformed)?;
+    let profile_id: [u8; 32] = bytes[38..70].try_into().map_err(|_| Q6arError::Malformed)?;
+    if &network_id != expected_network_id {
+        return Err(Q6arError::WrongNetwork);
+    }
+    if &profile_id != expected_profile_id {
+        return Err(Q6arError::WrongProfile);
+    }
+    let request = Q6arPullRequest {
+        request_id: u64::from_be_bytes(bytes[70..78].try_into().map_err(|_| Q6arError::Malformed)?),
+        network_id,
+        profile_id,
+        max_addresses: u16::from_be_bytes(
+            bytes[78..80].try_into().map_err(|_| Q6arError::Malformed)?,
+        ),
+    };
+    // Reuse the encoder as the single canonical shape validator.
+    encode_q6ar_pull_request(&request)?;
+    Ok(request)
+}
+
+/// Encode a response that is cryptographically session-bound by Noise and explicitly
+/// correlated with one request. An empty inventory is represented by a zero-length payload.
+pub fn encode_q6ar_pull_response(
+    request: &Q6arPullRequest,
+    advertisement: Option<&Q6arAdvertisement>,
+) -> Result<Vec<u8>, Q6arError> {
+    encode_q6ar_pull_request(request)?;
+    let payload = match advertisement {
+        Some(value) => {
+            if value.network_id != request.network_id
+                || value.profile_id != request.profile_id
+                || value.addresses.len() > request.max_addresses as usize
+            {
+                return Err(Q6arError::PullResponseMismatch);
+            }
+            encode_q6ar(value)?
+        }
+        None => Vec::new(),
+    };
+    if payload.len() > Q6AR_MAX_FRAME_BYTES {
+        return Err(Q6arError::Oversized);
+    }
+    let mut out = Vec::with_capacity(Q6AR_PULL_RESPONSE_HEADER_BYTES + payload.len());
+    out.extend_from_slice(&Q6AR_PULL_RESPONSE_MAGIC);
+    out.extend_from_slice(&Q6AR_PULL_VERSION.to_be_bytes());
+    out.extend_from_slice(&request.network_id);
+    out.extend_from_slice(&request.profile_id);
+    out.extend_from_slice(&request.request_id.to_be_bytes());
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(&payload);
+    if out.len() > Q6AR_PULL_MAX_RESPONSE_BYTES {
+        return Err(Q6arError::Oversized);
+    }
+    Ok(out)
+}
+
+/// Validate a pull response against the exact outstanding request and decode its TTL-bound
+/// Q6AR inventory. A response from another network, profile, or request is rejected.
+pub fn decode_q6ar_pull_response(
+    bytes: &[u8],
+    request: &Q6arPullRequest,
+    now_secs: u64,
+) -> Result<Q6arPullResponse, Q6arError> {
+    encode_q6ar_pull_request(request)?;
+    if bytes.len() < Q6AR_PULL_RESPONSE_HEADER_BYTES
+        || bytes.len() > Q6AR_PULL_MAX_RESPONSE_BYTES
+        || bytes[..4] != Q6AR_PULL_RESPONSE_MAGIC
+    {
+        return Err(Q6arError::Malformed);
+    }
+    if u16::from_be_bytes(bytes[4..6].try_into().map_err(|_| Q6arError::Malformed)?)
+        != Q6AR_PULL_VERSION
+    {
+        return Err(Q6arError::Malformed);
+    }
+    let network_id: [u8; 32] = bytes[6..38].try_into().map_err(|_| Q6arError::Malformed)?;
+    let profile_id: [u8; 32] = bytes[38..70].try_into().map_err(|_| Q6arError::Malformed)?;
+    let request_id =
+        u64::from_be_bytes(bytes[70..78].try_into().map_err(|_| Q6arError::Malformed)?);
+    let payload_len =
+        u32::from_be_bytes(bytes[78..82].try_into().map_err(|_| Q6arError::Malformed)?) as usize;
+    if network_id != request.network_id
+        || profile_id != request.profile_id
+        || request_id != request.request_id
+    {
+        return Err(Q6arError::PullResponseMismatch);
+    }
+    if payload_len > Q6AR_MAX_FRAME_BYTES
+        || bytes.len() != Q6AR_PULL_RESPONSE_HEADER_BYTES + payload_len
+    {
+        return Err(Q6arError::Oversized);
+    }
+    let advertisement = if payload_len == 0 {
+        None
+    } else {
+        let value = decode_q6ar(
+            &bytes[Q6AR_PULL_RESPONSE_HEADER_BYTES..],
+            &request.network_id,
+            &request.profile_id,
+            now_secs,
+        )?;
+        if value.addresses.len() > request.max_addresses as usize {
+            return Err(Q6arError::TooManyAddresses);
+        }
+        Some(value)
+    };
+    Ok(Q6arPullResponse {
+        request_id,
+        network_id,
+        profile_id,
+        advertisement,
+    })
+}
+
 /// Decode from any QFP6 Noise session. Unpinned Noise XX sources are explicitly marked
 /// untrusted and their advertised endpoints must remain low-trust candidates until each
 /// endpoint completes its own key-verified handshake. This mirrors Bitcoin-style untrusted
@@ -421,5 +598,71 @@ mod tests {
         let mut value = fixture();
         value.addresses.clear();
         assert_eq!(encode_q6ar(&value), Err(Q6arError::TooManyAddresses));
+    }
+
+    #[test]
+    fn q6ar_pull_request_and_inventory_response_roundtrip() {
+        let request = Q6arPullRequest {
+            request_id: 77,
+            network_id: [1; 32],
+            profile_id: [2; 32],
+            max_addresses: 2,
+        };
+        let request_wire = encode_q6ar_pull_request(&request).unwrap();
+        assert_eq!(request_wire.len(), Q6AR_PULL_REQUEST_BYTES);
+        assert_eq!(
+            decode_q6ar_pull_request(&request_wire, &[1; 32], &[2; 32]).unwrap(),
+            request
+        );
+
+        let advertisement = fixture();
+        let response_wire = encode_q6ar_pull_response(&request, Some(&advertisement)).unwrap();
+        let decoded = decode_q6ar_pull_response(&response_wire, &request, 1_100).unwrap();
+        assert_eq!(decoded.request_id, request.request_id);
+        assert_eq!(decoded.network_id, request.network_id);
+        assert_eq!(decoded.profile_id, request.profile_id);
+        assert_eq!(decoded.advertisement, Some(advertisement));
+
+        let empty_wire = encode_q6ar_pull_response(&request, None).unwrap();
+        assert_eq!(
+            decode_q6ar_pull_response(&empty_wire, &request, 1_100)
+                .unwrap()
+                .advertisement,
+            None
+        );
+    }
+
+    #[test]
+    fn q6ar_pull_rejects_wrong_request_network_and_oversized_inventory() {
+        let request = Q6arPullRequest {
+            request_id: 77,
+            network_id: [1; 32],
+            profile_id: [2; 32],
+            max_addresses: 2,
+        };
+        let wire = encode_q6ar_pull_response(&request, Some(&fixture())).unwrap();
+
+        let mut wrong_id = request.clone();
+        wrong_id.request_id += 1;
+        assert_eq!(
+            decode_q6ar_pull_response(&wire, &wrong_id, 1_100),
+            Err(Q6arError::PullResponseMismatch)
+        );
+
+        let mut wrong_network = request.clone();
+        wrong_network.network_id = [9; 32];
+        assert_eq!(
+            decode_q6ar_pull_response(&wire, &wrong_network, 1_100),
+            Err(Q6arError::PullResponseMismatch)
+        );
+
+        let too_small = Q6arPullRequest {
+            max_addresses: 1,
+            ..request.clone()
+        };
+        assert_eq!(
+            encode_q6ar_pull_response(&too_small, Some(&fixture())),
+            Err(Q6arError::PullResponseMismatch)
+        );
     }
 }

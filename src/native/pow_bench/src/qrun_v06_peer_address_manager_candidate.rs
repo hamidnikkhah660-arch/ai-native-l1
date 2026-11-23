@@ -162,6 +162,78 @@ impl QRunV06PeerAddressBookCandidate {
         self.records.values()
     }
 
+    /// Network and profile scope are immutable for this open address book.
+    pub fn network_id(&self) -> &[u8; 32] {
+        &self.network
+    }
+
+    pub fn profile_id(&self) -> &[u8; 32] {
+        &self.profile
+    }
+
+    /// Build a bounded, expiring inventory from authenticated-relay gossip only.
+    /// Manual pins without an original, fresh advertisement are never exported.
+    pub fn current_gossip_advertisement(
+        &self,
+        now_ms: u64,
+        max_addresses: usize,
+    ) -> Option<crate::qrun_v06_peer_address_relay_candidate::Q6arAdvertisement> {
+        use crate::qrun_v06_peer_address_relay_candidate::{
+            Q6arAddress, Q6arAdvertisement, Q6AR_MAX_ADDRESSES, Q6AR_MAX_TTL_SECS,
+        };
+        if self.trust_domain_registry_fingerprint.is_none()
+            || max_addresses == 0
+            || max_addresses > Q6AR_MAX_ADDRESSES
+        {
+            return None;
+        }
+        let mut addresses = Vec::new();
+        let mut earliest_expiry_ms = u64::MAX;
+        for record in self.records.values() {
+            if !record.relay_static_key_pinned
+                || record.relay_static_public_key.is_none()
+                || record.advertisement_fingerprint.is_none()
+                || record.advertised_noise_static_key.is_none()
+                || record.advertisement_expires_at_ms <= now_ms
+                || record.banned_until_ms > now_ms
+            {
+                continue;
+            }
+            let endpoint = match record.address.parse::<SocketAddr>() {
+                Ok(endpoint) => endpoint,
+                Err(_) => continue,
+            };
+            let Some(noise_static_public_key) = record.advertised_noise_static_key else {
+                continue;
+            };
+            addresses.push(Q6arAddress {
+                endpoint,
+                noise_static_public_key,
+            });
+            earliest_expiry_ms = earliest_expiry_ms.min(record.advertisement_expires_at_ms);
+            if addresses.len() >= max_addresses {
+                break;
+            }
+        }
+        if addresses.is_empty() {
+            return None;
+        }
+        // Never extend a candidate beyond the earliest source-advertisement expiry.
+        let issued_at_secs = now_ms / 1_000;
+        let remaining_secs = earliest_expiry_ms.saturating_sub(now_ms) / 1_000;
+        let ttl_secs = remaining_secs.min(Q6AR_MAX_TTL_SECS as u64) as u32;
+        if ttl_secs == 0 {
+            return None;
+        }
+        Some(Q6arAdvertisement {
+            network_id: self.network,
+            profile_id: self.profile,
+            issued_at_secs,
+            ttl_secs,
+            addresses,
+        })
+    }
+
     /// Bind this persistent address book to one exact operator-provisioned trust registry.
     /// Existing live Q6AR Gossip records must be attributable and fit the new domain quotas.
     /// Expired unapproved candidates are reclaimed as part of this startup transaction.
@@ -621,7 +693,11 @@ impl QRunV06PeerAddressBookCandidate {
                 record.source = PeerAddressSource::Manual;
                 record.last_seen_ms = record.last_seen_ms.max(now_ms);
                 record.operator_approved_noise_static_key = Some(noise_static_public_key);
-                record.operator_approved_at_ms = now_ms.max(1);
+                // Approval generation must advance even when two operator actions share
+                // the same wall-clock millisecond or the local clock moves backwards.
+                record.operator_approved_at_ms = now_ms
+                    .max(record.operator_approved_at_ms.saturating_add(1))
+                    .max(1);
                 record.failures = 0;
                 record.retry_after_ms = 0;
                 record.banned_until_ms = 0;
@@ -1099,6 +1175,54 @@ mod tests {
             book.records().next().unwrap().advertised_noise_static_key,
             Some([7; 32])
         );
+    }
+
+    #[test]
+    fn exports_only_fresh_relay_bound_candidates_with_nonextended_ttl() {
+        let t = Temp::new();
+        let p = t.0.join("peers.q6pa");
+        let policy = BootstrapTrustDomainPolicy::new([([9; 32], [10; 32])], 8, 1).unwrap();
+        let received = crate::qrun_v06_peer_address_relay_candidate::Q6arReceivedAdvertisement {
+            advertisement: crate::qrun_v06_peer_address_relay_candidate::Q6arAdvertisement {
+                network_id: [1; 32],
+                profile_id: [2; 32],
+                issued_at_secs: 100,
+                ttl_secs: 60,
+                addresses: vec![crate::qrun_v06_peer_address_relay_candidate::Q6arAddress {
+                    endpoint: "8.8.8.8:8333".parse().unwrap(),
+                    noise_static_public_key: [7; 32],
+                }],
+            },
+            relay_origin: crate::qrun_v06_peer_address_relay_candidate::Q6arRelayOrigin {
+                relay_static_public_key: [9; 32],
+                relay_static_key_pinned: true,
+            },
+        };
+
+        let mut book = QRunV06PeerAddressBookCandidate::open(&p, [1; 32], [2; 32]).unwrap();
+        book.bind_trust_domain_registry(&policy, 100_000).unwrap();
+        book.ingest_pinned_q6ar_with_trust_domains(&received, 100_000, &policy)
+            .unwrap();
+        book.upsert("1.1.1.1:8333", PeerAddressSource::Gossip, 100_000)
+            .unwrap();
+
+        let exported = book.current_gossip_advertisement(100_000, 32).unwrap();
+        assert_eq!(exported.network_id, [1; 32]);
+        assert_eq!(exported.profile_id, [2; 32]);
+        assert_eq!(exported.issued_at_secs, 100);
+        assert_eq!(exported.ttl_secs, 60);
+        assert_eq!(exported.addresses.len(), 1);
+        assert_eq!(
+            exported.addresses[0].endpoint,
+            "8.8.8.8:8333".parse().unwrap()
+        );
+        assert_eq!(exported.addresses[0].noise_static_public_key, [7; 32]);
+        assert!(book.approved_peer_pins(100_001, 8).is_empty());
+
+        // A fresh advertisement may be relayed, but its original expiry may not be extended.
+        let near_expiry = book.current_gossip_advertisement(159_000, 32).unwrap();
+        assert_eq!(near_expiry.ttl_secs, 1);
+        assert_eq!(book.current_gossip_advertisement(160_000, 32), None);
     }
 
     #[test]
