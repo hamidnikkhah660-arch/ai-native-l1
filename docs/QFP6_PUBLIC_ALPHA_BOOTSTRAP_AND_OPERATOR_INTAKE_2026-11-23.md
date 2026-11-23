@@ -37,7 +37,7 @@ Do not expose a listener or change firewall/router rules based only on this boot
 
 ## Operator independence and requested evidence
 
-The project is seeking independent zero-value QFP6 operators on separately administered hosts and networks. Initial interest can be posted to the operator-intake issue. Do not post private keys, credentials, wallet recovery data, public IP addresses, or sensitive host details. Initial reproduction/interest does not itself qualify an operator. Actual qualification requires evidence of a fresh identity, successful pinned Noise handshake, valid Q6PD record acceptance, independent history/state convergence, restart/reconnect, and a reachable endpoint before that operator is advertised as a relay.
+The project is seeking independent zero-value QFP6 operators on separately administered hosts and networks. Initial interest can be posted to [operator-intake issue #204](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/204). Do not post private keys, credentials, wallet recovery data, public IP addresses, or sensitive host details. Initial reproduction/interest does not itself qualify an operator. Actual qualification requires evidence of a fresh identity, successful pinned Noise handshake, valid Q6PD record acceptance, independent history/state convergence, restart/reconnect, and a reachable endpoint before that operator is advertised as a relay.
 
 ## Release boundary
 
