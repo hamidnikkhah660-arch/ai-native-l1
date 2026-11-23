@@ -4627,9 +4627,7 @@ mod software_testnet_ephemeral_key_policy_tests {
                 PUBLIC_TESTNET_DERIVED_GENESIS_ANCHOR_ACK,
             "trusted_manifest_anchor": "11".repeat(32)
         });
-        assert!(
-            derive_fresh_joiner_anchor_from_verified_genesis(&mixed_pin, true).is_err()
-        );
+        assert!(derive_fresh_joiner_anchor_from_verified_genesis(&mixed_pin, true).is_err());
 
         let disabled_with_ack = json!({
             "node_role": "joining",
