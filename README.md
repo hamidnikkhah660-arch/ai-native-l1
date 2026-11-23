@@ -3,6 +3,16 @@
 **QRun** is the public brand of an independently developed native Layer-1 project; **QZXB** is the selected native-coin ticker and **QRun Blockchain** is the network name. The source contains a Rust-native ledger research programme, deterministic state/recovery candidates, authenticated peer-networking and release-integrity research, ML-DSA-65 and hybrid-identity work, an isolated EVM/revm smart-contract laboratory, candidate market-operation processing, wallet tooling and an AI-native ecosystem roadmap.
 
 
+## QFP6 Zero-Value Public Alpha — independent operator intake (2026-11-23)
+
+QFP6 currently has one configured public bootstrap Seed. We are seeking the **first independently operated external QFP6 node** to verify signed peer-record admission and relay gossip across separate hosts/networks. The current candidate is experimental and zero-value only; a multi-host public mesh has not yet been demonstrated.
+
+- **Independent operator intake:** [Issue #204](https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/204)
+- **Bootstrap peer manifest and operator guide review:** [Draft PR #205](https://github.com/hamidnikkhah660-arch/ai-native-l1/pull/205)
+- **Current Seed identity:** `heymed.tail2a756d.ts.net:443`; exact Noise key pin and peer-file digest are in the PR.
+
+The older controlled-QA Joiner package is **not** a public installer for this Q6PD candidate. A fresh CP-0834-based operator bundle with local key generation, verified hashes, and no owner TPM/Vault material is still required. Please do not run stale QA instructions or expose a listener based only on the bootstrap file. No Mainnet, value transfers, issuance/rewards, or market activity are authorized.
+
 ## Public ecosystem status (2026-11-16)
 
 The source repository and project website are public, and we are actively inviting independent node operators, code contributors, security reviewers, AI/ML researchers, application developers and milestone sponsors. **The running node remains experimental public-alpha; value-bearing native Mainnet and a genuine QZXB/USDT market are not live.** A public source tree is open for review/contribution; it is not a claim that candidate balances are publicly spendable.
