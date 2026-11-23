@@ -15,11 +15,11 @@ use sha2::{Digest, Sha256};
 pub const Q6HI_REQUEST_MAGIC: [u8; 4] = *b"Q6HI";
 pub const Q6HR_STATUS_MAGIC: [u8; 4] = *b"Q6HR";
 pub const Q6HI_REQUEST_BYTES: usize = 80;
-pub const Q6HR_STATUS_BYTES: usize = 152;
+pub const Q6HR_STATUS_BYTES: usize = 224;
 pub const Q6HS_REQUEST_MAGIC: [u8; 4] = *b"Q6HS";
 pub const Q6HP_PAGE_MAGIC: [u8; 4] = *b"Q6HP";
 pub const Q6HC_CHUNK_MAGIC: [u8; 4] = *b"Q6HC";
-pub const Q6_HISTORY_SYNC_WIRE_VERSION: u16 = 1;
+pub const Q6_HISTORY_SYNC_WIRE_VERSION: u16 = 2;
 pub const Q6HS_REQUEST_BYTES: usize = 192;
 pub const Q6HP_PAGE_HEADER_BYTES: usize = 80;
 pub const Q6HC_CHUNK_HEADER_BYTES: usize = 96;
@@ -113,6 +113,9 @@ pub struct QRunV06HistoryInfoResponse {
     pub height: u64,
     pub consensus_tip: [u8; 32],
     pub execution_tip: [u8; 32],
+    pub base_height: u64,
+    pub base_consensus_tip: [u8; 32],
+    pub base_execution_tip: [u8; 32],
 }
 
 pub fn encode_q6hr_status(
@@ -120,12 +123,17 @@ pub fn encode_q6hr_status(
     height: u64,
     consensus_tip: [u8; 32],
     execution_tip: [u8; 32],
+    base_height: u64,
+    base_consensus_tip: [u8; 32],
+    base_execution_tip: [u8; 32],
 ) -> Result<[u8; Q6HR_STATUS_BYTES], Q6HistorySyncWireError> {
     if request.request_id == 0
         || is_zero(&request.network_id)
         || is_zero(&request.profile_id)
         || is_zero(&consensus_tip)
         || is_zero(&execution_tip)
+        || base_height > height
+        || (base_height != 0 && (is_zero(&base_consensus_tip) || is_zero(&base_execution_tip)))
     {
         return Err(Q6HistorySyncWireError::InvalidStatus);
     }
@@ -139,6 +147,9 @@ pub fn encode_q6hr_status(
     out[80..88].copy_from_slice(&height.to_be_bytes());
     out[88..120].copy_from_slice(&consensus_tip);
     out[120..152].copy_from_slice(&execution_tip);
+    out[152..160].copy_from_slice(&base_height.to_be_bytes());
+    out[160..192].copy_from_slice(&base_consensus_tip);
+    out[192..224].copy_from_slice(&base_execution_tip);
     Ok(out)
 }
 
@@ -159,6 +170,9 @@ pub fn decode_q6hr_status(
         height: u64_at(bytes, 80)?,
         consensus_tip: array_at(bytes, 88)?,
         execution_tip: array_at(bytes, 120)?,
+        base_height: u64_at(bytes, 152)?,
+        base_consensus_tip: array_at(bytes, 160)?,
+        base_execution_tip: array_at(bytes, 192)?,
     };
     if response.request_id != request.request_id {
         return Err(Q6HistorySyncWireError::WrongRequest);
@@ -169,7 +183,12 @@ pub fn decode_q6hr_status(
     if response.profile_id != request.profile_id {
         return Err(Q6HistorySyncWireError::WrongProfile);
     }
-    if is_zero(&response.consensus_tip) || is_zero(&response.execution_tip) {
+    if response.base_height > response.height
+        || is_zero(&response.consensus_tip)
+        || is_zero(&response.execution_tip)
+        || (response.base_height != 0
+            && (is_zero(&response.base_consensus_tip) || is_zero(&response.base_execution_tip)))
+    {
         return Err(Q6HistorySyncWireError::InvalidStatus);
     }
     Ok(response)
@@ -766,12 +785,18 @@ mod tests {
         let decoded_request = decode_q6hi_request(&encoded_request).unwrap();
         assert_eq!(decoded_request, request);
 
-        let encoded_status = encode_q6hr_status(&request, 987, [0x53; 32], [0x64; 32]).unwrap();
+        let encoded_status = encode_q6hr_status(
+            &request, 987, [0x53; 32], [0x64; 32], 900, [0x51; 32], [0x61; 32],
+        )
+        .unwrap();
         assert_eq!(encoded_status.len(), Q6HR_STATUS_BYTES);
         let decoded_status = decode_q6hr_status(&encoded_status, &request).unwrap();
         assert_eq!(decoded_status.height, 987);
         assert_eq!(decoded_status.consensus_tip, [0x53; 32]);
         assert_eq!(decoded_status.execution_tip, [0x64; 32]);
+        assert_eq!(decoded_status.base_height, 900);
+        assert_eq!(decoded_status.base_consensus_tip, [0x51; 32]);
+        assert_eq!(decoded_status.base_execution_tip, [0x61; 32]);
 
         let mut wrong_id = encoded_status;
         wrong_id[15] ^= 1;

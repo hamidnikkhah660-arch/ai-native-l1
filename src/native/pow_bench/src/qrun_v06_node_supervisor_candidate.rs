@@ -34,6 +34,18 @@ use crate::{
     qrun_v06_node_runtime_candidate::{
         QRunV06NodeAnchorGate, QRunV06NodeRuntime, QRunV06PeerReplayGuard,
     },
+    qrun_v06_peer_address_relay_candidate::{
+        decode_q6ar_pull_request, encode_q6ar_pull_response, Q6AR_MAX_ADDRESSES,
+        Q6AR_PULL_REQUEST_MAGIC,
+    },
+    qrun_v06_peer_connection_manager_candidate::{
+        QRunV06PeerConnectionManagerCandidate, QRunV06PeerTrustState,
+    },
+    qrun_v06_peer_discovery_candidate::{
+        Q6PD_ANNOUNCE_REQUEST_MAGIC, Q6PD_MAX_TTL_SECS, Q6PD_PULL_REQUEST_MAGIC,
+    },
+    qrun_v06_peer_discovery_store_candidate::Q6pdPeerRecordStore,
+    qrun_v06_peer_identity_candidate::Q6pdNodeIdentity,
     qrun_v06_peer_listener_candidate::{
         process_qfp6_peer_frame_with_permissionless_runtime,
         process_qfp6_peer_frame_with_permissionless_runtime_and_quote_asset_authorization,
@@ -76,6 +88,32 @@ use std::{
 
 pub const QRUN_V06_SUPERVISOR_MAX_TOTAL_SESSIONS: usize = 1_000_000;
 const SHUTDOWN_WATCH_INTERVAL: Duration = Duration::from_millis(10);
+/// Reconnect to the operator-pinned bootstrap set so a joining node keeps tracking the chain
+/// after its initial history import. Each refresh is deliberately bounded and reuses no session.
+const QRUN_V06_OUTBOUND_BOOTSTRAP_RESYNC_INTERVAL: Duration = Duration::from_secs(30);
+const QRUN_V06_OUTBOUND_BOOTSTRAP_RESYNC_PEERS_PER_CYCLE: usize = 1;
+/// Periodically refresh candidate addresses from one operator-pinned Q6AR relay.
+const QRUN_V06_Q6AR_DISCOVERY_PULL_INTERVAL: Duration = Duration::from_secs(300);
+// Rapid Q6PD inventory exchange: signed addresses fan out through every
+// successful peer exchange, so this cadence governs how quickly the graph learns.
+const QRUN_V06_Q6PD_DISCOVERY_PULL_INTERVAL: Duration = Duration::from_secs(30);
+const QRUN_V06_Q6PD_CANDIDATE_DIAL_INTERVAL: Duration = Duration::from_secs(5);
+/// Determine whether the pinned-bootstrap history/resync cadence has elapsed.
+fn outbound_bootstrap_resync_due(last_sync: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_sync) >= QRUN_V06_OUTBOUND_BOOTSTRAP_RESYNC_INTERVAL
+}
+
+fn q6ar_discovery_pull_due(last_pull: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_pull) >= QRUN_V06_Q6AR_DISCOVERY_PULL_INTERVAL
+}
+
+fn q6pd_discovery_pull_due(last_pull: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_pull) >= QRUN_V06_Q6PD_DISCOVERY_PULL_INTERVAL
+}
+
+fn q6pd_candidate_dial_due(last_dial: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_dial) >= QRUN_V06_Q6PD_CANDIDATE_DIAL_INTERVAL
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QRunV06NodeSupervisorConfig {
@@ -167,6 +205,9 @@ impl QRunV06MiningSupervisorConfig {
 pub struct QRunV06PermissionlessMiningSupervisorConfig {
     pub peer: QRunV06NodeSupervisorConfig,
     pub listener_round_timeout: Duration,
+    /// Maximum established Noise sessions served before the supervisor takes a mining slice.
+    /// Defaults to one; public zero-value testnet may use a small bounded batch per 30-second round.
+    pub max_sessions_per_listener_round: usize,
     pub max_nonce_attempts_per_block: u64,
 }
 
@@ -175,6 +216,7 @@ impl Default for QRunV06PermissionlessMiningSupervisorConfig {
         Self {
             peer: QRunV06NodeSupervisorConfig::default(),
             listener_round_timeout: Duration::from_millis(250),
+            max_sessions_per_listener_round: 1,
             max_nonce_attempts_per_block: QRUN_V06_MAX_NONCE_ATTEMPTS_PER_JOB,
         }
     }
@@ -185,6 +227,8 @@ impl QRunV06PermissionlessMiningSupervisorConfig {
         self.peer.validate()?;
         if !(Duration::from_millis(20)..=Duration::from_secs(30))
             .contains(&self.listener_round_timeout)
+            || !(1..=crate::qrun_v06_peer_listener_candidate::QRUN_V06_LISTENER_MAX_SESSIONS)
+                .contains(&self.max_sessions_per_listener_round)
             || self.max_nonce_attempts_per_block == 0
             || self.max_nonce_attempts_per_block > QRUN_V06_MAX_NONCE_ATTEMPTS_PER_JOB
         {
@@ -335,6 +379,40 @@ fn system_now_ms() -> Result<u64, QRunV06NodeSupervisorError> {
         .map_err(|_| {
             QRunV06NodeSupervisorError::Runtime("system clock exceeds millisecond range".into())
         })
+}
+
+/// Build dial targets exclusively from durable operator approvals. Preserve TLS SNI only
+/// for an exact configured endpoint/key pair; newly approved numeric endpoints use direct Noise/TCP.
+fn address_book_approved_dial_targets(
+    address_book: &crate::qrun_v06_peer_address_manager_candidate::QRunV06PeerAddressBookCandidate,
+    configured_peers: &[QRunV06PinnedBootstrapPeer],
+    operator_selected_noise_keys: &[[u8; 32]],
+    now_ms: u64,
+) -> Vec<QRunV06PinnedBootstrapPeer> {
+    address_book
+        .approved_peer_pins(
+            now_ms,
+            crate::qrun_v06_peer_address_manager_candidate::MAX_PEERS,
+        )
+        .into_iter()
+        .filter(|(_, noise_static_public_key)| {
+            operator_selected_noise_keys.contains(noise_static_public_key)
+        })
+        .map(|(address, noise_static_public_key)| {
+            let tls_server_name = configured_peers
+                .iter()
+                .find(|peer| {
+                    peer.address == address
+                        && peer.noise_static_public_key == noise_static_public_key
+                })
+                .and_then(|peer| peer.tls_server_name.clone());
+            QRunV06PinnedBootstrapPeer {
+                address,
+                noise_static_public_key,
+                tls_server_name,
+            }
+        })
+        .collect()
 }
 
 fn validate_identity_material(
@@ -786,7 +864,11 @@ fn serve_qfp6_history_listener_round<F, G>(
     QRunV06NodeSupervisorError,
 >
 where
-    F: FnMut(&mut QRunV06PeerReplayGuard, &[u8]) -> Result<Vec<Vec<u8>>, String>,
+    F: FnMut(
+        std::net::SocketAddr,
+        &mut QRunV06PeerReplayGuard,
+        &[u8],
+    ) -> Result<Vec<Vec<u8>>, String>,
     G: FnMut(
         crate::qrun_v06_peer_address_relay_candidate::Q6arReceivedAdvertisement,
     ) -> Result<(), String>,
@@ -1270,6 +1352,10 @@ pub fn run_qfp6_permissionless_mining_supervisor<T: TransactionAuthenticator>(
         None,
         None,
         None,
+        None,
+        None,
+        false,
+        None,
     )
 }
 
@@ -1306,7 +1392,11 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_quote_asset_authorization<
         producer,
         mempool,
         None,
+        None,
         Some(quote_authorizer),
+        None,
+        None,
+        false,
         None,
     )
 }
@@ -1357,12 +1447,17 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_q6ar_candidate<
         authenticator,
         producer,
         mempool,
+        None,
         Some((
             address_book,
+            q6ar_relay_static_public_key_pins.to_vec(),
             q6ar_relay_static_public_key_pins.to_vec(),
             trust_domains,
         )),
         None,
+        None,
+        None,
+        false,
         None,
     )
 }
@@ -1416,12 +1511,17 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_q6ar_candidate_and_quote_a
             authenticator,
             producer,
             mempool,
+            None,
             Some((
                 address_book,
+                q6ar_relay_static_public_key_pins.to_vec(),
                 q6ar_relay_static_public_key_pins.to_vec(),
                 trust_domains,
             )),
             Some(quote_authorizer),
+            None,
+            None,
+            false,
             None,
         )?;
         total.listener_rounds = total
@@ -1771,15 +1871,26 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
     authenticator: &T,
     producer: [u8; 32],
     mempool: &mut QRunV06PermissionlessMempool,
+    // Exact operator-pinned bootstrap peers used for periodic outbound tip/history refresh.
+    outbound_sync_peers: Option<&[QRunV06PinnedBootstrapPeer]>,
     mut q6ar_candidate: Option<(
         &mut crate::qrun_v06_peer_address_manager_candidate::QRunV06PeerAddressBookCandidate,
+        Vec<[u8; 32]>,
         Vec<[u8; 32]>,
         &crate::qrun_v06_bootstrap_trust_domain_candidate::BootstrapTrustDomainPolicy,
     )>,
     mut quote_authorizer: Option<&mut QRunV06QuoteAssetAuthorizationProvider<'_>>,
     read_api_listener: Option<&TcpListener>,
+    mut q6pd_candidate: Option<&mut Q6pdPeerRecordStore>,
+    q6pd_pull_enabled: bool,
+    q6pd_self_announcement: Option<(&Q6pdNodeIdentity, SocketAddr, Option<String>)>,
 ) -> Result<QRunV06PermissionlessMiningSupervisorReport, QRunV06NodeSupervisorError> {
     config.validate()?;
+    // This flag outlives the scoped supervisor threads and lets them close cleanly.
+    let q6pd_workers_stop = AtomicBool::new(false);
+    if q6pd_self_announcement.is_some() && q6pd_candidate.is_none() {
+        return Err(QRunV06NodeSupervisorError::InvalidConfiguration);
+    }
     validate_identity_material(local_static_private_key, network_id, profile_id)?;
     if producer == [0; 32] {
         return Err(QRunV06NodeSupervisorError::InvalidIdentity);
@@ -1837,6 +1948,99 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
             let mut blocks_durably_committed = 0u64;
             let mut blocks_became_canonical = 0u64;
             let mut history_responder = QRunV06HistorySyncResponder::default();
+            let mut q6pd_address_manager = match q6pd_candidate.as_deref() {
+                Some(store) => Some(
+                    crate::qrun_v06_q6pd_address_manager_candidate::Q6pdAddressManager::open(
+                        store.address_manager_path(),
+                        *network_id,
+                        *profile_id,
+                    )
+                    .map_err(|error| {
+                        QRunV06NodeSupervisorError::BootstrapSync(format!(
+                            "Q6PD Address Manager open failed: {error}"
+                        ))
+                    })?,
+                ),
+                None => None,
+            };
+            let mut last_outbound_sync = Instant::now();
+            let mut next_outbound_peer_index = 0usize;
+            let mut last_q6ar_candidate_pull = Instant::now();
+            let mut next_q6ar_relay_index = 0usize;
+            let mut last_q6pd_candidate_pull = Instant::now();
+            let mut last_q6pd_self_announcement = Instant::now();
+            let mut next_q6pd_peer_index = 0usize;
+            // Q6PD records are self-signed address claims; verify the record first, then pin
+            // its Noise key in the direct handshake. One candidate is contacted per 30s cycle.
+            let mut last_q6pd_candidate_dial = Instant::now();
+            // Persistent Q6PD sessions require our own current public signed record.
+            // A node with no publicly reachable self-announcement (e.g. a local-only
+            // Joiner) does not reserve a long-lived remote slot.
+            let local_q6pd_noise_key = q6pd_self_announcement
+                .as_ref()
+                .map(|(identity, _, _)| identity.info().noise_static_public_key);
+            let initial_local_q6pd_record =
+                q6pd_self_announcement
+                    .as_ref()
+                    .and_then(|(identity, _, _)| {
+                        let now_ms = system_now_ms().ok()?;
+                        q6pd_candidate.as_deref().and_then(|store| {
+                            store.record_wire_for_peer(&identity.info().peer_id, now_ms)
+                        })
+                    });
+            let local_q6pd_announcement =
+                std::sync::Arc::new(std::sync::RwLock::new(initial_local_q6pd_record));
+            let mut q6pd_persistent_peer_keys = HashSet::new();
+            if q6pd_pull_enabled
+                && local_q6pd_noise_key.is_some()
+                && local_q6pd_announcement
+                    .read()
+                    .ok()
+                    .is_some_and(|record| record.is_some())
+            {
+                for peer in outbound_sync_peers
+                    .unwrap_or(&[])
+                    .iter()
+                    .take(crate::qrun_v06_q6pd_session_candidate::Q6PD_MAX_PERSISTENT_SESSIONS)
+                {
+                    if !q6pd_persistent_peer_keys.insert(peer.noise_static_public_key) {
+                        continue;
+                    }
+                    let address = peer.address;
+                    let tls_server_name = peer.tls_server_name.clone();
+                    let local_key = *local_static_private_key;
+                    let local_noise_key = local_q6pd_noise_key.unwrap_or([0; 32]);
+                    let remote_key = peer.noise_static_public_key;
+                    let network = *network_id;
+                    let profile = *profile_id;
+                    let announcement = std::sync::Arc::clone(&local_q6pd_announcement);
+                    let shutdown = &q6pd_workers_stop;
+                    eprintln!(
+                        "QFP6_Q6PD_SESSION_MANAGER_START endpoint={} source=operator_pinned_bootstrap",
+                        address
+                    );
+                    scope.spawn(move || {
+                        crate::qrun_v06_q6pd_session_candidate::run_q6pd_persistent_peer_session_worker(
+                            address,
+                            tls_server_name,
+                            local_key,
+                            local_noise_key,
+                            remote_key,
+                            network,
+                            profile,
+                            announcement,
+                            shutdown,
+                        );
+                    });
+                }
+            } else if q6pd_pull_enabled {
+                eprintln!("QFP6_Q6PD_SESSION_MANAGER_SKIPPED reason=no_public_signed_self_record");
+            }
+            // The address book owns durable approval; live verified-session state is ephemeral.
+            // Anonymous Q6AR candidates are never promoted or dialed by this manager.
+            let mut peer_connection_manager = q6ar_candidate
+                .as_ref()
+                .map(|(book, _, _, _)| QRunV06PeerConnectionManagerCandidate::new(&**book));
             let stop_reason;
 
             loop {
@@ -1858,10 +2062,158 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
                     .checked_sub(established_session_count(&aggregate)?)
                     .ok_or(QRunV06NodeSupervisorError::StatisticsOverflow)?;
                 let mut round_config = config.peer.listener;
-                round_config.max_sessions = round_config.max_sessions.min(remaining).min(1);
+                // Serve a bounded session batch, then yield to the miner. The default remains
+                // one session; public zero-value testnet opts into a small batch so history sync
+                // can cross reconnect boundaries without waiting through a mining slice each time.
+                round_config.max_sessions = round_config
+                    .max_sessions
+                    .min(remaining)
+                    .min(config.max_sessions_per_listener_round);
+                let q6ar_advertisement = q6ar_candidate.as_ref().and_then(|(book, _, _, _)| {
+                    system_now_ms().ok().and_then(|now_ms| {
+                        book.current_gossip_advertisement(now_ms, Q6AR_MAX_ADDRESSES)
+                    })
+                });
                 let mut on_application_frame =
-                    |guard: &mut QRunV06PeerReplayGuard, frame: &[u8]| {
-                        if frame.get(..4) == Some(&Q6HI_REQUEST_MAGIC) {
+                    |peer_addr: std::net::SocketAddr,
+                     guard: &mut QRunV06PeerReplayGuard,
+                     frame: &[u8]| {
+                        if frame.get(..4)
+                            == Some(
+                                &crate::qrun_v06_q6pd_session_candidate::Q6PD_SESSION_OPEN_MAGIC,
+                            )
+                        {
+                            let open =
+                                crate::qrun_v06_q6pd_session_candidate::decode_q6pd_session_open(
+                                    frame, network_id, profile_id,
+                                )
+                                .map_err(|error| {
+                                    format!("Q6PD persistent session open rejected: {error}")
+                                })?;
+                            let accepted = q6pd_candidate.is_some();
+                            Ok(vec![
+                                crate::qrun_v06_q6pd_session_candidate::encode_q6pd_session_open_ack(
+                                    &open,
+                                    accepted,
+                                ),
+                            ])
+                        } else if frame.get(..4) == Some(&Q6PD_ANNOUNCE_REQUEST_MAGIC) {
+                            let now_ms = system_now_ms().map_err(|error| error.to_string())?;
+                            let record_wire = crate::qrun_v06_peer_discovery_candidate::decode_q6pd_announce_request(frame)
+                                .map_err(|error| format!("Q6PD announcement frame rejected: {error}"))?;
+                            let store = q6pd_candidate
+                                .as_deref_mut()
+                                .ok_or("Q6PD peer-record exchange is disabled")?;
+                            let verified = crate::qrun_v06_peer_discovery_candidate::verify_q6pd_peer_record(
+                                record_wire,
+                                network_id,
+                                profile_id,
+                                now_ms / 1_000,
+                            )
+                            .map_err(|error| format!("Q6PD peer announcement verification failed: {error}"))?;
+                            let result = store.ingest(record_wire, now_ms).map_err(|error| {
+                                format!("Q6PD peer announcement persistence failed: {error}")
+                            })?;
+                            if let Some(manager) = q6pd_address_manager.as_mut() {
+                                manager.observe_from(&verified, peer_addr, now_ms).map_err(|error| {
+                                    format!("Q6PD Address Manager update failed: {error}")
+                                })?;
+                            }
+                            eprintln!(
+                                "QFP6_Q6PD_PEER_ANNOUNCEMENT_ACCEPTED ingest_result={:?}",
+                                result
+                            );
+                            let response = crate::qrun_v06_peer_discovery_candidate::encode_q6pd_announce_response(true);
+                            Ok(vec![response.to_vec()])
+                        } else if frame.get(..4)
+                            == Some(&crate::qrun_v06_peer_discovery_candidate::Q6PD_GOSSIP_PUSH_REQUEST_MAGIC)
+                        {
+                            let now_ms = system_now_ms().map_err(|error| error.to_string())?;
+                            let request = crate::qrun_v06_peer_discovery_candidate::decode_q6pd_gossip_push_request(
+                                frame,
+                                network_id,
+                                profile_id,
+                                now_ms / 1_000,
+                            )
+                            .map_err(|error| format!("Q6PD Gossip push rejected: {error}"))?;
+                            let store = q6pd_candidate
+                                .as_deref_mut()
+                                .ok_or("Q6PD peer-record exchange is disabled")?;
+                            let mut counts = crate::qrun_v06_peer_discovery_candidate::Q6pdGossipPushCounts {
+                                inserted: 0,
+                                updated: 0,
+                                duplicate: 0,
+                                rejected: 0,
+                            };
+                            for (record, wire) in request.records.iter().zip(&request.record_wires) {
+                                match store.ingest(wire, now_ms) {
+                                    Ok(crate::qrun_v06_peer_discovery_store_candidate::Q6pdIngestResult::Inserted) => {
+                                        counts.inserted = counts.inserted.saturating_add(1);
+                                        if let Some(manager) = q6pd_address_manager.as_mut() {
+                                            manager.observe_from(record, peer_addr, now_ms).map_err(|error| {
+                                                format!("Q6PD Address Manager update failed: {error}")
+                                            })?;
+                                        }
+                                    }
+                                    Ok(crate::qrun_v06_peer_discovery_store_candidate::Q6pdIngestResult::Updated) => {
+                                        counts.updated = counts.updated.saturating_add(1);
+                                        if let Some(manager) = q6pd_address_manager.as_mut() {
+                                            manager.observe_from(record, peer_addr, now_ms).map_err(|error| {
+                                                format!("Q6PD Address Manager update failed: {error}")
+                                            })?;
+                                        }
+                                    }
+                                    Ok(crate::qrun_v06_peer_discovery_store_candidate::Q6pdIngestResult::Duplicate) => {
+                                        counts.duplicate = counts.duplicate.saturating_add(1);
+                                        if let Some(manager) = q6pd_address_manager.as_mut() {
+                                            manager.observe_from(record, peer_addr, now_ms).map_err(|error| {
+                                                format!("Q6PD Address Manager update failed: {error}")
+                                            })?;
+                                        }
+                                    }
+                                    Err(crate::qrun_v06_peer_discovery_store_candidate::Q6pdStoreError::Replay)
+                                    | Err(crate::qrun_v06_peer_discovery_store_candidate::Q6pdStoreError::Capacity)
+                                    | Err(crate::qrun_v06_peer_discovery_store_candidate::Q6pdStoreError::InvalidRecord(
+                                        crate::qrun_v06_peer_discovery_candidate::Q6pdError::Expired,
+                                    )) => {
+                                        counts.rejected = counts.rejected.saturating_add(1);
+                                    }
+                                    Err(error) => {
+                                        return Err(format!("Q6PD Gossip store failed: {error}"));
+                                    }
+                                }
+                            }
+                            eprintln!(
+                                "QFP6_Q6PD_GOSSIP_PUSH_STORED source_records={} inserted={} updated={} duplicate={} rejected={}",
+                                request.records.len(), counts.inserted, counts.updated, counts.duplicate, counts.rejected
+                            );
+                            let response = crate::qrun_v06_peer_discovery_candidate::encode_q6pd_gossip_push_response(
+                                &request,
+                                counts,
+                            );
+                            Ok(vec![response.to_vec()])
+                        } else if frame.get(..4) == Some(&Q6PD_PULL_REQUEST_MAGIC) {
+                            let now_secs =
+                                system_now_ms().map_err(|error| error.to_string())? / 1_000;
+                            let store = q6pd_candidate
+                                .as_deref()
+                                .ok_or("Q6PD peer-record exchange is disabled")?;
+                            let response = store
+                                .respond_to_pull_frame(frame, now_secs)
+                                .map_err(|error| format!("Q6PD pull request rejected: {error}"))?;
+                            Ok(vec![response])
+                        } else if frame.get(..4) == Some(&Q6AR_PULL_REQUEST_MAGIC) {
+                            let request = decode_q6ar_pull_request(frame, network_id, profile_id)
+                                .map_err(|error| {
+                                format!("Q6AR pull request rejected: {error}")
+                            })?;
+                            let response =
+                                encode_q6ar_pull_response(&request, q6ar_advertisement.as_ref())
+                                    .map_err(|error| {
+                                        format!("Q6AR pull response failed: {error}")
+                                    })?;
+                            Ok(vec![response])
+                        } else if frame.get(..4) == Some(&Q6HI_REQUEST_MAGIC) {
                             let request =
                                 decode_q6hi_request(frame).map_err(|error| error.to_string())?;
                             let snapshot = history_responder
@@ -1872,6 +2224,9 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
                                 snapshot.height,
                                 snapshot.consensus_tip,
                                 snapshot.execution_tip,
+                                snapshot.base_height,
+                                snapshot.base_consensus_tip,
+                                snapshot.base_execution_tip,
                             )
                             .map_err(|error| error.to_string())?;
                             Ok(vec![response.to_vec()])
@@ -1896,12 +2251,13 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
                     };
                 let q6ar_relay_pins = q6ar_candidate
                     .as_ref()
-                    .map(|(_, pins, _)| pins.clone())
+                    .map(|(_, relay_pins, _, _)| relay_pins.clone())
                     .unwrap_or_default();
                 let mut on_q6ar = |received: crate::qrun_v06_peer_address_relay_candidate::Q6arReceivedAdvertisement| {
                     match q6ar_candidate.as_mut() {
-                        Some((book, _, trust_domains))
-                            if received.relay_origin.relay_static_key_pinned =>
+                        Some((book, relay_pins, _, trust_domains))
+                            if received.relay_origin.relay_static_key_pinned
+                                && relay_pins.contains(&received.relay_origin.relay_static_public_key) =>
                         {
                             let now_ms = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
@@ -1933,6 +2289,9 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
                     &mut on_q6ar,
                     &mut on_application_frame,
                 )?;
+                // End callback borrows before the outbound client mutates runtime/mempool.
+                drop(on_q6ar);
+                drop(on_application_frame);
                 listener_rounds = listener_rounds
                     .checked_add(1)
                     .ok_or(QRunV06NodeSupervisorError::StatisticsOverflow)?;
@@ -1943,17 +2302,765 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
                 {
                     return Err(QRunV06NodeSupervisorError::HandshakeBudgetExceeded);
                 }
-                if listener_report.stats.handler_failures > 0
-                    || listener_report.stats.malformed_responses > 0
-                {
+                // A malformed or failed remote application session is peer-local.
+                // Disconnect that session, record the failure and keep the public node serving.
+                // Only a locally malformed response remains fatal because it indicates that
+                // this node is about to emit an invalid protocol response.
+                if listener_report.stats.handler_failures > 0 {
+                    eprintln!(
+                        "QFP6_DIAG listener_peer_sessions_rejected={} action=disconnect_session_continue_node",
+                        listener_report.stats.handler_failures
+                    );
+                }
+                if listener_report.stats.malformed_responses > 0 {
                     return Err(QRunV06NodeSupervisorError::Listener(
-                        "permissionless application handler failed; supervisor stops before mining"
+                        "local listener response failed protocol validation; supervisor stops before mining"
                             .into(),
                     ));
                 }
                 if process_stopped || shutdown_requested.load(Ordering::Acquire) {
                     stop_reason = QRunV06NodeSupervisorStopReason::ShutdownRequested;
                     break;
+                }
+
+                // Refresh address candidates periodically from one exact operator-pinned relay.
+                // The received Noise keys remain unapproved candidates and are never dialed here.
+                let discovery_now = Instant::now();
+                let has_q6ar_relay = q6ar_candidate
+                    .as_ref()
+                    .is_some_and(|(_, relay_pins, _, _)| !relay_pins.is_empty());
+                if has_q6ar_relay
+                    && q6ar_discovery_pull_due(last_q6ar_candidate_pull, discovery_now)
+                {
+                    last_q6ar_candidate_pull = discovery_now;
+                    if let Some((book, relay_pins, _, trust_domains)) = q6ar_candidate.as_mut() {
+                        let now_ms = system_now_ms()?;
+                        let configured = outbound_sync_peers.unwrap_or(&[]);
+                        let relays = address_book_approved_dial_targets(
+                            &**book, configured, relay_pins, now_ms,
+                        );
+                        if !relays.is_empty() {
+                            let relay_index = next_q6ar_relay_index % relays.len();
+                            next_q6ar_relay_index = (relay_index + 1) % relays.len();
+                            let relay = &relays[relay_index];
+                            let discovery_config = QRunV06HistorySyncClientConfig {
+                                connect_timeout: Duration::from_secs(5),
+                                io_timeout: Duration::from_secs(10),
+                                max_blocks_per_page: 1,
+                                max_bytes_per_page: 64 * 1024,
+                                max_pages: 1,
+                                max_rounds: 1,
+                            };
+                            match crate::qrun_v06_history_sync_service_candidate::pull_q6ar_candidates_from_pinned_peer(
+                                relay.address,
+                                local_static_private_key,
+                                &relay.noise_static_public_key,
+                                network_id,
+                                profile_id,
+                                discovery_config,
+                                relay.tls_server_name.as_deref(),
+                                &mut **book,
+                                &**trust_domains,
+                            ) {
+                                Ok(count) => eprintln!(
+                                    "QFP6_DISCOVERY_REFRESH relay={} candidates_persisted={} next_pull_seconds={}",
+                                    relay.address,
+                                    count,
+                                    QRUN_V06_Q6AR_DISCOVERY_PULL_INTERVAL.as_secs()
+                                ),
+                                Err(error) => eprintln!(
+                                    "QFP6_DISCOVERY_REFRESH_RETRY relay={} error={error}; next_pull_seconds={}",
+                                    relay.address,
+                                    QRUN_V06_Q6AR_DISCOVERY_PULL_INTERVAL.as_secs()
+                                ),
+                            }
+                        } else {
+                            eprintln!(
+                                "QFP6_DISCOVERY_REFRESH_SKIPPED reason=no_eligible_pinned_relay"
+                            );
+                        }
+                    }
+                }
+
+                // Periodically exchange signed Q6PD records with one exact operator-pinned
+                // bootstrap peer. Received records are signature-verified and persisted as
+                // candidate hints only; this path never expands the trusted or dialable set.
+                if let Some((identity, endpoint, tls_server_name)) = q6pd_self_announcement.as_ref()
+                {
+                    if q6pd_candidate.is_some()
+                        && q6pd_discovery_pull_due(last_q6pd_self_announcement, discovery_now)
+                    {
+                        last_q6pd_self_announcement = discovery_now;
+                        let now_ms = system_now_ms()?;
+                        let store = q6pd_candidate
+                            .as_deref_mut()
+                            .ok_or(QRunV06NodeSupervisorError::InvalidConfiguration)?;
+                        let sequence = store
+                            .sequence_for_peer(&identity.info().peer_id)
+                            .unwrap_or(0)
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                QRunV06NodeSupervisorError::BootstrapSync(
+                                    "Q6PD self-announcement sequence exhausted".into(),
+                                )
+                            })?;
+                        let wire = identity
+                            .sign_announcement_with_tls_server_name(
+                                *endpoint,
+                                tls_server_name.as_deref(),
+                                sequence,
+                                now_ms / 1_000,
+                                Q6PD_MAX_TTL_SECS,
+                            )
+                            .map_err(|error| {
+                                QRunV06NodeSupervisorError::BootstrapSync(format!(
+                                    "Q6PD self-announcement signing failed: {error}"
+                                ))
+                            })?;
+                        match store.ingest(&wire, now_ms) {
+                            Ok(result) => {
+                                if let Ok(mut shared_record) = local_q6pd_announcement.write() {
+                                    *shared_record = Some(wire.clone());
+                                }
+                                eprintln!(
+                                    "QFP6_Q6PD_SELF_ANNOUNCEMENT_REFRESH endpoint={} sequence={} ttl_seconds={} store_result={:?} persistent_sessions_record_refreshed=true",
+                                    endpoint, sequence, Q6PD_MAX_TTL_SECS, result
+                                );
+                            }
+                            Err(error) => eprintln!(
+                                "QFP6_Q6PD_SELF_ANNOUNCEMENT_REFRESH_REJECTED endpoint={} sequence={} error={error}",
+                                endpoint, sequence
+                            ),
+                        }
+                    }
+                }
+
+                if q6pd_pull_enabled
+                    && q6pd_candidate.is_some()
+                    && q6pd_discovery_pull_due(last_q6pd_candidate_pull, discovery_now)
+                {
+                    last_q6pd_candidate_pull = discovery_now;
+                    let configured_peers = outbound_sync_peers.unwrap_or(&[]);
+                    if configured_peers.is_empty() {
+                        eprintln!(
+                            "QFP6_Q6PD_PULL_SKIPPED reason=no_operator_pinned_bootstrap_peer"
+                        );
+                    } else {
+                        let peer_index = next_q6pd_peer_index % configured_peers.len();
+                        next_q6pd_peer_index = (peer_index + 1) % configured_peers.len();
+                        let peer = configured_peers[peer_index].clone();
+                        let discovery_config = QRunV06HistorySyncClientConfig {
+                            // A DNS seed may return several A/AAAA routes. Bound each
+                            // route attempt tightly so one dead edge cannot stall discovery.
+                            connect_timeout: Duration::from_secs(3),
+                            io_timeout: Duration::from_secs(5),
+                            max_blocks_per_page: 1,
+                            max_bytes_per_page: 64 * 1024,
+                            max_pages: 1,
+                            max_rounds: 1,
+                        };
+                        if let Some(store) = q6pd_candidate.as_deref_mut() {
+                            let announcement_now_ms = system_now_ms()?;
+                            let local_announcement =
+                                q6pd_self_announcement
+                                    .as_ref()
+                                    .and_then(|(identity, _, _)| {
+                                        store.record_wire_for_peer(
+                                            &identity.info().peer_id,
+                                            announcement_now_ms,
+                                        )
+                                    });
+                            let pull_result = if let Some(hostname) =
+                                peer.tls_server_name.as_deref()
+                            {
+                                crate::qrun_v06_history_sync_service_candidate::pull_q6pd_peer_records_from_dns_seed_with_announcement(
+                                    hostname,
+                                    peer.address.port(),
+                                    local_static_private_key,
+                                    &peer.noise_static_public_key,
+                                    network_id,
+                                    profile_id,
+                                    discovery_config,
+                                    crate::qrun_v06_peer_discovery_candidate::Q6PD_MAX_RECORDS_PER_FRAME as u16,
+                                    local_announcement.as_deref(),
+                                    store,
+                                )
+                            } else {
+                                crate::qrun_v06_history_sync_service_candidate::pull_q6pd_peer_records_from_pinned_peer_with_announcement(
+                                    peer.address,
+                                    local_static_private_key,
+                                    &peer.noise_static_public_key,
+                                    network_id,
+                                    profile_id,
+                                    discovery_config,
+                                    None,
+                                    crate::qrun_v06_peer_discovery_candidate::Q6PD_MAX_RECORDS_PER_FRAME as u16,
+                                    local_announcement.as_deref(),
+                                    store,
+                                )
+                            };
+                            match pull_result {
+                                Ok(report) => eprintln!(
+                                    "QFP6_Q6PD_DISCOVERY_REFRESH peer={} received={} inserted={} updated={} duplicate={} rejected={} next_pull_seconds={}",
+                                    peer.address,
+                                    report.records_received,
+                                    report.records_inserted,
+                                    report.records_updated,
+                                    report.records_duplicate,
+                                    report.records_rejected,
+                                    QRUN_V06_Q6PD_DISCOVERY_PULL_INTERVAL.as_secs()
+                                ),
+                                Err(error) => eprintln!(
+                                    "QFP6_Q6PD_DISCOVERY_REFRESH_RETRY peer={} error={error}; next_pull_seconds={}",
+                                    peer.address,
+                                    QRUN_V06_Q6PD_DISCOVERY_PULL_INTERVAL.as_secs()
+                                ),
+                            }
+                        }
+                    }
+                }
+
+                // Merge configured bootstrap peers only with the operator-selected approved set.
+                // approved_peer_keys comes from the launcher trust-domain / attempt-budget selection;
+                // this preserves enable_approved_peer_outbound_sync and its configured cap.
+                // Anonymous/unapproved advertisements never enter this vector.
+                let configured_peers = outbound_sync_peers.unwrap_or(&[]);
+                let mut dial_peers = configured_peers.to_vec();
+                if let Some((book, _, approved_peer_keys, _)) = q6ar_candidate.as_ref() {
+                    let now_ms = system_now_ms()?;
+                    for approved in address_book_approved_dial_targets(
+                        &**book,
+                        configured_peers,
+                        approved_peer_keys,
+                        now_ms,
+                    ) {
+                        if !dial_peers.iter().any(|peer| {
+                            peer.address == approved.address
+                                && peer.noise_static_public_key == approved.noise_static_public_key
+                        }) {
+                            dial_peers.push(approved);
+                        }
+                    }
+                }
+
+                if !dial_peers.is_empty() {
+                    let sync_now = Instant::now();
+                    if outbound_bootstrap_resync_due(last_outbound_sync, sync_now) {
+                        last_outbound_sync = sync_now;
+                        let attempts = dial_peers
+                            .len()
+                            .min(QRUN_V06_OUTBOUND_BOOTSTRAP_RESYNC_PEERS_PER_CYCLE);
+                        for _ in 0..attempts {
+                            if shutdown_requested.load(Ordering::Acquire) {
+                                break;
+                            }
+                            let peer_index = next_outbound_peer_index % dial_peers.len();
+                            next_outbound_peer_index = (peer_index + 1) % dial_peers.len();
+                            let peer = dial_peers[peer_index].clone();
+                            let refresh_config = QRunV06HistorySyncClientConfig {
+                                connect_timeout: Duration::from_secs(5),
+                                io_timeout: Duration::from_secs(15),
+                                max_blocks_per_page: 16,
+                                max_bytes_per_page: 4 * 1024 * 1024,
+                                max_pages: 2,
+                                max_rounds: 1,
+                            };
+                            let sync_result = if let (Some(manager), Some((book, _, _, _))) =
+                                (peer_connection_manager.as_mut(), q6ar_candidate.as_mut())
+                            {
+                                let book: &mut crate::qrun_v06_peer_address_manager_candidate::QRunV06PeerAddressBookCandidate =
+                                        &mut **book;
+                                let reservation_ms = system_now_ms()?;
+                                match manager.reserve_operator_approved_endpoint(
+                                        book,
+                                        peer.address,
+                                        reservation_ms,
+                                    ) {
+                                        Ok(_) => {}
+                                        Err(crate::qrun_v06_peer_connection_manager_candidate::QRunV06PeerConnectionManagerError::PeerNotEligible) => {
+                                            eprintln!(
+                                                "QFP6_PEER_DIAL_SKIPPED peer={} reason=address_book_backoff",
+                                                peer.address
+                                            );
+                                            continue;
+                                        }
+                                        Err(error) => {
+                                            return Err(QRunV06NodeSupervisorError::BootstrapSync(
+                                                format!("approved peer reservation failed for {}: {error}", peer.address),
+                                            ));
+                                        }
+                                    }
+
+                                let mut verification_callback_invoked = false;
+                                let result = crate::qrun_v06_history_sync_service_candidate::sync_history_from_pinned_peer_with_verified_session_callback(
+                                        peer.address,
+                                        local_static_private_key,
+                                        &peer.noise_static_public_key,
+                                        runtime,
+                                        authenticator,
+                                        refresh_config,
+                                        quote_authorizer.as_deref_mut(),
+                                        peer.tls_server_name.as_deref(),
+                                        |noise_session| {
+                                            verification_callback_invoked = true;
+                                            let verified_at_ms =
+                                                system_now_ms().map_err(|error| error.to_string())?;
+                                            manager
+                                                .complete_outbound_handshake(
+                                                    book,
+                                                    peer.address,
+                                                    noise_session,
+                                                    verified_at_ms,
+                                                )
+                                                .map_err(|error| error.to_string())
+                                        },
+                                    );
+
+                                // The history-sync helper owns and drops the actual stream.
+                                // Mirror that exact lifetime in the manager; never retain a
+                                // stale "verified" flag after the stream has been closed.
+                                // A wall-clock error must not leave a verified session or
+                                // pending dial reservation stranded after its stream is dropped.
+                                let closed_at_ms = system_now_ms().unwrap_or(reservation_ms);
+                                let address = peer.address.to_string();
+                                if manager.trust_state(book, &address)
+                                    == QRunV06PeerTrustState::NoiseKeyVerified
+                                {
+                                    manager
+                                        .mark_disconnected(
+                                            book,
+                                            peer.address,
+                                            closed_at_ms,
+                                            result.is_err(),
+                                        )
+                                        .map_err(|error| {
+                                            QRunV06NodeSupervisorError::BootstrapSync(
+                                                format!("verified peer close bookkeeping failed for {}: {error}", peer.address),
+                                            )
+                                        })?;
+                                } else if manager.trust_state(book, &address)
+                                    == QRunV06PeerTrustState::DialPending
+                                {
+                                    manager
+                                        .fail_outbound_attempt(book, peer.address, closed_at_ms)
+                                        .map_err(|error| {
+                                            QRunV06NodeSupervisorError::BootstrapSync(format!(
+                                                "pending peer dial cleanup failed for {}: {error}",
+                                                peer.address
+                                            ))
+                                        })?;
+                                } else if verification_callback_invoked {
+                                    book.record_failure(&address, closed_at_ms).map_err(|error| {
+                                        QRunV06NodeSupervisorError::BootstrapSync(
+                                            format!("rejected peer failure bookkeeping failed for {}: {error}", peer.address),
+                                        )
+                                    })?;
+                                } else {
+                                    manager
+                                        .fail_outbound_attempt(book, peer.address, closed_at_ms)
+                                        .map_err(|error| {
+                                            QRunV06NodeSupervisorError::BootstrapSync(
+                                                format!("peer dial failure bookkeeping failed for {}: {error}", peer.address),
+                                            )
+                                        })?;
+                                }
+                                result
+                            } else {
+                                crate::qrun_v06_history_sync_service_candidate::sync_history_from_pinned_peer_with_quote_asset_authorization(
+                                        peer.address,
+                                        local_static_private_key,
+                                        &peer.noise_static_public_key,
+                                        runtime,
+                                        authenticator,
+                                        refresh_config,
+                                        quote_authorizer.as_deref_mut(),
+                                        peer.tls_server_name.as_deref(),
+                                    )
+                            };
+
+                            match sync_result {
+                                Ok(report) => {
+                                    if report.blocks_imported > 0 {
+                                        let refreshed_graph =
+                                            runtime.fork_choice_snapshot().map_err(|error| {
+                                                QRunV06NodeSupervisorError::Runtime(
+                                                    error.to_string(),
+                                                )
+                                            })?;
+                                        let refreshed_timestamp = current_candidate_timestamp(
+                                            refreshed_graph.canonical_state(),
+                                        )
+                                        .map_err(QRunV06NodeSupervisorError::Mining)?;
+                                        mempool
+                                            .reconcile_after_canonical_change_with_quote_asset_authorization(
+                                                runtime,
+                                                authenticator,
+                                                producer,
+                                                refreshed_timestamp,
+                                                quote_authorizer.as_deref_mut(),
+                                            )
+                                            .map_err(|error| QRunV06NodeSupervisorError::Mempool(error.to_string()))?;
+                                        history_responder = QRunV06HistorySyncResponder::default();
+                                    }
+                                    eprintln!(
+                                        "QFP6_OUTBOUND_SYNC peer={} blocks_imported={} pages={} source_height={} final_height={} complete={}",
+                                        peer.address,
+                                        report.blocks_imported,
+                                        report.pages_imported,
+                                        report.source_height,
+                                        report.final_height,
+                                        report.complete
+                                    );
+                                }
+                                Err(error) => {
+                                    // A transient or stale peer never stops the local node. The
+                                    // bounded scheduler retries after the interval and rotates.
+                                    eprintln!(
+                                        "QFP6_OUTBOUND_SYNC_RETRY peer={} error={error}; retry_after_seconds={}",
+                                        peer.address,
+                                        QRUN_V06_OUTBOUND_BOOTSTRAP_RESYNC_INTERVAL.as_secs()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Bitcoin-style peer discovery continuation: signed Q6PD candidates are
+                // dialed directly, without per-peer operator approval. The record store has
+                // already checked Ed25519 signature, network/profile, endpoint, TTL and replay
+                // sequence. The live Noise handshake pins the exact Noise key in that record.
+                // A bounded candidate attempt is scheduled every five seconds; failed candidates back off.
+                if q6pd_pull_enabled
+                    && q6pd_candidate.is_some()
+                    && q6pd_candidate_dial_due(last_q6pd_candidate_dial, Instant::now())
+                {
+                    last_q6pd_candidate_dial = Instant::now();
+                    let now_ms = system_now_ms()?;
+                    let mut candidates = q6pd_candidate
+                        .as_deref()
+                        .map(|store| store.candidates(now_ms))
+                        .unwrap_or_default();
+                    // Configured seeds have their own bootstrap cadence and are excluded
+                    // from candidate dialing to avoid duplicate work on the same endpoint.
+                    candidates.retain(|record| {
+                        !configured_peers.iter().any(|peer| {
+                            peer.address == record.endpoint
+                                && peer.noise_static_public_key == record.noise_static_public_key
+                        })
+                    });
+                    let local_peer_id = q6pd_self_announcement
+                        .as_ref()
+                        .map(|(identity, _, _)| identity.info().peer_id);
+                    let selected = match q6pd_address_manager.as_mut() {
+                        Some(manager) => manager
+                            .select_candidate(
+                                &candidates,
+                                local_peer_id,
+                                local_q6pd_noise_key,
+                                now_ms,
+                            )
+                            .map_err(|error| {
+                                QRunV06NodeSupervisorError::BootstrapSync(format!(
+                                    "Q6PD Address Manager selection failed: {error}"
+                                ))
+                            })?,
+                        None => None,
+                    };
+
+                    if selected.is_none() {
+                        eprintln!(
+                            "QFP6_Q6PD_AUTO_DIAL_SKIPPED reason=no_eligible_signed_candidates stored_candidates={}",
+                            q6pd_candidate
+                                .as_deref()
+                                .map_or(0, |store| store.candidate_count())
+                        );
+                    } else {
+                        let peer = selected.expect("selected candidate was checked as present");
+                        let is_feeler = q6pd_address_manager
+                            .as_ref()
+                            .is_some_and(|manager| manager.is_pending_feeler(&peer.peer_id));
+                        if is_feeler {
+                            if let Some(manager) = q6pd_address_manager.as_mut() {
+                                manager
+                                    .record_attempt(&peer.peer_id, now_ms)
+                                    .map_err(|error| {
+                                        QRunV06NodeSupervisorError::BootstrapSync(format!(
+                                            "Q6PD feeler attempt update failed: {error}"
+                                        ))
+                                    })?;
+                            }
+                            let feeler_config = QRunV06HistorySyncClientConfig {
+                                connect_timeout: Duration::from_secs(3),
+                                io_timeout: Duration::from_secs(3),
+                                max_blocks_per_page: 1,
+                                max_bytes_per_page: 4096,
+                                max_pages: 1,
+                                max_rounds: 1,
+                            };
+                            match crate::qrun_v06_history_sync_service_candidate::probe_q6pd_pinned_peer(
+                                peer.endpoint,
+                                local_static_private_key,
+                                &peer.noise_static_public_key,
+                                network_id,
+                                profile_id,
+                                peer.tls_server_name.as_deref(),
+                                feeler_config,
+                            ) {
+                                Ok(()) => {
+                                    if let Some(manager) = q6pd_address_manager.as_mut() {
+                                        manager.record_success(&peer.peer_id, system_now_ms()?).map_err(|error| {
+                                            QRunV06NodeSupervisorError::BootstrapSync(format!(
+                                                "Q6PD feeler success update failed: {error}"
+                                            ))
+                                        })?;
+                                    }
+                                    eprintln!(
+                                        "QFP6_Q6PD_FEELER_AUTHENTICATED endpoint={} action=retain_tried_incumbent",
+                                        peer.endpoint
+                                    );
+                                }
+                                Err(error) => {
+                                    if let Some(manager) = q6pd_address_manager.as_mut() {
+                                        manager.record_feeler_failure(&peer.peer_id, system_now_ms()?).map_err(|manager_error| {
+                                            QRunV06NodeSupervisorError::BootstrapSync(format!(
+                                                "Q6PD feeler collision resolution failed: {manager_error}"
+                                            ))
+                                        })?;
+                                    }
+                                    eprintln!(
+                                        "QFP6_Q6PD_FEELER_FAILED endpoint={} action=demote_incumbent_promote_new error={error}",
+                                        peer.endpoint
+                                    );
+                                }
+                            }
+                        } else {
+                            if let Some(manager) = q6pd_address_manager.as_mut() {
+                                manager
+                                    .record_attempt(&peer.peer_id, now_ms)
+                                    .map_err(|error| {
+                                        QRunV06NodeSupervisorError::BootstrapSync(format!(
+                                            "Q6PD Address Manager attempt update failed: {error}"
+                                        ))
+                                    })?;
+                            }
+                            let pull_config = QRunV06HistorySyncClientConfig {
+                                connect_timeout: Duration::from_secs(3),
+                                io_timeout: Duration::from_secs(5),
+                                max_blocks_per_page: 1,
+                                max_bytes_per_page: 64 * 1024,
+                                max_pages: 1,
+                                max_rounds: 1,
+                            };
+
+                            let pull_result = match q6pd_candidate.as_deref_mut() {
+                                Some(store) => {
+                                    let announcement_now_ms = system_now_ms()?;
+                                    let local_announcement = q6pd_self_announcement
+                                        .as_ref()
+                                        .and_then(|(identity, _, _)| {
+                                            store.record_wire_for_peer(
+                                                &identity.info().peer_id,
+                                                announcement_now_ms,
+                                            )
+                                        });
+                                    crate::qrun_v06_history_sync_service_candidate::pull_q6pd_peer_records_from_pinned_peer_with_announcement(
+                                    peer.endpoint,
+                                    local_static_private_key,
+                                    &peer.noise_static_public_key,
+                                    network_id,
+                                    profile_id,
+                                    pull_config,
+                                    peer.tls_server_name.as_deref(),
+                                    crate::qrun_v06_peer_discovery_candidate::Q6PD_MAX_RECORDS_PER_FRAME as u16,
+                                    local_announcement.as_deref(),
+                                    store,
+                                )
+                                }
+                                None => continue,
+                            };
+
+                            match pull_result {
+                                Ok(report) => {
+                                    // Attribute pulled records to the authenticated pinned source,
+                                    // rather than inventing a source from each advertised endpoint.
+                                    if let Some(manager) = q6pd_address_manager.as_mut() {
+                                        manager
+                                            .observe_all_from(
+                                                &report.accepted_records,
+                                                peer.endpoint,
+                                                system_now_ms()?,
+                                            )
+                                            .map_err(|error| {
+                                                QRunV06NodeSupervisorError::BootstrapSync(format!(
+                                                    "Q6PD source-aware AddrMan ingest failed: {error}"
+                                                ))
+                                            })?;
+                                    }
+                                    // This exchange authenticates the candidate's Noise key and
+                                    // refreshes its signed address inventory, but the bounded helper
+                                    // closes its socket on return. Record a success cooldown instead
+                                    // of claiming a long-lived connection or redialing every 30s.
+                                    if let Some(manager) = q6pd_address_manager.as_mut() {
+                                        manager
+                                        .record_success(&peer.peer_id, system_now_ms()?)
+                                        .map_err(|error| {
+                                            QRunV06NodeSupervisorError::BootstrapSync(format!(
+                                                "Q6PD Address Manager success update failed: {error}"
+                                            ))
+                                        })?;
+                                    }
+                                    eprintln!(
+                                    "QFP6_Q6PD_AUTO_DIAL_AUTHENTICATED endpoint={} peer_id_prefix={:02x?} records_received={} inserted={} updated={} duplicate={} rejected={} next_recheck_seconds={}",
+                                    peer.endpoint,
+                                    &peer.peer_id[..4],
+                                    report.records_received,
+                                    report.records_inserted,
+                                    report.records_updated,
+                                    report.records_duplicate,
+                                    report.records_rejected,
+                                    crate::qrun_v06_q6pd_address_manager_candidate::Q6PD_ADDRMAN_SUCCESS_RECHECK_MS / 1000
+                                );
+
+                                    if let Some(local_noise_key) =
+                                        local_q6pd_noise_key.filter(|_| {
+                                            local_q6pd_announcement
+                                                .read()
+                                                .ok()
+                                                .is_some_and(|record| record.is_some())
+                                        })
+                                    {
+                                        if q6pd_persistent_peer_keys.len()
+                                        < crate::qrun_v06_q6pd_session_candidate::Q6PD_MAX_PERSISTENT_SESSIONS
+                                        && q6pd_persistent_peer_keys.insert(peer.noise_static_public_key)
+                                    {
+                                        let address = peer.endpoint;
+                                        let tls_server_name = peer.tls_server_name.clone();
+                                        let local_key = *local_static_private_key;
+                                        let remote_key = peer.noise_static_public_key;
+                                        let network = *network_id;
+                                        let profile = *profile_id;
+                                        let announcement =
+                                            std::sync::Arc::clone(&local_q6pd_announcement);
+                                        let shutdown = &q6pd_workers_stop;
+                                        eprintln!(
+                                            "QFP6_Q6PD_SESSION_MANAGER_START endpoint={} source=signed_candidate peer_id_prefix={:02x?}",
+                                            address,
+                                            &peer.peer_id[..4]
+                                        );
+                                        scope.spawn(move || {
+                                            crate::qrun_v06_q6pd_session_candidate::run_q6pd_persistent_peer_session_worker(
+                                                address,
+                                                tls_server_name,
+                                                local_key,
+                                                local_noise_key,
+                                                remote_key,
+                                                network,
+                                                profile,
+                                                announcement,
+                                                shutdown,
+                                            );
+                                        });
+                                    }
+                                    }
+
+                                    // Reuse the newly authenticated peer as a bounded history
+                                    // source. Consensus validation and local fork choice remain
+                                    // authoritative; peer count is never treated as a vote.
+                                    // Keep candidate discovery responsive: this opportunistic
+                                    // history sample is deliberately one small bounded page.
+                                    let history_config = QRunV06HistorySyncClientConfig {
+                                        connect_timeout: Duration::from_secs(3),
+                                        io_timeout: Duration::from_secs(5),
+                                        max_blocks_per_page: 1,
+                                        max_bytes_per_page: 64 * 1024,
+                                        max_pages: 1,
+                                        max_rounds: 1,
+                                    };
+                                    match crate::qrun_v06_history_sync_service_candidate::sync_history_from_pinned_peer_with_quote_asset_authorization(
+                                    peer.endpoint,
+                                    local_static_private_key,
+                                    &peer.noise_static_public_key,
+                                    runtime,
+                                    authenticator,
+                                    history_config,
+                                    quote_authorizer.as_deref_mut(),
+                                    peer.tls_server_name.as_deref(),
+                                ) {
+                                    Ok(history_report) => {
+                                        if history_report.blocks_imported > 0 {
+                                            let refreshed_graph =
+                                                runtime.fork_choice_snapshot().map_err(|error| {
+                                                    QRunV06NodeSupervisorError::Runtime(
+                                                        error.to_string(),
+                                                    )
+                                                })?;
+                                            let refreshed_timestamp = current_candidate_timestamp(
+                                                refreshed_graph.canonical_state(),
+                                            )
+                                            .map_err(QRunV06NodeSupervisorError::Mining)?;
+                                            mempool
+                                                .reconcile_after_canonical_change_with_quote_asset_authorization(
+                                                    runtime,
+                                                    authenticator,
+                                                    producer,
+                                                    refreshed_timestamp,
+                                                    quote_authorizer.as_deref_mut(),
+                                                )
+                                                .map_err(|error| {
+                                                    QRunV06NodeSupervisorError::Mempool(
+                                                        error.to_string(),
+                                                    )
+                                                })?;
+                                            history_responder = QRunV06HistorySyncResponder::default();
+                                        }
+                                        eprintln!(
+                                            "QFP6_Q6PD_PEER_HISTORY_SYNC endpoint={} blocks_imported={} pages={} source_height={} final_height={} complete={}",
+                                            peer.endpoint,
+                                            history_report.blocks_imported,
+                                            history_report.pages_imported,
+                                            history_report.source_height,
+                                            history_report.final_height,
+                                            history_report.complete
+                                        );
+                                    }
+                                    Err(error) => eprintln!(
+                                        "QFP6_Q6PD_PEER_HISTORY_SYNC_RETRY endpoint={} error={error}",
+                                        peer.endpoint
+                                    ),
+                                }
+                                }
+                                Err(error) => {
+                                    let failed_at_ms = system_now_ms()?;
+                                    let mut failures = 0u32;
+                                    let mut retry_after_ms = failed_at_ms;
+                                    if let Some(manager) = q6pd_address_manager.as_mut() {
+                                        manager
+                                        .record_failure(&peer.peer_id, failed_at_ms)
+                                        .map_err(|manager_error| {
+                                            QRunV06NodeSupervisorError::BootstrapSync(format!(
+                                                "Q6PD Address Manager failure update failed: {manager_error}"
+                                            ))
+                                        })?;
+                                        if let Some(entry) = manager
+                                        .entries()
+                                        .find(|entry| entry.peer_id == crate::qrun_v06_q6pd_address_manager_candidate::peer_id_hex(&peer.peer_id))
+                                    {
+                                        failures = entry.failures;
+                                        retry_after_ms = entry.retry_after_ms;
+                                    }
+                                    }
+                                    eprintln!(
+                                    "QFP6_Q6PD_AUTO_DIAL_RETRY endpoint={} peer_id_prefix={:02x?} failures={} retry_after_ms={} error={error}",
+                                    peer.endpoint,
+                                    &peer.peer_id[..4],
+                                    failures,
+                                    retry_after_ms
+                                );
+                                }
+                            }
+                        }
+                    }
                 }
 
                 let graph = runtime
@@ -2022,6 +3129,7 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
                 stop_reason,
             })
         })();
+        q6pd_workers_stop.store(true, Ordering::Release);
         watcher_stop.store(true, Ordering::Release);
         if watcher.join().is_err() {
             return Err(QRunV06NodeSupervisorError::ShutdownWatcherPanicked);
@@ -2196,6 +3304,94 @@ pub fn run_qfp6_permissionless_mining_supervisor_open<T: TransactionAuthenticato
             return Ok(total);
         }
         // SessionBudgetReached is a window rotation, not a node shutdown.
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+/// Genesis-rooted open listener with Q6PD signed-record serving and self-announcement.
+/// Unlike the legacy open wrapper, this keeps the candidate store attached to inbound Noise
+/// application frames when the root has no upstream peers; signed inbound candidates may still
+/// be pulled and auto-dialed when Q6PD outbound discovery is enabled.
+#[allow(clippy::too_many_arguments)]
+pub fn run_qfp6_permissionless_mining_supervisor_open_with_q6pd_candidate<
+    T: TransactionAuthenticator,
+>(
+    listener: &TcpListener,
+    config: QRunV06PermissionlessMiningSupervisorConfig,
+    local_static_private_key: &[u8; 32],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    shutdown_requested: &AtomicBool,
+    runtime: &mut QRunV06PermissionlessNodeRuntime,
+    authenticator: &T,
+    producer: [u8; 32],
+    mempool: &mut QRunV06PermissionlessMempool,
+    mut quote_authorizer: Option<&mut QRunV06QuoteAssetAuthorizationProvider<'_>>,
+    q6pd_candidate: &mut Q6pdPeerRecordStore,
+    q6pd_pull_enabled: bool,
+    q6pd_self_announcement: Option<(&Q6pdNodeIdentity, SocketAddr, Option<String>)>,
+) -> Result<QRunV06PermissionlessMiningSupervisorReport, QRunV06NodeSupervisorError> {
+    let mut total = QRunV06PermissionlessMiningSupervisorReport {
+        listener_rounds: 0,
+        mining_rounds: 0,
+        blocks_durably_committed: 0,
+        blocks_became_canonical: 0,
+        ending_height: 0,
+        pending_mempool_transactions: 0,
+        pending_mempool_bytes: 0,
+        mempool_journal_generation: 0,
+        stats: QRunV06PeerListenerStats::default(),
+        stop_reason: QRunV06NodeSupervisorStopReason::ShutdownRequested,
+    };
+    loop {
+        if shutdown_requested.load(Ordering::Acquire) {
+            total.stop_reason = QRunV06NodeSupervisorStopReason::ShutdownRequested;
+            return Ok(total);
+        }
+        let report = run_qfp6_permissionless_mining_supervisor_inner(
+            listener,
+            config,
+            local_static_private_key,
+            &[],
+            network_id,
+            profile_id,
+            shutdown_requested,
+            runtime,
+            authenticator,
+            producer,
+            mempool,
+            None,
+            None,
+            quote_authorizer.as_deref_mut(),
+            None,
+            Some(&mut *q6pd_candidate),
+            q6pd_pull_enabled,
+            q6pd_self_announcement.clone(),
+        )?;
+        total.listener_rounds = total
+            .listener_rounds
+            .checked_add(report.listener_rounds)
+            .ok_or(QRunV06NodeSupervisorError::StatisticsOverflow)?;
+        total.mining_rounds = total
+            .mining_rounds
+            .checked_add(report.mining_rounds)
+            .ok_or(QRunV06NodeSupervisorError::StatisticsOverflow)?;
+        total.blocks_durably_committed = total
+            .blocks_durably_committed
+            .checked_add(report.blocks_durably_committed)
+            .ok_or(QRunV06NodeSupervisorError::StatisticsOverflow)?;
+        total.blocks_became_canonical = total
+            .blocks_became_canonical
+            .checked_add(report.blocks_became_canonical)
+            .ok_or(QRunV06NodeSupervisorError::StatisticsOverflow)?;
+        add_stats(&mut total.stats, report.stats)?;
+        total.ending_height = report.ending_height;
+        total.pending_mempool_transactions = report.pending_mempool_transactions;
+        total.pending_mempool_bytes = report.pending_mempool_bytes;
+        total.mempool_journal_generation = report.mempool_journal_generation;
+        total.stop_reason = report.stop_reason;
+        if report.stop_reason == QRunV06NodeSupervisorStopReason::ShutdownRequested {
+            return Ok(total);
+        }
         thread::sleep(Duration::from_millis(100));
     }
 }
@@ -2458,6 +3654,7 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_bootstrap_and_q6ar_candida
     config: QRunV06PermissionlessMiningSupervisorConfig,
     local_static_private_key: &[u8; 32],
     bootstrap_peers: &[QRunV06PinnedBootstrapPeer],
+    q6ar_relay_static_public_key_pins: &[[u8; 32]],
     network_id: &[u8; 32],
     profile_id: &[u8; 32],
     shutdown_requested: &AtomicBool,
@@ -2471,6 +3668,9 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_bootstrap_and_q6ar_candida
     trust_domains: &crate::qrun_v06_bootstrap_trust_domain_candidate::BootstrapTrustDomainPolicy,
     mut quote_authorizer: Option<&mut QRunV06QuoteAssetAuthorizationProvider<'_>>,
     read_api_listener: Option<&TcpListener>,
+    q6pd_candidate: Option<&mut Q6pdPeerRecordStore>,
+    q6pd_pull_enabled: bool,
+    q6pd_self_announcement: Option<(&Q6pdNodeIdentity, SocketAddr, Option<String>)>,
 ) -> Result<QRunV06PermissionlessLaunchReport, QRunV06NodeSupervisorError> {
     config.validate()?;
     sync_config
@@ -2608,9 +3808,21 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_bootstrap_and_q6ar_candida
         authenticator,
         producer,
         mempool,
-        Some((address_book, relay_pins.clone(), trust_domains)),
+        Some(bootstrap_peers),
+        Some((
+            address_book,
+            q6ar_relay_static_public_key_pins.to_vec(),
+            bootstrap_peers
+                .iter()
+                .map(|peer| peer.noise_static_public_key)
+                .collect(),
+            trust_domains,
+        )),
         quote_authorizer.as_deref_mut(),
         read_api_listener,
+        q6pd_candidate,
+        q6pd_pull_enabled,
+        q6pd_self_announcement,
     )?;
     Ok(QRunV06PermissionlessLaunchReport {
         bootstrap_sync,
@@ -2637,6 +3849,9 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_bootstrap<T: TransactionAu
     sync_config: QRunV06HistorySyncClientConfig,
     mut quote_authorizer: Option<&mut QRunV06QuoteAssetAuthorizationProvider<'_>>,
     read_api_listener: Option<&TcpListener>,
+    q6pd_candidate: Option<&mut Q6pdPeerRecordStore>,
+    q6pd_pull_enabled: bool,
+    q6pd_self_announcement: Option<(&Q6pdNodeIdentity, SocketAddr, Option<String>)>,
 ) -> Result<QRunV06PermissionlessLaunchReport, QRunV06NodeSupervisorError> {
     config.validate()?;
     sync_config
@@ -2692,9 +3907,13 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_bootstrap<T: TransactionAu
         authenticator,
         producer,
         mempool,
+        Some(bootstrap_peers),
         None,
         quote_authorizer.as_deref_mut(),
         read_api_listener,
+        q6pd_candidate,
+        q6pd_pull_enabled,
+        q6pd_self_announcement,
     )?;
     Ok(QRunV06PermissionlessLaunchReport {
         bootstrap_sync,
@@ -2705,6 +3924,122 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_bootstrap<T: TransactionAu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outbound_bootstrap_resync_waits_for_bounded_poll_interval() {
+        let started = Instant::now();
+        assert!(!outbound_bootstrap_resync_due(
+            started,
+            started + Duration::from_secs(29),
+        ));
+        assert!(outbound_bootstrap_resync_due(
+            started,
+            started + Duration::from_secs(30),
+        ));
+        let next_poll = started + Duration::from_secs(30);
+        assert!(!outbound_bootstrap_resync_due(
+            next_poll,
+            next_poll + Duration::from_secs(29),
+        ));
+    }
+
+    #[test]
+    fn q6pd_discovery_refresh_runs_every_thirty_seconds() {
+        let started = Instant::now();
+        assert!(!q6pd_discovery_pull_due(
+            started,
+            started + Duration::from_secs(29),
+        ));
+        assert!(q6pd_discovery_pull_due(
+            started,
+            started + Duration::from_secs(30),
+        ));
+        let next_pull = started + Duration::from_secs(30);
+        assert!(!q6pd_discovery_pull_due(
+            next_pull,
+            next_pull + Duration::from_secs(29),
+        ));
+    }
+
+    #[test]
+    fn q6pd_candidate_dial_runs_on_a_five_second_cadence() {
+        let started = Instant::now();
+        assert!(!q6pd_candidate_dial_due(
+            started,
+            started + Duration::from_secs(4),
+        ));
+        assert!(q6pd_candidate_dial_due(
+            started,
+            started + Duration::from_secs(5),
+        ));
+    }
+
+    #[test]
+    fn q6ar_discovery_refresh_waits_for_five_minute_interval() {
+        let started = Instant::now();
+        assert!(!q6ar_discovery_pull_due(
+            started,
+            started + Duration::from_secs(299),
+        ));
+        assert!(q6ar_discovery_pull_due(
+            started,
+            started + Duration::from_secs(300),
+        ));
+        let next_pull = started + Duration::from_secs(300);
+        assert!(!q6ar_discovery_pull_due(
+            next_pull,
+            next_pull + Duration::from_secs(299),
+        ));
+    }
+
+    #[test]
+    fn automatic_dial_targets_respect_selected_approved_key_set() {
+        use crate::qrun_v06_peer_address_manager_candidate::{
+            PeerAddressSource, QRunV06PeerAddressBookCandidate,
+        };
+
+        const NETWORK: [u8; 32] = [0xA1; 32];
+        const PROFILE: [u8; 32] = [0xA2; 32];
+        const SELECTED_KEY: [u8; 32] = [0x31; 32];
+        const OTHER_APPROVED_KEY: [u8; 32] = [0x32; 32];
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "qfp6-approved-dial-targets-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = root.join("peers.q6pa");
+
+        let mut book = QRunV06PeerAddressBookCandidate::open(&store, NETWORK, PROFILE).unwrap();
+        let selected_address: std::net::SocketAddr = "127.0.0.1:30336".parse().unwrap();
+        let other_address: std::net::SocketAddr = "127.0.0.1:30337".parse().unwrap();
+        book.pin_manual_peer(&selected_address.to_string(), SELECTED_KEY, 100)
+            .unwrap();
+        book.pin_manual_peer(&other_address.to_string(), OTHER_APPROVED_KEY, 100)
+            .unwrap();
+        book.upsert("127.0.0.1:30338", PeerAddressSource::Gossip, 100)
+            .unwrap();
+
+        let configured = [QRunV06PinnedBootstrapPeer {
+            address: selected_address,
+            noise_static_public_key: SELECTED_KEY,
+            tls_server_name: Some("seed.example".into()),
+        }];
+        let targets =
+            address_book_approved_dial_targets(&book, &configured, &[SELECTED_KEY], 1_000);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].address, selected_address);
+        assert_eq!(targets[0].noise_static_public_key, SELECTED_KEY);
+        assert_eq!(targets[0].tls_server_name.as_deref(), Some("seed.example"));
+
+        drop(book);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     use crate::{
         consensus::{ConsensusParameters, PowAlgorithm, PowParameters, Uint256},
         qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
@@ -2828,6 +4163,22 @@ mod tests {
     fn permissionless_mining_supervisor_config_is_finite_and_bounded() {
         let mut config = QRunV06PermissionlessMiningSupervisorConfig::default();
         assert!(config.validate().is_ok());
+        assert_eq!(config.max_sessions_per_listener_round, 1);
+        config.max_sessions_per_listener_round = 6;
+        assert!(config.validate().is_ok());
+        config.max_sessions_per_listener_round = 0;
+        assert_eq!(
+            config.validate(),
+            Err(QRunV06NodeSupervisorError::InvalidConfiguration)
+        );
+        config = QRunV06PermissionlessMiningSupervisorConfig::default();
+        config.max_sessions_per_listener_round =
+            crate::qrun_v06_peer_listener_candidate::QRUN_V06_LISTENER_MAX_SESSIONS + 1;
+        assert_eq!(
+            config.validate(),
+            Err(QRunV06NodeSupervisorError::InvalidConfiguration)
+        );
+        config = QRunV06PermissionlessMiningSupervisorConfig::default();
         config.max_nonce_attempts_per_block = 0;
         assert_eq!(
             config.validate(),
@@ -2926,7 +4277,7 @@ mod tests {
                         Ok(())
                     }
                 },
-                |_guard, _frame| {
+                |_peer_addr, _guard, _frame| {
                     Err("Q6AR must not reach the application transaction handler".into())
                 },
             )
@@ -3108,7 +4459,7 @@ mod tests {
                         }
                     }
                 },
-                |_guard, _frame| {
+                |_peer_addr, _guard, _frame| {
                     Err("Q6AR must not reach the application transaction handler".into())
                 },
             )
@@ -3311,7 +4662,7 @@ mod tests {
                     server_accepted.fetch_add(1, AtomicOrdering::AcqRel);
                     Ok(())
                 },
-                |_guard, _frame| {
+                |_peer_addr, _guard, _frame| {
                     Err("Q6AR must not reach the application transaction handler".into())
                 },
             )

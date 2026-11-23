@@ -145,6 +145,8 @@ pub mod private_testnet_v4_hybrid_fork_store_candidate;
 /// Candidate-only PTB2 envelope for linked PoW headers + canonical block-body transport.
 pub mod private_testnet_wire;
 pub mod protocol_profile;
+/// CP-0801 TPM-backed local Device Root binding for the existing QFP6 Noise identity.
+pub mod qfp6_device_identity_candidate;
 /// Candidate-only QRA1 preservation of every branch named by an old QRun v0.5 PFS2 manifest; no provider CAS or manifest rebase.
 pub mod qrun_v05_history_archive_candidate;
 /// M2c candidate for network-bound signed asset metadata and issuer supply policy.
@@ -201,6 +203,10 @@ pub mod qrun_v06_profile_pin_candidate;
 pub mod qrun_v06_profile_trust_candidate;
 /// CP-0548 candidate AWS DynamoDB monotonic Q6TS floor adapter with a node read-only wrapper; not provisioned or deployed.
 pub mod qrun_v06_profile_trust_dynamodb_floor_candidate;
+/// CP-0839 durable Q6PD new/tried peer-address selection and reconnect backoff; never grants peer trust.
+pub mod qrun_v06_q6pd_address_manager_candidate;
+/// CP-0832 bounded persistent Q6PD Noise liveness sessions with pinned reconnect management.
+pub mod qrun_v06_q6pd_session_candidate;
 /// CP-0559 orchestration of QAP1 with the signed Provider and authenticated Q6EA Noise transport.
 pub mod qrun_v06_qap1_coordinator_candidate;
 /// CP-0558 append-only QAP1 intent journal for exact QFP6/Provider/Q6EA crash recovery.
@@ -580,6 +586,17 @@ pub mod qrun_v06_cp0651_supply_candidate;
 
 /// Candidate-only bounded, profile-bound durable peer address book; not runtime-wired.
 pub mod qrun_v06_peer_address_manager_candidate;
+
+/// Candidate-only ephemeral dial scheduling and pinned Noise-session state; supervisor wiring pending.
+pub mod qrun_v06_peer_connection_manager_candidate;
+
+/// Q6PD v1 signed, network/profile-bound self-announcement primitive; not yet runtime-wired.
+pub mod qrun_v06_peer_discovery_candidate;
+
+/// Bounded persistent Q6PD candidate store with replay-resistant sequence high-water marks.
+pub mod qrun_v06_peer_discovery_store_candidate;
+/// CP-0822 DPAPI-custodied Q6PD node identity with a TPM Device Root binding.
+pub mod qrun_v06_peer_identity_candidate;
 
 /// Candidate-only Q6AR network/profile-bound address relay codec; not runtime-wired.
 pub mod qrun_v06_peer_address_relay_candidate;

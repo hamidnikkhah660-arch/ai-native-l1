@@ -7,18 +7,24 @@ use super::{
 };
 use ai_native_l1_pow_bench::{
     noise_key_provisioning::load_protected_noise_private_key,
+    qfp6_device_identity_candidate::{derive_noise_static_public_key, verify_device_root_binding},
     qrun_v06_bootstrap_trust_domain_candidate::BootstrapTrustDomainPolicy,
     qrun_v06_canonical_execution_candidate::QRunV06CanonicalExecutionState,
     qrun_v06_checkpoint_candidate::MAX_QRUN_V06_CHECKPOINT_BYTES,
     qrun_v06_cp0651_supply_candidate::CP0651_OWNER_GENESIS_ATOMS,
     qrun_v06_genesis_approval_candidate::QRunV06GenesisApproval,
     qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor,
-    qrun_v06_history_sync_service_candidate::QRunV06HistorySyncClientConfig,
+    qrun_v06_history_sync_service_candidate::{
+        pull_q6ar_candidates_from_pinned_peer,
+        pull_q6pd_peer_records_from_dns_seed_with_announcement,
+        pull_q6pd_peer_records_from_pinned_peer_with_announcement, QRunV06HistorySyncClientConfig,
+    },
     qrun_v06_hybrid_auth_candidate::QRunV06HybridTransactionAuthenticator,
     qrun_v06_local_anchor_vault_candidate::QRunV06LocalAnchorVault,
     qrun_v06_node_supervisor_candidate::{
         run_qfp6_permissionless_mining_supervisor_open,
         run_qfp6_permissionless_mining_supervisor_open_with_q6ar_candidate,
+        run_qfp6_permissionless_mining_supervisor_open_with_q6pd_candidate,
         run_qfp6_permissionless_mining_supervisor_with_bootstrap,
         run_qfp6_permissionless_mining_supervisor_with_bootstrap_and_q6ar_candidate,
         run_qfp6_permissionless_mining_supervisor_with_q6ar_candidate_and_quote_asset_authorization,
@@ -27,6 +33,9 @@ use ai_native_l1_pow_bench::{
         QRunV06PinnedBootstrapPeer,
     },
     qrun_v06_peer_address_manager_candidate::QRunV06PeerAddressBookCandidate,
+    qrun_v06_peer_discovery_candidate::Q6PD_MAX_TTL_SECS,
+    qrun_v06_peer_discovery_store_candidate::Q6pdPeerRecordStore,
+    qrun_v06_peer_identity_candidate::load_q6pd_node_identity,
     qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessNodeRuntime,
     qrun_v06_permissionless_service_candidate::QRunV06PermissionlessMempool,
     qrun_v06_pow_fork_choice_candidate::QRunV06QuoteAssetAuthorizationProvider,
@@ -48,10 +57,40 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs},
     path::{Component, Path, PathBuf},
     sync::atomic::AtomicBool,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use zeroize::Zeroizing;
 
+const PUBLIC_TESTNET_LISTENER_ROUND_TIMEOUT: Duration = Duration::from_secs(30);
+const PUBLIC_TESTNET_LISTENER_MAX_SESSIONS_PER_ROUND: usize = 6;
+// Scheduling policy only: keep the return-to-listener gap short on the zero-value testnet.
+// This does not alter the Q6CP consensus target, hash function, or per-block validity rules.
+const PUBLIC_TESTNET_MAX_NONCE_ATTEMPTS_PER_SLICE: u64 = 4_096;
+
+fn apply_public_testnet_listener_round_timeout(
+    supervisor: &mut QRunV06PermissionlessMiningSupervisorConfig,
+    public_testnet: bool,
+) {
+    if public_testnet {
+        // Noise XX has an 8-second absolute handshake budget. A 250 ms listener round
+        // cancelled the bounded handshake workers before public TLS/Funnel RTTs completed.
+        // Keep private/overlay polling unchanged; give the public zero-value path enough
+        // room for the handshake and the first bounded history-sync exchanges.
+        supervisor.listener_round_timeout = PUBLIC_TESTNET_LISTENER_ROUND_TIMEOUT;
+        supervisor.max_sessions_per_listener_round = PUBLIC_TESTNET_LISTENER_MAX_SESSIONS_PER_ROUND;
+    }
+}
+
+fn apply_public_testnet_mining_slice(
+    supervisor: &mut QRunV06PermissionlessMiningSupervisorConfig,
+    public_testnet: bool,
+) {
+    if public_testnet {
+        supervisor.max_nonce_attempts_per_block = supervisor
+            .max_nonce_attempts_per_block
+            .min(PUBLIC_TESTNET_MAX_NONCE_ATTEMPTS_PER_SLICE);
+    }
+}
 const MAX_PEERS_BYTES: u64 = 16 * 1024;
 const MAX_TRUST_DOMAIN_REGISTRY_BYTES: u64 = 64 * 1024;
 const MAX_TRUST_DOMAIN_REGISTRY_RELAYS: usize = 256;
@@ -695,6 +734,65 @@ fn q6ar_candidate_address_book_enabled(cfg: &Value) -> Result<bool, String> {
     }
 }
 
+/// Enable signed Q6PD peer-record exchange; default OFF to preserve older node behavior.
+fn q6pd_peer_discovery_enabled(cfg: &Value) -> Result<bool, String> {
+    match cfg.get("enable_q6pd_peer_discovery") {
+        None => Ok(false),
+        Some(Value::Bool(enabled)) => Ok(*enabled),
+        Some(_) => {
+            Err("permissionless_runtime.enable_q6pd_peer_discovery must be a boolean".into())
+        }
+    }
+}
+
+/// Pull only from explicitly selected pinned peers after those peers have been upgraded.
+fn q6pd_peer_pull_enabled(cfg: &Value) -> Result<bool, String> {
+    match cfg.get("enable_q6pd_peer_pull") {
+        None => Ok(false),
+        Some(Value::Bool(enabled)) => Ok(*enabled),
+        Some(_) => Err("permissionless_runtime.enable_q6pd_peer_pull must be a boolean".into()),
+    }
+}
+
+/// A genesis-rooted Seed has no upstream peer to pin: it receives signed Q6PD
+/// announcements from joining nodes, relays the verified records, and may dial
+/// those signed candidates. Joining nodes still require at least one pinned seed.
+fn q6pd_peer_pull_requires_operator_pinned_seed(node_role: &str, peer_count: usize) -> bool {
+    !node_role.eq_ignore_ascii_case("seed") && peer_count == 0
+}
+
+/// Publish this node's own TPM-bound signed endpoint record; default OFF.
+fn q6pd_self_announcement_enabled(cfg: &Value) -> Result<bool, String> {
+    match cfg.get("enable_q6pd_self_announcement") {
+        None => Ok(false),
+        Some(Value::Bool(enabled)) => Ok(*enabled),
+        Some(_) => {
+            Err("permissionless_runtime.enable_q6pd_self_announcement must be a boolean".into())
+        }
+    }
+}
+
+/// Standalone operator address book; independent of Q6AR candidate exchange.
+fn peer_address_book_enabled(cfg: &Value) -> Result<bool, String> {
+    match cfg.get("enable_peer_address_book") {
+        None => Ok(false),
+        Some(Value::Bool(enabled)) => Ok(*enabled),
+        Some(_) => Err("permissionless_runtime.enable_peer_address_book must be a boolean".into()),
+    }
+}
+
+/// Pull inventory only from bootstrap relays that the operator has separately verified
+/// already support Q6PQ/Q6PL. Defaults off so older peers never receive an unknown frame.
+fn q6ar_candidate_pull_enabled(cfg: &Value) -> Result<bool, String> {
+    match cfg.get("enable_q6ar_candidate_pull") {
+        None => Ok(false),
+        Some(Value::Bool(enabled)) => Ok(*enabled),
+        Some(_) => {
+            Err("permissionless_runtime.enable_q6ar_candidate_pull must be a boolean".into())
+        }
+    }
+}
+
 /// Explicitly authorize a registry fingerprint change. This setting is covered by the
 /// independently pinned permissionless config SHA-256 and defaults to disabled.
 fn q6ar_trust_domains_rotation_authorized(cfg: &Value) -> Result<bool, String> {
@@ -819,6 +917,26 @@ fn load_q6ar_trust_domain_registry(
         "Q6AR operator trust-domain registry",
     )?;
     decode_q6ar_trust_domain_registry(&bytes, expected_sha, pinned_relays)
+}
+
+/// Separate operator policy for approved peer-book pins when Q6AR is disabled.
+/// The exact same bounded trust-domain schema is used, but it has independent path/hash pins.
+fn load_peer_trust_domain_registry(
+    base: &Path,
+    cfg: &Value,
+    approved_peer_keys: &[[u8; 32]],
+) -> Result<BootstrapTrustDomainPolicy, String> {
+    let registry_path = path(base, cfg, "peer_trust_domains_path")?;
+    let expected_sha = parse_hex32(
+        "peer_trust_domains_sha256",
+        req(cfg, "peer_trust_domains_sha256")?,
+    )?;
+    let bytes = read_bounded(
+        &registry_path,
+        MAX_TRUST_DOMAIN_REGISTRY_BYTES,
+        "operator peer trust-domain registry",
+    )?;
+    decode_q6ar_trust_domain_registry(&bytes, expected_sha, approved_peer_keys)
 }
 
 fn approved_peer_outbound_sync_enabled(cfg: &Value) -> Result<bool, String> {
@@ -1263,7 +1381,34 @@ fn trusted_manifest_anchor(
             Ok(Some(vault_tip))
         }
         (true, None) => Err("existing durable history requires independently pinned permissionless_runtime.trusted_manifest_anchor; refusing local-only rollback trust".into()),
-        (false, Some(_)) if joining_role => Ok(None),
+        (false, Some(value)) if joining_role => {
+            // A Joining node may be pre-provisioned from a checkpoint before its first local
+            // manifest exists. Select that path only after the complete C: vault and Q6SW
+            // witness chain validate. A missing vault preserves fresh-Genesis bootstrap.
+            let text = value
+                .as_str()
+                .filter(|text| !text.trim().is_empty())
+                .ok_or("trusted_manifest_anchor must be a non-empty 64-hex string")?;
+            let configured_root_anchor = parse_hex32("trusted_manifest_anchor", text)?;
+            let vault_path = local_anchor_vault_directory(cfg)?;
+            match fs::symlink_metadata(&vault_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(format!(
+                    "cannot inspect pre-provisioned Joining C: anchor vault: {error}"
+                )),
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(
+                    "pre-provisioned Joining C: anchor vault must be a real directory".into(),
+                ),
+                Ok(_) => validate_local_anchor_vault(
+                    cfg,
+                    expected_network_id,
+                    expected_profile_id,
+                    0,
+                    &configured_root_anchor,
+                )
+                .map(Some),
+            }
+        },
         (false, Some(_)) => Err("trusted_manifest_anchor must be omitted for a fresh Genesis-only data directory".into()),
         (false, None) => Ok(None),
     }
@@ -1478,6 +1623,44 @@ fn validate_public_testnet_topology(
     listen: SocketAddr,
     peers: &[QRunV06PinnedBootstrapPeer],
 ) -> Result<(), String> {
+    // NAT-friendly joining clients may participate through outbound-only sessions.
+    // They must bind exclusively to loopback, have a pinned public bootstrap peer,
+    // enable Q6PD discovery/pull, and never publish an unreachable self endpoint.
+    // A Seed or public relay continues through the original public-listener policy.
+    let outbound_only_joiner = req(cfg, "node_role")? == "joining"
+        && cfg
+            .get("enable_q6pd_self_announcement")
+            .and_then(Value::as_bool)
+            == Some(false);
+    if outbound_only_joiner {
+        if !listen.ip().is_loopback() || listen.port() == 0 {
+            return Err(
+                "outbound-only public-testnet joining nodes must bind a nonzero loopback listener"
+                    .into(),
+            );
+        }
+        if !q6pd_peer_discovery_enabled(cfg)? || !q6pd_peer_pull_enabled(cfg)? {
+            return Err(
+                "outbound-only joining nodes require Q6PD discovery and signed-record pull".into(),
+            );
+        }
+        if peers.is_empty() {
+            return Err(
+                "outbound-only joining nodes require an independently pinned bootstrap peer".into(),
+            );
+        }
+        if peers
+            .iter()
+            .any(|peer| !is_publicly_routable_peer_ip(peer.address.ip()))
+        {
+            return Err(
+                "outbound-only bootstrap peers must use publicly routable unicast IP addresses"
+                    .into(),
+            );
+        }
+        return Ok(());
+    }
+
     if !requires_public_listener_opt_in(listen.ip()) {
         return Err(
             "public-testnet mode must bind 0.0.0.0 or a public unicast address, not a private/loopback interface"
@@ -1784,22 +1967,114 @@ fn run_permissionless_node_with_visibility(
     let anchor_vault_dir = local_anchor_vault_directory(cfg)?;
     validate_anchor_vault_path_separation(&anchor_vault_dir, &data_dir, &mempool_dir)?;
     let enable_q6ar_candidate = q6ar_candidate_address_book_enabled(cfg)?;
+    let enable_q6pd_peer_discovery = q6pd_peer_discovery_enabled(cfg)?;
+    let enable_q6pd_peer_pull = q6pd_peer_pull_enabled(cfg)?;
+    let enable_q6pd_self_announcement = q6pd_self_announcement_enabled(cfg)?;
+    if enable_q6pd_peer_pull && !enable_q6pd_peer_discovery {
+        return Err("enable_q6pd_peer_pull requires enable_q6pd_peer_discovery=true".into());
+    }
+    if enable_q6pd_self_announcement && !enable_q6pd_peer_discovery {
+        return Err(
+            "enable_q6pd_self_announcement requires enable_q6pd_peer_discovery=true".into(),
+        );
+    }
+    if enable_q6pd_self_announcement && !public_testnet {
+        return Err(
+            "Q6PD self-announcement is restricted to the zero-value Public Testnet candidate"
+                .into(),
+        );
+    }
+    let q6pd_identity_config_keys = [
+        "q6pd_identity_key_path",
+        "q6pd_identity_binding_path",
+        "q6pd_self_advertise_endpoint",
+    ];
+    let q6pd_optional_endpoint_config_keys = ["q6pd_self_advertise_tls_server_name"];
+    if enable_q6pd_self_announcement {
+        for key in q6pd_identity_config_keys {
+            if cfg.get(key).is_none() {
+                return Err(format!("enable_q6pd_self_announcement requires {key}"));
+            }
+        }
+        if cfg.get("device_root_metadata_path").is_none() {
+            return Err("enable_q6pd_self_announcement requires device_root_metadata_path".into());
+        }
+    } else if q6pd_identity_config_keys
+        .iter()
+        .chain(q6pd_optional_endpoint_config_keys.iter())
+        .any(|key| cfg.get(*key).is_some())
+    {
+        return Err(
+            "Q6PD identity paths and endpoint require enable_q6pd_self_announcement=true".into(),
+        );
+    }
+    if enable_q6pd_peer_discovery && !public_testnet {
+        return Err(
+            "Q6PD peer discovery is restricted to the zero-value Public Testnet candidate".into(),
+        );
+    }
+    let enable_peer_address_book = peer_address_book_enabled(cfg)?;
+    let enable_address_book = enable_q6ar_candidate || enable_peer_address_book;
+    let enable_q6ar_candidate_pull = q6ar_candidate_pull_enabled(cfg)?;
     let enable_approved_peer_sync = approved_peer_outbound_sync_enabled(cfg)?;
     let max_approved_attempts = max_approved_peer_sync_attempts(cfg)?;
-    if enable_approved_peer_sync && !enable_q6ar_candidate {
+    if enable_q6ar_candidate_pull && !enable_q6ar_candidate {
         return Err(
-            "enable_approved_peer_outbound_sync requires enable_q6ar_candidate_address_book=true"
+            "enable_q6ar_candidate_pull requires enable_q6ar_candidate_address_book=true".into(),
+        );
+    }
+    if enable_approved_peer_sync && !enable_address_book {
+        return Err(
+            "enable_approved_peer_outbound_sync requires enable_peer_address_book=true or enable_q6ar_candidate_address_book=true"
                 .into(),
+        );
+    }
+    if enable_peer_address_book && !enable_approved_peer_sync {
+        return Err(
+            "enable_peer_address_book requires enable_approved_peer_outbound_sync=true".into(),
+        );
+    }
+    if enable_q6pd_peer_discovery {
+        // A genesis-rooted seed may serve signed records and accept incoming announcements
+        // before it knows any other peer. Only nodes that pull/dial need a pinned bootstrap;
+        // that stricter requirement is enforced below by enable_q6pd_peer_pull.
+        if cfg.get("q6pd_peer_record_store_path").is_none() {
+            return Err("enable_q6pd_peer_discovery requires q6pd_peer_record_store_path".into());
+        }
+    } else if cfg.get("q6pd_peer_record_store_path").is_some() {
+        return Err("q6pd_peer_record_store_path requires enable_q6pd_peer_discovery=true".into());
+    }
+    if enable_q6pd_peer_pull
+        && q6pd_peer_pull_requires_operator_pinned_seed(req(cfg, "node_role")?, peers.len())
+    {
+        return Err("enable_q6pd_peer_pull requires at least one operator-pinned, Q6PD-capable bootstrap peer for joining nodes".into());
+    }
+    if enable_q6ar_candidate
+        && (cfg.get("peer_trust_domains_path").is_some()
+            || cfg.get("peer_trust_domains_sha256").is_some())
+    {
+        return Err("peer_trust_domains_path/sha256 are only for standalone peer-book mode".into());
+    }
+    if !enable_peer_address_book
+        && (cfg.get("peer_trust_domains_path").is_some()
+            || cfg.get("peer_trust_domains_sha256").is_some())
+    {
+        return Err(
+            "peer trust-domain registry settings require enable_peer_address_book=true".into(),
         );
     }
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("system clock invalid for Q6AR address book: {error}"))?
+        .map_err(|error| format!("system clock invalid for peer address book: {error}"))?
         .as_millis()
         .try_into()
-        .map_err(|_| "system clock exceeds Q6AR millisecond range".to_string())?;
-    let mut q6ar_address_book = if enable_q6ar_candidate {
-        let address_book_path = path(base, cfg, "q6ar_candidate_address_book_path")?;
+        .map_err(|_| "system clock exceeds peer address-book millisecond range".to_string())?;
+    let mut q6ar_address_book = if enable_address_book {
+        let address_book_path = if enable_peer_address_book {
+            path(base, cfg, "peer_address_book_path")?
+        } else {
+            path(base, cfg, "q6ar_candidate_address_book_path")?
+        };
         if address_book_path == data_dir
             || address_book_path.starts_with(&data_dir)
             || data_dir.starts_with(&address_book_path)
@@ -1807,14 +2082,16 @@ fn run_permissionless_node_with_visibility(
             || address_book_path.starts_with(&mempool_dir)
             || mempool_dir.starts_with(&address_book_path)
         {
-            return Err("Q6AR candidate address-book path must be separate from data and mempool directories".into());
+            return Err(
+                "peer address-book path must be separate from data and mempool directories".into(),
+            );
         }
         let mut book = QRunV06PeerAddressBookCandidate::open(
             &address_book_path,
             descriptor.network_id(),
             descriptor.profile_id(),
         )
-        .map_err(|error| format!("Q6AR candidate address-book open failed: {error}"))?;
+        .map_err(|error| format!("operator peer address-book open failed: {error}"))?;
         for peer in &peers {
             book.pin_manual_peer(
                 &peer.address.to_string(),
@@ -1822,10 +2099,123 @@ fn run_permissionless_node_with_visibility(
                 now_ms,
             )
             .map_err(|error| {
-                format!("cannot seed Q6AR address book from pinned bootstrap peer: {error}")
+                format!("cannot seed peer address book from configured operator pins: {error}")
             })?;
         }
         Some(book)
+    } else {
+        None
+    };
+    let mut q6pd_peer_record_store = if enable_q6pd_peer_discovery {
+        let record_store_path = path(base, cfg, "q6pd_peer_record_store_path")?;
+        let record_components =
+            normalized_absolute_path_components(&record_store_path, "q6pd_peer_record_store_path")?;
+        for (label, candidate) in [
+            ("data_directory", &data_dir),
+            ("mempool_directory", &mempool_dir),
+        ] {
+            let candidate_components = normalized_absolute_path_components(candidate, label)?;
+            if path_components_overlap(&record_components, &candidate_components) {
+                return Err(format!(
+                    "q6pd_peer_record_store_path must be separate and non-nested from {label}"
+                ));
+            }
+        }
+        if enable_address_book {
+            let address_book_path = if enable_peer_address_book {
+                path(base, cfg, "peer_address_book_path")?
+            } else {
+                path(base, cfg, "q6ar_candidate_address_book_path")?
+            };
+            let address_components =
+                normalized_absolute_path_components(&address_book_path, "peer_address_book_path")?;
+            if path_components_overlap(&record_components, &address_components) {
+                return Err("q6pd_peer_record_store_path must be separate and non-nested from the Q6AR/peer address book".into());
+            }
+        }
+        Some(
+            Q6pdPeerRecordStore::open(
+                &record_store_path,
+                descriptor.network_id(),
+                descriptor.profile_id(),
+                now_ms,
+            )
+            .map_err(|error| format!("Q6PD signed peer-record store open failed: {error}"))?,
+        )
+    } else {
+        None
+    };
+    let q6pd_self_announcement_config = if enable_q6pd_self_announcement {
+        let identity_key_path = path(base, cfg, "q6pd_identity_key_path")?;
+        let identity_binding_path = path(base, cfg, "q6pd_identity_binding_path")?;
+        let device_root_metadata_path = path(base, cfg, "device_root_metadata_path")?;
+        let noise_key_path = path(base, cfg, "node_noise_private_key_path")?;
+        let record_store_path = path(base, cfg, "q6pd_peer_record_store_path")?;
+        let endpoint_text = cfg
+            .get("q6pd_self_advertise_endpoint")
+            .and_then(Value::as_str)
+            .ok_or("q6pd_self_advertise_endpoint must be a numeric IP:port socket address")?;
+        let advertise_endpoint: SocketAddr = endpoint_text
+            .parse()
+            .map_err(|error| format!("invalid q6pd_self_advertise_endpoint: {error}"))?;
+        if advertise_endpoint.port() == 0 {
+            return Err("Q6PD self-advertise endpoint must use a fixed non-zero TCP port".into());
+        }
+        let tls_server_name = cfg
+            .get("q6pd_self_advertise_tls_server_name")
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|name| !name.trim().is_empty())
+                    .map(str::to_owned)
+                    .ok_or("q6pd_self_advertise_tls_server_name must be a non-empty DNS name")
+            })
+            .transpose()?;
+        if tls_server_name.is_some() && advertise_endpoint.port() != 443 {
+            return Err("Q6PD self-advertise TLS SNI requires endpoint port 443".into());
+        }
+        let protected_paths = [
+            ("q6pd_identity_key_path", identity_key_path.clone()),
+            ("q6pd_identity_binding_path", identity_binding_path.clone()),
+            (
+                "device_root_metadata_path",
+                device_root_metadata_path.clone(),
+            ),
+            ("node_noise_private_key_path", noise_key_path.clone()),
+            ("q6pd_peer_record_store_path", record_store_path),
+            ("data_directory", data_dir.clone()),
+            ("mempool_directory", mempool_dir.clone()),
+            (
+                "trusted_manifest_anchor_vault_path",
+                anchor_vault_dir.clone(),
+            ),
+        ];
+        let normalized: Vec<(String, Vec<String>)> = protected_paths
+            .iter()
+            .map(|(label, candidate)| {
+                Ok((
+                    (*label).to_string(),
+                    normalized_absolute_path_components(candidate, label)?,
+                ))
+            })
+            .collect::<Result<_, String>>()?;
+        for left in 0..normalized.len() {
+            for right in left + 1..normalized.len() {
+                if path_components_overlap(&normalized[left].1, &normalized[right].1) {
+                    return Err(format!(
+                        "{} must be a distinct, non-overlapping path from {}",
+                        normalized[left].0, normalized[right].0
+                    ));
+                }
+            }
+        }
+        Some((
+            identity_key_path,
+            identity_binding_path,
+            device_root_metadata_path,
+            advertise_endpoint,
+            tls_server_name,
+        ))
     } else {
         None
     };
@@ -1841,11 +2231,15 @@ fn run_permissionless_node_with_visibility(
         if approved_candidates.is_empty() {
             return Err("approved peer outbound sync is enabled, but no operator-approved peer is currently eligible (check persistent backoff or add a peer pin)".into());
         }
-        let candidate_relay_pins: Vec<[u8; 32]> = approved_candidates
+        let candidate_peer_keys: Vec<[u8; 32]> = approved_candidates
             .iter()
             .map(|(_, noise_static_public_key)| *noise_static_public_key)
             .collect();
-        let policy = load_q6ar_trust_domain_registry(base, cfg, &candidate_relay_pins)?;
+        let policy = if enable_q6ar_candidate {
+            load_q6ar_trust_domain_registry(base, cfg, &candidate_peer_keys)?
+        } else {
+            load_peer_trust_domain_registry(base, cfg, &candidate_peer_keys)?
+        };
         supervisor_peers = select_approved_bootstrap_peers(
             &approved_candidates,
             &peers,
@@ -1853,6 +2247,16 @@ fn run_permissionless_node_with_visibility(
             max_approved_attempts,
         )?;
         bootstrap_trust_domains = Some(policy);
+    }
+    if enable_q6pd_peer_pull
+        && q6pd_peer_pull_requires_operator_pinned_seed(
+            req(cfg, "node_role")?,
+            supervisor_peers.len(),
+        )
+    {
+        return Err(
+            "Q6PD peer pull requires an operator-pinned Q6PD-capable bootstrap peer for joining nodes".into(),
+        );
     }
     let q6ar_relay_pins: Vec<[u8; 32]> = if enable_q6ar_candidate {
         supervisor_peers
@@ -1862,19 +2266,24 @@ fn run_permissionless_node_with_visibility(
     } else {
         Vec::new()
     };
-    let q6ar_trust_domains = if enable_q6ar_candidate {
+    let outbound_trust_domains = if enable_q6ar_candidate {
         let policy = match bootstrap_trust_domains.take() {
             Some(policy) => policy,
             None => load_q6ar_trust_domain_registry(base, cfg, &q6ar_relay_pins)?,
         };
         Some(policy)
+    } else if enable_peer_address_book {
+        let policy = bootstrap_trust_domains
+            .take()
+            .ok_or("standalone peer address book has no approved-peer trust-domain policy")?;
+        Some(policy)
     } else {
         if cfg.get("q6ar_trust_domains_path").is_some()
             || cfg.get("q6ar_trust_domains_sha256").is_some()
+            || cfg.get("q6ar_trust_domains_rotation_authorized").is_some()
         {
             return Err(
-                "Q6AR trust-domain registry settings require enable_q6ar_candidate_address_book=true"
-                    .into(),
+                "Q6AR trust-domain settings require enable_q6ar_candidate_address_book=true".into(),
             );
         }
         None
@@ -1882,25 +2291,23 @@ fn run_permissionless_node_with_visibility(
     let q6ar_rotation_authorized = if enable_q6ar_candidate {
         q6ar_trust_domains_rotation_authorized(cfg)?
     } else {
-        if cfg.get("q6ar_trust_domains_rotation_authorized").is_some() {
-            return Err(
-                "Q6AR trust-domain rotation authorization requires enable_q6ar_candidate_address_book=true"
-                    .into(),
-            );
-        }
         false
     };
-    if let (Some(book), Some(policy)) = (q6ar_address_book.as_mut(), q6ar_trust_domains.as_ref()) {
-        let binding_result = if q6ar_rotation_authorized {
-            book.rotate_trust_domain_registry(policy, now_ms)
-        } else {
-            book.bind_trust_domain_registry(policy, now_ms)
-        };
-        binding_result.map_err(|error| {
-            format!(
-                "Q6AR address book trust-domain registry binding/rotation failed closed: {error}"
-            )
-        })?;
+    if enable_q6ar_candidate {
+        if let (Some(book), Some(policy)) =
+            (q6ar_address_book.as_mut(), outbound_trust_domains.as_ref())
+        {
+            let binding_result = if q6ar_rotation_authorized {
+                book.rotate_trust_domain_registry(policy, now_ms)
+            } else {
+                book.bind_trust_domain_registry(policy, now_ms)
+            };
+            binding_result.map_err(|error| {
+                format!(
+                    "Q6AR address book trust-domain registry binding/rotation failed closed: {error}"
+                )
+            })?;
+        }
     }
     let listen = endpoint(
         "permissionless_runtime.listen_address",
@@ -1951,6 +2358,108 @@ fn run_permissionless_node_with_visibility(
         load_protected_noise_private_key(&key_path, &descriptor.network_id())
             .map_err(|e| format!("protected local Noise key unavailable: {e:?}"))?,
     );
+    let require_device_root_binding = match cfg.get("require_device_root_binding") {
+        None => false,
+        Some(Value::Bool(required)) => *required,
+        Some(_) => {
+            return Err(
+                "permissionless_runtime.require_device_root_binding must be a boolean".into(),
+            )
+        }
+    };
+    let metadata_configured = cfg.get("device_root_metadata_path").is_some();
+    let binding_configured = cfg.get("device_root_binding_path").is_some();
+    if metadata_configured != binding_configured && !enable_q6pd_self_announcement {
+        return Err("TPM Device Root binding requires both device_root_metadata_path and device_root_binding_path".into());
+    }
+    if require_device_root_binding && (!metadata_configured || !binding_configured) {
+        return Err("require_device_root_binding=true but no TPM Device Root metadata/binding paths were configured".into());
+    }
+    if metadata_configured && binding_configured {
+        let metadata_path = path(base, cfg, "device_root_metadata_path")?;
+        let binding_path = path(base, cfg, "device_root_binding_path")?;
+        if metadata_path == binding_path || metadata_path == key_path || binding_path == key_path {
+            return Err("TPM Device Root metadata, binding record, and protected Noise key must be three distinct files".into());
+        }
+        let local_noise_public = derive_noise_static_public_key(&*local_key).map_err(|error| {
+            format!("cannot derive local Noise public identity for TPM binding: {error}")
+        })?;
+        verify_device_root_binding(
+            &metadata_path,
+            &binding_path,
+            &local_noise_public,
+            &descriptor.network_id(),
+            &descriptor.profile_id(),
+        )
+        .map_err(|error| format!("TPM Device Root to Noise identity binding rejected before listener startup: {error}"))?;
+        eprintln!("QFP6_DEVICE_IDENTITY=TPM_BOUND_LOCAL_ONLY; TPM_PRIVATE_EXPORT=BLOCKED; NOISE_KEY=EXISTING_NPK1; NETWORK_ACCESS=NOT_USED");
+    } else if enable_q6pd_self_announcement {
+        eprintln!("QFP6_DEVICE_IDENTITY=Q6PD_TPM_IDENTITY_BINDING_REQUIRED; noise-only-root-binding=NOT_CONFIGURED");
+    } else {
+        eprintln!("QFP6_DEVICE_IDENTITY=UNBOUND; require_device_root_binding=false; legacy local Noise identity remains active");
+    }
+    let mut q6pd_node_identity = None;
+    let q6pd_self_announcement_report = if let Some((
+        identity_key_path,
+        identity_binding_path,
+        device_root_metadata_path,
+        advertise_endpoint,
+        tls_server_name,
+    )) = q6pd_self_announcement_config.as_ref()
+    {
+        q6pd_node_identity = Some(
+            load_q6pd_node_identity(
+                identity_key_path,
+                identity_binding_path,
+                device_root_metadata_path,
+                &key_path,
+                &descriptor.network_id(),
+                &descriptor.profile_id(),
+            )
+            .map_err(|error| {
+                format!("TPM-bound Q6PD node identity rejected before publication: {error}")
+            })?,
+        );
+        let identity = q6pd_node_identity
+            .as_ref()
+            .ok_or("Q6PD node identity was not loaded")?;
+        let store = q6pd_peer_record_store
+            .as_mut()
+            .ok_or("Q6PD self-announcement enabled but peer-record store is unavailable")?;
+        let sequence = store
+            .sequence_for_peer(&identity.info().peer_id)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or("Q6PD self-announcement sequence exhausted")?;
+        let issued_at_secs = now_ms / 1000;
+        let wire = identity
+            .sign_announcement_with_tls_server_name(
+                *advertise_endpoint,
+                tls_server_name.as_deref(),
+                sequence,
+                issued_at_secs,
+                Q6PD_MAX_TTL_SECS,
+            )
+            .map_err(|error| format!("Q6PD self-announcement could not be signed: {error}"))?;
+        let ingest = store
+            .ingest(&wire, now_ms)
+            .map_err(|error| format!("Q6PD self-announcement could not be persisted: {error}"))?;
+        Some((
+            identity.info().peer_id,
+            *advertise_endpoint,
+            tls_server_name.clone(),
+            sequence,
+            ingest,
+        ))
+    } else {
+        None
+    };
+    let q6pd_self_announcement = q6pd_node_identity
+        .as_ref()
+        .zip(q6pd_self_announcement_config.as_ref())
+        .map(|(identity, (_, _, _, endpoint, tls_server_name))| {
+            (identity, *endpoint, tls_server_name.clone())
+        });
     let authenticator = QRunV06HybridTransactionAuthenticator::new(LibcruxMlDsa65VerifierCandidate);
     let pq_verifier = LibcruxMlDsa65VerifierCandidate;
     let mut trust_authorized_pin: Option<QRunV06TrustAuthorizedProfilePin> = None;
@@ -2108,6 +2617,7 @@ fn run_permissionless_node_with_visibility(
     let producer = parse_hex32("producer_account", req(cfg, "producer_account")?)?;
     // The supervisor owns the one-time Q6MJ/Q6MM startup reconciliation.
     let mut supervisor_config = QRunV06PermissionlessMiningSupervisorConfig::default();
+    apply_public_testnet_listener_round_timeout(&mut supervisor_config, public_testnet);
     if let Some(n) = cfg.get("max_nonce_attempts_per_block") {
         supervisor_config.max_nonce_attempts_per_block = n
             .as_u64()
@@ -2116,6 +2626,7 @@ fn run_permissionless_node_with_visibility(
     supervisor_config
         .validate()
         .map_err(|e| format!("permissionless supervisor config invalid: {e:?}"))?;
+    apply_public_testnet_mining_slice(&mut supervisor_config, public_testnet);
     let listener = TcpListener::bind(listen)
         .map_err(|e| format!("permissionless P2P listener bind failed: {e}"))?;
     let read_api_listener = if let Some(address) = read_api_address {
@@ -2137,6 +2648,20 @@ fn run_permissionless_node_with_visibility(
     );
     println!("listener={listen}");
     println!("bootstrap_peer_count={}", peers.len());
+    println!(
+        "listener_round_timeout_ms={}",
+        supervisor_config.listener_round_timeout.as_millis()
+    );
+    println!(
+        "listener_max_sessions_per_round={}",
+        supervisor_config.max_sessions_per_listener_round
+    );
+    if public_testnet {
+        println!(
+            "public_testnet_max_nonce_attempts_per_slice={}",
+            supervisor_config.max_nonce_attempts_per_block
+        );
+    }
     if public_testnet {
         println!("public_testnet_mode=ZERO_VALUE_CANDIDATE_ONLY");
         println!("public_testnet_role={}", req(cfg, "node_role")?);
@@ -2144,7 +2669,29 @@ fn run_permissionless_node_with_visibility(
         println!("public_market_or_usdt=NOT_PROVIDED");
         println!("public_inbound_noise=ANONYMOUS_UNAUTHENTICATED_XX");
         println!("remote_static_key_is_identity=FALSE");
-        println!("automatic_peer_discovery=NOT_IMPLEMENTED");
+        println!(
+            "automatic_peer_discovery={}",
+            if enable_q6pd_peer_discovery {
+                "Q6PD_SIGNED_RECORD_GOSSIP; AUTO_DIAL_1_PER_30S"
+            } else if enable_q6ar_candidate_pull {
+                "PINNED_Q6AR_RELAY_REFRESH_300S"
+            } else {
+                "OFF"
+            }
+        );
+        println!(
+            "automatic_peer_dial={}",
+            if enable_q6pd_peer_pull {
+                "Q6PD_SIGNED_RECORDS_NOISE_KEY_PINNED_AUTO_DIAL_1_PER_30S"
+            } else if enable_approved_peer_sync {
+                "OPERATOR_SELECTED_ADDRESS_BOOK_PINS_ONLY_1_PER_30S"
+            } else if !supervisor_peers.is_empty() {
+                "CONFIGURED_BOOTSTRAP_PINS_ONLY_1_PER_30S"
+            } else {
+                "OFF"
+            }
+        );
+        println!("unapproved_q6ar_candidates_auto_dialed=FALSE");
     } else if mainnet {
         println!("mainnet_native_mode=VALUE_BEARING_CANDIDATE");
         println!("mainnet_inbound_noise=NOISE_XX_STATIC_KEY_ALLOWLIST_REQUIRED");
@@ -2169,32 +2716,182 @@ fn run_permissionless_node_with_visibility(
     println!("cp0651_owner_genesis_allocation_target_qzxb=1000000000");
     println!("cp0651_accounting_labels_circulating=FALSE; block_subsidy_qzxb=0");
     if let Some(book) = q6ar_address_book.as_ref() {
-        println!("q6ar_candidate_address_book=ENABLED");
-        println!("q6ar_candidate_records_at_start={}", book.records().count());
-        println!("q6ar_pinned_relay_count={}", q6ar_relay_pins.len());
+        println!("peer_address_book=ENABLED");
         println!(
-            "q6ar_trust_domain_registry=BOUND; relay_assignments={}",
-            q6ar_trust_domains
-                .as_ref()
-                .map_or(0, BootstrapTrustDomainPolicy::relay_count)
+            "peer_address_book_records_at_start={}",
+            book.records().count()
         );
-        println!("q6ar_advertised_keys_auto_trusted=false");
-        println!("q6ar_discovered_peers_auto_connected=false");
+        println!("q6ar_candidate_address_book={enable_q6ar_candidate}");
+        println!("q6ar_candidate_pull_enabled={enable_q6ar_candidate_pull}");
+        if enable_q6ar_candidate {
+            println!("q6ar_pinned_relay_count={}", q6ar_relay_pins.len());
+            println!(
+                "q6ar_trust_domain_registry=BOUND; relay_assignments={}",
+                outbound_trust_domains
+                    .as_ref()
+                    .map_or(0, BootstrapTrustDomainPolicy::relay_count)
+            );
+            println!("q6ar_advertised_keys_auto_trusted=false");
+            println!("q6ar_discovered_peers_auto_connected=false");
+        } else {
+            println!("q6ar_candidate_refresh=OFF; standalone_operator_peer_book=true");
+        }
         println!("approved_peer_outbound_sync_enabled={enable_approved_peer_sync}");
         println!("approved_peer_sync_attempt_limit={max_approved_attempts}");
         println!("pinned_outbound_peer_count={}", supervisor_peers.len());
     } else {
+        println!("peer_address_book=DISABLED_DEFAULT");
         println!("q6ar_candidate_address_book=DISABLED_DEFAULT");
     }
+    if enable_q6ar_candidate_pull && supervisor_peers.is_empty() {
+        return Err(
+            "Q6AR candidate pull requires at least one operator-pinned bootstrap relay".into(),
+        );
+    }
+    if enable_q6ar_candidate_pull {
+        let book = q6ar_address_book
+            .as_mut()
+            .ok_or("Q6AR candidate pull has no address book")?;
+        let trust_domains = outbound_trust_domains
+            .as_ref()
+            .ok_or("Q6AR candidate pull has no bound trust-domain registry")?;
+        for peer in &supervisor_peers {
+            match pull_q6ar_candidates_from_pinned_peer(
+                peer.address,
+                &local_key,
+                &peer.noise_static_public_key,
+                &descriptor.network_id(),
+                &descriptor.profile_id(),
+                QRunV06HistorySyncClientConfig::default(),
+                peer.tls_server_name.as_deref(),
+                book,
+                trust_domains,
+            ) {
+                Ok(count) => println!(
+                    "q6ar_candidate_pull_complete relay={} candidates_persisted={count}",
+                    peer.address
+                ),
+                Err(error) => println!(
+                    "q6ar_candidate_pull_failed relay={} error={error}; history_bootstrap_remains_authoritative=true",
+                    peer.address
+                ),
+            }
+        }
+    }
+    if enable_q6pd_peer_discovery {
+        let store = q6pd_peer_record_store
+            .as_ref()
+            .ok_or("Q6PD discovery enabled but candidate store was not opened")?;
+        println!("q6pd_peer_discovery=SIGNED_RECORD_SERVING");
+        match q6pd_self_announcement_report.as_ref() {
+            Some((peer_id, endpoint, tls_server_name, sequence, ingest)) => println!(
+                "q6pd_self_announcement=SIGNED_PUBLIC_TCP_ENDPOINT peer_id={:02x?} endpoint={} tls_sni={:?} sequence={} ttl_seconds={} store_result={:?}",
+                peer_id, endpoint, tls_server_name, sequence, Q6PD_MAX_TTL_SECS, ingest
+            ),
+            None => println!("q6pd_self_announcement=OFF"),
+        }
+        println!(
+            "q6pd_peer_pull={}",
+            if enable_q6pd_peer_pull && supervisor_peers.is_empty() {
+                "ON_ROOT_SEED_INBOUND_SIGNED_RECORDS_PLUS_AUTO_DIAL_30S"
+            } else if enable_q6pd_peer_pull {
+                "ON_PINNED_BOOTSTRAP_REFRESH_300S_PLUS_SIGNED_CANDIDATE_AUTO_DIAL_30S"
+            } else {
+                "OFF"
+            }
+        );
+        println!(
+            "q6pd_candidate_records_at_start={}",
+            store.candidate_count()
+        );
+        println!(
+            "q6pd_candidate_auto_trust=false; q6pd_candidate_auto_dial={}",
+            enable_q6pd_peer_pull
+        );
+    }
+    if enable_q6pd_peer_pull {
+        let local_q6pd_announcement_wire = q6pd_node_identity.as_ref().and_then(|identity| {
+            q6pd_peer_record_store
+                .as_ref()
+                .and_then(|store| store.record_wire_for_peer(&identity.info().peer_id, now_ms))
+        });
+        let store = q6pd_peer_record_store
+            .as_mut()
+            .ok_or("Q6PD peer pull enabled but candidate store was not opened")?;
+        // Query up to three independent configured seed peers on first start, matching the
+        // multi-seed bootstrap pattern. Later cycles rotate across the complete configured set.
+        // The genesis-rooted Seed is itself the first bootstrap endpoint: it has no upstream
+        // Seed to pull from, so it receives signed announcements and auto-dials those records.
+        if supervisor_peers.is_empty() && req(cfg, "node_role")? == "seed" {
+            println!("q6pd_initial_pull=ROOT_SEED_NO_UPSTREAM; inbound_signed_record_ingest=ON; signed_candidate_auto_dial=ON");
+        }
+        // Older peers may not support Q6PD yet; one failed seed never blocks the node.
+        // A configured DNS seed is resolved to all public A/AAAA routes at contact time.
+        // Every route keeps the same TLS SNI and exact operator-pinned Noise key.
+        for peer in supervisor_peers.iter().take(3) {
+            let pull_config = QRunV06HistorySyncClientConfig {
+                connect_timeout: std::time::Duration::from_secs(5),
+                io_timeout: std::time::Duration::from_secs(10),
+                ..QRunV06HistorySyncClientConfig::default()
+            };
+            let pull_result = if let Some(hostname) = peer.tls_server_name.as_deref() {
+                pull_q6pd_peer_records_from_dns_seed_with_announcement(
+                    hostname,
+                    peer.address.port(),
+                    &local_key,
+                    &peer.noise_static_public_key,
+                    &descriptor.network_id(),
+                    &descriptor.profile_id(),
+                    pull_config,
+                    16,
+                    local_q6pd_announcement_wire.as_deref(),
+                    store,
+                )
+            } else {
+                pull_q6pd_peer_records_from_pinned_peer_with_announcement(
+                    peer.address,
+                    &local_key,
+                    &peer.noise_static_public_key,
+                    &descriptor.network_id(),
+                    &descriptor.profile_id(),
+                    pull_config,
+                    None,
+                    16,
+                    local_q6pd_announcement_wire.as_deref(),
+                    store,
+                )
+            };
+            match pull_result {
+                Ok(report) => println!(
+                    "q6pd_initial_pull_complete peer={} received={} inserted={} updated={} duplicate={} rejected={}",
+                    peer.tls_server_name.as_deref().unwrap_or(&peer.address.to_string()),
+                    report.records_received,
+                    report.records_inserted,
+                    report.records_updated,
+                    report.records_duplicate,
+                    report.records_rejected
+                ),
+                Err(error) => println!(
+                    "q6pd_initial_pull_failed peer={} error={error}; startup_continues=true",
+                    peer.tls_server_name.as_deref().unwrap_or(&peer.address.to_string())
+                ),
+            }
+        }
+    } else if enable_q6pd_peer_discovery {
+        println!("q6pd_peer_pull=OFF; no Q6PD request is sent to bootstrap peers");
+    } else {
+        println!("q6pd_peer_discovery=OFF");
+    }
+
     if read_api_listener.is_some() && supervisor_peers.is_empty() {
         return Err("read-only RPC requires pinned bootstrap peers in this candidate".into());
     }
     let supervisor_report = if supervisor_peers.is_empty() {
         println!("bootstrap_mode=GENESIS_ROOTED_NO_SEED_PEERS");
         if let Some(book) = q6ar_address_book.as_mut() {
-            let trust_domains = q6ar_trust_domains
+            let trust_domains = outbound_trust_domains
                 .as_ref()
-                .ok_or("Q6AR address book has no bound trust-domain registry")?;
+                .ok_or("peer address book has no outbound trust-domain registry")?;
             match quote_authorizer.as_deref_mut() {
                 Some(provider) => run_qfp6_permissionless_mining_supervisor_with_q6ar_candidate_and_quote_asset_authorization(
                     &listener,
@@ -2230,6 +2927,27 @@ fn run_permissionless_node_with_visibility(
                 )
                 .map_err(|e| format!("permissionless open-network/Q6AR supervisor stopped: {e}"))?,
             }
+        } else if enable_q6pd_peer_discovery {
+            let store = q6pd_peer_record_store
+                .as_mut()
+                .ok_or("Q6PD discovery enabled but candidate store was not opened")?;
+            run_qfp6_permissionless_mining_supervisor_open_with_q6pd_candidate(
+                &listener,
+                supervisor_config,
+                &local_key,
+                &descriptor.network_id(),
+                &descriptor.profile_id(),
+                &shutdown,
+                &mut runtime,
+                &authenticator,
+                producer,
+                &mut mempool,
+                quote_authorizer.as_deref_mut(),
+                store,
+                enable_q6pd_peer_pull,
+                q6pd_self_announcement.clone(),
+            )
+            .map_err(|e| format!("permissionless open-network/Q6PD supervisor stopped: {e}"))?
         } else {
             match quote_authorizer.as_deref_mut() {
                 Some(provider) => {
@@ -2267,6 +2985,14 @@ fn run_permissionless_node_with_visibility(
             }
         }
     } else {
+        // Keep each authenticated history session comfortably inside the finite 30-second
+        // public listener window. Reconnects resume the same pinned source snapshot.
+        let sync_config = QRunV06HistorySyncClientConfig {
+            max_blocks_per_page: 4,
+            max_pages: 3,
+            max_rounds: 512,
+            ..QRunV06HistorySyncClientConfig::default()
+        };
         let report = if let Some(book) = q6ar_address_book.as_mut() {
             let peer_attempt_limit = if enable_approved_peer_sync {
                 max_approved_attempts
@@ -2278,6 +3004,7 @@ fn run_permissionless_node_with_visibility(
                 supervisor_config,
                 &local_key,
                 &supervisor_peers,
+                &q6ar_relay_pins,
                 &descriptor.network_id(),
                 &descriptor.profile_id(),
                 &shutdown,
@@ -2285,14 +3012,17 @@ fn run_permissionless_node_with_visibility(
                 &authenticator,
                 producer,
                 &mut mempool,
-                QRunV06HistorySyncClientConfig::default(),
+                sync_config,
                 peer_attempt_limit,
                 book,
-                q6ar_trust_domains
+                outbound_trust_domains
                     .as_ref()
-                    .ok_or("Q6AR address book has no bound trust-domain registry")?,
+                    .ok_or("peer address book has no outbound trust-domain registry")?,
                 quote_authorizer.as_deref_mut(),
                 read_api_listener.as_ref(),
+                q6pd_peer_record_store.as_mut(),
+                enable_q6pd_peer_pull,
+                q6pd_self_announcement,
             )
             .map_err(|e| format!("permissionless bootstrap/Q6AR/Q6QA supervisor stopped: {e}"))?
         } else {
@@ -2308,9 +3038,12 @@ fn run_permissionless_node_with_visibility(
                 &authenticator,
                 producer,
                 &mut mempool,
-                QRunV06HistorySyncClientConfig::default(),
+                sync_config,
                 quote_authorizer.as_deref_mut(),
                 read_api_listener.as_ref(),
+                q6pd_peer_record_store.as_mut(),
+                enable_q6pd_peer_pull,
+                q6pd_self_announcement,
             )
             .map_err(|e| format!("permissionless bootstrap/Q6QA supervisor stopped: {e}"))?
         };
@@ -2382,17 +3115,56 @@ fn run_permissionless_node_with_visibility(
 #[cfg(test)]
 mod tests {
     use super::{
+        apply_public_testnet_listener_round_timeout, apply_public_testnet_mining_slice,
         approved_peer_outbound_sync_enabled, decode_q6ar_trust_domain_registry, endpoint,
         is_publicly_routable_peer_ip, load_peers, load_peers_with_resolver,
-        max_approved_peer_sync_attempts, q6ar_candidate_address_book_enabled,
-        q6ar_trust_domains_rotation_authorized, read_regular_bounded,
-        select_approved_bootstrap_peers, validate_anchor_vault_path_separation,
-        validate_mainnet_native_topology, validate_permissionless_cp0651_genesis,
-        validate_public_listener_opt_in, validate_public_testnet_topology,
-        validate_q6ga_local_devnet_scope, validate_runtime_mode, BootstrapTrustDomainPolicy,
+        max_approved_peer_sync_attempts, peer_address_book_enabled,
+        q6ar_candidate_address_book_enabled, q6ar_candidate_pull_enabled,
+        q6ar_trust_domains_rotation_authorized, q6pd_peer_discovery_enabled,
+        q6pd_peer_pull_enabled, q6pd_peer_pull_requires_operator_pinned_seed,
+        q6pd_self_announcement_enabled, read_regular_bounded, select_approved_bootstrap_peers,
+        validate_anchor_vault_path_separation, validate_mainnet_native_topology,
+        validate_permissionless_cp0651_genesis, validate_public_listener_opt_in,
+        validate_public_testnet_topology, validate_q6ga_local_devnet_scope, validate_runtime_mode,
+        BootstrapTrustDomainPolicy, QRunV06PermissionlessMiningSupervisorConfig,
         QRunV06PinnedBootstrapPeer,
     };
     use sha2::{Digest, Sha256};
+    use std::time::Duration;
+
+    #[test]
+    fn public_testnet_listener_round_keeps_noise_handshake_worker_alive() {
+        let mut public_config = QRunV06PermissionlessMiningSupervisorConfig::default();
+        let private_default = public_config.listener_round_timeout;
+        apply_public_testnet_listener_round_timeout(&mut public_config, true);
+        assert_eq!(
+            public_config.listener_round_timeout,
+            Duration::from_secs(30)
+        );
+        assert!(public_config.listener_round_timeout > Duration::from_secs(8));
+
+        // Keep each uninterrupted public-testnet mining slice well below the absolute Noise
+        // handshake budget, then return to the accept loop without changing consensus rules.
+        public_config.max_nonce_attempts_per_block = 1_000_000;
+        apply_public_testnet_mining_slice(&mut public_config, true);
+        assert_eq!(public_config.max_nonce_attempts_per_block, 4_096);
+
+        let mut lower_public_config = QRunV06PermissionlessMiningSupervisorConfig::default();
+        lower_public_config.max_nonce_attempts_per_block = 1_024;
+        apply_public_testnet_mining_slice(&mut lower_public_config, true);
+        assert_eq!(lower_public_config.max_nonce_attempts_per_block, 1_024);
+
+        let mut overlay_config = QRunV06PermissionlessMiningSupervisorConfig::default();
+        apply_public_testnet_listener_round_timeout(&mut overlay_config, false);
+        assert_eq!(overlay_config.listener_round_timeout, private_default);
+        assert_eq!(private_default, Duration::from_millis(250));
+        let private_nonce_budget = overlay_config.max_nonce_attempts_per_block;
+        apply_public_testnet_mining_slice(&mut overlay_config, false);
+        assert_eq!(
+            overlay_config.max_nonce_attempts_per_block,
+            private_nonce_budget
+        );
+    }
 
     #[test]
     fn anchor_vault_path_must_not_overlap_data_or_mempool() {
@@ -2494,6 +3266,78 @@ mod tests {
     }
 
     #[test]
+    fn q6pd_peer_discovery_flag_is_disabled_by_default_and_requires_boolean() {
+        assert!(!q6pd_peer_discovery_enabled(&serde_json::json!({})).unwrap());
+        assert!(q6pd_peer_discovery_enabled(
+            &serde_json::json!({"enable_q6pd_peer_discovery": true})
+        )
+        .unwrap());
+        assert!(!q6pd_peer_discovery_enabled(
+            &serde_json::json!({"enable_q6pd_peer_discovery": false})
+        )
+        .unwrap());
+        assert!(q6pd_peer_discovery_enabled(
+            &serde_json::json!({"enable_q6pd_peer_discovery": "true"})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn q6pd_self_announcement_flag_is_disabled_by_default_and_requires_boolean() {
+        assert!(!q6pd_self_announcement_enabled(&serde_json::json!({})).unwrap());
+        assert!(q6pd_self_announcement_enabled(
+            &serde_json::json!({"enable_q6pd_self_announcement": true})
+        )
+        .unwrap());
+        assert!(!q6pd_self_announcement_enabled(
+            &serde_json::json!({"enable_q6pd_self_announcement": false})
+        )
+        .unwrap());
+        assert!(q6pd_self_announcement_enabled(
+            &serde_json::json!({"enable_q6pd_self_announcement": "true"})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn genesis_root_seed_may_auto_dial_signed_records_without_upstream_seed() {
+        assert!(!q6pd_peer_pull_requires_operator_pinned_seed("seed", 0));
+        assert!(q6pd_peer_pull_requires_operator_pinned_seed("joining", 0));
+        assert!(!q6pd_peer_pull_requires_operator_pinned_seed("joining", 1));
+    }
+
+    #[test]
+    fn q6pd_peer_pull_flag_is_disabled_by_default_and_requires_boolean() {
+        assert!(!q6pd_peer_pull_enabled(&serde_json::json!({})).unwrap());
+        assert!(
+            q6pd_peer_pull_enabled(&serde_json::json!({"enable_q6pd_peer_pull": true})).unwrap()
+        );
+        assert!(
+            !q6pd_peer_pull_enabled(&serde_json::json!({"enable_q6pd_peer_pull": false})).unwrap()
+        );
+        assert!(
+            q6pd_peer_pull_enabled(&serde_json::json!({"enable_q6pd_peer_pull": "true"})).is_err()
+        );
+    }
+
+    #[test]
+    fn standalone_peer_address_book_flag_is_disabled_by_default_and_requires_boolean() {
+        assert!(!peer_address_book_enabled(&serde_json::json!({})).unwrap());
+        assert!(
+            peer_address_book_enabled(&serde_json::json!({"enable_peer_address_book": true}))
+                .unwrap()
+        );
+        assert!(!peer_address_book_enabled(
+            &serde_json::json!({"enable_peer_address_book": false})
+        )
+        .unwrap());
+        assert!(peer_address_book_enabled(
+            &serde_json::json!({"enable_peer_address_book": "true"})
+        )
+        .is_err());
+    }
+
+    #[test]
     fn approved_peer_outbound_sync_is_disabled_by_default_and_bounded() {
         assert!(!approved_peer_outbound_sync_enabled(&serde_json::json!({})).unwrap());
         assert!(approved_peer_outbound_sync_enabled(
@@ -2584,6 +3428,23 @@ mod tests {
         .unwrap());
         assert!(q6ar_candidate_address_book_enabled(
             &serde_json::json!({"enable_q6ar_candidate_address_book": "true"})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn q6ar_candidate_pull_is_opt_in_and_requires_a_boolean() {
+        assert!(!q6ar_candidate_pull_enabled(&serde_json::json!({})).unwrap());
+        assert!(q6ar_candidate_pull_enabled(
+            &serde_json::json!({ "enable_q6ar_candidate_pull": true })
+        )
+        .unwrap());
+        assert!(!q6ar_candidate_pull_enabled(
+            &serde_json::json!({ "enable_q6ar_candidate_pull": false })
+        )
+        .unwrap());
+        assert!(q6ar_candidate_pull_enabled(
+            &serde_json::json!({ "enable_q6ar_candidate_pull": "true" })
         )
         .is_err());
     }
@@ -3130,6 +3991,41 @@ mod tests {
 
         let documentation_listen: SocketAddr = "192.0.2.10:30333".parse().unwrap();
         assert!(validate_public_testnet_topology(&seed, documentation_listen, &[]).is_err());
+
+        let loopback: SocketAddr = "127.0.0.1:31000".parse().unwrap();
+        let outbound_only = json!({
+            "node_role": "joining",
+            "enable_q6pd_peer_discovery": true,
+            "enable_q6pd_peer_pull": true,
+            "enable_q6pd_self_announcement": false
+        });
+        assert!(validate_public_testnet_topology(
+            &outbound_only,
+            loopback,
+            std::slice::from_ref(&valid_peer)
+        )
+        .is_ok());
+        assert!(validate_public_testnet_topology(&outbound_only, loopback, &[]).is_err());
+
+        let discovery_disabled = json!({
+            "node_role": "joining",
+            "enable_q6pd_peer_discovery": false,
+            "enable_q6pd_peer_pull": true,
+            "enable_q6pd_self_announcement": false
+        });
+        assert!(validate_public_testnet_topology(
+            &discovery_disabled,
+            loopback,
+            std::slice::from_ref(&valid_peer)
+        )
+        .is_err());
+
+        assert!(validate_public_testnet_topology(
+            &outbound_only,
+            wildcard,
+            std::slice::from_ref(&valid_peer)
+        )
+        .is_err());
     }
 }
 
@@ -3371,6 +4267,67 @@ mod manifest_anchor_tests {
         assert_eq!(
             trusted_manifest_anchor(&cfg, &dir, &network, &profile).unwrap(),
             Some((0, root_anchor))
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn joining_role_uses_preloaded_checkpoint_vault_without_data_manifests() {
+        let dir = test_dir();
+        let network = [0x22; 32];
+        let profile = [0x33; 32];
+        let anchor = [0x51; 32];
+        let missing_vault = dir.join("fresh-vault-not-yet-created");
+        let fresh_cfg = json!({
+            "node_role": "joining",
+            "trusted_manifest_anchor": hex(&anchor),
+            "trusted_manifest_anchor_vault_path": missing_vault.to_string_lossy().to_string()
+        });
+        assert_eq!(
+            trusted_manifest_anchor(&fresh_cfg, &dir, &network, &profile).unwrap(),
+            None
+        );
+
+        let vault_path = dir.join("preloaded-checkpoint-vault");
+        let mut vault = ai_native_l1_pow_bench::qrun_v06_local_anchor_vault_candidate::QRunV06LocalAnchorVault::provision_genesis_root(
+            &vault_path,
+            network,
+            profile,
+            anchor,
+        )
+        .unwrap();
+        let tip = vault.tip();
+        vault
+            .append_checkpoint_segment_witness(
+                ai_native_l1_pow_bench::qrun_v06_local_anchor_vault_candidate::QRunV06CheckpointSegmentWitness {
+                    sequence: 1,
+                    predecessor_vault_sequence: tip.sequence,
+                    predecessor_global_generation: tip.manifest_generation,
+                    predecessor_manifest_anchor: tip.manifest_anchor,
+                    predecessor_record_digest: tip.record_digest,
+                    checkpoint_commitment: [0x61; 32],
+                    segment_root_manifest_anchor: [0x62; 32],
+                    checkpoint_base_height: 1024,
+                    checkpoint_tip_hash: [0x63; 32],
+                    checkpoint_state_root: [0x64; 32],
+                    checkpoint_cumulative_work: [0x65; 32],
+                    network_id: network,
+                    profile_id: profile,
+                    genesis_descriptor_commitment: [0x66; 32],
+                    consensus_fingerprint: [0x67; 32],
+                    previous_witness_digest: [0; 32],
+                    witness_digest: [0; 32],
+                },
+            )
+            .unwrap();
+        let checkpoint_cfg = json!({
+            "node_role": "joining",
+            "trusted_manifest_anchor": hex(&anchor),
+            "trusted_manifest_anchor_vault_path": vault_path.to_string_lossy().to_string()
+        });
+        assert_eq!(
+            trusted_manifest_anchor(&checkpoint_cfg, &dir, &network, &profile).unwrap(),
+            Some((0, anchor))
         );
         fs::remove_dir_all(dir).unwrap();
     }

@@ -189,6 +189,28 @@ struct TargetHistoryNode {
     parent: Option<Arc<TargetHistoryNode>>,
 }
 
+// Target history is a parent-linked Arc chain. The default Arc destructor recursively
+// releases each unique parent; after a long-running chain (for example, a public-testnet
+// history with tens of thousands of blocks), that recursion can exhaust the fixed main
+// thread stack. Drain the uniquely-owned suffix iteratively and stop at the first shared
+// ancestor. Any remaining owner will apply this same iterative destructor when released.
+impl Drop for TargetHistoryNode {
+    fn drop(&mut self) {
+        let mut parent = self.parent.take();
+        while let Some(node) = parent {
+            match Arc::try_unwrap(node) {
+                Ok(mut unique_parent) => {
+                    parent = unique_parent.parent.take();
+                }
+                Err(shared_parent) => {
+                    drop(shared_parent);
+                    break;
+                }
+            }
+        }
+    }
+}
+
 impl TargetHistoryNode {
     fn genesis_at(params: &ConsensusParameters, timestamp: u64) -> Arc<Self> {
         Self::genesis_with_timestamp(params, Some(timestamp))
@@ -1278,6 +1300,32 @@ mod tests {
     const ALICE: [u8; 32] = [0x63; 32];
     const BOB: [u8; 32] = [0x64; 32];
     const PRODUCER: [u8; 32] = [0x65; 32];
+
+    #[test]
+    fn qfp6_target_history_drop_is_iterative_for_deep_unique_chains() {
+        let params = params(2);
+        let worker = std::thread::Builder::new()
+            .name("qfp6-target-history-drop".into())
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                let mut history = TargetHistoryNode::genesis_with_timestamp(&params, Some(1));
+                for height in 1..=50_000u64 {
+                    history = Arc::new(TargetHistoryNode {
+                        height,
+                        target: params.initial_target,
+                        timestamp: Some(height + 1),
+                        parent: Some(history),
+                    });
+                }
+                assert_eq!(history.height, 50_000);
+                drop(history);
+            })
+            .expect("bounded-stack history-drop worker should start");
+
+        worker
+            .join()
+            .expect("deep target history must drop without recursive stack growth");
+    }
 
     struct DigestAuthenticator;
     impl TransactionAuthenticator for DigestAuthenticator {

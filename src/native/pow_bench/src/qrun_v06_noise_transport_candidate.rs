@@ -152,8 +152,13 @@ impl QRunV06NoiseSession {
             .write_message(&[], &mut message)
             .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
         write_handshake(stream, &message[..written], deadline)?;
+        eprintln!("QFP6_SYNC_DIAG noise_handshake_frame_flushed step=1 bytes={written}");
 
         let second = read_handshake(stream, deadline)?;
+        eprintln!(
+            "QFP6_SYNC_DIAG noise_handshake_frame_received step=2 bytes={}",
+            second.len()
+        );
         let read = handshake
             .read_message(&second, &mut payload)
             .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
@@ -173,6 +178,7 @@ impl QRunV06NoiseSession {
             .write_message(&[], &mut message)
             .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
         write_handshake(stream, &message[..written], deadline)?;
+        eprintln!("QFP6_SYNC_DIAG noise_handshake_frame_flushed step=3 bytes={written}");
         let transport = handshake
             .into_transport_mode()
             .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
@@ -505,6 +511,7 @@ impl QRunV06NoiseSession {
         }
         write_all_until(stream, &(ciphertext.len() as u32).to_be_bytes(), deadline)
             .and_then(|()| write_all_until(stream, &ciphertext, deadline))
+            .and_then(|()| flush_until(stream, deadline))
             .map_err(map_record_io_error)
     }
 
@@ -628,8 +635,10 @@ fn write_handshake_with_cancellation(
         cancellation,
     )
     .and_then(|()| write_all_until_with_cancellation(stream, bytes, deadline, cancellation))
+    .and_then(|()| flush_until_with_cancellation(stream, deadline, cancellation))
     .map_err(map_handshake_io_error)
 }
+
 fn read_exact_until(
     stream: &mut dyn QRunV06NoiseIo,
     output: &mut [u8],
@@ -720,6 +729,44 @@ fn write_all_until_with_cancellation(
     check_handshake_cancellation(cancellation)?;
     Ok(())
 }
+fn flush_until(stream: &mut dyn QRunV06NoiseIo, deadline: Instant) -> io::Result<()> {
+    flush_until_with_cancellation(stream, deadline, None)
+}
+
+fn flush_until_with_cancellation(
+    stream: &mut dyn QRunV06NoiseIo,
+    deadline: Instant,
+    cancellation: Option<&AtomicBool>,
+) -> io::Result<()> {
+    loop {
+        check_handshake_cancellation(cancellation)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "QFP6 Noise flush deadline",
+            ));
+        }
+        stream.set_write_timeout(Some(remaining.min(Duration::from_millis(100))))?;
+        match stream.flush() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if error.kind() == io::ErrorKind::TimedOut
+                    || error.kind() == io::ErrorKind::WouldBlock =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "QFP6 Noise flush deadline",
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn check_handshake_cancellation(cancellation: Option<&AtomicBool>) -> io::Result<()> {
     if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
         return Err(io::Error::new(
