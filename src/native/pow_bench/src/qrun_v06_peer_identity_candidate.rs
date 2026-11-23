@@ -384,15 +384,24 @@ mod tests {
         let network_id = [0x51; 32];
         let profile_id = [0x52; 32];
         let first = create_software_zero_value_testnet_q6pd_identity(
-            &noise_key, &[0x55; 32], &network_id, &profile_id,
+            &noise_key,
+            &[0x55; 32],
+            &network_id,
+            &profile_id,
         )
         .unwrap();
         let second = create_software_zero_value_testnet_q6pd_identity(
-            &noise_key, &[0x56; 32], &network_id, &profile_id,
+            &noise_key,
+            &[0x56; 32],
+            &network_id,
+            &profile_id,
         )
         .unwrap();
         assert_ne!(first.info().peer_id, second.info().peer_id);
-        assert_eq!(first.info().noise_static_public_key, second.info().noise_static_public_key);
+        assert_eq!(
+            first.info().noise_static_public_key,
+            second.info().noise_static_public_key
+        );
         assert_eq!(first.info().device_id, "software-zero-value-testnet");
 
         let now = 1_800_000_000u64;
@@ -401,7 +410,10 @@ mod tests {
             .unwrap();
         let verified = verify_q6pd_peer_record(&wire, &network_id, &profile_id, now).unwrap();
         assert_eq!(verified.peer_id, first.info().peer_id);
-        assert_eq!(verified.noise_static_public_key, first.info().noise_static_public_key);
+        assert_eq!(
+            verified.noise_static_public_key,
+            first.info().noise_static_public_key
+        );
     }
 
     #[test]
