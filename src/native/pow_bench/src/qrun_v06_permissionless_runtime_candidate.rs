@@ -342,6 +342,34 @@ impl QRunV06PermissionlessNodeRuntime {
     /// Bootstrap a genuinely fresh Genesis-only store and immediately pin its generation-zero
     /// manifest in a separate append-only anchor vault before exposing the runtime.
     /// Existing history, an existing/partial vault, or any nonzero generation fails closed.
+    /// Open a fresh public-testnet Joiner and derive its sequence-1 vault root from
+    /// the locally verified Genesis. The caller must have already verified the Q6PN
+    /// profile pin, Q6GD descriptor, Genesis snapshot hash, and Q6GA public-testnet
+    /// authorization. This path refuses any pre-existing generation/height and any
+    /// unresolved QAP1 intent; it never adopts existing local or remote history.
+    ///
+    /// This method is intended only for an explicitly opted-in zero-value Public Testnet
+    /// Joiner. Production and existing-history recovery must continue to use an
+    /// independently pinned root through open_with_fresh_genesis_anchor_vault.
+    pub fn open_with_verified_genesis_fresh_anchor_vault<A: TransactionAuthenticator>(
+        directory: impl AsRef<Path>,
+        genesis_state: QRunV06CanonicalExecutionState,
+        params: ConsensusParameters,
+        authenticator: &A,
+        verified_profile_pin: &QRunV06VerifiedProfilePin,
+        vault_directory: impl AsRef<Path>,
+    ) -> Result<Self, QRunV06PermissionlessRuntimeError> {
+        Self::open_with_fresh_genesis_anchor_vault_inner(
+            directory,
+            genesis_state,
+            params,
+            authenticator,
+            verified_profile_pin,
+            None,
+            vault_directory,
+        )
+    }
+
     pub fn open_with_fresh_genesis_anchor_vault<A: TransactionAuthenticator>(
         directory: impl AsRef<Path>,
         genesis_state: QRunV06CanonicalExecutionState,
@@ -349,6 +377,26 @@ impl QRunV06PermissionlessNodeRuntime {
         authenticator: &A,
         verified_profile_pin: &QRunV06VerifiedProfilePin,
         trusted_genesis_anchor: [u8; 32],
+        vault_directory: impl AsRef<Path>,
+    ) -> Result<Self, QRunV06PermissionlessRuntimeError> {
+        Self::open_with_fresh_genesis_anchor_vault_inner(
+            directory,
+            genesis_state,
+            params,
+            authenticator,
+            verified_profile_pin,
+            Some(trusted_genesis_anchor),
+            vault_directory,
+        )
+    }
+
+    fn open_with_fresh_genesis_anchor_vault_inner<A: TransactionAuthenticator>(
+        directory: impl AsRef<Path>,
+        genesis_state: QRunV06CanonicalExecutionState,
+        params: ConsensusParameters,
+        authenticator: &A,
+        verified_profile_pin: &QRunV06VerifiedProfilePin,
+        trusted_genesis_anchor: Option<[u8; 32]>,
         vault_directory: impl AsRef<Path>,
     ) -> Result<Self, QRunV06PermissionlessRuntimeError> {
         let descriptor = verified_profile_pin.descriptor();
@@ -371,11 +419,13 @@ impl QRunV06PermissionlessNodeRuntime {
             ));
         }
         let genesis_anchor = store.manifest_anchor()?;
-        if genesis_anchor != trusted_genesis_anchor {
-            return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
-                "fresh Genesis manifest differs from the independently pinned Genesis anchor"
-                    .into(),
-            ));
+        if let Some(trusted_genesis_anchor) = trusted_genesis_anchor {
+            if genesis_anchor != trusted_genesis_anchor {
+                return Err(QRunV06PermissionlessRuntimeError::LocalAnchorVault(
+                    "fresh Genesis manifest differs from the independently pinned Genesis anchor"
+                        .into(),
+                ));
+            }
         }
         let vault = QRunV06LocalAnchorVault::provision_genesis_root(
             vault_directory,
@@ -2297,15 +2347,15 @@ mod tests {
         let expected_genesis_anchor = expected_store.manifest_anchor().unwrap();
         drop(expected_store);
         fs::remove_dir_all(&expected_genesis_dir).unwrap();
-        let mut runtime = QRunV06PermissionlessNodeRuntime::open_with_fresh_genesis_anchor_vault(
-            &data_dir,
-            genesis.clone(),
-            params.clone(),
-            &authenticator,
-            &verified_pin,
-            expected_genesis_anchor,
-            &vault_dir,
-        )
+        let mut runtime =
+            QRunV06PermissionlessNodeRuntime::open_with_verified_genesis_fresh_anchor_vault(
+                &data_dir,
+                genesis.clone(),
+                params.clone(),
+                &authenticator,
+                &verified_pin,
+                &vault_dir,
+            )
         .unwrap();
         let genesis_status = runtime.status().unwrap();
         assert_eq!(genesis_status.height, 0);
