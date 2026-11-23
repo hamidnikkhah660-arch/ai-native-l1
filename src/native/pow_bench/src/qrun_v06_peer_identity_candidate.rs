@@ -157,38 +157,32 @@ fn build_info(
     }
 }
 
-/// Create a new in-memory Q6PD identity for an explicitly opted-in zero-value Public Testnet node.
-///
-/// This deliberately does not persist or export private material and is not a replacement for
-/// TPM-bound operator identity. The public-testnet launcher is the only caller and separately
-/// enforces the exact testnet-only acknowledgement; Mainnet and ordinary permissionless modes
-/// continue to require their existing identity and trust paths.
-pub fn create_ephemeral_zero_value_testnet_q6pd_identity(
+/// Create an in-memory Q6PD signer from a per-node software-custodied seed for an explicitly
+/// opted-in zero-value Public Testnet node. The caller supplies the seed from the service's
+/// secret store; this function never persists or exports it. This is not TPM-bound identity.
+pub fn create_software_zero_value_testnet_q6pd_identity(
     noise_private_key: &[u8; 32],
+    identity_seed: &[u8; 32],
     network_id: &[u8; 32],
     profile_id: &[u8; 32],
 ) -> Result<Q6pdNodeIdentity, String> {
     if *network_id == [0; 32] || *profile_id == [0; 32] {
-        return Err("ephemeral Q6PD identity requires nonzero network and profile IDs".into());
+        return Err("software Q6PD identity requires nonzero network and profile IDs".into());
     }
-    if noise_private_key.iter().all(|byte| *byte == 0) {
-        return Err("ephemeral Q6PD identity requires a nonzero Noise private key".into());
+    if noise_private_key.iter().all(|byte| *byte == 0)
+        || identity_seed.iter().all(|byte| *byte == 0)
+    {
+        return Err("software Q6PD identity requires nonzero private key material".into());
     }
 
     let noise_static_public_key = derive_noise_static_public_key(noise_private_key)
-        .map_err(|error| format!("ephemeral Noise public-key derivation failed: {error}"))?;
-    let mut seed = Zeroizing::new([0u8; 32]);
-    getrandom::getrandom(&mut *seed)
-        .map_err(|error| format!("ephemeral Q6PD identity generation failed: {error}"))?;
-    if seed.iter().all(|byte| *byte == 0) {
-        return Err("ephemeral Q6PD identity generator returned an invalid seed".into());
-    }
-    let signing_key = SigningKey::from_bytes(&seed);
+        .map_err(|error| format!("software Noise public-key derivation failed: {error}"))?;
+    let signing_key = SigningKey::from_bytes(identity_seed);
     let identity_public_key = signing_key.verifying_key().to_bytes();
     let info = build_info(
         identity_public_key,
         noise_static_public_key,
-        "ephemeral-zero-value-testnet".into(),
+        "software-zero-value-testnet".into(),
         *network_id,
         *profile_id,
     );
@@ -385,19 +379,21 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_zero_value_testnet_identity_is_unique_and_signs_bound_records() {
+    fn software_zero_value_testnet_identity_is_unique_and_signs_bound_records() {
         let noise_key = [0x53; 32];
         let network_id = [0x51; 32];
         let profile_id = [0x52; 32];
-        let first =
-            create_ephemeral_zero_value_testnet_q6pd_identity(&noise_key, &network_id, &profile_id)
-                .unwrap();
-        let second =
-            create_ephemeral_zero_value_testnet_q6pd_identity(&noise_key, &network_id, &profile_id)
-                .unwrap();
+        let first = create_software_zero_value_testnet_q6pd_identity(
+            &noise_key, &[0x55; 32], &network_id, &profile_id,
+        )
+        .unwrap();
+        let second = create_software_zero_value_testnet_q6pd_identity(
+            &noise_key, &[0x56; 32], &network_id, &profile_id,
+        )
+        .unwrap();
         assert_ne!(first.info().peer_id, second.info().peer_id);
         assert_eq!(first.info().noise_static_public_key, second.info().noise_static_public_key);
-        assert_eq!(first.info().device_id, "ephemeral-zero-value-testnet");
+        assert_eq!(first.info().device_id, "software-zero-value-testnet");
 
         let now = 1_800_000_000u64;
         let wire = first
@@ -409,15 +405,24 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_zero_value_testnet_identity_rejects_zero_or_unscoped_material() {
-        assert!(create_ephemeral_zero_value_testnet_q6pd_identity(
+    fn software_zero_value_testnet_identity_rejects_zero_or_unscoped_material() {
+        assert!(create_software_zero_value_testnet_q6pd_identity(
+            &[0; 32],
+            &[0x54; 32],
+            &[0x51; 32],
+            &[0x52; 32],
+        )
+        .is_err());
+        assert!(create_software_zero_value_testnet_q6pd_identity(
+            &[0x53; 32],
             &[0; 32],
             &[0x51; 32],
             &[0x52; 32],
         )
         .is_err());
-        assert!(create_ephemeral_zero_value_testnet_q6pd_identity(
+        assert!(create_software_zero_value_testnet_q6pd_identity(
             &[0x53; 32],
+            &[0x54; 32],
             &[0; 32],
             &[0x52; 32],
         )
