@@ -2356,7 +2356,7 @@ mod tests {
                 &verified_pin,
                 &vault_dir,
             )
-        .unwrap();
+            .unwrap();
         let genesis_status = runtime.status().unwrap();
         assert_eq!(genesis_status.height, 0);
         assert_eq!(genesis_status.manifest_generation, 0);
