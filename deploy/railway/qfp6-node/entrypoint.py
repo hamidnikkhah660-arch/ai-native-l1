@@ -98,14 +98,16 @@ def build_config(role: str) -> tuple[dict, bytes]:
     # Keep each logical node's durable state isolated. Versioned paths also
     # prevent an interrupted, pre-listener validation attempt from poisoning the
     # next clean Genesis bootstrap on the same persistent Railway volume.
-    node_data = DATA / f"node-data-{role}-v2"
-    mempool_data = DATA / f"mempool-{role}-v2"
-    q6pd_data = DATA / f"q6pd-{role}-v2"
-    anchor_vault = DATA / f"anchor-vault-{role}-v2"
-    (node_data).mkdir(parents=True, exist_ok=True)
-    (mempool_data).mkdir(parents=True, exist_ok=True)
-    (q6pd_data).mkdir(parents=True, exist_ok=True)
-    (anchor_vault).mkdir(parents=True, exist_ok=True)
+    node_data = DATA / f"node-data-{role}-v3"
+    mempool_data = DATA / f"mempool-{role}-v3"
+    q6pd_data = DATA / f"q6pd-{role}-v3"
+    anchor_vault = DATA / f"anchor-vault-{role}-v3"
+    node_data.mkdir(parents=True, exist_ok=True)
+    mempool_data.mkdir(parents=True, exist_ok=True)
+    q6pd_data.mkdir(parents=True, exist_ok=True)
+    # Do NOT pre-create the anchor-vault directory. A fresh Joining node must
+    # see it as absent so the runtime can provision the Genesis-rooted vault
+    # atomically. An existing empty vault is correctly rejected as corruption.
     (DATA / "keys").mkdir(parents=True, exist_ok=True)
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
