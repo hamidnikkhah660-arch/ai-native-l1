@@ -1,0 +1,6 @@
+# Minimal entrypoint-only refresh over the already verified Genesis-derived QFP6 Linux node.
+# This changes only per-node storage paths; it does not rebuild or replace the Rust binary.
+FROM ghcr.io/hamidnikkhah660-arch/qfp6-railway-node:66468e2b3667
+USER root
+COPY deploy/railway/qfp6-node/entrypoint.py /app/entrypoint.py
+RUN chmod 0644 /app/entrypoint.py && chown root:root /app/entrypoint.py
