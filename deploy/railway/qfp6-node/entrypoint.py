@@ -97,10 +97,10 @@ def build_config(role: str) -> tuple[dict, bytes]:
     # Keep each logical node's durable state isolated. Versioned paths also
     # prevent an interrupted, pre-listener validation attempt from poisoning the
     # next clean Genesis bootstrap on the same persistent Railway volume.
-    node_data = DATA / f"node-data-{role}-v3"
-    mempool_data = DATA / f"mempool-{role}-v3"
-    q6pd_data = DATA / f"q6pd-{role}-v3"
-    anchor_vault = DATA / f"anchor-vault-{role}-v3"
+    node_data = DATA / f"node-data-{role}-v4"
+    mempool_data = DATA / f"mempool-{role}-v4"
+    q6pd_data = DATA / f"q6pd-{role}-v4"
+    anchor_vault = DATA / f"anchor-vault-{role}-v4"
     node_data.mkdir(parents=True, exist_ok=True)
     mempool_data.mkdir(parents=True, exist_ok=True)
     q6pd_data.mkdir(parents=True, exist_ok=True)
