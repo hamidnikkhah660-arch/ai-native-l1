@@ -1991,13 +1991,9 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
             let local_q6pd_announcement =
                 std::sync::Arc::new(std::sync::RwLock::new(initial_local_q6pd_record));
             let mut q6pd_persistent_peer_keys = HashSet::new();
-            if q6pd_pull_enabled
-                && local_q6pd_noise_key.is_some()
-                && local_q6pd_announcement
-                    .read()
-                    .ok()
-                    .is_some_and(|record| record.is_some())
-            {
+            // Persistent sessions are outbound and can be held by NAT-only Joiners.
+            // A local signed public endpoint is optional; the remote seed remains key-pinned.
+            if q6pd_pull_enabled && q6pd_candidate.is_some() {
                 for peer in outbound_sync_peers
                     .unwrap_or(&[])
                     .iter()
@@ -2009,7 +2005,7 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
                     let address = peer.address;
                     let tls_server_name = peer.tls_server_name.clone();
                     let local_key = *local_static_private_key;
-                    let local_noise_key = local_q6pd_noise_key.unwrap_or([0; 32]);
+                    let local_noise_key = local_q6pd_noise_key;
                     let remote_key = peer.noise_static_public_key;
                     let network = *network_id;
                     let profile = *profile_id;
@@ -2034,7 +2030,7 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
                     });
                 }
             } else if q6pd_pull_enabled {
-                eprintln!("QFP6_Q6PD_SESSION_MANAGER_SKIPPED reason=no_public_signed_self_record");
+                eprintln!("QFP6_Q6PD_SESSION_MANAGER_SKIPPED reason=no_q6pd_record_store");
             }
             // The address book owns durable approval; live verified-session state is ephemeral.
             // Anonymous Q6AR candidates are never promoted or dialed by this manager.
@@ -2922,18 +2918,13 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
                                     crate::qrun_v06_q6pd_address_manager_candidate::Q6PD_ADDRMAN_SUCCESS_RECHECK_MS / 1000
                                 );
 
-                                    if let Some(local_noise_key) =
-                                        local_q6pd_noise_key.filter(|_| {
-                                            local_q6pd_announcement
-                                                .read()
-                                                .ok()
-                                                .is_some_and(|record| record.is_some())
-                                        })
-                                    {
-                                        if q6pd_persistent_peer_keys.len()
+                                    // A node behind NAT still keeps the verified outbound
+                                    // Noise session alive; self-announcement is independently optional.
+                                    if q6pd_persistent_peer_keys.len()
                                         < crate::qrun_v06_q6pd_session_candidate::Q6PD_MAX_PERSISTENT_SESSIONS
                                         && q6pd_persistent_peer_keys.insert(peer.noise_static_public_key)
                                     {
+                                        let local_noise_key = local_q6pd_noise_key;
                                         let address = peer.endpoint;
                                         let tls_server_name = peer.tls_server_name.clone();
                                         let local_key = *local_static_private_key;
@@ -2961,7 +2952,6 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
                                                 shutdown,
                                             );
                                         });
-                                    }
                                     }
 
                                     // Reuse the newly authenticated peer as a bounded history

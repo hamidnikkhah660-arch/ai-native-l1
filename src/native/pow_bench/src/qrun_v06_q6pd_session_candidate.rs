@@ -365,14 +365,37 @@ fn announce_local_q6pd_record(
     Ok(())
 }
 
-/// Client worker for one exact endpoint/Noise-key pair. It must present a currently valid
-/// self-signed Q6PD record that commits to this node's exact Noise static key before opening
-/// a persistent liveness slot. This worker never changes operator trust.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Q6pdLocalAnnouncementModeError {
+    MissingRecordForPublicIdentity,
+    RecordWithoutPublicIdentity,
+    ZeroNoiseKey,
+}
+
+/// A NAT-only Joiner may maintain an authenticated outbound session without claiming
+/// a publicly reachable endpoint. Publicly announcing nodes must still provide a signed
+/// record bound to their exact local Noise static key.
+fn select_local_announcement_mode(
+    local_noise_static_public_key: Option<[u8; 32]>,
+    record_wire: Option<Vec<u8>>,
+) -> Result<Option<([u8; 32], Vec<u8>)>, Q6pdLocalAnnouncementModeError> {
+    match (local_noise_static_public_key, record_wire) {
+        (None, None) => Ok(None),
+        (Some(key), Some(record)) if key != [0; 32] => Ok(Some((key, record))),
+        (Some(_), Some(_)) => Err(Q6pdLocalAnnouncementModeError::ZeroNoiseKey),
+        (Some(_), None) => Err(Q6pdLocalAnnouncementModeError::MissingRecordForPublicIdentity),
+        (None, Some(_)) => Err(Q6pdLocalAnnouncementModeError::RecordWithoutPublicIdentity),
+    }
+}
+/// Client worker for one exact endpoint/Noise-key pair. A publicly announcing node
+/// presents a currently valid self-signed Q6PD record bound to its local Noise key. A
+/// NAT-only Joiner may omit that local announcement while still pinning the remote key.
+/// This worker never changes operator trust.
 pub fn run_q6pd_persistent_peer_session_worker(
     address: SocketAddr,
     tls_server_name: Option<String>,
     local_static_private_key: [u8; 32],
-    local_noise_static_public_key: [u8; 32],
+    local_noise_static_public_key: Option<[u8; 32]>,
     remote_static_public_key: [u8; 32],
     network_id: [u8; 32],
     profile_id: [u8; 32],
@@ -387,13 +410,27 @@ pub fn run_q6pd_persistent_peer_session_worker(
             .read()
             .ok()
             .and_then(|guard| guard.clone());
-        let Some(announcement) = announcement else {
-            eprintln!(
-                "QFP6_Q6PD_SESSION_WAITING_FOR_PUBLIC_SIGNED_RECORD endpoint={}",
-                address
-            );
-            let _ = sleep_interruptibly(Q6PD_RECONNECT_MAX, shutdown);
-            continue;
+        let announcement_mode = match select_local_announcement_mode(
+            local_noise_static_public_key,
+            announcement,
+        ) {
+            Ok(mode) => mode,
+            Err(Q6pdLocalAnnouncementModeError::MissingRecordForPublicIdentity) => {
+                eprintln!(
+                    "QFP6_Q6PD_SESSION_WAITING_FOR_PUBLIC_SIGNED_RECORD endpoint={}",
+                    address
+                );
+                let _ = sleep_interruptibly(Q6PD_RECONNECT_BASE, shutdown);
+                continue;
+            }
+            Err(error) => {
+                eprintln!(
+                        "QFP6_Q6PD_SESSION_LOCAL_ANNOUNCEMENT_CONFIG_REJECTED endpoint={} error={error:?}",
+                        address
+                    );
+                let _ = sleep_interruptibly(Q6PD_RECONNECT_MAX, shutdown);
+                continue;
+            }
         };
         let config =
             crate::qrun_v06_history_sync_service_candidate::QRunV06HistorySyncClientConfig {
@@ -427,14 +464,19 @@ pub fn run_q6pd_persistent_peer_session_worker(
                         "QFP6_Q6PD_SESSION_PIN_REJECTED endpoint={} action=drop_session",
                         address
                     );
-                } else if let Err(error) = announce_local_q6pd_record(
-                    &mut noise,
-                    stream.as_mut(),
-                    &announcement,
-                    &local_noise_static_public_key,
-                    &network_id,
-                    &profile_id,
-                ) {
+                } else if let Err(error) = match announcement_mode.as_ref() {
+                    Some((local_noise_key, local_record)) => announce_local_q6pd_record(
+                        &mut noise,
+                        stream.as_mut(),
+                        local_record,
+                        local_noise_key,
+                        &network_id,
+                        &profile_id,
+                    ),
+                    // No local public endpoint is a supported NAT client mode. The
+                    // remote key is still pinned by the signed Q6PD record and Noise handshake.
+                    None => Ok(()),
+                } {
                     eprintln!(
                         "QFP6_Q6PD_SESSION_LOCAL_ANNOUNCEMENT_REJECTED endpoint={} error={error}",
                         address
@@ -677,5 +719,30 @@ mod tests {
         drop(slots.pop());
         assert!(try_reserve_q6pd_persistent_session().is_some());
         drop(slots);
+    }
+    #[test]
+    fn nat_joiner_can_open_persistent_session_without_public_self_announcement() {
+        assert_eq!(select_local_announcement_mode(None, None), Ok(None));
+    }
+
+    #[test]
+    fn publicly_announcing_peer_still_requires_matching_local_record_material() {
+        let local_noise_key = [0x71; 32];
+        assert_eq!(
+            select_local_announcement_mode(Some(local_noise_key), Some(vec![1, 2, 3])),
+            Ok(Some((local_noise_key, vec![1, 2, 3])))
+        );
+        assert_eq!(
+            select_local_announcement_mode(Some(local_noise_key), None),
+            Err(Q6pdLocalAnnouncementModeError::MissingRecordForPublicIdentity)
+        );
+        assert_eq!(
+            select_local_announcement_mode(None, Some(vec![1, 2, 3])),
+            Err(Q6pdLocalAnnouncementModeError::RecordWithoutPublicIdentity)
+        );
+        assert_eq!(
+            select_local_announcement_mode(Some([0; 32]), Some(vec![1])),
+            Err(Q6pdLocalAnnouncementModeError::ZeroNoiseKey)
+        );
     }
 }
