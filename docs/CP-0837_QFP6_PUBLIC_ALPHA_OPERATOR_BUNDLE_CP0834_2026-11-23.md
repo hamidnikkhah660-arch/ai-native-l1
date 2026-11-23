@@ -56,4 +56,4 @@ The config enables signed Q6PD discovery, pull, and self-announcement, requires 
 
 - Bootstrap PR: https://github.com/hamidnikkhah660-arch/ai-native-l1/pull/205
 - Operator intake: https://github.com/hamidnikkhah660-arch/ai-native-l1/issues/204
-- Package is staged locally and will be attached to a draft GitHub Release for owner/reviewer inspection. No public release/published binary download is claimed until the separate review/authorization step.
+- A GitHub Draft Release exists and its `.sha256` sidecar is uploaded. The 57 MB ZIP asset upload did not complete and is **not attached** to the Release; the verified ZIP remains local at the path above. Do not treat the Release page as a package download. No public binary download/release is claimed until upload, review, and a separate publication authorization are complete.
