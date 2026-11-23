@@ -2525,8 +2525,8 @@ fn run_permissionless_node_with_visibility(
         return Err("require_device_root_binding=true but no TPM Device Root metadata/binding paths were configured".into());
     }
     if software_testnet_key_custody {
-        eprintln!(
-            "QFP6_DEVICE_IDENTITY=EPHEMERAL_SOFTWARE_ZERO_VALUE_TESTNET_ONLY; PRIVATE_KEYS=MEMORY_ONLY; TPM_BINDING=NOT_CLAIMED"
+        println!(
+            "QFP6_DEVICE_IDENTITY=SOFTWARE_KEY_CUSTODY_ZERO_VALUE_TESTNET_ONLY; PRIVATE_KEYS=SERVICE_SECRET; TPM_BINDING=NOT_CLAIMED"
         );
     } else if metadata_configured && binding_configured {
         let metadata_path = path(base, cfg, "device_root_metadata_path")?;
@@ -2785,7 +2785,16 @@ fn run_permissionless_node_with_visibility(
     let mut mempool =
         QRunV06PermissionlessMempool::open(&mempool_dir, QRunV06MempoolLimits::default())
             .map_err(|e| format!("Q6MJ mempool journal open failed: {e:?}"))?;
-    let producer = parse_hex32("producer_account", req(cfg, "producer_account")?)?;
+    // Public Testnet uses the founder account committed by the verified Genesis descriptor.
+    // This prevents an arbitrary/zero producer address from being introduced by deployment config.
+    let producer = if public_testnet {
+        descriptor.founder_account()
+    } else {
+        parse_hex32("producer_account", req(cfg, "producer_account")?)?
+    };
+    if producer == [0; 32] {
+        return Err("producer_account must not be zero".into());
+    }
     // The supervisor owns the one-time Q6MJ/Q6MM startup reconciliation.
     let mut supervisor_config = QRunV06PermissionlessMiningSupervisorConfig::default();
     apply_public_testnet_listener_round_timeout(&mut supervisor_config, public_testnet);
