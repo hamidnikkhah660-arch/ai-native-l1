@@ -5,7 +5,7 @@
   "network_id": "633b5dfc16fb2ec1825baf924ae7f7f16bf2006f8b64441a57692a3531722712",
   "profile_id": "a0a057d72c11253386bfe90d428bccbc44ebc86fc84e04e3682193a99d8805c4",
   "bootstrap_peers_file": "qfp6-public-testnet-bootstrap-peers-v1.json",
-  "bootstrap_peers_sha256": "d61c0237d3f8117cb9181b301a3ca6166446b8f7d9ce152582f832228ff1ce3d",
+  "bootstrap_peers_sha256": "2305ca15acda495960f1e84f4f3f2a7d5b20e279a58953bbc6328e9b16b15e07",
   "seed_count": 1,
   "dns_seed": "heymed.tail2a756d.ts.net",
   "tls_sni": "heymed.tail2a756d.ts.net",
