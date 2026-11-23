@@ -1,0 +1,63 @@
+name: QFP6 Railway Linux testnet bundle
+
+on:
+  push:
+    branches: [release/qfp6-linux-node-v1]
+    paths:
+      - "src/native/pow_bench/**"
+      - "release/qfp6-candidate/artifacts/**"
+      - "deploy/railway/qfp6-node/**"
+      - ".github/workflows/qfp6-railway-linux-release.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: qfp6-railway-linux-release
+  cancel-in-progress: true
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact source revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install stable Rust
+        run: |
+          rustup update stable
+          rustc +stable --version
+          cargo +stable --version
+
+      - name: Build QFP6 Public Testnet node for Linux x86_64
+        working-directory: src/native/pow_bench
+        run: cargo +stable build --release --locked --bin qrun_v06_node
+
+      - name: Assemble minimal zero-value testnet bundle
+        id: bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA:0:12}"
+          tag="qfp6-railway-linux-${short_sha}"
+          mkdir -p dist/bundle/assets
+          install -m 0755 src/native/pow_bench/target/release/qrun_v06_node dist/bundle/qrun_v06_node
+          install -m 0644 deploy/railway/qfp6-node/entrypoint.py dist/bundle/entrypoint.py
+          install -m 0644 release/qfp6-candidate/artifacts/*.q6* dist/bundle/assets/
+          install -m 0644 release/qfp6-candidate/artifacts/public-testnet-authorization.q6ga dist/bundle/assets/
+          tar -C dist/bundle -czf "dist/qfp6-node-linux-x86_64.tar.gz" .
+          sha256sum "dist/qfp6-node-linux-x86_64.tar.gz" > "dist/qfp6-node-linux-x86_64.tar.gz.sha256"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "bundle_sha256=$(cut -d ' ' -f1 dist/qfp6-node-linux-x86_64.tar.gz.sha256)" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish immutable prerelease bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.bundle.outputs.tag }}" \
+            dist/qfp6-node-linux-x86_64.tar.gz \
+            dist/qfp6-node-linux-x86_64.tar.gz.sha256 \
+            --title "QFP6 Linux zero-value testnet ${{ steps.bundle.outputs.tag }}" \
+            --notes "Linux x86_64 node binary and public zero-value-testnet artifacts. No private keys, operator credentials, or Mainnet authority are included." \
+            --prerelease
