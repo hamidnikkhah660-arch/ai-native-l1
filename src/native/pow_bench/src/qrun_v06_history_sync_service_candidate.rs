@@ -1625,69 +1625,11 @@ pub fn sync_history_from_pinned_peer_with_verified_session_callback<
                 }
             }
 
-            // If the peer has extended the exact canonical tip already held locally, request
-            // the next page from that validated parent instead of replaying the shared checkpoint
-            // prefix on every periodic poll. Both consensus and execution parent hashes must match.
-            let local_canonical_tip = base_graph.canonical_tip();
-            let local_canonical_state = base_graph.canonical_state();
-            if local_canonical_tip.height > source.base_height
-                && local_canonical_tip.height < source.height
-            {
-                let resume_height = local_canonical_tip
-                    .height
-                    .checked_add(1)
-                    .ok_or(QRunV06HistorySyncServiceError::PageBudgetExceeded)?;
-                let resume_request = QRunV06HistorySyncRequest {
-                    request_id: 2,
-                    network_id: local_start.network_id,
-                    profile_id: local_start.profile_id,
-                    snapshot_tip: source.consensus_tip,
-                    expected_parent_consensus_hash: local_canonical_tip.tip_hash,
-                    expected_parent_execution_hash: local_canonical_state.tip_hash(),
-                    start_height: resume_height,
-                    max_blocks: config.max_blocks_per_page,
-                    max_bytes: config.max_bytes_per_page,
-                };
-                resume_request.validate()?;
-                let resume_page = request_history_page_over_noise(
-                    &mut noise,
-                    stream.as_mut(),
-                    resume_request,
-                    base_graph.consensus_parameters().clone(),
-                )?;
-                let first_block = resume_page
-                    .envelopes
-                    .first()
-                    .map(|encoded| decode_qrun_v06_pow_block(encoded))
-                    .transpose()
-                    .map_err(|error| QRunV06HistorySyncServiceError::Wire(error.to_string()))?;
-                let extends_local_tip = first_block.as_ref().is_some_and(|block| {
-                    block.header.height == resume_height
-                        && block.header.previous_consensus_hash == local_canonical_tip.tip_hash
-                        && block.header.parent_hash == local_canonical_state.tip_hash()
-                });
-                if extends_local_tip
-                    && resume_page.start_height == resume_height
-                    && resume_page.snapshot_height == source.height
-                    && resume_page.snapshot_tip == source.consensus_tip
-                {
-                    eprintln!(
-                        "QFP6_SYNC_DIAG history_incremental_resume address={} local_height={} resume_height={} source_height={}",
-                        address, local_canonical_tip.height, resume_height, source.height
-                    );
-                    parent_consensus = local_canonical_tip.tip_hash;
-                    parent_execution = local_canonical_state.tip_hash();
-                    next_height = resume_height;
-                    source_snapshot = Some(observed);
-                    pending_resume_page = Some(resume_page);
-                } else {
-                    eprintln!(
-                        "QFP6_SYNC_DIAG history_incremental_resume_rejected address={} local_height={} source_height={} fallback=shared_checkpoint",
-                        address, local_canonical_tip.height, source.height
-                    );
-                }
-            }
-
+            // An unknown source tip cannot be assumed to extend the local canonical tip.
+            // Decoding a page against that unproven parent would reject a valid competing
+            // branch as NonContiguous before fork choice can compare its cumulative work.
+            // The source's authenticated checkpoint base was verified above, so unknown tips
+            // always use that common-base path. Exact known source tips retain fast-resume.
             if pending_resume_page.is_none() {
                 base_height = source.base_height;
                 base_tip = source.base_consensus_tip;
