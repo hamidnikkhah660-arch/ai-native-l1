@@ -36,7 +36,7 @@ use ai_native_l1_pow_bench::{
     qrun_v06_peer_discovery_candidate::Q6PD_MAX_TTL_SECS,
     qrun_v06_peer_discovery_store_candidate::Q6pdPeerRecordStore,
     qrun_v06_peer_identity_candidate::{
-        create_ephemeral_zero_value_testnet_q6pd_identity, load_q6pd_node_identity,
+        create_software_zero_value_testnet_q6pd_identity, load_q6pd_node_identity,
     },
     qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessNodeRuntime,
     qrun_v06_permissionless_service_candidate::QRunV06PermissionlessMempool,
@@ -61,7 +61,7 @@ use std::{
     sync::atomic::AtomicBool,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const PUBLIC_TESTNET_LISTENER_ROUND_TIMEOUT: Duration = Duration::from_secs(30);
 const PUBLIC_TESTNET_LISTENER_MAX_SESSIONS_PER_ROUND: usize = 6;
@@ -1419,20 +1419,20 @@ const PUBLIC_TESTNET_MODE: &str = "public-testnet-zero-value-candidate";
 const PUBLIC_TESTNET_ACK: &str = "ZERO_VALUE_PUBLIC_TESTNET_NO_MAINNET_NO_MARKET";
 const PUBLIC_TESTNET_INBOUND_ACK: &str = "ANONYMOUS_NOISE_XX_UNAUTHENTICATED";
 const PUBLIC_TESTNET_SOFTWARE_KEYS_ACK: &str =
-    "EPHEMERAL_SOFTWARE_KEYS_ZERO_VALUE_TESTNET_ONLY";
+    "SOFTWARE_KEY_CUSTODY_ZERO_VALUE_TESTNET_ONLY";
 const MAINNET_NATIVE_MODE: &str = "mainnet-native-value-candidate";
 const MAINNET_NATIVE_ACK: &str = "QZXB_MAINNET_NATIVE_VALUE_OWNER_AUTHORIZATION_REQUIRED";
 const MAINNET_NATIVE_INBOUND_ACK: &str = "PINNED_NOISE_STATIC_KEY_ALLOWLIST_REQUIRED";
 
-fn software_testnet_ephemeral_keys_enabled(
+fn software_testnet_key_custody_enabled(
     cfg: &Value,
     public_testnet: bool,
 ) -> Result<bool, String> {
-    match cfg.get("allow_software_testnet_ephemeral_keys") {
+    match cfg.get("allow_software_testnet_key_custody") {
         None | Some(Value::Bool(false)) => {
-            if cfg.get("software_testnet_keys_acknowledgement").is_some() {
+            if cfg.get("software_testnet_key_custody_acknowledgement").is_some() {
                 return Err(
-                    "software_testnet_keys_acknowledgement is forbidden unless ephemeral testnet keys are enabled"
+                    "software_testnet_keys_acknowledgement is forbidden unless software testnet key custody are enabled"
                         .into(),
                 );
             }
@@ -1441,7 +1441,7 @@ fn software_testnet_ephemeral_keys_enabled(
         Some(Value::Bool(true)) => {
             if !public_testnet {
                 return Err(
-                    "software ephemeral keys are restricted to the zero-value Public Testnet path"
+                    "software-custodied keys are restricted to the zero-value Public Testnet path"
                         .into(),
                 );
             }
@@ -1454,7 +1454,7 @@ fn software_testnet_ephemeral_keys_enabled(
             }
             if cfg.get("require_device_root_binding").and_then(Value::as_bool) == Some(true) {
                 return Err(
-                    "software ephemeral testnet keys cannot satisfy require_device_root_binding"
+                    "software-custodied testnet keys cannot satisfy require_device_root_binding"
                         .into(),
                 );
             }
@@ -1468,17 +1468,45 @@ fn software_testnet_ephemeral_keys_enabled(
             .any(|key| cfg.get(*key).is_some())
             {
                 return Err(
-                    "software ephemeral testnet identity must not be mixed with TPM identity paths"
+                    "software testnet identity must not be mixed with TPM identity paths"
                         .into(),
                 );
             }
             Ok(true)
         }
         Some(_) => Err(
-            "permissionless_runtime.allow_software_testnet_ephemeral_keys must be a boolean"
+            "permissionless_runtime.allow_software_testnet_key_custody must be a boolean"
                 .into(),
         ),
     }
+}
+
+fn load_software_testnet_private_key_from_env(
+    variable_name: &str,
+) -> Result<Zeroizing<[u8; 32]>, String> {
+    let mut encoded = std::env::var(variable_name)
+        .map_err(|_| format!("required testnet secret environment variable {variable_name} is missing"))?;
+    if encoded.len() != 64
+        || !encoded.is_ascii()
+        || encoded
+            .bytes()
+            .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+    {
+        encoded.zeroize();
+        return Err(format!(
+            "testnet secret {variable_name} must be exactly 64 lowercase hexadecimal characters"
+        ));
+    }
+    let mut secret = Zeroizing::new([0u8; 32]);
+    for (index, slot) in secret.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16)
+            .map_err(|_| format!("testnet secret {variable_name} is malformed"))?;
+    }
+    encoded.zeroize();
+    if secret.iter().all(|byte| *byte == 0) {
+        return Err(format!("testnet secret {variable_name} must not be zero"));
+    }
+    Ok(secret)
 }
 
 fn validate_runtime_mode(cfg: &Value, public_testnet: bool, mainnet: bool) -> Result<(), String> {
@@ -1837,8 +1865,8 @@ fn run_permissionless_node_with_visibility(
         .get("permissionless_runtime")
         .ok_or("permissionless_runtime section missing")?;
     validate_runtime_mode(cfg, public_testnet, mainnet)?;
-    let software_testnet_ephemeral_keys =
-        software_testnet_ephemeral_keys_enabled(cfg, public_testnet)?;
+    let software_testnet_key_custody =
+        software_testnet_key_custody_enabled(cfg, public_testnet)?;
     let base = config_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -2057,7 +2085,7 @@ fn run_permissionless_node_with_visibility(
         if cfg.get("q6pd_self_advertise_endpoint").is_none() {
             return Err("enable_q6pd_self_announcement requires q6pd_self_advertise_endpoint".into());
         }
-        if software_testnet_ephemeral_keys {
+        if software_testnet_key_custody {
             if [
                 "q6pd_identity_key_path",
                 "q6pd_identity_binding_path",
@@ -2229,17 +2257,17 @@ fn run_permissionless_node_with_visibility(
         None
     };
     let q6pd_self_announcement_config = if enable_q6pd_self_announcement {
-        let identity_key_path = if software_testnet_ephemeral_keys {
+        let identity_key_path = if software_testnet_key_custody {
             None
         } else {
             Some(path(base, cfg, "q6pd_identity_key_path")?)
         };
-        let identity_binding_path = if software_testnet_ephemeral_keys {
+        let identity_binding_path = if software_testnet_key_custody {
             None
         } else {
             Some(path(base, cfg, "q6pd_identity_binding_path")?)
         };
-        let device_root_metadata_path = if software_testnet_ephemeral_keys {
+        let device_root_metadata_path = if software_testnet_key_custody {
             None
         } else {
             Some(path(base, cfg, "device_root_metadata_path")?)
@@ -2452,20 +2480,23 @@ fn run_permissionless_node_with_visibility(
     // Do not expose a TCP socket until all cryptographic inputs, durable state, the
     // mempool journal, and restored pending transactions have passed validation.
     let key_path = path(base, cfg, "node_noise_private_key_path")?;
-    let local_key = if software_testnet_ephemeral_keys {
-        let mut generated = Zeroizing::new([0u8; 32]);
-        getrandom::getrandom(&mut *generated)
-            .map_err(|error| format!("ephemeral testnet Noise-key generation failed: {error}"))?;
-        if generated.iter().all(|byte| *byte == 0) {
-            return Err("ephemeral testnet Noise-key generator returned an invalid key".into());
-        }
-        generated
+    let local_key = if software_testnet_key_custody {
+        load_software_testnet_private_key_from_env("QFP6_TESTNET_NOISE_PRIVATE_KEY_HEX")?
     } else {
         Zeroizing::new(
             load_protected_noise_private_key(&key_path, &descriptor.network_id())
                 .map_err(|e| format!("protected local Noise key unavailable: {e:?}"))?,
         )
     };
+    if software_testnet_key_custody {
+        let public_key = derive_noise_static_public_key(&*local_key)
+            .map_err(|error| format!("testnet Noise public-key derivation failed: {error}"))?;
+        println!(
+            "QFP6_TESTNET_NOISE_STATIC_PUBLIC_KEY={}",
+            super::super::hex(&public_key)
+        );
+        println!("QFP6_TESTNET_KEY_CUSTODY=RAILWAY_SERVICE_SECRET; MAINNET=FORBIDDEN");
+    }
     let require_device_root_binding = match cfg.get("require_device_root_binding") {
         None => false,
         Some(Value::Bool(required)) => *required,
@@ -2477,8 +2508,8 @@ fn run_permissionless_node_with_visibility(
     };
     let metadata_configured = cfg.get("device_root_metadata_path").is_some();
     let binding_configured = cfg.get("device_root_binding_path").is_some();
-    if software_testnet_ephemeral_keys && (metadata_configured || binding_configured) {
-        return Err("software ephemeral testnet keys cannot be combined with TPM Device Root paths".into());
+    if software_testnet_key_custody && (metadata_configured || binding_configured) {
+        return Err("software-custodied testnet keys cannot be combined with TPM Device Root paths".into());
     }
     if metadata_configured != binding_configured && !enable_q6pd_self_announcement {
         return Err("TPM Device Root binding requires both device_root_metadata_path and device_root_binding_path".into());
@@ -2486,7 +2517,7 @@ fn run_permissionless_node_with_visibility(
     if require_device_root_binding && (!metadata_configured || !binding_configured) {
         return Err("require_device_root_binding=true but no TPM Device Root metadata/binding paths were configured".into());
     }
-    if software_testnet_ephemeral_keys {
+    if software_testnet_key_custody {
         eprintln!(
             "QFP6_DEVICE_IDENTITY=EPHEMERAL_SOFTWARE_ZERO_VALUE_TESTNET_ONLY; PRIVATE_KEYS=MEMORY_ONLY; TPM_BINDING=NOT_CLAIMED"
         );
@@ -2522,14 +2553,17 @@ fn run_permissionless_node_with_visibility(
         tls_server_name,
     )) = q6pd_self_announcement_config.as_ref()
     {
-        q6pd_node_identity = Some(if software_testnet_ephemeral_keys {
-            create_ephemeral_zero_value_testnet_q6pd_identity(
+        q6pd_node_identity = Some(if software_testnet_key_custody {
+            let identity_seed =
+                load_software_testnet_private_key_from_env("QFP6_TESTNET_Q6PD_IDENTITY_SEED_HEX")?;
+            create_software_zero_value_testnet_q6pd_identity(
                 &*local_key,
+                &*identity_seed,
                 &descriptor.network_id(),
                 &descriptor.profile_id(),
             )
             .map_err(|error| {
-                format!("ephemeral zero-value testnet Q6PD identity creation failed: {error}")
+                format!("software zero-value testnet Q6PD identity creation failed: {error}")
             })?
         } else {
             load_q6pd_node_identity(
@@ -4472,29 +4506,29 @@ mod software_testnet_ephemeral_key_policy_tests {
     #[test]
     fn software_ephemeral_keys_require_explicit_zero_value_testnet_acknowledgement() {
         let cfg = json!({
-            "allow_software_testnet_ephemeral_keys": true,
+            "allow_software_testnet_key_custody": true,
             "software_testnet_keys_acknowledgement": PUBLIC_TESTNET_SOFTWARE_KEYS_ACK
         });
-        assert_eq!(software_testnet_ephemeral_keys_enabled(&cfg, true), Ok(true));
-        assert!(software_testnet_ephemeral_keys_enabled(&cfg, false).is_err());
+        assert_eq!(software_testnet_key_custody_enabled(&cfg, true), Ok(true));
+        assert!(software_testnet_key_custody_enabled(&cfg, false).is_err());
     }
 
     #[test]
     fn software_ephemeral_keys_fail_closed_without_ack_or_when_mixed_with_tpm_paths() {
-        let no_ack = json!({"allow_software_testnet_ephemeral_keys": true});
-        assert!(software_testnet_ephemeral_keys_enabled(&no_ack, true).is_err());
+        let no_ack = json!({"allow_software_testnet_key_custody": true});
+        assert!(software_testnet_key_custody_enabled(&no_ack, true).is_err());
 
         let mixed = json!({
-            "allow_software_testnet_ephemeral_keys": true,
+            "allow_software_testnet_key_custody": true,
             "software_testnet_keys_acknowledgement": PUBLIC_TESTNET_SOFTWARE_KEYS_ACK,
             "device_root_metadata_path": "/run/not-used/device-root.json"
         });
-        assert!(software_testnet_ephemeral_keys_enabled(&mixed, true).is_err());
+        assert!(software_testnet_key_custody_enabled(&mixed, true).is_err());
 
         let disabled_with_ack = json!({
-            "allow_software_testnet_ephemeral_keys": false,
+            "allow_software_testnet_key_custody": false,
             "software_testnet_keys_acknowledgement": PUBLIC_TESTNET_SOFTWARE_KEYS_ACK
         });
-        assert!(software_testnet_ephemeral_keys_enabled(&disabled_with_ack, true).is_err());
+        assert!(software_testnet_key_custody_enabled(&disabled_with_ack, true).is_err());
     }
 }
