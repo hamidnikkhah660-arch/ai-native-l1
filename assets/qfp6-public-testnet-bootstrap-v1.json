@@ -1,0 +1,19 @@
+{
+  "schema": "qfp6-public-testnet-bootstrap-manifest",
+  "version": 1,
+  "status": "ZERO_VALUE_PUBLIC_TESTNET_CANDIDATE_ONLY",
+  "network_id": "633b5dfc16fb2ec1825baf924ae7f7f16bf2006f8b64441a57692a3531722712",
+  "profile_id": "a0a057d72c11253386bfe90d428bccbc44ebc86fc84e04e3682193a99d8805c4",
+  "bootstrap_peers_file": "qfp6-public-testnet-bootstrap-peers-v1.json",
+  "bootstrap_peers_sha256": "d61c0237d3f8117cb9181b301a3ca6166446b8f7d9ce152582f832228ff1ce3d",
+  "seed_count": 1,
+  "dns_seed": "heymed.tail2a756d.ts.net",
+  "tls_sni": "heymed.tail2a756d.ts.net",
+  "tcp_port": 443,
+  "noise_static_public_key": "9899d6d17d1659df8befcca2bf3ebe19ebe106a8c3d9bd0a4f06d141db3af508",
+  "dns_is_transport_only": true,
+  "noise_key_pin_is_identity_anchor": true,
+  "auto_trust": false,
+  "mainnet_authorized": false,
+  "market_authorized": false
+}
