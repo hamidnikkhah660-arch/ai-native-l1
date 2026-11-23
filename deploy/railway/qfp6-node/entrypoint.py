@@ -21,7 +21,7 @@ DATA = Path("/data")
 CONFIG_DIR = DATA / "config"
 CONFIG = CONFIG_DIR / "node-config.json"
 CONFIG_HASH = CONFIG_DIR / "node-config.json.sha256"
-BOOTSTRAP = ASSETS / "qfp6-public-testnet-bootstrap-peers-v1.json"
+BOOTSTRAP = DATA / "bootstrap-peers.json"
 
 NETWORK_ID = "633b5dfc16fb2ec1825baf924ae7f7f16bf2006f8b64441a57692a3531722712"
 PROFILE_ID = "a0a057d72c11253386bfe90d428bccbc44ebc86fc84e04e3682193a99d8805c4"
