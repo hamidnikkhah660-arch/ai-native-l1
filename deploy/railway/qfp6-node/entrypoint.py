@@ -26,7 +26,6 @@ BOOTSTRAP = DATA / "bootstrap-peers.json"
 NETWORK_ID = "633b5dfc16fb2ec1825baf924ae7f7f16bf2006f8b64441a57692a3531722712"
 PROFILE_ID = "a0a057d72c11253386bfe90d428bccbc44ebc86fc84e04e3682193a99d8805c4"
 PROFILE_COMMITMENT = "a5707de437cf461f1a775a3d5a92d619955af35736ba54b609012a9446701d3e"
-TRUSTED_GENESIS_ANCHOR = "652ad475a0646e285329d690f493b9b10bf89d44f6ff1cf381c96b7d83ed25b0"
 SOFTWARE_KEY_ACK = "SOFTWARE_KEY_CUSTODY_ZERO_VALUE_TESTNET_ONLY"
 
 
@@ -107,8 +106,7 @@ def build_config(role: str) -> tuple[dict, bytes]:
     q6pd_data.mkdir(parents=True, exist_ok=True)
     # Do NOT pre-create the anchor-vault directory. A fresh Joining node must
     # see it as absent so the runtime can provision the Genesis-rooted vault
-    # only after validating the pinned Genesis trust material. An empty vault
-    # directory is treated as corruption and must never be pre-created here.
+    # atomically. An existing empty vault is correctly rejected as corruption.
     (DATA / "keys").mkdir(parents=True, exist_ok=True)
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -151,7 +149,13 @@ def build_config(role: str) -> tuple[dict, bytes]:
     }
 
     if not is_seed:
-        runtime["trusted_manifest_anchor"] = TRUSTED_GENESIS_ANCHOR
+        # Only fresh zero-value Testnet Joiners may derive their own immutable local
+        # sequence-1 vault root, and only after Q6PN/Q6GD/Q6GA and Genesis checks pass.
+        # Existing history is still rejected by the runtime's generation/height gate.
+        runtime["derive_fresh_joiner_anchor_from_verified_genesis"] = True
+        runtime["fresh_genesis_anchor_derivation_acknowledgement"] = (
+            "VERIFIED_GENESIS_DERIVED_ANCHOR_ZERO_VALUE_TESTNET_ONLY"
+        )
     if is_public:
         runtime["q6pd_self_advertise_endpoint"] = advertise_endpoint
 
