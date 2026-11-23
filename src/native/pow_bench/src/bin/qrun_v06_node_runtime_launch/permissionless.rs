@@ -1418,19 +1418,18 @@ fn trusted_manifest_anchor(
 const PUBLIC_TESTNET_MODE: &str = "public-testnet-zero-value-candidate";
 const PUBLIC_TESTNET_ACK: &str = "ZERO_VALUE_PUBLIC_TESTNET_NO_MAINNET_NO_MARKET";
 const PUBLIC_TESTNET_INBOUND_ACK: &str = "ANONYMOUS_NOISE_XX_UNAUTHENTICATED";
-const PUBLIC_TESTNET_SOFTWARE_KEYS_ACK: &str =
-    "SOFTWARE_KEY_CUSTODY_ZERO_VALUE_TESTNET_ONLY";
+const PUBLIC_TESTNET_SOFTWARE_KEYS_ACK: &str = "SOFTWARE_KEY_CUSTODY_ZERO_VALUE_TESTNET_ONLY";
 const MAINNET_NATIVE_MODE: &str = "mainnet-native-value-candidate";
 const MAINNET_NATIVE_ACK: &str = "QZXB_MAINNET_NATIVE_VALUE_OWNER_AUTHORIZATION_REQUIRED";
 const MAINNET_NATIVE_INBOUND_ACK: &str = "PINNED_NOISE_STATIC_KEY_ALLOWLIST_REQUIRED";
 
-fn software_testnet_key_custody_enabled(
-    cfg: &Value,
-    public_testnet: bool,
-) -> Result<bool, String> {
+fn software_testnet_key_custody_enabled(cfg: &Value, public_testnet: bool) -> Result<bool, String> {
     match cfg.get("allow_software_testnet_key_custody") {
         None | Some(Value::Bool(false)) => {
-            if cfg.get("software_testnet_key_custody_acknowledgement").is_some() {
+            if cfg
+                .get("software_testnet_key_custody_acknowledgement")
+                .is_some()
+            {
                 return Err(
                     "software_testnet_key_custody_acknowledgement is forbidden unless software testnet key custody is enabled"
                         .into(),
@@ -1452,7 +1451,11 @@ fn software_testnet_key_custody_enabled(
                     "software_testnet_key_custody_acknowledgement must be exactly '{PUBLIC_TESTNET_SOFTWARE_KEYS_ACK}'"
                 ));
             }
-            if cfg.get("require_device_root_binding").and_then(Value::as_bool) == Some(true) {
+            if cfg
+                .get("require_device_root_binding")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
                 return Err(
                     "software-custodied testnet keys cannot satisfy require_device_root_binding"
                         .into(),
@@ -1468,15 +1471,13 @@ fn software_testnet_key_custody_enabled(
             .any(|key| cfg.get(*key).is_some())
             {
                 return Err(
-                    "software testnet identity must not be mixed with TPM identity paths"
-                        .into(),
+                    "software testnet identity must not be mixed with TPM identity paths".into(),
                 );
             }
             Ok(true)
         }
         Some(_) => Err(
-            "permissionless_runtime.allow_software_testnet_key_custody must be a boolean"
-                .into(),
+            "permissionless_runtime.allow_software_testnet_key_custody must be a boolean".into(),
         ),
     }
 }
@@ -1484,8 +1485,9 @@ fn software_testnet_key_custody_enabled(
 fn load_software_testnet_private_key_from_env(
     variable_name: &str,
 ) -> Result<Zeroizing<[u8; 32]>, String> {
-    let mut encoded = std::env::var(variable_name)
-        .map_err(|_| format!("required testnet secret environment variable {variable_name} is missing"))?;
+    let mut encoded = std::env::var(variable_name).map_err(|_| {
+        format!("required testnet secret environment variable {variable_name} is missing")
+    })?;
     if encoded.len() != 64
         || !encoded.is_ascii()
         || encoded
@@ -1865,8 +1867,7 @@ fn run_permissionless_node_with_visibility(
         .get("permissionless_runtime")
         .ok_or("permissionless_runtime section missing")?;
     validate_runtime_mode(cfg, public_testnet, mainnet)?;
-    let software_testnet_key_custody =
-        software_testnet_key_custody_enabled(cfg, public_testnet)?;
+    let software_testnet_key_custody = software_testnet_key_custody_enabled(cfg, public_testnet)?;
     let base = config_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -2083,7 +2084,9 @@ fn run_permissionless_node_with_visibility(
     let q6pd_optional_endpoint_config_keys = ["q6pd_self_advertise_tls_server_name"];
     if enable_q6pd_self_announcement {
         if cfg.get("q6pd_self_advertise_endpoint").is_none() {
-            return Err("enable_q6pd_self_announcement requires q6pd_self_advertise_endpoint".into());
+            return Err(
+                "enable_q6pd_self_announcement requires q6pd_self_advertise_endpoint".into(),
+            );
         }
         if software_testnet_key_custody {
             if [
@@ -2107,7 +2110,9 @@ fn run_permissionless_node_with_visibility(
                 }
             }
             if cfg.get("device_root_metadata_path").is_none() {
-                return Err("enable_q6pd_self_announcement requires device_root_metadata_path".into());
+                return Err(
+                    "enable_q6pd_self_announcement requires device_root_metadata_path".into(),
+                );
             }
         }
     } else if q6pd_identity_config_keys
@@ -2509,7 +2514,9 @@ fn run_permissionless_node_with_visibility(
     let metadata_configured = cfg.get("device_root_metadata_path").is_some();
     let binding_configured = cfg.get("device_root_binding_path").is_some();
     if software_testnet_key_custody && (metadata_configured || binding_configured) {
-        return Err("software-custodied testnet keys cannot be combined with TPM Device Root paths".into());
+        return Err(
+            "software-custodied testnet keys cannot be combined with TPM Device Root paths".into(),
+        );
     }
     if metadata_configured != binding_configured && !enable_q6pd_self_announcement {
         return Err("TPM Device Root binding requires both device_root_metadata_path and device_root_binding_path".into());
@@ -4496,7 +4503,6 @@ mod manifest_anchor_tests {
         fs::remove_dir_all(dir).unwrap();
     }
 }
-
 
 #[cfg(test)]
 mod software_testnet_ephemeral_key_policy_tests {
