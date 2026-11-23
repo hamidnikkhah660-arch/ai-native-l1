@@ -34,7 +34,7 @@ jobs:
           image="ghcr.io/hamidnikkhah660-arch/qfp6-railway-node"
           echo "QFP6_IMAGE_REF=${image}:${short_sha}" >> "${GITHUB_OUTPUT}"
           docker build --pull --platform linux/amd64 \
-            --file Dockerfile.railway-qfp6-entrypoint-hotfix \
+            --file Dockerfile.railway-qfp6 \
             --label "org.opencontainers.image.source=https://github.com/hamidnikkhah660-arch/ai-native-l1" \
             --label "org.opencontainers.image.description=QFP6 zero-value public testnet node; no Mainnet authority" \
             --tag "${image}:${short_sha}" .
