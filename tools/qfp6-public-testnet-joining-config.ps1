@@ -10,9 +10,11 @@ param(
     [string]$OutputBootstrapPeersPath,
     [string]$OutputDeploymentRecordPath,
     [switch]$ConfirmSeedFingerprintOutOfBand,
-    [switch]$ConfirmPublicExposure
+    [switch]$ConfirmPublicExposure,
+    [switch]$AllowPublicTcpRelay
 )
 $ErrorActionPreference='Stop'
+Import-Module (Join-Path $PSScriptRoot 'qfp6-public-seed-endpoint.psm1') -Force -ErrorAction Stop
 
 function Assert-Absolute([string]$Value,[string]$Label){
     if([string]::IsNullOrWhiteSpace($Value) -or -not [IO.Path]::IsPathRooted($Value)){throw "$Label must be an absolute path."}
@@ -125,9 +127,10 @@ if([string]::IsNullOrWhiteSpace($OutputBootstrapPeersPath)){$OutputBootstrapPeer
 if([string]::IsNullOrWhiteSpace($OutputDeploymentRecordPath)){$OutputDeploymentRecordPath=Join-Path $package 'joining-deployment-record.json'}
 foreach($pair in @(@($JoiningNoisePrivateKeyPath,'JoiningNoisePrivateKeyPath'),@($AnchorVaultDirectory,'AnchorVaultDirectory'),@($OutputConfigPath,'OutputConfigPath'),@($OutputBootstrapPeersPath,'OutputBootstrapPeersPath'),@($OutputDeploymentRecordPath,'OutputDeploymentRecordPath'))){Assert-Absolute ([string]$pair[0]) ([string]$pair[1])}
 
-$seedEp=Parse-Endpoint $SeedEndpoint 'SeedEndpoint' $false
+$seedEp=Resolve-Qfp6PublicSeedEndpoint -Value $SeedEndpoint -AllowPublicTcpRelay:$AllowPublicTcpRelay
 $listenEp=Parse-Endpoint $ListenAddress 'ListenAddress' $true
-if(-not $listenEp.Wildcard -and $listenEp.Address.Equals($seedEp.Address)){throw 'Joining listen endpoint must not alias the Seed endpoint.'}
+if(-not $listenEp.Wildcard){foreach($seedAddress in $seedEp.ResolvedAddresses){if($listenEp.Address.Equals($seedAddress)){throw 'Joining listen endpoint must not alias the Seed endpoint.'}}}
+$seedEndpointMode=if($seedEp.Relay){'PUBLIC_TCP_RELAY_443'}else{'DIRECT_TCP_30333'}
 
 $seedPath=Join-Path $package 'seed-noise-identity.json'
 $joinPath=Join-Path $package 'joining-noise-identity.json'
@@ -249,6 +252,7 @@ $record=[ordered]@{
     network_id=$joining.network_id
     profile_id=$joining.profile_id
     seed_endpoint=$seedEp.Normalized
+    seed_endpoint_mode=$seedEndpointMode
     seed_public_key_sha256_fingerprint=$seedFp
     seed_fingerprint_confirmed_out_of_band=$true
     joining_public_key_sha256_fingerprint=$joinFp
@@ -286,6 +290,7 @@ Write-Output "bootstrap_peers_path=$bootFull"
 Write-Output "bootstrap_peers_sha256=$peerHash"
 Write-Output "deployment_record_path=$recordFull"
 Write-Output "seed_endpoint=$($seedEp.Normalized)"
+Write-Output "seed_endpoint_mode=$seedEndpointMode"
 Write-Output "seed_public_key_sha256_fingerprint=$seedFp"
 Write-Output "joining_public_key_sha256_fingerprint=$joinFp"
 Write-Output "data_disk_number=$dataDisk"

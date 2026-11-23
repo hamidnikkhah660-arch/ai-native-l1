@@ -208,10 +208,14 @@ pub struct QRunV06PermissionlessMiningSupervisorReport {
     pub stop_reason: QRunV06NodeSupervisorStopReason,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QRunV06PinnedBootstrapPeer {
+    /// Numeric destination chosen from a hash-pinned bootstrap record at launch.
     pub address: SocketAddr,
+    /// Static Noise identity pin; this remains the peer authentication authority.
     pub noise_static_public_key: [u8; 32],
+    /// Optional TLS SNI for a public TCP/443 relay. None preserves direct Noise/TCP.
+    pub tls_server_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2206,10 +2210,43 @@ pub fn validate_qfp6_pinned_bootstrap_peers(
     let mut keys = HashSet::new();
     let mut trusted_keys = Vec::with_capacity(peers.len());
     for peer in peers {
+        let invalid_tls_relay = match peer.tls_server_name.as_deref() {
+            None => false,
+            Some(name) => {
+                peer.address.port() != 443
+                    || name.is_empty()
+                    || name.len() > 253
+                    || name.parse::<std::net::IpAddr>().is_ok()
+                    || !name.contains('.')
+                    || name.ends_with('.')
+                    || name.split('.').any(|label| {
+                        let bytes = label.as_bytes();
+                        bytes.is_empty()
+                            || bytes.len() > 63
+                            || !bytes[0].is_ascii_alphanumeric()
+                            || !bytes[bytes.len() - 1].is_ascii_alphanumeric()
+                            || bytes
+                                .iter()
+                                .any(|byte| !byte.is_ascii_alphanumeric() && *byte != b'-')
+                    })
+                    || name.eq_ignore_ascii_case("localhost")
+                    || [
+                        ".localhost",
+                        ".local",
+                        ".internal",
+                        ".test",
+                        ".invalid",
+                        ".example",
+                    ]
+                    .iter()
+                    .any(|suffix| name.to_ascii_lowercase().ends_with(suffix))
+            }
+        };
         if peer.address.port() == 0
             || peer.address.ip().is_unspecified()
             || peer.address.ip().is_multicast()
             || peer.noise_static_public_key == [0; 32]
+            || invalid_tls_relay
             || !addresses.insert(peer.address)
             || !keys.insert(peer.noise_static_public_key)
         {
@@ -2367,6 +2404,7 @@ where
             quote_authorizer,
             coordinator,
             sync_config,
+            peer.tls_server_name.as_deref(),
         ) {
             Ok(report) if report.complete => {
                 bootstrap_sync = Some(report);
@@ -2491,6 +2529,7 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_bootstrap_and_q6ar_candida
             authenticator,
             sync_config,
             quote_authorizer.as_deref_mut(),
+            peer.tls_server_name.as_deref(),
         ) {
             Ok(report) if report.complete => {
                 address_book.record_success(&address_key).map_err(|error| {
@@ -2626,6 +2665,7 @@ pub fn run_qfp6_permissionless_mining_supervisor_with_bootstrap<T: TransactionAu
             authenticator,
             sync_config,
             quote_authorizer.as_deref_mut(),
+            peer.tls_server_name.as_deref(),
         ) {
             Ok(report) if report.complete => {
                 bootstrap_report = Some(report);
@@ -3841,18 +3881,44 @@ mod tests {
         let first = QRunV06PinnedBootstrapPeer {
             address: "127.0.0.1:30333".parse().unwrap(),
             noise_static_public_key: [0x31; 32],
+            tls_server_name: None,
         };
         assert_eq!(
-            validate_qfp6_pinned_bootstrap_peers(&[first]),
+            validate_qfp6_pinned_bootstrap_peers(std::slice::from_ref(&first)),
             Ok(vec![[0x31; 32]])
         );
+        let relay = QRunV06PinnedBootstrapPeer {
+            address: "1.1.1.1:443".parse().unwrap(),
+            noise_static_public_key: [0x32; 32],
+            tls_server_name: Some("seed.tailnet.ts.net".to_owned()),
+        };
         assert_eq!(
-            validate_qfp6_pinned_bootstrap_peers(&[first, first]),
+            validate_qfp6_pinned_bootstrap_peers(std::slice::from_ref(&relay)),
+            Ok(vec![[0x32; 32]])
+        );
+        let invalid_relay = QRunV06PinnedBootstrapPeer {
+            tls_server_name: Some("seed..tailnet.ts.net".to_owned()),
+            ..relay.clone()
+        };
+        assert_eq!(
+            validate_qfp6_pinned_bootstrap_peers(&[invalid_relay]),
+            Err(QRunV06NodeSupervisorError::InvalidBootstrapPeers)
+        );
+        let relay_wrong_port = QRunV06PinnedBootstrapPeer {
+            address: "1.1.1.1:30333".parse().unwrap(),
+            ..relay
+        };
+        assert_eq!(
+            validate_qfp6_pinned_bootstrap_peers(&[relay_wrong_port]),
+            Err(QRunV06NodeSupervisorError::InvalidBootstrapPeers)
+        );
+        assert_eq!(
+            validate_qfp6_pinned_bootstrap_peers(&[first.clone(), first.clone()]),
             Err(QRunV06NodeSupervisorError::InvalidBootstrapPeers)
         );
         let zero_key = QRunV06PinnedBootstrapPeer {
             noise_static_public_key: [0; 32],
-            ..first
+            ..first.clone()
         };
         assert_eq!(
             validate_qfp6_pinned_bootstrap_peers(&[zero_key]),
