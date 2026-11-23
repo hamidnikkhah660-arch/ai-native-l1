@@ -1482,6 +1482,61 @@ fn software_testnet_key_custody_enabled(cfg: &Value, public_testnet: bool) -> Re
     }
 }
 
+const PUBLIC_TESTNET_DERIVED_GENESIS_ANCHOR_ACK: &str =
+    "VERIFIED_GENESIS_DERIVED_ANCHOR_ZERO_VALUE_TESTNET_ONLY";
+
+fn derive_fresh_joiner_anchor_from_verified_genesis(
+    cfg: &Value,
+    public_testnet: bool,
+) -> Result<bool, String> {
+    match cfg.get("derive_fresh_joiner_anchor_from_verified_genesis") {
+        None | Some(Value::Bool(false)) => {
+            if cfg
+                .get("fresh_genesis_anchor_derivation_acknowledgement")
+                .is_some()
+            {
+                return Err(
+                    "fresh_genesis_anchor_derivation_acknowledgement is forbidden unless Genesis-derived Joiner anchoring is enabled"
+                        .into(),
+                );
+            }
+            Ok(false)
+        }
+        Some(Value::Bool(true)) => {
+            if !public_testnet {
+                return Err(
+                    "Genesis-derived local anchors are restricted to zero-value Public Testnet"
+                        .into(),
+                );
+            }
+            if req(cfg, "node_role")? != "joining" {
+                return Err(
+                    "Genesis-derived local anchors are allowed only for a fresh joining node"
+                        .into(),
+                );
+            }
+            if req(cfg, "fresh_genesis_anchor_derivation_acknowledgement")?
+                != PUBLIC_TESTNET_DERIVED_GENESIS_ANCHOR_ACK
+            {
+                return Err(format!(
+                    "fresh_genesis_anchor_derivation_acknowledgement must be exactly '{PUBLIC_TESTNET_DERIVED_GENESIS_ANCHOR_ACK}'"
+                ));
+            }
+            if cfg.get("trusted_manifest_anchor").is_some() {
+                return Err(
+                    "trusted_manifest_anchor must be omitted when deriving a fresh Joiner root from verified Genesis"
+                        .into(),
+                );
+            }
+            Ok(true)
+        }
+        Some(_) => Err(
+            "permissionless_runtime.derive_fresh_joiner_anchor_from_verified_genesis must be a boolean"
+                .into(),
+        ),
+    }
+}
+
 fn load_software_testnet_private_key_from_env(
     variable_name: &str,
 ) -> Result<Zeroizing<[u8; 32]>, String> {
@@ -1868,6 +1923,8 @@ fn run_permissionless_node_with_visibility(
         .ok_or("permissionless_runtime section missing")?;
     validate_runtime_mode(cfg, public_testnet, mainnet)?;
     let software_testnet_key_custody = software_testnet_key_custody_enabled(cfg, public_testnet)?;
+    let derive_joiner_anchor_from_verified_genesis =
+        derive_fresh_joiner_anchor_from_verified_genesis(cfg, public_testnet)?;
     let base = config_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -2749,22 +2806,36 @@ fn run_permissionless_node_with_visibility(
             })?;
         runtime
     } else if public_testnet && req(cfg, "node_role")? == "joining" {
-        let trusted_genesis_anchor = parse_hex32(
-            "trusted_manifest_anchor",
-            req(cfg, "trusted_manifest_anchor")?,
-        )?;
         let vault_directory = local_anchor_vault_directory(cfg)?;
         let segments_root = checkpoint_segments_directory(&data_dir)?;
-        let mut runtime = QRunV06PermissionlessNodeRuntime::open_with_fresh_genesis_anchor_vault(
-            &data_dir,
-            genesis,
-            params,
-            &authenticator,
-            &verified_pin,
-            trusted_genesis_anchor,
-            &vault_directory,
-        )
-        .map_err(|error| format!("fresh Joining Genesis/Vault bootstrap failed: {error:?}"))?;
+        let mut runtime = if derive_joiner_anchor_from_verified_genesis {
+            QRunV06PermissionlessNodeRuntime::open_with_verified_genesis_fresh_anchor_vault(
+                &data_dir,
+                genesis,
+                params,
+                &authenticator,
+                &verified_pin,
+                &vault_directory,
+            )
+            .map_err(|error| {
+                format!("verified fresh Joining Genesis/Vault bootstrap failed: {error:?}")
+            })?
+        } else {
+            let trusted_genesis_anchor = parse_hex32(
+                "trusted_manifest_anchor",
+                req(cfg, "trusted_manifest_anchor")?,
+            )?;
+            QRunV06PermissionlessNodeRuntime::open_with_fresh_genesis_anchor_vault(
+                &data_dir,
+                genesis,
+                params,
+                &authenticator,
+                &verified_pin,
+                trusted_genesis_anchor,
+                &vault_directory,
+            )
+            .map_err(|error| format!("fresh Joining Genesis/Vault bootstrap failed: {error:?}"))?
+        };
         runtime
             .enable_auto_checkpoint_rollover(&segments_root, verified_pin.clone())
             .map_err(|error| {
@@ -4517,6 +4588,59 @@ mod manifest_anchor_tests {
 mod software_testnet_ephemeral_key_policy_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn genesis_derived_anchor_is_only_for_acknowledged_fresh_public_testnet_joiners() {
+        let cfg = json!({
+            "node_role": "joining",
+            "derive_fresh_joiner_anchor_from_verified_genesis": true,
+            "fresh_genesis_anchor_derivation_acknowledgement":
+                PUBLIC_TESTNET_DERIVED_GENESIS_ANCHOR_ACK
+        });
+        assert_eq!(
+            derive_fresh_joiner_anchor_from_verified_genesis(&cfg, true),
+            Ok(true)
+        );
+        assert!(derive_fresh_joiner_anchor_from_verified_genesis(&cfg, false).is_err());
+
+        let wrong_role = json!({
+            "node_role": "seed",
+            "derive_fresh_joiner_anchor_from_verified_genesis": true,
+            "fresh_genesis_anchor_derivation_acknowledgement":
+                PUBLIC_TESTNET_DERIVED_GENESIS_ANCHOR_ACK
+        });
+        assert!(derive_fresh_joiner_anchor_from_verified_genesis(&wrong_role, true).is_err());
+    }
+
+    #[test]
+    fn genesis_derived_anchor_requires_exact_ack_and_forbids_mixed_external_pin() {
+        let no_ack = json!({
+            "node_role": "joining",
+            "derive_fresh_joiner_anchor_from_verified_genesis": true
+        });
+        assert!(derive_fresh_joiner_anchor_from_verified_genesis(&no_ack, true).is_err());
+
+        let mixed_pin = json!({
+            "node_role": "joining",
+            "derive_fresh_joiner_anchor_from_verified_genesis": true,
+            "fresh_genesis_anchor_derivation_acknowledgement":
+                PUBLIC_TESTNET_DERIVED_GENESIS_ANCHOR_ACK,
+            "trusted_manifest_anchor": "11".repeat(32)
+        });
+        assert!(
+            derive_fresh_joiner_anchor_from_verified_genesis(&mixed_pin, true).is_err()
+        );
+
+        let disabled_with_ack = json!({
+            "node_role": "joining",
+            "derive_fresh_joiner_anchor_from_verified_genesis": false,
+            "fresh_genesis_anchor_derivation_acknowledgement":
+                PUBLIC_TESTNET_DERIVED_GENESIS_ANCHOR_ACK
+        });
+        assert!(
+            derive_fresh_joiner_anchor_from_verified_genesis(&disabled_with_ack, true).is_err()
+        );
+    }
 
     #[test]
     fn software_ephemeral_keys_require_explicit_zero_value_testnet_acknowledgement() {
