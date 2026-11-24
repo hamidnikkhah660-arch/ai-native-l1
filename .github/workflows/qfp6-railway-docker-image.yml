@@ -29,6 +29,12 @@ jobs:
       - name: Test Railway entrypoint trust-anchor input
         run: python3 deploy/railway/qfp6-node/test_entrypoint.py
 
+      - name: Check QFP6 runtime formatting
+        run: cargo +stable fmt --manifest-path src/native/pow_bench/Cargo.toml --all -- --check
+
+      - name: Test QFP6 node runtime and external anchor-floor gates
+        run: cargo +stable test --manifest-path src/native/pow_bench/Cargo.toml --bin qrun_v06_node --locked -- --test-threads=1
+
       - name: Build Linux x86_64 QFP6 image
         shell: bash
         run: |
