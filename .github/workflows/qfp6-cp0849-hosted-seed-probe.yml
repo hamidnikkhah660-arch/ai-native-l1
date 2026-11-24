@@ -1,4 +1,4 @@
-name: QFP6 CP-0849 hosted cross-host Seed probe
+name: QFP6 CP-0849 hosted cross-host Joiner qualification
 
 on:
   push:
@@ -6,6 +6,7 @@ on:
       - "review/cp0849-nat-persistent-peer-sessions"
     paths:
       - "src/native/pow_bench/src/bin/qfp6_public_seed_probe.rs"
+      - "src/native/pow_bench/src/bin/qfp6_public_q6pd_joiner.rs"
       - "src/native/pow_bench/src/qrun_v06_noise_transport_candidate.rs"
       - "src/native/pow_bench/Cargo.toml"
       - "src/native/pow_bench/Cargo.lock"
@@ -36,7 +37,7 @@ jobs:
         with:
           toolchain: 1.82.0
 
-      - name: Build the outbound pinned-Noise probe
+      - name: Build the outbound Seed probe and Q6PD Joiner
         shell: pwsh
         working-directory: src/native/pow_bench
         run: |
@@ -45,13 +46,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'rustc unavailable' }
           cargo --version
           if ($LASTEXITCODE -ne 0) { throw 'cargo unavailable' }
-          cargo build --locked --release --bin qfp6_public_seed_probe -j 1
-          if ($LASTEXITCODE -ne 0) { throw 'QFP6 public Seed probe build failed' }
-          $exe = 'target\release\qfp6_public_seed_probe.exe'
-          if (-not (Test-Path $exe)) { throw 'Probe executable missing' }
-          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          cargo build --locked --release --bin qfp6_public_seed_probe --bin qfp6_public_q6pd_joiner -j 1
+          if ($LASTEXITCODE -ne 0) { throw 'QFP6 hosted Joiner binaries failed to build' }
+          $probe = 'target\release\qfp6_public_seed_probe.exe'
+          $joiner = 'target\release\qfp6_public_q6pd_joiner.exe'
+          if (-not (Test-Path $probe) -or -not (Test-Path $joiner)) { throw 'Hosted probe or Joiner executable missing' }
+          $probeHash = (Get-FileHash $probe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $joinerHash = (Get-FileHash $joiner -Algorithm SHA256).Hash.ToLowerInvariant()
           Write-Host "HOSTED_RUNNER=github-windows-2022"
-          Write-Host "PROBE_SHA256=$hash"
+          Write-Host "PROBE_SHA256=$probeHash"
+          Write-Host "Q6PD_JOINER_SHA256=$joinerHash"
 
       - name: Connect from the hosted runner using the pinned Seed Noise key
         shell: pwsh
@@ -71,8 +75,36 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Hosted cross-host pinned Seed probe failed' }
           if (-not (Select-String -Path $log -Pattern '^PINNED_NOISE_XX=PASS$')) { throw 'Pinned Noise handshake evidence missing' }
           if (-not (Select-String -Path $log -Pattern '^Q6HI_Q6HR=PASS$')) { throw 'Seed Q6HI/Q6HR response validation missing' }
+          $joiner = '.\target\release\qfp6_public_q6pd_joiner.exe'
+          & $joiner --host heymed.tail2a756d.ts.net --port 443 --network-id-hex 633b5dfc16fb2ec1825baf924ae7f7f16bf2006f8b64441a57692a3531722712 --profile-id-hex a0a057d72c11253386bfe90d428bccbc44ebc86fc84e04e3682193a99d8805c4 --remote-noise-key-hex 9899d6d17d1659df8befcca2bf3ebe19ebe106a8c3d9bd0a4f06d141db3af508 --session-seconds 72 2>&1 | Tee-Object -FilePath $log -Append
+          if ($LASTEXITCODE -ne 0) { throw 'Hosted Q6PD Joiner signed-record and persistent-session test failed' }
+          if (-not (Select-String -Path $log -Pattern '^Q6PD_SIGNED_RECORD_PULL=PASS
+
+      - name: Upload non-secret probe evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: qfp6-cp0849-hosted-joiner-evidence
+          path: ${{ runner.temp }}/qfp6-hosted-seed-probe.log
+          if-no-files-found: ignore
+          retention-days: 7
+)) { throw 'Accepted signed Q6PD inventory evidence missing' }
+          if (-not (Select-String -Path $log -Pattern '^QFP6_Q6PD_SESSION_ACTIVE endpoint=')) { throw 'Q6PD persistent session did not become active' }
+          if (-not (Select-String -Path $log -Pattern '^QFP6_Q6PD_SESSION_HEALTHY endpoint=.*heartbeats=6')) { throw 'Six confirmed Q6PD heartbeats were not observed' }
+          if (-not (Select-String -Path $log -Pattern '^Q6PD_JOINER_WORKER_STOPPED=PASS
+
+      - name: Upload non-secret probe evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: qfp6-cp0849-hosted-seed-probe
+          path: ${{ runner.temp }}/qfp6-hosted-seed-probe.log
+          if-no-files-found: ignore
+          retention-days: 7
+)) { throw 'Q6PD Joiner worker did not shut down cleanly' }
           Write-Host 'HOSTED_CROSS_HOST_SEED_PROBE=PASS'
-          Write-Host 'SCOPE_LIMIT=TRANSPORT_AND_SEED_STATUS_ONLY_NOT_Q6PD_GOSSIP_OR_A_FULL_JOINER_NODE'
+          Write-Host 'HOSTED_CROSS_HOST_Q6PD_JOINER=PASS'
+          Write-Host 'SCOPE_LIMIT=SIGNED_Q6PD_INVENTORY_PULL_AND_72S_PERSISTENT_HEARTBEAT_NOT_A_FULL_CHAIN_OR_CONSENSUS_NODE'
 
       - name: Upload non-secret probe evidence
         if: always()
