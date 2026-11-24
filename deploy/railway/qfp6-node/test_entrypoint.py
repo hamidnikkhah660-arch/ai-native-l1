@@ -131,5 +131,6 @@ class TrustedManifestAnchorEnvironmentTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     ENTRYPOINT.trusted_manifest_floor_from_env()
 
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
