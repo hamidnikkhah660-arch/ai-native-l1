@@ -82,7 +82,7 @@ jobs:
           if (-not (Select-String -Path $log -Pattern '^Q6HI_Q6HR=PASS$')) { throw 'Seed Q6HI/Q6HR response validation missing' }
 
           $joiner = '.\target\release\qfp6_public_q6pd_joiner.exe'
-          & $joiner --host heymed.tail2a756d.ts.net --port 443 --network-id-hex 633b5dfc16fb2ec1825baf924ae7f7f16bf2006f8b64441a57692a3531722712 --profile-id-hex a0a057d72c11253386bfe90d428bccbc44ebc86fc84e04e3682193a99d8805c4 --remote-noise-key-hex 9899d6d17d1659df8befcca2bf3ebe19ebe106a8c3d9bd0a4f06d141db3af508 --session-seconds 72 2>&1 | Tee-Object -FilePath $log -Append
+          & $joiner --host heymed.tail2a756d.ts.net --port 8443 --network-id-hex 633b5dfc16fb2ec1825baf924ae7f7f16bf2006f8b64441a57692a3531722712 --profile-id-hex a0a057d72c11253386bfe90d428bccbc44ebc86fc84e04e3682193a99d8805c4 --remote-noise-key-hex 9899d6d17d1659df8befcca2bf3ebe19ebe106a8c3d9bd0a4f06d141db3af508 --session-seconds 72 2>&1 | Tee-Object -FilePath $log -Append
           if ($LASTEXITCODE -ne 0) { throw 'Hosted Q6PD Joiner signed-record and persistent-session test failed' }
           if (-not (Select-String -Path $log -Pattern '^Q6PD_SIGNED_RECORD_PULL=PASS$')) { throw 'Accepted signed Q6PD inventory evidence missing' }
           if (-not (Select-String -Path $log -Pattern '^QFP6_Q6PD_SESSION_ACTIVE endpoint=')) { throw 'Q6PD persistent session did not become active' }
