@@ -168,7 +168,10 @@ def main() -> int:
     if normalized_a != normalized_b:
         print("RESULT=PE_CONTENT_DIFFERENT_AFTER_METADATA_NORMALIZATION")
         return 1
-    print("RESULT=PE_CONTENT_IDENTICAL_AFTER_BUILD_METADATA_NORMALIZATION")
+    if stats_a["original_sha256"] == stats_b["original_sha256"]:
+        print("RESULT=WHOLE_FILE_IDENTICAL_ACROSS_TWO_HOSTED_WINDOWS_BUILDS")
+    else:
+        print("RESULT=PE_CONTENT_IDENTICAL_AFTER_BUILD_METADATA_NORMALIZATION")
     return 0
 
 
