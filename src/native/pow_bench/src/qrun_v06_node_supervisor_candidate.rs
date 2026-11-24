@@ -2559,7 +2559,10 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
                                 max_blocks_per_page: 16,
                                 max_bytes_per_page: 4 * 1024 * 1024,
                                 max_pages: 2,
-                                max_rounds: 1,
+                                // Keep each Noise session small, but resume the exact pinned
+                                // source snapshot across bounded reconnect windows. The verified
+                                // session manager is transitioned for every reconnect below.
+                                max_rounds: 64,
                             };
                             let sync_result = if let (Some(manager), Some((book, _, _, _))) =
                                 (peer_connection_manager.as_mut(), q6ar_candidate.as_mut())
@@ -2588,6 +2591,7 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
                                     }
 
                                 let mut verification_callback_invoked = false;
+                                let mut verified_session_count = 0u32;
                                 let result = crate::qrun_v06_history_sync_service_candidate::sync_history_from_pinned_peer_with_verified_session_callback(
                                         peer.address,
                                         local_static_private_key,
@@ -2601,6 +2605,30 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
                                             verification_callback_invoked = true;
                                             let verified_at_ms =
                                                 system_now_ms().map_err(|error| error.to_string())?;
+                                            // The history client deliberately reconnects between
+                                            // bounded page windows while retaining the same
+                                            // authenticated source snapshot and branch cursor.
+                                            // Mirror each real stream lifetime in the peer manager:
+                                            // close the previous verified session, reserve the same
+                                            // operator-pinned endpoint again, then verify this exact
+                                            // new Noise session before any page is accepted.
+                                            if verified_session_count > 0 {
+                                                manager
+                                                    .mark_disconnected(
+                                                        book,
+                                                        peer.address,
+                                                        verified_at_ms,
+                                                        false,
+                                                    )
+                                                    .map_err(|error| error.to_string())?;
+                                                manager
+                                                    .reserve_operator_approved_endpoint(
+                                                        book,
+                                                        peer.address,
+                                                        verified_at_ms,
+                                                    )
+                                                    .map_err(|error| error.to_string())?;
+                                            }
                                             manager
                                                 .complete_outbound_handshake(
                                                     book,
@@ -2608,7 +2636,11 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
                                                     noise_session,
                                                     verified_at_ms,
                                                 )
-                                                .map_err(|error| error.to_string())
+                                                .map_err(|error| error.to_string())?;
+                                            verified_session_count = verified_session_count
+                                                .checked_add(1)
+                                                .ok_or_else(|| "verified session counter overflow".to_string())?;
+                                            Ok(())
                                         },
                                     );
 
