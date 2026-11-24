@@ -105,6 +105,7 @@ pub enum QRunV06PeerListenerStopReason {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QRunV06PeerListenerStats {
     pub accepted_connections: usize,
+    /// Completed Noise handshakes; permissionless mode does not authenticate operator identity.
     pub authenticated_sessions: usize,
     pub rejected_handshakes: usize,
     pub requests_received: usize,
@@ -382,6 +383,143 @@ where
     Ok(QRunV06PeerListenerReport { stats, stop_reason })
 }
 
+/// Run a bounded permissionless Noise XX listener over a caller-bound TCP listener.
+///
+/// Unlike serve_qfp6_noise_listener, this mode does not require a per-operator
+/// static-key allowlist and does not restrict the supplied bind address. The caller
+/// may bind a public interface. It is only a transport/admission candidate:
+/// Noise XX without an independently authenticated peer identity is MITM/key-substitution
+/// susceptible. Never trust peer-provided state or use the transport key as operator
+/// authorization. The callback MUST perform canonical transaction/block validation and
+/// the configured independent checkpoint/QAP1 admission before returning Accepted.
+///
+/// Resource bounds remain finite: one active session, bounded sessions/requests/failed
+/// handshakes, bounded Noise records, and an explicit shutdown flag.
+pub fn serve_qfp6_permissionless_noise_listener<F>(
+    listener: &TcpListener,
+    config: QRunV06PeerListenerConfig,
+    local_static_private_key: &[u8; 32],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+    shutdown: &AtomicBool,
+    mut on_q6pb: F,
+) -> Result<QRunV06PeerListenerReport, QRunV06PeerListenerError>
+where
+    F: FnMut(
+        &mut QRunV06PeerReplayGuard,
+        &[u8],
+    ) -> Result<[u8; QRUN_V06_PEER_ADMISSION_RESPONSE_BYTES], String>,
+{
+    config.validate()?;
+    if local_static_private_key.iter().all(|byte| *byte == 0)
+        || network_id.iter().all(|byte| *byte == 0)
+        || profile_id.iter().all(|byte| *byte == 0)
+    {
+        return Err(QRunV06PeerListenerError::InvalidConfiguration);
+    }
+
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| QRunV06PeerListenerError::Io(error.to_string()))?;
+
+    let mut stats = QRunV06PeerListenerStats::default();
+    let stop_reason = loop {
+        if shutdown.load(Ordering::Acquire) {
+            break QRunV06PeerListenerStopReason::ShutdownRequested;
+        }
+        if stats.rejected_handshakes >= config.max_failed_handshakes {
+            break QRunV06PeerListenerStopReason::FailedHandshakeLimitReached;
+        }
+        if stats.accepted_connections >= config.max_sessions {
+            break QRunV06PeerListenerStopReason::SessionLimitReached;
+        }
+
+        let (mut stream, _) = match listener.accept() {
+            Ok(connection) => connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(config.accept_poll_interval);
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(QRunV06PeerListenerError::Io(error.to_string())),
+        };
+        stats.accepted_connections += 1;
+        if let Err(error) = stream.set_nodelay(true) {
+            stats.handler_failures += 1;
+            drop(stream);
+            let _ = error;
+            continue;
+        }
+
+        let mut noise = match QRunV06NoiseSession::accept_permissionless(
+            &mut stream,
+            local_static_private_key,
+            network_id,
+            profile_id,
+        ) {
+            Ok(session) => session,
+            Err(_error) => {
+                stats.rejected_handshakes += 1;
+                drop(stream);
+                continue;
+            }
+        };
+        // Counts a completed encrypted Noise session, not an authenticated operator identity.
+        stats.authenticated_sessions += 1;
+        let mut replay_guard = QRunV06PeerReplayGuard::new();
+
+        for _ in 0..config.max_requests_per_session {
+            if shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            let frame = match noise.read_record(&mut stream) {
+                Ok(frame) => frame,
+                Err(QRunV06NoiseError::RecordTimeout)
+                | Err(QRunV06NoiseError::Io(_))
+                | Err(QRunV06NoiseError::MalformedRecord)
+                | Err(QRunV06NoiseError::RecordAuthentication)
+                | Err(QRunV06NoiseError::RecordTooLarge(_)) => break,
+                Err(QRunV06NoiseError::HandshakeTimeout)
+                | Err(QRunV06NoiseError::Handshake(_))
+                | Err(QRunV06NoiseError::MalformedHandshake)
+                | Err(QRunV06NoiseError::UntrustedPeer)
+                | Err(QRunV06NoiseError::InvalidNetworkOrProfile)
+                | Err(QRunV06NoiseError::InvalidPrivateKey)
+                | Err(QRunV06NoiseError::EmptyTrustSet)
+                | Err(QRunV06NoiseError::OversizedTrustSet)
+                | Err(QRunV06NoiseError::DuplicateTrustedKey) => break,
+            };
+            let request = match decode_qrun_v06_peer_block_request(&frame) {
+                Ok(request) => request,
+                Err(_) => {
+                    stats.handler_failures += 1;
+                    break;
+                }
+            };
+            stats.requests_received += 1;
+            let response = match on_q6pb(&mut replay_guard, &frame) {
+                Ok(response) => response,
+                Err(_) => {
+                    stats.handler_failures += 1;
+                    break;
+                }
+            };
+            if !validate_q6pa_response(&response, request.request_id) {
+                stats.malformed_responses += 1;
+                break;
+            }
+            if noise.write_record(&mut stream, &response).is_err() {
+                stats.handler_failures += 1;
+                break;
+            }
+            stats.responses_written += 1;
+        }
+        stats.sessions_closed += 1;
+    };
+
+    Ok(QRunV06PeerListenerReport { stats, stop_reason })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -603,6 +741,68 @@ mod tests {
             QRunV06PeerListenerStopReason::FailedHandshakeLimitReached
         );
         let _ = pinned_client_private;
+    }
+
+    #[test]
+    fn qfp6_permissionless_listener_accepts_unknown_peer_without_operator_pin() {
+        let (server_private, _server_public) = keypair();
+        let (client_private, _client_public) = keypair();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = AtomicBool::new(false);
+        let server = thread::spawn(move || {
+            let mut handler = |guard: &mut QRunV06PeerReplayGuard, frame: &[u8]| {
+                let request = decode_qrun_v06_peer_block_request(frame).unwrap();
+                let status = if guard.accept(request.request_id).is_ok() {
+                    QRunV06PeerAdmissionStatus::Accepted as u16
+                } else {
+                    QRunV06PeerAdmissionStatus::Rejected as u16
+                };
+                Ok(make_response(request.request_id, status))
+            };
+            serve_qfp6_permissionless_noise_listener(
+                &listener,
+                QRunV06PeerListenerConfig {
+                    max_sessions: 1,
+                    max_requests_per_session: 1,
+                    max_failed_handshakes: 1,
+                    accept_poll_interval: Duration::from_millis(10),
+                },
+                &server_private,
+                &NETWORK,
+                &PROFILE,
+                &shutdown,
+                &mut handler,
+            )
+            .unwrap()
+        });
+
+        let mut stream = connect_until(address);
+        let mut noise = QRunV06NoiseSession::connect_permissionless(
+            &mut stream,
+            &client_private,
+            &NETWORK,
+            &PROFILE,
+        )
+        .unwrap();
+        let frame = encode_qrun_v06_peer_block_request(7, b"permissionless-listener").unwrap();
+        noise.write_q6pb_request(&mut stream, &frame).unwrap();
+        let response = noise.read_q6pa_response(&mut stream, 7).unwrap();
+        assert_eq!(
+            u16::from_be_bytes([response[6], response[7]]),
+            QRunV06PeerAdmissionStatus::Accepted as u16
+        );
+
+        let report = server.join().unwrap();
+        assert_eq!(
+            report.stop_reason,
+            QRunV06PeerListenerStopReason::SessionLimitReached
+        );
+        assert_eq!(report.stats.accepted_connections, 1);
+        assert_eq!(report.stats.authenticated_sessions, 1);
+        assert_eq!(report.stats.requests_received, 1);
+        assert_eq!(report.stats.responses_written, 1);
+        assert_eq!(report.stats.sessions_closed, 1);
     }
 
     #[test]
