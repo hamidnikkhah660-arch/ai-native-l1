@@ -74,6 +74,8 @@ def trusted_manifest_floor_from_env() -> tuple[int, str] | None:
         raise RuntimeError(
             "QFP6_TRUSTED_MANIFEST_FLOOR_GENERATION must be canonical unsigned decimal"
         )
+    if len(generation_text) > 20:
+        raise RuntimeError("QFP6_TRUSTED_MANIFEST_FLOOR_GENERATION exceeds u64")
     generation = int(generation_text)
     if generation > (1 << 64) - 1:
         raise RuntimeError("QFP6_TRUSTED_MANIFEST_FLOOR_GENERATION exceeds u64")
@@ -84,6 +86,7 @@ def trusted_manifest_floor_from_env() -> tuple[int, str] | None:
     if anchor == "0" * 64:
         raise RuntimeError("QFP6_TRUSTED_MANIFEST_FLOOR_ANCHOR must not be zero")
     return generation, anchor
+
 
 def select_storage_layout(role: str) -> str:
     """Preserve an existing v3/v4 data layout; refuse ambiguous mixed layouts."""
