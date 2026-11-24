@@ -4407,6 +4407,8 @@ mod manifest_anchor_tests {
         write_vault_record(&vault, 1, network, profile, 0, anchor, [0; 32]);
         let cfg = json!({
             "trusted_manifest_anchor": hex(&anchor),
+            "trusted_manifest_floor_generation": 0,
+            "trusted_manifest_floor_anchor": hex(&anchor),
             "trusted_manifest_anchor_vault_path": vault.to_string_lossy().to_string()
         });
         assert_eq!(
@@ -4492,6 +4494,8 @@ mod manifest_anchor_tests {
         write_vault_record(&vault, 2, network, profile, 1, anchor, [0x99; 32]);
         let cfg = json!({
             "trusted_manifest_anchor": hex(&[0x11; 32]),
+            "trusted_manifest_floor_generation": 0,
+            "trusted_manifest_floor_anchor": hex(&[0x11; 32]),
             "trusted_manifest_anchor_vault_path": vault.to_string_lossy().to_string()
         });
         assert_ne!(first_digest, [0x99; 32]);
@@ -4563,12 +4567,89 @@ mod manifest_anchor_tests {
         write_vault_record(&vault, 1, network, profile, 0, root_anchor, [0; 32]);
         let cfg = json!({
             "trusted_manifest_anchor": hex(&root_anchor),
+            "trusted_manifest_floor_generation": 0,
+            "trusted_manifest_floor_anchor": hex(&root_anchor),
             "trusted_manifest_anchor_vault_path": vault.to_string_lossy().to_string()
         });
         assert_eq!(
             trusted_manifest_anchor(&cfg, &dir, &network, &profile).unwrap(),
             Some((0, root_anchor))
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn external_manifest_floor_rejects_a_locally_valid_vault_rolled_back_below_floor() {
+        let dir = test_dir();
+        let network = [0x22; 32];
+        let profile = [0x33; 32];
+        let manifests = dir.join("manifests");
+        fs::create_dir_all(&manifests).unwrap();
+        fs::write(
+            manifests.join("qfp6-manifest-00000000000000000000.q6mf"),
+            b"fixture",
+        )
+        .unwrap();
+
+        let vault = dir.join("vault");
+        let root_anchor = [0x11; 32];
+        write_vault_record(&vault, 1, network, profile, 0, root_anchor, [0; 32]);
+        let cfg = json!({
+            "trusted_manifest_anchor": hex(&root_anchor),
+            "trusted_manifest_floor_generation": 1,
+            "trusted_manifest_floor_anchor": hex(&[0x22; 32]),
+            "trusted_manifest_anchor_vault_path": vault.to_string_lossy().to_string()
+        });
+        assert!(trusted_manifest_anchor(&cfg, &dir, &network, &profile).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn external_manifest_floor_rejects_wrong_anchor_at_pinned_generation() {
+        let dir = test_dir();
+        let network = [0x22; 32];
+        let profile = [0x33; 32];
+        let manifests = dir.join("manifests");
+        fs::create_dir_all(&manifests).unwrap();
+        fs::write(
+            manifests.join("qfp6-manifest-00000000000000000000.q6mf"),
+            b"fixture",
+        )
+        .unwrap();
+
+        let vault = dir.join("vault");
+        let root_anchor = [0x11; 32];
+        write_vault_record(&vault, 1, network, profile, 0, root_anchor, [0; 32]);
+        let cfg = json!({
+            "trusted_manifest_anchor": hex(&root_anchor),
+            "trusted_manifest_floor_generation": 0,
+            "trusted_manifest_floor_anchor": hex(&[0x44; 32]),
+            "trusted_manifest_anchor_vault_path": vault.to_string_lossy().to_string()
+        });
+        assert!(trusted_manifest_anchor(&cfg, &dir, &network, &profile).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn existing_history_requires_external_floor_even_when_root_pin_is_present() {
+        let dir = test_dir();
+        let network = [0x22; 32];
+        let profile = [0x33; 32];
+        let manifests = dir.join("manifests");
+        fs::create_dir_all(&manifests).unwrap();
+        fs::write(
+            manifests.join("qfp6-manifest-00000000000000000000.q6mf"),
+            b"fixture",
+        )
+        .unwrap();
+        let vault = dir.join("vault");
+        let root_anchor = [0x11; 32];
+        write_vault_record(&vault, 1, network, profile, 0, root_anchor, [0; 32]);
+        let cfg = json!({
+            "trusted_manifest_anchor": hex(&root_anchor),
+            "trusted_manifest_anchor_vault_path": vault.to_string_lossy().to_string()
+        });
+        assert!(trusted_manifest_anchor(&cfg, &dir, &network, &profile).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4624,7 +4705,9 @@ mod manifest_anchor_tests {
         let checkpoint_cfg = json!({
             "node_role": "joining",
             "trusted_manifest_anchor": hex(&anchor),
-            "trusted_manifest_anchor_vault_path": vault_path.to_string_lossy().to_string()
+            "trusted_manifest_floor_generation": 0,
+            "trusted_manifest_floor_anchor": hex(&anchor),
+            "trusted_manifest_anchor_vault_path": vault_path.to_string_lossy().to_string
         });
         assert_eq!(
             trusted_manifest_anchor(&checkpoint_cfg, &dir, &network, &profile).unwrap(),
