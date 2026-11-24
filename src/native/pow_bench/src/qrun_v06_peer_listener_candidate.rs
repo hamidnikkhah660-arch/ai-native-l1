@@ -2294,6 +2294,142 @@ mod tests {
     }
 
     #[test]
+    fn nat_only_q6pd_session_uses_separate_unverified_slot_without_public_record() {
+        use crate::qrun_v06_q6pd_session_candidate::{
+            active_q6pd_nat_only_session_count, active_q6pd_persistent_session_count,
+            decode_q6pd_nat_only_session_ack, decode_q6pd_session_open,
+            decode_q6pd_session_pong, encode_q6pd_nat_only_session_open,
+            encode_q6pd_session_open_ack, encode_q6pd_session_ping, Q6pdSessionControl,
+        };
+
+        let (server_private, server_public) = keypair();
+        let (client_private, _client_public) = keypair();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = AtomicBool::new(false);
+        let mut config = QRunV06PeerListenerConfig::default();
+        config.max_sessions = 1;
+        config.max_requests_per_session = 2;
+
+        let server = thread::spawn(move || {
+            serve_qfp6_noise_listener_with_history_and_q6ar_relay_pins(
+                &listener,
+                config,
+                &server_private,
+                &[],
+                &[],
+                &NETWORK,
+                &PROFILE,
+                &shutdown,
+                |_received| Ok(()),
+                |_guard, frame| {
+                    let open = decode_q6pd_session_open(frame, &NETWORK, &PROFILE)
+                        .map_err(|error| error.to_string())?;
+                    Ok(vec![encode_q6pd_session_open_ack(&open, true)])
+                },
+            )
+            .unwrap()
+        });
+
+        let mut stream = connect_until(address);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut noise = QRunV06NoiseSession::connect(
+            &mut stream,
+            &client_private,
+            &server_public,
+            &NETWORK,
+            &PROFILE,
+        )
+        .unwrap();
+
+        // The first control explicitly requests an unverified, short-lived NAT-only slot.
+        // No signed Q6PD record, advertised endpoint or peer-store mutation is sent.
+        let opt_in = Q6pdSessionControl {
+            request_id: 10,
+            network_id: NETWORK,
+            profile_id: PROFILE,
+        };
+        noise
+            .write_record(&mut stream, &encode_q6pd_nat_only_session_open(&opt_in))
+            .unwrap();
+        let opt_in_ack = noise.read_record(&mut stream).unwrap();
+        assert_eq!(
+            decode_q6pd_nat_only_session_ack(&opt_in_ack, &opt_in),
+            Ok(true)
+        );
+
+        let open = Q6pdSessionControl {
+            request_id: 11,
+            network_id: NETWORK,
+            profile_id: PROFILE,
+        };
+        noise
+            .write_record(
+                &mut stream,
+                &crate::qrun_v06_q6pd_session_candidate::encode_q6pd_session_open(&open),
+            )
+            .unwrap();
+        let open_ack = noise.read_record(&mut stream).unwrap();
+        assert_eq!(
+            crate::qrun_v06_q6pd_session_candidate::decode_q6pd_session_open_ack(
+                &open_ack, &open
+            ),
+            Ok(true)
+        );
+
+        let report = server.join().unwrap();
+        assert_eq!(
+            report.stop_reason,
+            QRunV06PeerListenerStopReason::SessionLimitReached
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while active_q6pd_nat_only_session_count() != 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(active_q6pd_nat_only_session_count(), 1);
+        assert_eq!(active_q6pd_persistent_session_count(), 0);
+
+        for request_id in 12..=14 {
+            let ping = Q6pdSessionControl {
+                request_id,
+                network_id: NETWORK,
+                profile_id: PROFILE,
+            };
+            noise
+                .write_record(&mut stream, &encode_q6pd_session_ping(&ping))
+                .unwrap();
+            let pong = noise.read_record(&mut stream).unwrap();
+            assert_eq!(decode_q6pd_session_pong(&pong, &ping), Ok(()));
+        }
+
+        let close = Q6pdSessionControl {
+            request_id: 15,
+            network_id: NETWORK,
+            profile_id: PROFILE,
+        };
+        noise
+            .write_record(
+                &mut stream,
+                &crate::qrun_v06_q6pd_session_candidate::encode_q6pd_session_close(&close),
+            )
+            .unwrap();
+        drop(noise);
+        drop(stream);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while active_q6pd_nat_only_session_count() != 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(active_q6pd_nat_only_session_count(), 0);
+        assert_eq!(active_q6pd_persistent_session_count(), 0);
+    }
+
+    #[test]
     fn application_session_has_absolute_lifetime_and_per_record_read_budget() {
         let now = Instant::now();
         let long_session_deadline = now + Duration::from_secs(60);
