@@ -95,6 +95,24 @@ A backup is not complete until all of the following evidence exists:
 8. **Operator drill:** run against synthetic test data first; then request explicit approval for any live read/snapshot operation that may affect resource use.
 9. **Deployment gate:** only after independent review, passing CI, verified trust-anchor provisioning, and a separate explicit deployment approval.
 
+
+## Repository lineage update (2026-11-24)
+
+The more advanced QFP6/QAP1 candidate is in [PR #135](https://github.com/hamidnikkhah660-arch/ai-native-l1/pull/135), branch `feat/qzxb-usdt-trading-gate-20261104`, exact head `22d39246bb7d5bce382789da1f0252755db99540`.
+
+Verified evidence:
+- Exact-head CI run `42579272907` completed successfully: Format/check/test, Windows PMT4/TXN4 two-node loopback, and EVM/wallet/dependency audit all passed.
+- Cross-host private-overlay QFP6/QAP1 candidate run `42205440686` completed successfully on its exact tested commit `30bd6a19da87a991b51feed4a7a76aebf1895bff`. The test used the owner's Windows host and an ephemeral GitHub-hosted Windows runner, with Node B restart continuity and cleanup.
+- The branch contains QFP6 runtime, QAP1 coordinator, QFP6 peer-listener and Noise transport candidate modules, plus the cross-host controller/runner and evidence.
+
+Important limitation:
+- The QFP6 runtime and peer-listener files explicitly identify themselves as candidate/library seams, not a production node executable. The CP-0566 qualification design says a dedicated executable that owns the full QFP6/QAP1 lifecycle is still missing.
+- The feature branch has no Railway Dockerfile/entrypoint or dedicated `qrun_v06` node binary. Therefore its successful private-overlay test is not a deployed public P2P network.
+- PR #135 remains open and Draft. No merge or deployment has occurred.
+- The interim Railway environment bridge in PR #210 was superseded and closed without merging. Do not merge or deploy that older-runtime patch by itself.
+
+**Next engineering priority:** build a dedicated QFP6/QAP1 node executable that opens the verified durable QFP6 store, recovers QAP1 against independently pinned Provider/Q6EA services before binding the bounded authenticated peer listener, routes Q6PB through QAP1, and returns positive Q6PA only after durable finalization. Then add a deployment image and an operator-safe migration path for the existing v3/v4 Railway data directories. Public operation remains NO-GO until independent provider/anchor custody, public peer reachability, multi-operator testing, and restore drills are proven.
+
 ## Current gate decision
 
 **NO-GO for live backup/export and NO-GO for deployment at this stage.** The deployed QRun v0.6 process refuses startup because existing durable manifests are present but the independent `trusted_manifest_anchor` is not supplied. The current entrypoint does not supply it, and the local anchor vault is colocated on the same Railway volume as the node data. Do not solve this by deleting history, silently enabling fresh-Genesis mode, or weakening the gate.
