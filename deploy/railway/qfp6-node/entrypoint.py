@@ -55,6 +55,36 @@ def trusted_manifest_anchor_from_env() -> str | None:
     return value
 
 
+def trusted_manifest_floor_from_env() -> tuple[int, str] | None:
+    """Read an independently retained minimum generation/anchor checkpoint."""
+    generation_text = os.environ.get("QFP6_TRUSTED_MANIFEST_FLOOR_GENERATION", "").strip()
+    anchor = os.environ.get("QFP6_TRUSTED_MANIFEST_FLOOR_ANCHOR", "").strip()
+    if not generation_text and not anchor:
+        return None
+    if not generation_text or not anchor:
+        raise RuntimeError(
+            "QFP6_TRUSTED_MANIFEST_FLOOR_GENERATION and "
+            "QFP6_TRUSTED_MANIFEST_FLOOR_ANCHOR must be set together"
+        )
+    if (
+        not generation_text.isascii()
+        or not generation_text.isdigit()
+        or (len(generation_text) > 1 and generation_text.startswith("0"))
+    ):
+        raise RuntimeError(
+            "QFP6_TRUSTED_MANIFEST_FLOOR_GENERATION must be canonical unsigned decimal"
+        )
+    generation = int(generation_text)
+    if generation > (1 << 64) - 1:
+        raise RuntimeError("QFP6_TRUSTED_MANIFEST_FLOOR_GENERATION exceeds u64")
+    if len(anchor) != 64 or any(ch not in "0123456789abcdef" for ch in anchor):
+        raise RuntimeError(
+            "QFP6_TRUSTED_MANIFEST_FLOOR_ANCHOR must be exactly 64 lowercase hexadecimal characters"
+        )
+    if anchor == "0" * 64:
+        raise RuntimeError("QFP6_TRUSTED_MANIFEST_FLOOR_ANCHOR must not be zero")
+    return generation, anchor
+
 def select_storage_layout(role: str) -> str:
     """Preserve an existing v3/v4 data layout; refuse ambiguous mixed layouts."""
     existing_versions: list[str] = []
@@ -121,6 +151,11 @@ def build_config(role: str) -> tuple[dict, bytes]:
     # Validate this external pin before writing bootstrap/config files. Absence is
     # allowed for genuinely fresh Genesis state; existing history will fail closed.
     configured_root_anchor = trusted_manifest_anchor_from_env()
+    configured_floor = trusted_manifest_floor_from_env()
+    if (configured_root_anchor is None) != (configured_floor is None):
+        raise RuntimeError(
+            "QFP6_TRUSTED_MANIFEST_ANCHOR and the external manifest floor must be provisioned together"
+        )
 
     is_seed = role == "seed"
     is_relay = role == "relay"
@@ -210,8 +245,10 @@ def build_config(role: str) -> tuple[dict, bytes]:
         runtime["fresh_genesis_anchor_derivation_acknowledgement"] = (
             "VERIFIED_GENESIS_DERIVED_ANCHOR_ZERO_VALUE_TESTNET_ONLY"
         )
-    if configured_root_anchor is not None:
+    if configured_root_anchor is not None and configured_floor is not None:
         runtime["trusted_manifest_anchor"] = configured_root_anchor
+        runtime["trusted_manifest_floor_generation"] = configured_floor[0]
+        runtime["trusted_manifest_floor_anchor"] = configured_floor[1]
     if is_public:
         runtime["q6pd_self_advertise_endpoint"] = advertise_endpoint
 
