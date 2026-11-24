@@ -2450,7 +2450,7 @@ mod tests {
         let common_tip = source_runtime.status().unwrap().tip;
         assert_eq!(destination_runtime.status().unwrap().tip, common_tip);
 
-        // The branches diverge at height two: destination has one block, source has two.
+        // The branches diverge at height two; source builds a 70-block suffix.
         let local_mined = destination_mempool
             .mine_one_batch(
                 &mut destination_runtime,
@@ -2464,10 +2464,8 @@ mod tests {
             .unwrap();
         assert!(local_mined.became_canonical);
         let local_tip = destination_runtime.status().unwrap().tip;
-        for timestamp in [
-            first_branch_timestamp.saturating_add(60),
-            first_branch_timestamp.saturating_add(120),
-        ] {
+        for block_index in 1..=70u64 {
+            let timestamp = first_branch_timestamp.saturating_add(block_index.saturating_mul(60));
             let mined = source_mempool
                 .mine_one_batch(
                     &mut source_runtime,
@@ -2482,7 +2480,7 @@ mod tests {
             assert!(mined.became_canonical);
         }
         let source_status = source_runtime.status().unwrap();
-        assert_eq!(source_status.height, 3);
+        assert_eq!(source_status.height, 71);
         assert_ne!(source_status.tip, local_tip);
         let source_work = source_runtime
             .fork_choice_snapshot()
@@ -2530,13 +2528,13 @@ mod tests {
             )
         });
 
-        // One page per Noise session forces reconnect and cursor resume mid-source-chain.
+        // Two 16-block pages per session force bounded reconnects across a 70-block suffix.
         let sync_config = QRunV06HistorySyncClientConfig {
             connect_timeout: Duration::from_secs(3),
             io_timeout: Duration::from_secs(5),
-            max_blocks_per_page: 1,
+            max_blocks_per_page: 16,
             max_bytes_per_page: 1024 * 1024,
-            max_pages: 1,
+            max_pages: 2,
             max_rounds: 4,
         };
         let mut verified_session_callbacks = 0usize;
@@ -2586,9 +2584,9 @@ mod tests {
         shutdown.store(true, Ordering::Release);
         let server_report = server.join().unwrap().unwrap();
         assert!(server_report.stats.accepted_connections >= 3);
-        assert_eq!(sync_report.source_height, 3);
-        assert_eq!(sync_report.pages_imported, 3);
-        assert_eq!(sync_report.blocks_imported, 3);
+        assert_eq!(sync_report.source_height, 71);
+        assert_eq!(sync_report.pages_imported, 5);
+        assert_eq!(sync_report.blocks_imported, 70);
         assert!(sync_report.complete);
 
         let synchronized = destination_runtime.status().unwrap();
