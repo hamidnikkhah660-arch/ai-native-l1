@@ -473,8 +473,8 @@ impl QRunV06DurableForkStore {
         )
     }
     /// Open a Genesis-rooted store from a Q6PN bundle that was already checked against a
-    /// separately provisioned profile-pin commitment. The descriptor, Founder/tokenomics
-    /// identity, and active consensus parameters are cross-checked before any store I/O.
+    /// separately provisioned profile-pin commitment. The descriptor, selected monetary
+    /// policy identity (CP-0528 or CP-0437), and active consensus parameters are checked before store I/O.
     pub fn open_with_verified_profile_pin<A: TransactionAuthenticator>(
         directory: impl AsRef<Path>,
         genesis_state: QRunV06CanonicalExecutionState,
@@ -495,13 +495,22 @@ impl QRunV06DurableForkStore {
         {
             return Err(QRunV06ForkStoreError::ProfilePinMismatch);
         }
-        let tokenomics = genesis_state
-            .tokenomics()
-            .ok_or(QRunV06ForkStoreError::ProfilePinTokenomicsMismatch)?;
-        if tokenomics.founder_account() != descriptor.founder_account()
-            || tokenomics.policy_fingerprint() != descriptor.tokenomics_policy_fingerprint()
-        {
-            return Err(QRunV06ForkStoreError::ProfilePinTokenomicsMismatch);
+        match genesis_state.tokenomics() {
+            Some(tokenomics) => {
+                if tokenomics.founder_account() != descriptor.founder_account()
+                    || tokenomics.policy_fingerprint() != descriptor.tokenomics_policy_fingerprint()
+                {
+                    return Err(QRunV06ForkStoreError::ProfilePinTokenomicsMismatch);
+                }
+            }
+            None => {
+                if descriptor.tokenomics_policy_fingerprint()
+                    != crate::qrun_v06_canonical_execution_candidate::qrun_v06_full_supply_policy_fingerprint()
+                    || genesis_state.validate_consensus_parameters(&params).is_err()
+                {
+                    return Err(QRunV06ForkStoreError::ProfilePinTokenomicsMismatch);
+                }
+            }
         }
         Self::open_with_expected_genesis_descriptor_commitment(
             directory,
@@ -2394,6 +2403,21 @@ mod tests {
         genesis_state_for_founder(OWNER)
     }
 
+    fn cp0437_genesis_state(params: &ConsensusParameters) -> QRunV06CanonicalExecutionState {
+        let descriptor =
+            crate::qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor::new(
+                NETWORK,
+                PROFILE,
+                OWNER,
+                1,
+                crate::qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint(params)
+                    .unwrap(),
+                crate::qrun_v06_canonical_execution_candidate::qrun_v06_full_supply_policy_fingerprint(),
+            )
+            .unwrap();
+        QRunV06CanonicalExecutionState::cp0437_full_supply_genesis_candidate(descriptor).unwrap()
+    }
+
     fn cp0528_genesis_state() -> QRunV06CanonicalExecutionState {
         genesis_state_for_founder(OWNER)
     }
@@ -3611,6 +3635,102 @@ mod tests {
                 QRunV06ForkChoiceError::GenesisDescriptorMismatch
             ))
         ));
+    }
+
+    #[test]
+    fn cp0437_full_supply_genesis_survives_durable_store_submit_and_reopen() {
+        let mut params = params();
+        params.issuance = crate::issuance_schedule::IssuanceParameters::fee_only(
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS,
+        )
+        .unwrap();
+        let genesis = cp0437_genesis_state(&params);
+        let descriptor = *genesis.genesis_descriptor().unwrap();
+        let descriptor_commitment = descriptor.commitment();
+        let profile_bundle = QRunV06ProfilePinCandidate::new(
+            descriptor,
+            crate::external_cas_anchor_candidate::ExternalCasPin {
+                provider_id: [0x91; 32],
+                network_id: NETWORK,
+                genesis_digest: [0x92; 32],
+                receipt_key_id: [0x93; 32],
+                receipt_public_key: [0x94;
+                    crate::v4_fat1_trust_candidate::ML_DSA_65_PUBLIC_KEY_BYTES],
+            },
+        )
+        .unwrap();
+        let profile_bytes = profile_bundle.encode().unwrap();
+        let verified_profile_pin =
+            crate::qrun_v06_profile_pin_candidate::QRunV06VerifiedProfilePin::decode(
+                &profile_bytes,
+                profile_bundle.commitment().unwrap(),
+            )
+            .unwrap();
+        let auth = EmptyAuthenticator;
+        let directory = TestDir::new();
+        let mut store = QRunV06DurableForkStore::open_with_verified_profile_pin(
+            &directory.0,
+            genesis.clone(),
+            params.clone(),
+            &auth,
+            None,
+            &verified_profile_pin,
+        )
+        .unwrap();
+        assert_eq!(store.canonical_height().unwrap(), 0);
+        assert_eq!(
+            store
+                .graph()
+                .unwrap()
+                .canonical_state()
+                .unified()
+                .ledger()
+                .total_value()
+                .unwrap(),
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+        );
+        let parent = store.graph().unwrap().canonical_state().clone();
+        let parent_tip = store.graph().unwrap().base_tip();
+        let target = store
+            .graph()
+            .unwrap()
+            .expected_next_target(&parent_tip)
+            .unwrap();
+        let (envelope, _) = candidate(&parent, parent_tip, 100, target, &params);
+        store.submit(&envelope, &auth).unwrap();
+        assert_eq!(store.canonical_height().unwrap(), 1);
+        let expected_root = store.canonical_state_root().unwrap();
+        let manifest_anchor = store.manifest_anchor().unwrap();
+        drop(store);
+
+        let reopened = QRunV06DurableForkStore::open_with_expected_genesis_descriptor_commitment(
+            &directory.0,
+            genesis,
+            params,
+            &auth,
+            Some(manifest_anchor),
+            descriptor_commitment,
+        )
+        .unwrap();
+        assert_eq!(reopened.canonical_height().unwrap(), 1);
+        assert_eq!(reopened.canonical_state_root().unwrap(), expected_root);
+        assert_eq!(
+            reopened
+                .graph()
+                .unwrap()
+                .canonical_state()
+                .unified()
+                .ledger()
+                .total_value()
+                .unwrap(),
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+        );
+        assert!(reopened
+            .graph()
+            .unwrap()
+            .canonical_state()
+            .tokenomics()
+            .is_none());
     }
 
     #[test]

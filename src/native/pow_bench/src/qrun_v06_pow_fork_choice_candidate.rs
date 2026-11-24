@@ -411,7 +411,7 @@ impl QRunV06PowForkChoice {
         if params.protocol_version != 6 {
             return Err(QRunV06ForkChoiceError::InvalidConsensusProfile);
         }
-        if genesis_state.tokenomics().is_none()
+        if (genesis_state.tokenomics().is_none() && genesis_state.genesis_descriptor().is_none())
             || genesis_state
                 .validate_consensus_parameters(&params)
                 .is_err()
@@ -492,15 +492,12 @@ impl QRunV06PowForkChoice {
         }
         checkpoint.validate(&params)?;
         let base_state = checkpoint.execution_state().clone();
-        if base_state.tokenomics().is_none() {
+        if base_state.validate_consensus_parameters(&params).is_err() {
             return Err(QRunV06ForkChoiceError::InvalidConsensusProfile);
         }
         let descriptor = base_state
             .genesis_descriptor()
             .ok_or(QRunV06ForkChoiceError::MissingGenesisDescriptor)?;
-        if base_state.validate_consensus_parameters(&params).is_err() {
-            return Err(QRunV06ForkChoiceError::InvalidConsensusProfile);
-        }
         let base_history = TargetHistoryNode::from_checkpoint_entries(
             checkpoint.target_history(),
             checkpoint.height(),
@@ -1184,6 +1181,21 @@ mod tests {
         genesis_state_for_profile(PROFILE, params)
     }
 
+    fn cp0437_genesis_state(params: &ConsensusParameters) -> QRunV06CanonicalExecutionState {
+        let descriptor =
+            crate::qrun_v06_genesis_descriptor_candidate::QRunV06GenesisDescriptor::new(
+                NETWORK,
+                PROFILE,
+                ALICE,
+                1,
+                crate::qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint(params)
+                    .unwrap(),
+                crate::qrun_v06_canonical_execution_candidate::qrun_v06_full_supply_policy_fingerprint(),
+            )
+            .unwrap();
+        QRunV06CanonicalExecutionState::cp0437_full_supply_genesis_candidate(descriptor).unwrap()
+    }
+
     fn signed_transfer(amount: u64) -> QRunV06BlockOperation {
         let mut tx = Transaction {
             network_id: NETWORK,
@@ -1315,6 +1327,66 @@ mod tests {
             }
         }
         panic!("test quote-authorized PoW nonce search exhausted");
+    }
+
+    #[test]
+    fn cp0437_full_supply_runs_through_pow_fork_choice_and_checkpoint_restore() {
+        let mut params = params(2);
+        params.issuance =
+            IssuanceParameters::fee_only(crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS).unwrap();
+        let genesis = cp0437_genesis_state(&params);
+        let genesis_commitment = genesis.genesis_descriptor_commitment().unwrap();
+        let mut graph = QRunV06PowForkChoice::new_with_expected_genesis_descriptor_commitment(
+            genesis.clone(),
+            params.clone(),
+            genesis_commitment,
+        )
+        .unwrap();
+        let base = graph.base_tip();
+        let target = graph.expected_next_target(&base).unwrap();
+        let (block, tip) = make_candidate(&genesis, base, 100, target, Vec::new(), &params);
+        graph.insert_encoded(&block, &DigestAuthenticator).unwrap();
+        assert_eq!(graph.canonical_tip().height, 1);
+        assert_eq!(
+            graph
+                .canonical_state()
+                .unified()
+                .ledger()
+                .total_value()
+                .unwrap(),
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+        );
+        assert!(graph.canonical_state().tokenomics().is_none());
+
+        let checkpoint = graph.checkpoint_at_tip(&tip).unwrap();
+        let checkpoint_bytes = checkpoint.encode_snapshot().unwrap();
+        let checkpoint_anchor = checkpoint.commitment().unwrap();
+        let decoded = QRunV06CheckpointCandidate::decode_snapshot(
+            &checkpoint_bytes,
+            &params,
+            &NETWORK,
+            &PROFILE,
+            checkpoint_anchor,
+        )
+        .unwrap();
+        let resumed =
+            QRunV06PowForkChoice::from_checkpoint_with_expected_genesis_descriptor_commitment(
+                decoded,
+                params,
+                genesis_commitment,
+            )
+            .unwrap();
+        assert_eq!(resumed.base_height(), 1);
+        assert_eq!(resumed.canonical_tip().height, 1);
+        assert_eq!(
+            resumed
+                .canonical_state()
+                .unified()
+                .ledger()
+                .total_value()
+                .unwrap(),
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+        );
     }
 
     #[test]

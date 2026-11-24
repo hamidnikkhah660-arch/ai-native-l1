@@ -1,7 +1,8 @@
 //! Isolated QFP6 canonical block codec and deterministic execution candidate.
 //!
-//! QFP5/QFB5 encodings are untouched. QFB6 v4 commits CP-0528 issuance counters and signed category releases,
-//! the Founder Genesis policy and the mining-security reward schedule in the execution root.
+//! QFP5/QFB5 encodings are untouched. QFB6 v4 commits CP-0528 issuance counters and signed
+//! category releases when that profile is selected. The separate CP-0437 path commits a
+//! full-supply, fee-only Genesis descriptor with no CP-0528 tokenomics state or native subsidy.
 //! The candidate also executes native TXN2 transfers, signed AMM operations, signed asset
 //! registrations and issuer-admin operations in the canonical order carried by QFB6. The root is computed
 //! after per-block fee settlement and header advancement, then the tip is committed from
@@ -54,6 +55,18 @@ const QUOTE_ASSET_EXECUTION_PIN_BYTES: usize = 32 * 3 + 8 * 4;
 const QUOTE_ASSET_EXECUTION_PIN_DOMAIN: &[u8] = b"QRUN-V06-EXECUTION-QUOTE-ASSET-AUTH-PIN-V1\0";
 const MAX_NAME_BYTES: usize = 64;
 const MAX_SYMBOL_BYTES: usize = 16;
+const CP0437_FULL_SUPPLY_POLICY_DOMAIN: &[u8] = b"QRUN-V06-CP0437-FULL-SUPPLY-FEE-ONLY-V1\0";
+
+/// Fingerprint for the owner-directed CP-0437 policy: all 10B QZXB issued at Genesis,
+/// no post-Genesis subsidy, and no CP-0528 allocation buckets.
+pub fn qrun_v06_full_supply_policy_fingerprint() -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(CP0437_FULL_SUPPLY_POLICY_DOMAIN);
+    hash.update(crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS.to_be_bytes());
+    hash.update(0u128.to_be_bytes());
+    hash.update(1u64.to_be_bytes());
+    hash.finalize().into()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QRunV06ExecutionError {
@@ -366,6 +379,37 @@ impl QRunV06CanonicalExecutionState {
         Self::new_with_tokenomics(unified, profile_id, tokenomics)
     }
 
+    /// Construct the CP-0437 full-supply Genesis candidate from an immutable descriptor.
+    /// All 10B QZXB are credited once to the owner; tokenomics buckets and block subsidies
+    /// are absent. The descriptor must bind the CP-0437 policy fingerprint and selected
+    /// QFP6 consensus fingerprint. This remains a candidate until the node/replay path is wired.
+    pub fn cp0437_full_supply_genesis_candidate(
+        descriptor: QRunV06GenesisDescriptor,
+    ) -> Result<Self, QRunV06ExecutionError> {
+        let network_id = descriptor.network_id();
+        let profile_id = descriptor.profile_id();
+        let owner = descriptor.founder_account();
+        let policy_fingerprint = qrun_v06_full_supply_policy_fingerprint();
+        descriptor.validate_binding(
+            &network_id,
+            &profile_id,
+            &owner,
+            &descriptor.consensus_fingerprint(),
+            &policy_fingerprint,
+        )?;
+        let ledger = LedgerState::genesis_at(
+            network_id,
+            vec![(owner, crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS as u64)],
+            descriptor.genesis_timestamp(),
+        )?;
+        let amm = QzxbAmmStateCandidate::new(network_id, 32, 64, 512)?;
+        let unified = QRunV06UnifiedAssetState::new(ledger, amm)?;
+        let mut state = Self::new(unified, profile_id)?;
+        state.genesis_descriptor = Some(descriptor);
+        state.verify_invariants()?;
+        Ok(state)
+    }
+
     /// Construct a CP-0528 Genesis state from an immutable, profile-pinned descriptor.
     /// Unlike the legacy research fixture constructor, this path sets the Ledger Genesis
     /// timestamp and commits the descriptor into every canonical execution root.
@@ -501,7 +545,8 @@ impl QRunV06CanonicalExecutionState {
         Ok(())
     }
 
-    /// The active QFP6 consensus profile must use the same subsidy schedule as Q6TM.
+    /// Bind the execution state to its selected monetary policy: CP-0528's Q6TM schedule,
+    /// or CP-0437's full-supply Genesis with zero subsidy and the fixed 10B cap.
     pub fn validate_consensus_parameters(
         &self,
         params: &ConsensusParameters,
@@ -527,8 +572,24 @@ impl QRunV06CanonicalExecutionState {
                     &tokenomics.policy_fingerprint(),
                 )?;
             }
-        } else if self.genesis_descriptor.is_some() {
-            return Err(QRunV06ExecutionError::TokenomicsConsensusMismatch);
+        } else if let Some(descriptor) = &self.genesis_descriptor {
+            let expected_supply = crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS;
+            let consensus_fingerprint =
+                crate::qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint(params)
+                    .map_err(|_| QRunV06ExecutionError::TokenomicsConsensusMismatch)?;
+            if params.issuance.maximum_supply() != expected_supply
+                || params.issuance.initial_subsidy() != 0
+                || params.issuance.blocks_per_halving() != 1
+            {
+                return Err(QRunV06ExecutionError::TokenomicsConsensusMismatch);
+            }
+            descriptor.validate_binding(
+                &self.network_id(),
+                &self.profile_id,
+                &descriptor.founder_account(),
+                &consensus_fingerprint,
+                &qrun_v06_full_supply_policy_fingerprint(),
+            )?;
         }
         Ok(())
     }
@@ -567,8 +628,41 @@ impl QRunV06CanonicalExecutionState {
                     return Err(QRunV06ExecutionError::InvalidTimestamp);
                 }
             }
-        } else if self.genesis_descriptor.is_some() {
-            return Err(QRunV06ExecutionError::TokenomicsConsensusMismatch);
+        } else if let Some(descriptor) = &self.genesis_descriptor {
+            let expected_supply = crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS;
+            if self.unified.ledger().total_value()? != expected_supply {
+                return Err(QRunV06ExecutionError::TokenomicsConsensusMismatch);
+            }
+            let owner = descriptor.founder_account();
+            if self.height() == 0 {
+                let owner_balance = self
+                    .unified
+                    .ledger()
+                    .account(&owner)
+                    .map_or(0u128, |account| account.balance as u128);
+                if owner_balance != expected_supply
+                    || self
+                        .unified
+                        .ledger()
+                        .account_entries()
+                        .iter()
+                        .any(|(account, state)| *account != owner && state.balance != 0)
+                {
+                    return Err(QRunV06ExecutionError::TokenomicsGenesisRequiresEmptyLedger);
+                }
+                if self.last_timestamp() != descriptor.genesis_timestamp() {
+                    return Err(QRunV06ExecutionError::InvalidTimestamp);
+                }
+            } else if self.last_timestamp() <= descriptor.genesis_timestamp() {
+                return Err(QRunV06ExecutionError::InvalidTimestamp);
+            }
+            descriptor.validate_binding(
+                &self.network_id(),
+                &self.profile_id,
+                &owner,
+                &descriptor.consensus_fingerprint(),
+                &qrun_v06_full_supply_policy_fingerprint(),
+            )?;
         }
         if let Some(quote_authorization) = &self.quote_asset_authorization {
             quote_authorization.validate()?;
@@ -3944,6 +4038,69 @@ mod tests {
         assert_eq!(restored, state);
         assert_eq!(restored.state_root().unwrap(), state.state_root().unwrap());
         assert!(restored.tokenomics().is_some());
+    }
+
+    #[test]
+    fn cp0437_full_supply_genesis_is_fee_only_profile_bound_and_snapshot_replayable() {
+        let mut consensus = ConsensusParameters::qrun_v05_calibrated_candidate().unwrap();
+        consensus.protocol_version = 6;
+        consensus.issuance = crate::issuance_schedule::IssuanceParameters::fee_only(
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS,
+        )
+        .unwrap();
+        let policy = qrun_v06_full_supply_policy_fingerprint();
+        let descriptor = QRunV06GenesisDescriptor::new(
+            NETWORK,
+            PROFILE,
+            ALICE,
+            1_800_000_000,
+            crate::qrun_v06_checkpoint_candidate::qrun_v06_consensus_fingerprint(&consensus)
+                .unwrap(),
+            policy,
+        )
+        .unwrap();
+        let mut state =
+            QRunV06CanonicalExecutionState::cp0437_full_supply_genesis_candidate(descriptor)
+                .unwrap();
+        assert!(state.tokenomics().is_none());
+        assert_eq!(
+            state.unified().ledger().total_value().unwrap(),
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+        );
+        assert_eq!(
+            state.unified().ledger().account(&ALICE).unwrap().balance as u128,
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+        );
+        state.validate_consensus_parameters(&consensus).unwrap();
+
+        let snapshot = state.encode_snapshot().unwrap();
+        let restored =
+            QRunV06CanonicalExecutionState::decode_snapshot(&snapshot, &NETWORK, &PROFILE).unwrap();
+        assert_eq!(restored, state);
+        assert_eq!(restored.state_root().unwrap(), state.state_root().unwrap());
+
+        let mut block = block_for(&state, Vec::new());
+        block.state_root = state
+            .preview_state_root_after(&block, &DigestAuthenticator)
+            .unwrap();
+        let summary = state.apply_block(&block, &DigestAuthenticator).unwrap();
+        assert_eq!(summary.mining_reward_atoms, 0);
+        assert_eq!(
+            state.unified().ledger().total_value().unwrap(),
+            crate::state_machine::MAX_TOTAL_SUPPLY_ATOMS
+        );
+
+        let mut invalid_consensus = consensus.clone();
+        invalid_consensus.issuance = crate::issuance_schedule::IssuanceParameters::new(
+            invalid_consensus.issuance.maximum_supply(),
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            state.validate_consensus_parameters(&invalid_consensus),
+            Err(QRunV06ExecutionError::TokenomicsConsensusMismatch)
+        );
     }
 
     #[test]
