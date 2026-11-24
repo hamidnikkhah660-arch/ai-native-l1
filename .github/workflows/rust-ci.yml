@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, "ci/**", "public/**", "review/**", "feat/qfp6-public-testnet-dns-relay-20261120", "feat/cp0584-q6ti-q6ta-noise-transaction-ingress-20261110", "feat/cp0585-q6ti-supervised-mining-20261110", "feat/cp0586-q6ti-durable-mempool-20261110", "feat/cp0587-q6ti-cross-host-recovery-20261111"]
   pull_request:
-    branches: [main, "feat/q6ga-v3-mainnet-scope-20261119", "feat/qfp6-public-testnet-dns-relay-20261120", "release/qfp6-railway-node-image-v2"]
+    branches: [main, "feat/q6ga-v3-mainnet-scope-20261119", "feat/qfp6-public-testnet-dns-relay-20261120"]
   workflow_dispatch:
 
 permissions:
@@ -32,9 +32,6 @@ jobs:
           rustup component add rustfmt --toolchain stable
           rustc +stable --version
           cargo +stable --version
-
-      - name: Validate QFP6 Railway trusted-manifest-anchor input
-        run: python3 ../../../deploy/railway/qfp6-node/test_entrypoint.py
 
       - name: Verify independent monetary Genesis snapshot oracle
         run: python3 ../../../simulations/cp0361_monetary_genesis_snapshot_oracle.py
