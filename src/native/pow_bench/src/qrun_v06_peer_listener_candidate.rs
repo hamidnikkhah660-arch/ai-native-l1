@@ -30,11 +30,11 @@ use crate::{
     qrun_v06_permissionless_runtime_candidate::QRunV06PermissionlessNodeRuntime,
     qrun_v06_pow_fork_choice_candidate::QRunV06QuoteAssetAuthorizationProvider,
     qrun_v06_q6pd_session_candidate::{
-        decode_q6pd_nat_only_session_open, decode_q6pd_session_open,
-        decode_q6pd_session_open_ack, encode_q6pd_nat_only_session_ack,
-        encode_q6pd_session_open_ack, serve_q6pd_persistent_session,
-        try_reserve_q6pd_nat_only_session, try_reserve_q6pd_persistent_session,
-        Q6PD_NAT_ONLY_SESSION_OPEN_MAGIC, Q6PD_SESSION_OPEN_MAGIC,
+        decode_q6pd_nat_only_session_open, decode_q6pd_session_open, decode_q6pd_session_open_ack,
+        encode_q6pd_nat_only_session_ack, encode_q6pd_session_open_ack,
+        serve_q6pd_persistent_session, try_reserve_q6pd_nat_only_session,
+        try_reserve_q6pd_persistent_session, Q6PD_NAT_ONLY_SESSION_OPEN_MAGIC,
+        Q6PD_SESSION_OPEN_MAGIC,
     },
     qrun_v06_qap1_coordinator_candidate::{
         QRunV06Qap1AnchorTransport, QRunV06Qap1ExternalCoordinator,
@@ -1455,15 +1455,20 @@ where
             // NAT-only mode is explicitly unverified and has a separate two-socket pool.
             // The opt-in is transport-only; it creates no peer record and changes no trust.
             if frame.get(..4) == Some(&Q6PD_NAT_ONLY_SESSION_OPEN_MAGIC) {
-                let opt_in = match decode_q6pd_nat_only_session_open(&frame, network_id, profile_id) {
+                let opt_in = match decode_q6pd_nat_only_session_open(&frame, network_id, profile_id)
+                {
                     Ok(value) => value,
                     Err(error) => {
-                        eprintln!("QFP6_Q6PD_NAT_ONLY_OPT_IN_REJECTED source={peer_addr} error={error:?}");
+                        eprintln!(
+                            "QFP6_Q6PD_NAT_ONLY_OPT_IN_REJECTED source={peer_addr} error={error:?}"
+                        );
                         stats.handler_failures = stats.handler_failures.saturating_add(1);
                         break;
                     }
                 };
-                if q6pd_nat_only_session_authorized || replay_guard.accept(opt_in.request_id).is_err() {
+                if q6pd_nat_only_session_authorized
+                    || replay_guard.accept(opt_in.request_id).is_err()
+                {
                     let rejected = encode_q6pd_nat_only_session_ack(&opt_in, false);
                     if noise.write_record(&mut stream, &rejected).is_err() {
                         stats.handler_failures = stats.handler_failures.saturating_add(1);
@@ -1582,7 +1587,11 @@ where
                 stats.responses_written = stats.responses_written.saturating_add(1);
                 let worker_stream = stream;
                 let worker_noise = noise;
-                let session_mode = if nat_only { "nat-only-unverified" } else { "signed-peer" };
+                let session_mode = if nat_only {
+                    "nat-only-unverified"
+                } else {
+                    "signed-peer"
+                };
                 match thread::Builder::new()
                     .name("q6pd-persistent-session".into())
                     .spawn(move || {
@@ -2297,9 +2306,9 @@ mod tests {
     fn nat_only_q6pd_session_uses_separate_unverified_slot_without_public_record() {
         use crate::qrun_v06_q6pd_session_candidate::{
             active_q6pd_nat_only_session_count, active_q6pd_persistent_session_count,
-            decode_q6pd_nat_only_session_ack, decode_q6pd_session_open,
-            decode_q6pd_session_pong, encode_q6pd_nat_only_session_open,
-            encode_q6pd_session_open_ack, encode_q6pd_session_ping, Q6pdSessionControl,
+            decode_q6pd_nat_only_session_ack, decode_q6pd_session_open, decode_q6pd_session_pong,
+            encode_q6pd_nat_only_session_open, encode_q6pd_session_open_ack,
+            encode_q6pd_session_ping, Q6pdSessionControl,
         };
 
         let (server_private, server_public) = keypair();
@@ -2376,9 +2385,7 @@ mod tests {
             .unwrap();
         let open_ack = noise.read_record(&mut stream).unwrap();
         assert_eq!(
-            crate::qrun_v06_q6pd_session_candidate::decode_q6pd_session_open_ack(
-                &open_ack, &open
-            ),
+            crate::qrun_v06_q6pd_session_candidate::decode_q6pd_session_open_ack(&open_ack, &open),
             Ok(true)
         );
 
