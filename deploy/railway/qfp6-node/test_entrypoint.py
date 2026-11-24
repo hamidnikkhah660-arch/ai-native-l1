@@ -86,6 +86,50 @@ class TrustedManifestAnchorEnvironmentTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "must be a real directory"):
                     ENTRYPOINT.select_storage_layout("seed")
 
+    def test_external_floor_missing_is_unset(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("QFP6_TRUSTED_MANIFEST_FLOOR_GENERATION", None)
+            os.environ.pop("QFP6_TRUSTED_MANIFEST_FLOOR_ANCHOR", None)
+            self.assertIsNone(ENTRYPOINT.trusted_manifest_floor_from_env())
+
+    def test_external_floor_valid_pair_is_returned(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ["QFP6_TRUSTED_MANIFEST_FLOOR_GENERATION"] = "1024"
+            os.environ["QFP6_TRUSTED_MANIFEST_FLOOR_ANCHOR"] = "ab" * 32
+            self.assertEqual(
+                ENTRYPOINT.trusted_manifest_floor_from_env(),
+                (1024, "ab" * 32),
+            )
+
+    def test_external_floor_requires_both_variables(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("QFP6_TRUSTED_MANIFEST_FLOOR_ANCHOR", None)
+            os.environ["QFP6_TRUSTED_MANIFEST_FLOOR_GENERATION"] = "1"
+            with self.assertRaisesRegex(RuntimeError, "must be set together"):
+                ENTRYPOINT.trusted_manifest_floor_from_env()
+
+    def test_external_floor_generation_must_be_canonical_decimal(self) -> None:
+        for value in ("01", "-1", "+1", "1.0", "١"):
+            with self.subTest(value=value), patch.dict(os.environ, {}, clear=False):
+                os.environ["QFP6_TRUSTED_MANIFEST_FLOOR_GENERATION"] = value
+                os.environ["QFP6_TRUSTED_MANIFEST_FLOOR_ANCHOR"] = "ab" * 32
+                with self.assertRaisesRegex(RuntimeError, "canonical unsigned decimal"):
+                    ENTRYPOINT.trusted_manifest_floor_from_env()
+
+    def test_external_floor_generation_must_fit_u64(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ["QFP6_TRUSTED_MANIFEST_FLOOR_GENERATION"] = str(1 << 64)
+            os.environ["QFP6_TRUSTED_MANIFEST_FLOOR_ANCHOR"] = "ab" * 32
+            with self.assertRaisesRegex(RuntimeError, "exceeds u64"):
+                ENTRYPOINT.trusted_manifest_floor_from_env()
+
+    def test_external_floor_anchor_rejects_uppercase_and_zero(self) -> None:
+        for value in ("AB" * 32, "0" * 64, "g0" * 32):
+            with self.subTest(value=value), patch.dict(os.environ, {}, clear=False):
+                os.environ["QFP6_TRUSTED_MANIFEST_FLOOR_GENERATION"] = "0"
+                os.environ["QFP6_TRUSTED_MANIFEST_FLOOR_ANCHOR"] = value
+                with self.assertRaises(RuntimeError):
+                    ENTRYPOINT.trusted_manifest_floor_from_env()
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
