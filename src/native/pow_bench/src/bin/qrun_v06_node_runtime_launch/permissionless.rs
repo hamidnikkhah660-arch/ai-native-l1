@@ -1171,9 +1171,10 @@ fn trusted_manifest_floor(cfg: &Value) -> Result<(u64, [u8; 32]), String> {
     let anchor = parse_hex32("trusted_manifest_floor_anchor", anchor_text)?;
     Ok((generation, anchor))
 }
-/// Verify the full append-only vault chain on the separate local system volume.
-/// This detects D:-only rollback while the C: vault remains intact. It is not a TPM
-/// monotonic counter and cannot defeat full-machine/two-disk rollback.
+/// Verify the full append-only local vault chain and an externally pinned minimum floor.
+/// The external floor detects rollback below its pinned generation. The local vault alone
+/// cannot detect rollback of the vault and node data together, and the floor does not reject
+/// rollback to the pinned generation itself.
 fn validate_local_anchor_vault(
     cfg: &Value,
     expected_network_id: &[u8; 32],
