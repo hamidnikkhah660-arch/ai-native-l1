@@ -55,6 +55,35 @@ def trusted_manifest_anchor_from_env() -> str | None:
     return value
 
 
+def select_storage_layout(role: str) -> str:
+    """Preserve an existing v3/v4 data layout; refuse ambiguous mixed layouts."""
+    existing_versions: list[str] = []
+    for version in ("v3", "v4"):
+        paths = (
+            DATA / f"node-data-{role}-{version}",
+            DATA / f"mempool-{role}-{version}",
+            DATA / f"q6pd-{role}-{version}",
+            DATA / f"anchor-vault-{role}-{version}",
+        )
+        found = False
+        for path in paths:
+            if not os.path.lexists(path):
+                continue
+            if path.is_symlink() or not path.is_dir():
+                raise RuntimeError(
+                    f"QFP6 {version} storage path must be a real directory: {path.name}"
+                )
+            found = True
+        if found:
+            existing_versions.append(version)
+
+    if len(existing_versions) > 1:
+        raise RuntimeError(
+            f"ambiguous QFP6 storage layouts for {role}: v3 and v4 both exist; "
+            "refusing to ignore or combine durable history"
+        )
+    return existing_versions[0] if existing_versions else "v4"
+
 def resolve_public_proxy_endpoint(value: str) -> tuple[str, int]:
     host, separator, port_text = value.rpartition(":")
     if not separator or not host or not port_text.isdigit():
@@ -117,13 +146,13 @@ def build_config(role: str) -> tuple[dict, bytes]:
     BOOTSTRAP.write_bytes(bootstrap_bytes)
     bootstrap_sha = hashlib.sha256(bootstrap_bytes).hexdigest()
 
-    # Keep each logical node's durable state isolated. Versioned paths also
-    # prevent an interrupted, pre-listener validation attempt from poisoning the
-    # next clean Genesis bootstrap on the same persistent Railway volume.
-    node_data = DATA / f"node-data-{role}-v4"
-    mempool_data = DATA / f"mempool-{role}-v4"
-    q6pd_data = DATA / f"q6pd-{role}-v4"
-    anchor_vault = DATA / f"anchor-vault-{role}-v4"
+    # Preserve an existing v3 or v4 data layout across an image refresh. If
+    # both versions exist, refuse instead of silently switching away from history.
+    layout_version = select_storage_layout(role)
+    node_data = DATA / f"node-data-{role}-{layout_version}"
+    mempool_data = DATA / f"mempool-{role}-{layout_version}"
+    q6pd_data = DATA / f"q6pd-{role}-{layout_version}"
+    anchor_vault = DATA / f"anchor-vault-{role}-{layout_version}"
     node_data.mkdir(parents=True, exist_ok=True)
     mempool_data.mkdir(parents=True, exist_ok=True)
     q6pd_data.mkdir(parents=True, exist_ok=True)
