@@ -86,6 +86,16 @@ class TrustedManifestAnchorEnvironmentTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "must be a real directory"):
                     ENTRYPOINT.select_storage_layout("seed")
 
+    def test_symlink_storage_path_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target"
+            target.mkdir()
+            (root / "node-data-seed-v3").symlink_to(target)
+            with patch.object(ENTRYPOINT, "DATA", root):
+                with self.assertRaisesRegex(RuntimeError, "must be a real directory"):
+                    ENTRYPOINT.select_storage_layout("seed")
+
     def test_external_floor_missing_is_unset(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("QFP6_TRUSTED_MANIFEST_FLOOR_GENERATION", None)
