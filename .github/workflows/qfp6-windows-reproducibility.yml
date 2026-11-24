@@ -259,16 +259,16 @@ jobs:
           {
             echo '## QFP6 independent Windows Release build comparison'
             echo
-            echo "- Commit A: \`\${COMMIT_A:-missing}\`"
-            echo "- Commit B: \`\${COMMIT_B:-missing}\`"
-            echo "- Raw build A SHA-256: \`\${HASH_A:-missing}\` (size: \${SIZE_A:-missing})"
-            echo "- Raw build B SHA-256: \`\${HASH_B:-missing}\` (size: \${SIZE_B:-missing})"
-            echo "- Rust: \`\${RUSTC_A:-missing}\` / \`\${RUSTC_B:-missing}\`"
-            echo "- Cargo: \`\${CARGO_A:-missing}\` / \`\${CARGO_B:-missing}\`"
-            echo "- MSVC linker SHA-256: \`\${LINKER_A:-missing}\` / \`\${LINKER_B:-missing}\`"
-            echo "- MSVC librarian SHA-256: \`\${LIB_A:-missing}\` / \`\${LIB_B:-missing}\`"
-            echo "- Windows SDK: \`\${SDK_A:-missing}\` / \`\${SDK_B:-missing}\`"
-            echo "- Cargo.lock SHA-256: \`\${LOCK_A:-missing}\` / \`\${LOCK_B:-missing}\`"
+            echo "- Commit A: ${COMMIT_A:-missing}"
+            echo "- Commit B: ${COMMIT_B:-missing}"
+            echo "- Raw build A SHA-256: ${HASH_A:-missing} (size: ${SIZE_A:-missing})"
+            echo "- Raw build B SHA-256: ${HASH_B:-missing} (size: ${SIZE_B:-missing})"
+            echo "- Rust: ${RUSTC_A:-missing} / ${RUSTC_B:-missing}"
+            echo "- Cargo: ${CARGO_A:-missing} / ${CARGO_B:-missing}"
+            echo "- MSVC linker SHA-256: ${LINKER_A:-missing} / ${LINKER_B:-missing}"
+            echo "- MSVC librarian SHA-256: ${LIB_A:-missing} / ${LIB_B:-missing}"
+            echo "- Windows SDK: ${SDK_A:-missing} / ${SDK_B:-missing}"
+            echo "- Cargo.lock SHA-256: ${LOCK_A:-missing} / ${LOCK_B:-missing}"
             echo
           } >> "$GITHUB_STEP_SUMMARY"
 
