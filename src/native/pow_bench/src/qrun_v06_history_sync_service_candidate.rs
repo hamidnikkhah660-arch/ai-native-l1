@@ -2586,7 +2586,7 @@ mod tests {
         assert!(server_report.stats.accepted_connections >= 3);
         assert_eq!(sync_report.source_height, 71);
         assert_eq!(sync_report.pages_imported, 5);
-        assert_eq!(sync_report.blocks_imported, 70);
+        assert_eq!(sync_report.blocks_imported, 71);
         assert!(sync_report.complete);
 
         let synchronized = destination_runtime.status().unwrap();
