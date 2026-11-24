@@ -87,3 +87,20 @@ Workflow: https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/4532
 - Do not read, print, export, rotate, or copy service secrets or TPM-bound keys.
 - Do not add paid infrastructure or claim Railway is free; billing/credit state was not verified.
 - Next engineering item is a tested resumable sync cursor / retained-snapshot design, followed by a time-aligned consensus convergence harness.
+
+
+## 7. CP-0852 CI and live-staging recheck (2026-11-24)
+
+The follow-up implementation is committed on the Draft PR branch at `24cffd1a0235dd0a3c5eb8df88552278ef48cbb2`. GitHub Actions run [45324671074](https://github.com/hamidnikkhah660-arch/ai-native-l1/actions/runs/45324671074) completed successfully across all three jobs:
+
+- `cargo fmt --all -- --check`, `cargo check --all-targets`, and `cargo test --all-targets`: PASS.
+- Windows PMT4/TXN4 two-node loopback suite: PASS, including DPAPI offline trust provisioner, signed transaction submit/invalid-signature rejection/peer propagation/replay, and PFM4 paged archive sync with inter-page reorg and stale-cursor rejection.
+- EVM contract, wallet console, and dependency audit: PASS.
+
+This validates the source revision against the existing CI suite. It does not prove multi-round live synchronization or multi-operator consensus.
+
+A read-only Railway recheck found all three staging services still live, each with its own 500 MB volume, no staged changes, and successful current deployments. The deployed immutable images remain the prior build: Seed image tag `1c2edc459093`; Relay and Joiner image tag `6fbbd98f4730`. None contains CP-0852. No deployment, restart, volume mutation, or secret change was performed.
+
+Recent runtime logs show the unresolved old-image behavior directly: Relay and Joiner repeatedly report `start_height=1`, import only two 16-block pages (`blocks_imported=32`), and finish with `complete=false` while the Seed source snapshot is around height 712. The Seed's own history client also reports one-block incomplete imports. This confirms the deployed staging topology is not yet demonstrating complete synchronization. The observed final heights are not sufficient to establish matching canonical tips; log samples also show different tip hashes and heights at different times, so no convergence claim is justified.
+
+CP-0852's 64 reconnect-window change remains un-deployed and therefore has not yet changed these live logs. Keep PR #208 Draft. Before any live canary, add a focused regression test for the verified-session callback across reconnect windows and qualify the exact CP-0852 binary in an isolated or safely recoverable environment. Then collect time-aligned network/profile, height, consensus tip, execution tip/state root, and fork-choice evidence from all services. Preserve existing volumes and anchor-vault state; do not roll all three services at once.
