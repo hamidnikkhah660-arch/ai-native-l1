@@ -17,6 +17,7 @@ Provide a verifiable, recoverable backup path for each QFP6 zero-value testnet n
 ## Exact deployed runtime trace (read-only inspection, 2026-11-24)
 
 - Railway's seed service uses image tag `1c2edc459093`, which resolves to repository commit `1c2edc45909329157b97d364c77666fbf19bf541`. Relay and joiner use `6fbbd98f4730`, resolving to `6fbbd98f47309f1deb5883b8bc6a6955f9e1702c`.
+- The seed image's entrypoint uses v3 role directories (`node-data-<role>-v3`, `mempool-<role>-v3`, `q6pd-<role>-v3`, `anchor-vault-<role>-v3`); the relay/joiner image refresh uses the corresponding v4 directories. A unified image refresh must preserve each role's existing layout or explicitly refuse ambiguous v3/v4 state; it must not silently switch the seed to an empty v4 directory.
 - The latter image is an entrypoint-only refresh over base image `66468e2b3667`; its Dockerfile copies a Python entrypoint and does not rebuild or replace the Rust binary.
 - The base Dockerfile builds `qrun_v06_node` using `cargo build --release --locked --bin qrun_v06_node`. The Railway entrypoint executes that binary with `--public-testnet-run`. Therefore the deployed target is the QRun v0.6 public-testnet candidate runtime, not `devnet_node` and not `private_testnet_node`.
 - The separate `devnet_node` / `private_testnet_node` sources are explicitly loopback-only harnesses. They are not the Railway executable.
