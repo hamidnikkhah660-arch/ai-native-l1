@@ -142,13 +142,15 @@ pub fn decode_q6pd_nat_only_session_open(
     network_id: &[u8; 32],
     profile_id: &[u8; 32],
 ) -> Result<Q6pdSessionControl, Q6pdSessionControlError> {
-    decode_control(frame, Q6PD_NAT_ONLY_SESSION_OPEN_MAGIC, network_id, profile_id)
+    decode_control(
+        frame,
+        Q6PD_NAT_ONLY_SESSION_OPEN_MAGIC,
+        network_id,
+        profile_id,
+    )
 }
 
-pub fn encode_q6pd_nat_only_session_ack(
-    value: &Q6pdSessionControl,
-    accepted: bool,
-) -> Vec<u8> {
+pub fn encode_q6pd_nat_only_session_ack(value: &Q6pdSessionControl, accepted: bool) -> Vec<u8> {
     let mut out = encode_control(Q6PD_NAT_ONLY_SESSION_ACK_MAGIC, value);
     out.push(u8::from(accepted));
     out
@@ -592,20 +594,30 @@ pub fn run_q6pd_persistent_peer_session_worker(
                             network_id,
                             profile_id,
                         };
-                        noise.write_record(
-                            stream.as_mut(),
-                            &encode_q6pd_nat_only_session_open(&opt_in),
-                        )
-                        .map_err(|error| format!("NAT-only session opt-in write failed: {error}"))?;
+                        noise
+                            .write_record(
+                                stream.as_mut(),
+                                &encode_q6pd_nat_only_session_open(&opt_in),
+                            )
+                            .map_err(|error| {
+                                format!("NAT-only session opt-in write failed: {error}")
+                            })?;
                         let ack = noise
                             .read_record_with_budget(stream.as_mut(), Q6PD_OPEN_ACK_BUDGET)
-                            .map_err(|error| format!("NAT-only session opt-in acknowledgement failed: {error}"))?;
+                            .map_err(|error| {
+                                format!("NAT-only session opt-in acknowledgement failed: {error}")
+                            })?;
                         match decode_q6pd_nat_only_session_ack(&ack, &opt_in) {
                             Ok(true) => {
-                                eprintln!("QFP6_Q6PD_SESSION_NAT_ONLY_OPT_IN=PASS endpoint={}", address);
+                                eprintln!(
+                                    "QFP6_Q6PD_SESSION_NAT_ONLY_OPT_IN=PASS endpoint={}",
+                                    address
+                                );
                                 Ok(())
                             }
-                            Ok(false) => Err("remote peer refused bounded NAT-only liveness mode".into()),
+                            Ok(false) => {
+                                Err("remote peer refused bounded NAT-only liveness mode".into())
+                            }
                             Err(error) => Err(format!("NAT-only session opt-in rejected: {error}")),
                         }
                     })(),
@@ -717,7 +729,11 @@ pub fn run_q6pd_persistent_peer_session_worker(
                             Ok(false) => eprintln!(
                                 "QFP6_Q6PD_SESSION_OPEN_REFUSED endpoint={} mode={}",
                                 address,
-                                if announcement_mode.is_some() { "signed_peer" } else { "nat_only_unverified" }
+                                if announcement_mode.is_some() {
+                                    "signed_peer"
+                                } else {
+                                    "nat_only_unverified"
+                                }
                             ),
                             Err(error) => eprintln!(
                                 "QFP6_Q6PD_SESSION_OPEN_REJECTED endpoint={} error={error:?}",
