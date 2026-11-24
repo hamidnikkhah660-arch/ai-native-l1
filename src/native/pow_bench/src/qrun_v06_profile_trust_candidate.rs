@@ -1839,6 +1839,177 @@ mod tests {
         .unwrap();
         assert_eq!(authorized.trust_epoch(), 1);
     }
+
+    struct FixedHttpsRunner(Vec<u8>);
+    impl crate::qrun_v06_profile_trust_https_source_candidate::QRunV06TrustHttpRunner
+        for FixedHttpsRunner
+    {
+        fn get(
+            &mut self,
+            _: &str,
+        ) -> Result<
+            crate::qrun_v06_profile_trust_https_source_candidate::QRunV06TrustHttpOutput,
+            String,
+        > {
+            Ok(
+                crate::qrun_v06_profile_trust_https_source_candidate::QRunV06TrustHttpOutput {
+                    success: true,
+                    body: self.0.clone(),
+                    error: String::new(),
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn https_source_flows_through_dual_signature_and_independent_floor_authorization() {
+        let fixture = TrustFixture::new(0x72);
+        let envelope = fixture.sign(fixture.record(
+            1,
+            QRunV06ProfileTrustStatus::Active,
+            fixture.profile_commitment,
+            [0; 32],
+        ));
+        let bytes = envelope.encode().unwrap().to_vec();
+        let mut floor = fixture.floor_store();
+        fixture.prepublish(&envelope, &mut floor);
+        let mut source =
+            crate::qrun_v06_profile_trust_https_source_candidate::HttpsQRunV06ProfileTrustSource::with_runner(
+                "https://trust.example",
+                FixedHttpsRunner(bytes),
+            )
+            .unwrap();
+
+        let authorized = authorize_qrun_v06_profile_pin_from_source(
+            Some(&fixture.profile_bytes),
+            &mut source,
+            &fixture.authority,
+            &fixture.verifier,
+            &mut floor,
+            NETWORK,
+            PROFILE,
+        )
+        .unwrap();
+        assert_eq!(authorized.trust_epoch(), 1);
+    }
+
+    #[test]
+    fn https_source_never_bypasses_signature_verification() {
+        let fixture = TrustFixture::new(0x73);
+        let current = fixture.sign(fixture.record(
+            1,
+            QRunV06ProfileTrustStatus::Active,
+            fixture.profile_commitment,
+            [0; 32],
+        ));
+        let mut floor = fixture.floor_store();
+        fixture.prepublish(&current, &mut floor);
+        let next = fixture.sign(fixture.record(
+            2,
+            QRunV06ProfileTrustStatus::Active,
+            fixture.profile_commitment,
+            current.record.record_id().unwrap(),
+        ));
+        let mut bytes = next.encode().unwrap().to_vec();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        let mut source =
+            crate::qrun_v06_profile_trust_https_source_candidate::HttpsQRunV06ProfileTrustSource::with_runner(
+                "https://trust.example",
+                FixedHttpsRunner(bytes),
+            )
+            .unwrap();
+
+        let error = authorize_qrun_v06_profile_pin_from_source(
+            Some(&fixture.profile_bytes),
+            &mut source,
+            &fixture.authority,
+            &fixture.verifier,
+            &mut floor,
+            NETWORK,
+            PROFILE,
+        )
+        .unwrap_err();
+        assert_eq!(error, QRunV06ProfileTrustError::InvalidMlDsa65Signature);
+    }
+
+    struct LoopbackQ6tsPublisher {
+        bytes: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+        fail_next_publish: bool,
+    }
+    impl crate::qrun_v06_profile_trust_publisher_candidate::QRunV06ProfileTrustPublisher
+        for LoopbackQ6tsPublisher
+    {
+        type Error = String;
+        fn publish_signed_record(
+            &mut self,
+            _: &[u8; 32],
+            _: &[u8; 32],
+            envelope_bytes: &[u8],
+        ) -> Result<(), Self::Error> {
+            if self.fail_next_publish {
+                self.fail_next_publish = false;
+                return Err("simulated publisher outage".to_owned());
+            }
+            *self.bytes.borrow_mut() = envelope_bytes.to_vec();
+            Ok(())
+        }
+    }
+    struct LoopbackQ6tsSource(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+    impl QRunV06ProfileTrustSource for LoopbackQ6tsSource {
+        type Error = String;
+        fn read_current_signed_record(
+            &mut self,
+            _: &[u8; 32],
+            _: &[u8; 32],
+        ) -> Result<Vec<u8>, Self::Error> {
+            Ok(self.0.borrow().clone())
+        }
+    }
+    #[test]
+    fn q6ts_publisher_advances_floor_before_publish_and_retries_idempotently() {
+        let fixture = TrustFixture::new(0x74);
+        let envelope = fixture.sign(fixture.record(
+            1,
+            QRunV06ProfileTrustStatus::Active,
+            fixture.profile_commitment,
+            [0; 32],
+        ));
+        let bytes = envelope.encode().unwrap().to_vec();
+        let mut floor = fixture.floor_store();
+        let shared = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut publisher = LoopbackQ6tsPublisher {
+            bytes: shared.clone(),
+            fail_next_publish: true,
+        };
+        let mut source = LoopbackQ6tsSource(shared);
+
+        let first = crate::qrun_v06_profile_trust_publisher_candidate::publish_qrun_v06_profile_trust_envelope(
+            &bytes,
+            &fixture.authority,
+            &fixture.verifier,
+            &mut floor,
+            &mut publisher,
+            &mut source,
+        );
+        assert!(matches!(
+            first,
+            Err(crate::qrun_v06_profile_trust_publisher_candidate::QRunV06ProfileTrustPublicationError::Publish(_))
+        ));
+        assert_eq!(floor.floor.trust_epoch, 1);
+
+        let published = crate::qrun_v06_profile_trust_publisher_candidate::publish_qrun_v06_profile_trust_envelope(
+            &bytes,
+            &fixture.authority,
+            &fixture.verifier,
+            &mut floor,
+            &mut publisher,
+            &mut source,
+        )
+        .unwrap();
+        assert_eq!(published.trust_epoch, 1);
+        assert_eq!(*source.0.borrow(), bytes);
+    }
 }
 
 /// Exact historical cryptographic payloads are fetched by immutable entry ID.

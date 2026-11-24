@@ -160,6 +160,10 @@ pub mod qrun_v06_profile_pin_candidate;
 pub mod qrun_v06_profile_trust_candidate;
 /// CP-0548 candidate AWS DynamoDB monotonic Q6TS floor adapter with a node read-only wrapper; not provisioned or deployed.
 pub mod qrun_v06_profile_trust_dynamodb_floor_candidate;
+/// CP-0570 bounded HTTPS reader for signed Q6TS trust envelopes; still requires independent floor verification.
+pub mod qrun_v06_profile_trust_https_source_candidate;
+/// CP-0571 ordered Q6TS publication coordinator; transport and independent storage remain deployment responsibilities.
+pub mod qrun_v06_profile_trust_publisher_candidate;
 /// CP-0559 orchestration of QAP1 with the signed Provider and authenticated Q6EA Noise transport.
 pub mod qrun_v06_qap1_coordinator_candidate;
 /// CP-0558 append-only QAP1 intent journal for exact QFP6/Provider/Q6EA crash recovery.
