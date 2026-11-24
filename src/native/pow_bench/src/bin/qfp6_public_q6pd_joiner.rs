@@ -37,7 +37,9 @@ fn value(args: &[String], name: &str) -> Result<String, String> {
 
 fn parse_hex32(name: &str, value: &str) -> Result<[u8; 32], String> {
     if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!("{name} must contain exactly 64 hexadecimal characters"));
+        return Err(format!(
+            "{name} must contain exactly 64 hexadecimal characters"
+        ));
     }
     let mut out = [0u8; 32];
     for (i, pair) in value.as_bytes().chunks_exact(2).enumerate() {
@@ -89,7 +91,10 @@ fn run() -> Result<(), String> {
     let address = parse_address(&host, port)?;
     println!("HOSTED_JOINER_RUNNER=github-windows-2022");
     println!("SEED_DNS_RESOLVED=PASS");
-    println!("SEED_ADDRESS_FAMILY={}", if address.is_ipv4() { "IPv4" } else { "IPv6" });
+    println!(
+        "SEED_ADDRESS_FAMILY={}",
+        if address.is_ipv4() { "IPv4" } else { "IPv6" }
+    );
     println!("CLIENT_NOISE_IDENTITY=EPHEMERAL_NOT_SAVED");
     println!("LOCAL_SELF_ANNOUNCEMENT=DISABLED_NAT_ONLY_MODE");
 
@@ -105,15 +110,12 @@ fn run() -> Result<(), String> {
         .try_into()
         .map_err(|_| "ephemeral Noise private key has unexpected length")?;
 
-    let store_path: PathBuf =
-        env::temp_dir().join(format!("qfp6-cp0849-q6pd-joiner-{}.json", std::process::id()));
-    let mut store = Q6pdPeerRecordStore::open(
-        &store_path,
-        network_id,
-        profile_id,
-        now_ms()?,
-    )
-    .map_err(|e| format!("temporary Q6PD record store could not open: {e}"))?;
+    let store_path: PathBuf = env::temp_dir().join(format!(
+        "qfp6-cp0849-q6pd-joiner-{}.json",
+        std::process::id()
+    ));
+    let mut store = Q6pdPeerRecordStore::open(&store_path, network_id, profile_id, now_ms()?)
+        .map_err(|e| format!("temporary Q6PD record store could not open: {e}"))?;
 
     let discovery_config = QRunV06HistorySyncClientConfig {
         connect_timeout: Duration::from_secs(5),
@@ -131,7 +133,8 @@ fn run() -> Result<(), String> {
         &profile_id,
         discovery_config,
         Some(&host),
-        ai_native_l1_pow_bench::qrun_v06_peer_discovery_candidate::Q6PD_MAX_RECORDS_PER_FRAME as u16,
+        ai_native_l1_pow_bench::qrun_v06_peer_discovery_candidate::Q6PD_MAX_RECORDS_PER_FRAME
+            as u16,
         &mut store,
     )
     .map_err(|e| format!("Q6PD signed-record pull failed: {e}"))?;
@@ -145,9 +148,15 @@ fn run() -> Result<(), String> {
     println!("Q6PD_RECORDS_UPDATED={}", pull.records_updated);
     println!("Q6PD_RECORDS_DUPLICATE={}", pull.records_duplicate);
     println!("Q6PD_RECORDS_REJECTED={}", pull.records_rejected);
-    println!("Q6PD_PINNED_SEED_IDENTITY_IN_INVENTORY={}", seed_identity_present);
+    println!(
+        "Q6PD_PINNED_SEED_IDENTITY_IN_INVENTORY={}",
+        seed_identity_present
+    );
     if pull.records_received == 0 || pull.accepted_records.is_empty() || !seed_identity_present {
-        return Err("Seed did not return an accepted signed Q6PD record bound to its pinned Noise key".into());
+        return Err(
+            "Seed did not return an accepted signed Q6PD record bound to its pinned Noise key"
+                .into(),
+        );
     }
     println!("Q6PD_SIGNED_RECORD_PULL=PASS");
 
