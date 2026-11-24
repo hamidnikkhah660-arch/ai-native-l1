@@ -16,7 +16,10 @@ Provide a verifiable, recoverable backup path for each QFP6 zero-value testnet n
 - No verified live node export/snapshot endpoint or operator backup/restore interface has been identified.
 - Railway volume UI inspection did not expose a verified manual backup/snapshot/restore workflow. Wipe-volume UI wording mentioning backups does not establish backup availability or restore capability.
 
-## Non-negotiable safety rules
+## Additional runtime boundary discovered\n
+- The source header of `src/native/pow_bench/src/bin/private_testnet_node.rs` explicitly labels that binary a loopback-only, disposable integration harness, not a public P2P node or mainnet client. This must be reconciled against the exact Railway image/build command before making any public-network or value-bearing claims.
+- The source headers of `private_testnet_fork_store.rs` and `private_testnet_monetary_fork_store.rs` describe those stores as candidate-only and not integrated with the public TCP listener / live runtime. They must not be assumed to describe the actual mounted `/data` layout without tracing the deployed binary and startup configuration.
+\n## Non-negotiable safety rules
 
 1. Never wipe, detach, resize, replace, or reinitialize existing volumes as part of backup work.
 2. Never copy an actively-mutating database directory as if a raw filesystem copy were a consistent snapshot.
