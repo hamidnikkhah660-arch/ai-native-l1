@@ -4436,7 +4436,9 @@ mod manifest_anchor_tests {
         write_vault_record(&vault, 1, network, profile, 1, anchor, [0; 32]);
         let cfg = json!({
             "trusted_manifest_anchor": hex(&anchor),
-            "trusted_manifest_anchor_vault_path": vault.to_string_lossy().to_string()
+            "trusted_manifest_floor_generation": 0,
+            "trusted_manifest_floor_anchor": hex(&anchor),
+            "trusted_manifest_anchor_vault_path": vault.to_string_lossy().to_string
         });
         assert!(trusted_manifest_anchor(&cfg, &dir, &network, &profile).is_err());
         assert!(trusted_manifest_anchor(&cfg, &dir, &[0x44; 32], &profile).is_err());
@@ -4518,6 +4520,8 @@ mod manifest_anchor_tests {
         let missing_vault = dir.join("vault-not-created");
         let cfg = json!({
             "trusted_manifest_anchor": hex(&[0x11; 32]),
+            "trusted_manifest_floor_generation": 0,
+            "trusted_manifest_floor_anchor": hex(&[0x11; 32]),
             "trusted_manifest_anchor_vault_path": missing_vault.to_string_lossy().to_string()
         });
         assert!(trusted_manifest_anchor(&cfg, &dir, &network, &profile).is_err());
@@ -4542,6 +4546,8 @@ mod manifest_anchor_tests {
         write_vault_record(&vault, 3, network, profile, 2, [0x33; 32], first);
         let cfg = json!({
             "trusted_manifest_anchor": hex(&[0x11; 32]),
+            "trusted_manifest_floor_generation": 0,
+            "trusted_manifest_floor_anchor": hex(&[0x11; 32]),
             "trusted_manifest_anchor_vault_path": vault.to_string_lossy().to_string()
         });
         assert!(trusted_manifest_anchor(&cfg, &dir, &network, &profile).is_err());
@@ -4647,6 +4653,8 @@ mod manifest_anchor_tests {
         write_vault_record(&vault, 1, network, profile, 0, root_anchor, [0; 32]);
         let cfg = json!({
             "trusted_manifest_anchor": hex(&root_anchor),
+            "trusted_manifest_floor_generation": 0,
+            "trusted_manifest_floor_anchor": hex(&root_anchor),
             "trusted_manifest_anchor_vault_path": vault.to_string_lossy().to_string()
         });
         assert!(trusted_manifest_anchor(&cfg, &dir, &network, &profile).is_err());
@@ -4707,7 +4715,7 @@ mod manifest_anchor_tests {
             "trusted_manifest_anchor": hex(&anchor),
             "trusted_manifest_floor_generation": 0,
             "trusted_manifest_floor_anchor": hex(&anchor),
-            "trusted_manifest_anchor_vault_path": vault_path.to_string_lossy().to_string
+            "trusted_manifest_anchor_vault_path": vault_path.to_string_lossy().to_string()
         });
         assert_eq!(
             trusted_manifest_anchor(&checkpoint_cfg, &dir, &network, &profile).unwrap(),
