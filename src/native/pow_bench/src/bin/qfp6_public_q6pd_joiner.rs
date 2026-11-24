@@ -85,7 +85,9 @@ fn run() -> Result<(), String> {
         .parse::<u64>()
         .map_err(|_| "session duration is invalid")?;
     if !matches!(port, 443 | 8443) || !(65..=120).contains(&session_seconds) {
-        return Err("port must be 443 or 8443 and session duration must be 65..=120 seconds".into());
+        return Err(
+            "port must be 443 or 8443 and session duration must be 65..=120 seconds".into(),
+        );
     }
 
     let address = parse_address(&host, port)?;
