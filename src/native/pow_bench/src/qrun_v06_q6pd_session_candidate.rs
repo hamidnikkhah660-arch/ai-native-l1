@@ -610,10 +610,17 @@ pub fn run_q6pd_persistent_peer_session_worker(
                         }
                     })(),
                 } {
-                    eprintln!(
-                        "QFP6_Q6PD_SESSION_LOCAL_ANNOUNCEMENT_REJECTED endpoint={} error={error}",
-                        address
-                    );
+                    if announcement_mode.is_none() {
+                        eprintln!(
+                            "QFP6_Q6PD_SESSION_NAT_ONLY_OPT_IN_FAILED endpoint={} error={error}",
+                            address
+                        );
+                    } else {
+                        eprintln!(
+                            "QFP6_Q6PD_SESSION_LOCAL_ANNOUNCEMENT_REJECTED endpoint={} error={error}",
+                            address
+                        );
+                    }
                 } else {
                     request_id = request_id.saturating_add(1).max(1);
                     let open = Q6pdSessionControl {
