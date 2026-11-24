@@ -208,7 +208,7 @@ $assetPins=@(
 )
 foreach($pin in $assetPins){
  if([string]::IsNullOrWhiteSpace([string]$pin.Path) -or [string]::IsNullOrWhiteSpace([string]$pin.Hash)){throw "Generated config is missing the path/hash pin for $($pin.Name)."}
- $assetPath=Join-Path $AssetTargetRoot ([string]$pin.Path)
+ $assetPath=Join-Path $NodeRoot ([string]$pin.Path)
  if(!(Test-Path $assetPath -PathType Leaf)){throw "Node-local pinned asset is missing: $($pin.Name)"}
  $actual=(Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
  if($actual -cne ([string]$pin.Hash).ToLowerInvariant()){throw "Node-local pinned asset SHA-256 mismatch: $($pin.Name)"}
