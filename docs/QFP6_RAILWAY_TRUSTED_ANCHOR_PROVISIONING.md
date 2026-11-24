@@ -4,15 +4,17 @@
 
 ## Variable contract
 
-The Railway entrypoint accepts an optional service-level variable:
+The Railway entrypoint accepts three paired service-level variables for nodes with existing history:
 
-`QFP6_TRUSTED_MANIFEST_ANCHOR`
+- `QFP6_TRUSTED_MANIFEST_ANCHOR`: the immutable sequence-1 root, exactly 64 lowercase hex characters (32 bytes), nonzero.
+- `QFP6_TRUSTED_MANIFEST_FLOOR_GENERATION`: a canonical unsigned decimal integer in the u64 range.
+- `QFP6_TRUSTED_MANIFEST_FLOOR_ANCHOR`: the manifest anchor at exactly that floor generation, exactly 64 lowercase hex characters, nonzero.
 
-- It must contain exactly 64 lowercase hexadecimal characters (32 bytes), and must not be all zeroes.
-- It is a public trust commitment, not a private signing key. Do not place private keys, credentials, or signatures in this variable.
-- When present, the entrypoint copies it into `permissionless_runtime.trusted_manifest_anchor` in the generated, SHA-256-bound node configuration.
-- When absent, the field is omitted. A node with existing durable manifests will continue to fail closed. A genuinely fresh Genesis-only node can continue through its separate bootstrap path.
-- Invalid values cause the entrypoint to refuse before writing the bootstrap/config files.
+All three values must be present together. The two anchor values are public commitments, not private signing keys. The floor generation and floor anchor must come from an independently retained, authenticated operator checkpoint—not from a checksum or a value copied from the same Railway volume. The runtime verifies that the local append-only vault contains that exact generation and anchor. A vault below the floor or with a different anchor at the pinned generation is rejected.
+
+When these variables are absent, they are omitted from the generated, SHA-256-bound node configuration. Existing durable history continues to fail closed. A genuinely fresh Genesis-only node must omit all three and can continue through its separate bootstrap path. Invalid or partial values cause the entrypoint to refuse before writing bootstrap/config files.
+
+**Security boundary:** this is an externally pinned minimum checkpoint, not a continuously advancing remote CAS service. A rollback below the pinned generation is rejected; a rollback to the pinned generation itself can still pass. Advance the floor after each independently verified backup/checkpoint to narrow that rollback window. This does not qualify the candidate for value-bearing Mainnet.
 
 ## Existing data-layout compatibility
 
@@ -24,6 +26,12 @@ The currently observed service images do not all use the same directory version:
 - If both versions exist, or an existing path is a symlink/non-directory, refuse startup and require an explicit data inventory. It never merges or deletes the directories.
 
 This is intended to prevent an image refresh from silently ignoring a node's previous durable history. It does not migrate data between layouts.
+
+## Checkpoint-floor operating rule
+
+For an existing node, select a floor generation that is independently recorded outside the node's Railway volume and verify its corresponding manifest anchor. If the current local vault is ahead of that checkpoint, the floor remains a lower bound. To make the bound useful, refresh the external floor after each independently verified backup/checkpoint and preserve the previous approved record offline.
+
+The floor does not advance automatically with block production. It is not a substitute for a continuously available, strongly consistent external monotonic anchor service. Do not claim that it defeats rollback of both the Railway volume and the service-level configuration.
 
 ## Provisioning requirements
 
