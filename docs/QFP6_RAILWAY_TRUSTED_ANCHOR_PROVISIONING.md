@@ -52,4 +52,4 @@ Provision and validate seed, relay, and joiner separately. Do not copy one node'
 
 ## Change introduced by this patch
 
-The entrypoint now has a strict optional environment-to-config bridge and unit tests for absent, valid, malformed, uppercase, wrong-length, non-hex, and zero values. It does not change Railway variables, restart services, read live volume contents, infer any anchor value, or bypass Rust validation.
+The entrypoint now has strict root/floor environment parsing, v3/v4 history-preserving layout selection, and 19 Python unit tests. The Rust runtime validates the external floor against the local vault chain, with regression tests for stale and mismatched floors. The image workflow runs Python tests, Rust formatting, and targeted `qrun_v06_node` tests before building/publishing. This patch does not change Railway variables, restart services, read live volume contents, infer any anchor value, or bypass Rust validation.
