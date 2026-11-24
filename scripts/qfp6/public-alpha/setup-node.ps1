@@ -90,10 +90,34 @@ if(-not (Test-Path $AnchorVault)){
  $copy=robocopy (Join-Path $Root 'bootstrap\anchor-vault') $AnchorVault /E /COPY:DAT /DCOPY:T /R:1 /W:1 /NP /NFL /NDL
  if($LASTEXITCODE -ge 8){throw "Bootstrap Anchor Vault copy failed (robocopy=$LASTEXITCODE)."}
 }
-if(-not (Test-Path $CheckpointDir)){
- $copy=robocopy (Join-Path $Root 'runtime\data.checkpoint-segments') $CheckpointDir /E /COPY:DAT /DCOPY:T /R:1 /W:1 /NP /NFL /NDL
- if($LASTEXITCODE -ge 8){throw "Checkpoint segment copy failed (robocopy=$LASTEXITCODE)."}
+$BootstrapCheckpointRoot=Join-Path (Join-Path $Root 'runtime') 'data.checkpoint-segments'
+$WitnessDir=Join-Path $AnchorVault 'checkpoint-segment-witnesses'
+$witnessFiles=@(Get-ChildItem -LiteralPath $WitnessDir -File -ErrorAction Stop | Sort-Object Name)
+if($witnessFiles.Count -eq 0){throw 'Bootstrap Anchor Vault has no checkpoint-segment witness; refusing an unanchored checkpoint copy.'}
+$latestWitnessFile=$witnessFiles[-1]
+if($latestWitnessFile.Name -notmatch '^q6sw-(?<sequence>[0-9]{20})[.]json$'){throw 'Latest checkpoint witness filename is malformed.'}
+$latestSequence=[UInt64]::Parse($Matches.sequence)
+$latestWitness=Get-Content -LiteralPath $latestWitnessFile.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+if([UInt64]$latestWitness.sequence -ne $latestSequence){throw 'Latest checkpoint witness sequence differs from its filename.'}
+$activeSegmentName='segment-{0:D20}' -f $latestSequence
+$activeSegmentSource=Join-Path $BootstrapCheckpointRoot $activeSegmentName
+if(!(Test-Path $activeSegmentSource -PathType Container)){throw "Checkpoint segment referenced by latest Anchor Vault witness is missing: $activeSegmentName"}
+if(-not (Test-Path $CheckpointDir)){New-Item -ItemType Directory -Path $CheckpointDir -Force|Out-Null}
+$existingSegments=@(Get-ChildItem -LiteralPath $CheckpointDir -Directory -Filter 'segment-*' -ErrorAction SilentlyContinue)
+foreach($existingSegment in $existingSegments){
+ if($existingSegment.Name -notmatch '^segment-(?<sequence>[0-9]{20})$'){throw "Unexpected checkpoint segment directory: $($existingSegment.Name)"}
+ $sequence=[UInt64]::Parse($Matches.sequence)
+ $witnessName='q6sw-{0:D20}.json' -f $sequence
+ if($sequence -gt $latestSequence -or -not (Test-Path (Join-Path $WitnessDir $witnessName) -PathType Leaf)){
+  throw "Unanchored checkpoint segment exists in the node data directory: $($existingSegment.Name). Preserve and quarantine it before resuming."
+ }
 }
+$activeSegmentTarget=Join-Path $CheckpointDir $activeSegmentName
+if(-not (Test-Path $activeSegmentTarget)){
+ $copy=robocopy $activeSegmentSource $activeSegmentTarget /E /COPY:DAT /DCOPY:T /R:1 /W:1 /NP /NFL /NDL
+ if($LASTEXITCODE -ge 8){throw "Active checkpoint segment copy failed (robocopy=$LASTEXITCODE)."}
+}
+Write-Host "Active checkpoint segment selected from latest Anchor Vault witness: $activeSegmentName"
 
 # Every node has its own local Noise identity. Only publicly reachable relays need a TPM-bound advertised identity.
 $NoiseTool=Join-Path $Root 'qrun_v05_noise_key_provision.exe'
@@ -155,6 +179,42 @@ if($IsPublicRelay){
 }else{
  foreach($name in @('device_root_metadata_path','device_root_binding_path','q6pd_identity_key_path','q6pd_identity_binding_path','q6pd_self_advertise_endpoint','q6pd_self_advertise_tls_server_name')){Remove-JsonProperty $r $name}
 }
+$AssetSourceRoot=Join-Path $Root 'assets'
+$AssetTargetRoot=Join-Path $NodeRoot 'assets'
+if(!(Test-Path $AssetSourceRoot -PathType Container)){throw 'Package assets directory is missing.'}
+New-Item -ItemType Directory -Path $AssetTargetRoot -Force|Out-Null
+$assetFiles=@(Get-ChildItem -LiteralPath $AssetSourceRoot -File -Recurse)
+foreach($assetFile in $assetFiles){
+ if(($assetFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw "Package asset must not be a reparse point: $($assetFile.FullName)"}
+ $relative=$assetFile.FullName.Substring($AssetSourceRoot.Length).TrimStart([char]92,[char]47)
+ $target=Join-Path $AssetTargetRoot $relative
+ $targetParent=Split-Path -Parent $target
+ New-Item -ItemType Directory -Path $targetParent -Force|Out-Null
+ if(Test-Path $target -PathType Leaf){
+  $sourceHash=(Get-FileHash -LiteralPath $assetFile.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+  $targetHash=(Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant()
+  if($sourceHash -cne $targetHash){throw "Existing node asset differs from the pinned package asset: $relative"}
+ }else{
+  Copy-Item -LiteralPath $assetFile.FullName -Destination $target
+ }
+}
+$assetPins=@(
+ [pscustomobject]@{Path=$r.bootstrap_peers_path;Hash=$r.bootstrap_peers_sha256;Name='bootstrap peer set'},
+ [pscustomobject]@{Path=$r.genesis_snapshot_path;Hash=$r.genesis_snapshot_sha256;Name='Genesis snapshot'},
+ [pscustomobject]@{Path=$r.q6cp_profile_path;Hash=$r.q6cp_profile_sha256;Name='Q6CP consensus profile'},
+ [pscustomobject]@{Path=$r.q6gd_descriptor_path;Hash=$r.q6gd_descriptor_sha256;Name='Q6GD Genesis descriptor'},
+ [pscustomobject]@{Path=$r.q6pn_profile_pin_path;Hash=$r.q6pn_profile_pin_sha256;Name='Q6PN profile pin'},
+ [pscustomobject]@{Path=$r.public_testnet_authorization_path;Hash=$r.public_testnet_authorization_sha256;Name='Q6GA public-testnet authorization'}
+)
+foreach($pin in $assetPins){
+ if([string]::IsNullOrWhiteSpace([string]$pin.Path) -or [string]::IsNullOrWhiteSpace([string]$pin.Hash)){throw "Generated config is missing the path/hash pin for $($pin.Name)."}
+ $assetPath=Join-Path $NodeRoot ([string]$pin.Path)
+ if(!(Test-Path $assetPath -PathType Leaf)){throw "Node-local pinned asset is missing: $($pin.Name)"}
+ $actual=(Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+ if($actual -cne ([string]$pin.Hash).ToLowerInvariant()){throw "Node-local pinned asset SHA-256 mismatch: $($pin.Name)"}
+}
+Write-Host "QFP6_PUBLIC_ALPHA_NODE_ASSETS=PINNED_COPY_PASS (files=$($assetFiles.Count))"
+
 $json=$config|ConvertTo-Json -Depth 16
 [IO.File]::WriteAllText($ConfigPath,$json,[Text.UTF8Encoding]::new($false))
 $configHash=(Get-FileHash $ConfigPath -Algorithm SHA256).Hash.ToLowerInvariant()

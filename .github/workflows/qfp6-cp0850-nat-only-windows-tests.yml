@@ -1,0 +1,52 @@
+name: QFP6 CP-0850 NAT-only Windows integration tests
+
+on:
+  push:
+    branches:
+      - "review/cp0849-nat-persistent-peer-sessions"
+    paths:
+      - "src/native/pow_bench/src/qrun_v06_q6pd_session_candidate.rs"
+      - "src/native/pow_bench/src/qrun_v06_peer_listener_candidate.rs"
+      - "src/native/pow_bench/Cargo.toml"
+      - "src/native/pow_bench/Cargo.lock"
+      - ".github/workflows/qfp6-cp0850-nat-only-windows-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qfp6-cp0850-nat-only-windows-tests
+  cancel-in-progress: false
+
+jobs:
+  nat-only-session:
+    name: Windows 2022 loopback Noise NAT-only session
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact revision without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.82.0
+          components: rustfmt
+
+      - name: Format and execute focused NAT-only protocol tests
+        shell: pwsh
+        working-directory: src/native/pow_bench
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustc --version
+          cargo --version
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'Rust formatting check failed' }
+          cargo test --locked --lib nat_only -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'NAT-only Q6PD protocol/listener tests failed' }
+          Write-Host 'CP0850_NAT_ONLY_WINDOWS_TESTS=PASS'
+          Write-Host 'SCOPE=LOCAL_NOISE_LOOPBACK_ONLY_NOT_A_SECOND_INDEPENDENT_OPERATOR'

@@ -1991,13 +1991,9 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
             let local_q6pd_announcement =
                 std::sync::Arc::new(std::sync::RwLock::new(initial_local_q6pd_record));
             let mut q6pd_persistent_peer_keys = HashSet::new();
-            if q6pd_pull_enabled
-                && local_q6pd_noise_key.is_some()
-                && local_q6pd_announcement
-                    .read()
-                    .ok()
-                    .is_some_and(|record| record.is_some())
-            {
+            // Persistent sessions are outbound and can be held by NAT-only Joiners.
+            // A local signed public endpoint is optional; the remote seed remains key-pinned.
+            if q6pd_pull_enabled && q6pd_candidate.is_some() {
                 for peer in outbound_sync_peers
                     .unwrap_or(&[])
                     .iter()
@@ -2009,7 +2005,7 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
                     let address = peer.address;
                     let tls_server_name = peer.tls_server_name.clone();
                     let local_key = *local_static_private_key;
-                    let local_noise_key = local_q6pd_noise_key.unwrap_or([0; 32]);
+                    let local_noise_key = local_q6pd_noise_key;
                     let remote_key = peer.noise_static_public_key;
                     let network = *network_id;
                     let profile = *profile_id;
@@ -2034,7 +2030,7 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
                     });
                 }
             } else if q6pd_pull_enabled {
-                eprintln!("QFP6_Q6PD_SESSION_MANAGER_SKIPPED reason=no_public_signed_self_record");
+                eprintln!("QFP6_Q6PD_SESSION_MANAGER_SKIPPED reason=no_q6pd_record_store");
             }
             // The address book owns durable approval; live verified-session state is ephemeral.
             // Anonymous Q6AR candidates are never promoted or dialed by this manager.
@@ -2563,7 +2559,10 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
                                 max_blocks_per_page: 16,
                                 max_bytes_per_page: 4 * 1024 * 1024,
                                 max_pages: 2,
-                                max_rounds: 1,
+                                // Keep each Noise session small, but resume the exact pinned
+                                // source snapshot across bounded reconnect windows. The verified
+                                // session manager is transitioned for every reconnect below.
+                                max_rounds: 64,
                             };
                             let sync_result = if let (Some(manager), Some((book, _, _, _))) =
                                 (peer_connection_manager.as_mut(), q6ar_candidate.as_mut())
@@ -2592,6 +2591,7 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
                                     }
 
                                 let mut verification_callback_invoked = false;
+                                let mut verified_session_count = 0u32;
                                 let result = crate::qrun_v06_history_sync_service_candidate::sync_history_from_pinned_peer_with_verified_session_callback(
                                         peer.address,
                                         local_static_private_key,
@@ -2605,6 +2605,30 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
                                             verification_callback_invoked = true;
                                             let verified_at_ms =
                                                 system_now_ms().map_err(|error| error.to_string())?;
+                                            // The history client deliberately reconnects between
+                                            // bounded page windows while retaining the same
+                                            // authenticated source snapshot and branch cursor.
+                                            // Mirror each real stream lifetime in the peer manager:
+                                            // close the previous verified session, reserve the same
+                                            // operator-pinned endpoint again, then verify this exact
+                                            // new Noise session before any page is accepted.
+                                            if verified_session_count > 0 {
+                                                manager
+                                                    .mark_disconnected(
+                                                        book,
+                                                        peer.address,
+                                                        verified_at_ms,
+                                                        false,
+                                                    )
+                                                    .map_err(|error| error.to_string())?;
+                                                manager
+                                                    .reserve_operator_approved_endpoint(
+                                                        book,
+                                                        peer.address,
+                                                        verified_at_ms,
+                                                    )
+                                                    .map_err(|error| error.to_string())?;
+                                            }
                                             manager
                                                 .complete_outbound_handshake(
                                                     book,
@@ -2612,7 +2636,11 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
                                                     noise_session,
                                                     verified_at_ms,
                                                 )
-                                                .map_err(|error| error.to_string())
+                                                .map_err(|error| error.to_string())?;
+                                            verified_session_count = verified_session_count
+                                                .checked_add(1)
+                                                .ok_or_else(|| "verified session counter overflow".to_string())?;
+                                            Ok(())
                                         },
                                     );
 
@@ -2922,18 +2950,13 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
                                     crate::qrun_v06_q6pd_address_manager_candidate::Q6PD_ADDRMAN_SUCCESS_RECHECK_MS / 1000
                                 );
 
-                                    if let Some(local_noise_key) =
-                                        local_q6pd_noise_key.filter(|_| {
-                                            local_q6pd_announcement
-                                                .read()
-                                                .ok()
-                                                .is_some_and(|record| record.is_some())
-                                        })
-                                    {
-                                        if q6pd_persistent_peer_keys.len()
+                                    // A node behind NAT still keeps the verified outbound
+                                    // Noise session alive; self-announcement is independently optional.
+                                    if q6pd_persistent_peer_keys.len()
                                         < crate::qrun_v06_q6pd_session_candidate::Q6PD_MAX_PERSISTENT_SESSIONS
                                         && q6pd_persistent_peer_keys.insert(peer.noise_static_public_key)
                                     {
+                                        let local_noise_key = local_q6pd_noise_key;
                                         let address = peer.endpoint;
                                         let tls_server_name = peer.tls_server_name.clone();
                                         let local_key = *local_static_private_key;
@@ -2961,7 +2984,6 @@ fn run_qfp6_permissionless_mining_supervisor_inner<T: TransactionAuthenticator>(
                                                 shutdown,
                                             );
                                         });
-                                    }
                                     }
 
                                     // Reuse the newly authenticated peer as a bounded history

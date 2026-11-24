@@ -141,7 +141,7 @@ fn run() -> Result<(), String> {
     println!("SEED_EXECUTION_TIP={}", hex(&status.execution_tip));
     println!("CLIENT_NOISE_IDENTITY=EPHEMERAL_NOT_SAVED");
     println!("NODE_STORAGE_WRITES=NONE");
-    println!("TEST_SCOPE=SAME_LAPTOP_VIA_PUBLIC_FUNNEL_ENDPOINT");
+    println!("TEST_SCOPE=OUTBOUND_PUBLIC_FUNNEL_PROBE");
     Ok(())
 }
 

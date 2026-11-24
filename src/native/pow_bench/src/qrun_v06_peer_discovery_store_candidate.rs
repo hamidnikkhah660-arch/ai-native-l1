@@ -18,9 +18,11 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-pub const Q6PD_MAX_CANDIDATES: usize = 256;
-pub const Q6PD_MAX_SEQUENCE_WATERMARKS: usize = 1024;
-pub const Q6PD_MAX_STORE_BYTES: usize = 512 * 1024;
+// Per-node inventory safety bounds only. Peer gossip can span a network larger than any
+// single node's local address book; these constants are not a network-wide node limit.
+pub const Q6PD_MAX_CANDIDATES: usize = 16_384;
+pub const Q6PD_MAX_SEQUENCE_WATERMARKS: usize = 32_768;
+pub const Q6PD_MAX_STORE_BYTES: usize = 32 * 1024 * 1024;
 const Q6PD_WATERMARK_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const STORE_SCHEMA: &str = "qfp6-q6pd-candidate-store";
 const STORE_VERSION: u64 = 1;
@@ -277,7 +279,8 @@ impl Q6pdPeerRecordStore {
 
     /// Verify and persist one signed peer record. Equal-sequence identical records are
     /// idempotent; lower or conflicting equal-sequence records are rejected as replay.
-    /// This operation never marks a peer approved or eligible for automatic dialing.
+    /// This operation stores a candidate only; Q6PD AddrMan separately selects signed records
+    /// for bounded outbound attempts. No operator trust or consensus authority is granted.
     pub fn ingest(&mut self, wire: &[u8], now_ms: u64) -> Result<Q6pdIngestResult, Q6pdStoreError> {
         let record =
             verify_q6pd_peer_record(wire, &self.network_id, &self.profile_id, now_ms / 1000)?;
