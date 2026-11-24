@@ -1,0 +1,84 @@
+name: QFP6 CP-0849 hosted cross-host Seed probe
+
+on:
+  push:
+    branches:
+      - "review/cp0849-nat-persistent-peer-sessions"
+    paths:
+      - "src/native/pow_bench/src/bin/qfp6_public_seed_probe.rs"
+      - "src/native/pow_bench/src/qrun_v06_noise_transport_candidate.rs"
+      - "src/native/pow_bench/Cargo.toml"
+      - "src/native/pow_bench/Cargo.lock"
+      - ".github/workflows/qfp6-cp0849-hosted-seed-probe.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qfp6-cp0849-hosted-seed-probe
+  cancel-in-progress: false
+
+jobs:
+  hosted-seed-probe:
+    name: External Windows runner to pinned QFP6 Seed
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact revision without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.82.0
+
+      - name: Build the outbound pinned-Noise probe
+        shell: pwsh
+        working-directory: src/native/pow_bench
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustc --version
+          if ($LASTEXITCODE -ne 0) { throw 'rustc unavailable' }
+          cargo --version
+          if ($LASTEXITCODE -ne 0) { throw 'cargo unavailable' }
+          cargo build --locked --release --bin qfp6_public_seed_probe -j 1
+          if ($LASTEXITCODE -ne 0) { throw 'QFP6 public Seed probe build failed' }
+          $exe = 'target\release\qfp6_public_seed_probe.exe'
+          if (-not (Test-Path $exe)) { throw 'Probe executable missing' }
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "HOSTED_RUNNER=github-windows-2022"
+          Write-Host "PROBE_SHA256=$hash"
+
+      - name: Connect from the hosted runner using the pinned Seed Noise key
+        shell: pwsh
+        working-directory: src/native/pow_bench
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $log = Join-Path $env:RUNNER_TEMP 'qfp6-hosted-seed-probe.log'
+          "HOSTED_RUNNER=github-windows-2022" | Set-Content -Path $log -Encoding UTF8
+          "RUNNER_OS=$env:RUNNER_OS" | Add-Content -Path $log -Encoding UTF8
+          "GITHUB_SHA=${{ github.sha }}" | Add-Content -Path $log -Encoding UTF8
+          & .\target\release\qfp6_public_seed_probe.exe `
+            --host heymed.tail2a756d.ts.net `
+            --port 443 `
+            --network-id-hex 633b5dfc16fb2ec1825baf924ae7f7f16bf2006f8b64441a57692a3531722712 `
+            --profile-id-hex a0a057d72c11253386bfe90d428bccbc44ebc86fc84e04e3682193a99d8805c4 `
+            --remote-noise-key-hex 9899d6d17d1659df8befcca2bf3ebe19ebe106a8c3d9bd0a4f06d141db3af508 2>&1 | Tee-Object -FilePath $log -Append
+          if ($LASTEXITCODE -ne 0) { throw 'Hosted cross-host pinned Seed probe failed' }
+          if (-not (Select-String -Path $log -Pattern '^PINNED_NOISE_XX=PASS$')) { throw 'Pinned Noise handshake evidence missing' }
+          if (-not (Select-String -Path $log -Pattern '^Q6HI_Q6HR=PASS$')) { throw 'Seed Q6HI/Q6HR response validation missing' }
+          Write-Host 'HOSTED_CROSS_HOST_SEED_PROBE=PASS'
+          Write-Host 'SCOPE_LIMIT=TRANSPORT_AND_SEED_STATUS_ONLY_NOT_Q6PD_GOSSIP_OR_A_FULL_JOINER_NODE'
+
+      - name: Upload non-secret probe evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: qfp6-cp0849-hosted-seed-probe
+          path: ${{ runner.temp }}/qfp6-hosted-seed-probe.log
+          if-no-files-found: ignore
+          retention-days: 7
