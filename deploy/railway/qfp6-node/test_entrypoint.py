@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -52,6 +53,38 @@ class TrustedManifestAnchorEnvironmentTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "must not be zero"):
             self.read_with("0" * 64)
 
+    def test_storage_layout_defaults_to_v4_only_when_no_prior_layout_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(ENTRYPOINT, "DATA", Path(directory)):
+                self.assertEqual(ENTRYPOINT.select_storage_layout("seed"), "v4")
+
+    def test_existing_v3_layout_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "node-data-seed-v3").mkdir()
+            with patch.object(ENTRYPOINT, "DATA", Path(directory)):
+                self.assertEqual(ENTRYPOINT.select_storage_layout("seed"), "v3")
+
+    def test_existing_v4_layout_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "mempool-relay-v4").mkdir()
+            with patch.object(ENTRYPOINT, "DATA", Path(directory)):
+                self.assertEqual(ENTRYPOINT.select_storage_layout("relay"), "v4")
+
+    def test_mixed_v3_and_v4_layouts_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "node-data-joiner-v3").mkdir()
+            (root / "node-data-joiner-v4").mkdir()
+            with patch.object(ENTRYPOINT, "DATA", root):
+                with self.assertRaisesRegex(RuntimeError, "ambiguous QFP6 storage layouts"):
+                    ENTRYPOINT.select_storage_layout("joiner")
+
+    def test_non_directory_storage_path_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "node-data-seed-v3").write_text("unexpected", encoding="utf-8")
+            with patch.object(ENTRYPOINT, "DATA", Path(directory)):
+                with self.assertRaisesRegex(RuntimeError, "must be a real directory"):
+                    ENTRYPOINT.select_storage_layout("seed")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
