@@ -2539,15 +2539,28 @@ mod tests {
             max_pages: 1,
             max_rounds: 4,
         };
-        let sync_result = sync_history_from_pinned_peer(
+        let mut verified_session_callbacks = 0usize;
+        let sync_result = sync_history_from_pinned_peer_with_verified_session_callback(
             address,
             &client_private,
             &server_public,
             &mut destination_runtime,
             &authenticator,
             sync_config,
+            None,
+            None,
+            |_noise_session| {
+                verified_session_callbacks = verified_session_callbacks
+                    .checked_add(1)
+                    .ok_or_else(|| "verified-session callback counter overflow".to_string())?;
+                Ok(())
+            },
         );
         let sync_report = sync_result.unwrap();
+        assert_eq!(
+            verified_session_callbacks, 3,
+            "one callback must run for each newly authenticated Noise stream across reconnect windows"
+        );
 
         // The exact same peer tip is now in the local graph with both authenticated hashes.
         // Fast-resume must release the responder snapshot without replaying its known prefix.
