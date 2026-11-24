@@ -181,6 +181,114 @@ impl QRunV06NoiseSession {
         })
     }
 
+    /// Establish an encrypted session with any self-presented peer key.
+    ///
+    /// This is permissionless transport, NOT authenticated operator identity: without an
+    /// out-of-band pin, a man-in-the-middle can substitute keys. Treat the returned key only
+    /// as a self-asserted peer identifier. Never trust peer-supplied chain state; validate every
+    /// block, transaction, profile and checkpoint locally against independently pinned policy.
+    pub fn connect_permissionless(
+        stream: &mut TcpStream,
+        local_static_private_key: &[u8; 32],
+        network_id: &[u8; 32],
+        profile_id: &[u8; 32],
+    ) -> Result<Self, QRunV06NoiseError> {
+        validate_context(local_static_private_key, network_id, profile_id)?;
+        let deadline = Instant::now() + HANDSHAKE_BUDGET;
+        let mut handshake = Builder::new(noise_params()?)
+            .prologue(&prologue(network_id, profile_id))
+            .local_private_key(local_static_private_key)
+            .build_initiator()
+            .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
+        let mut payload = [0u8; MAX_HANDSHAKE_MESSAGE];
+        let mut message = [0u8; MAX_HANDSHAKE_MESSAGE];
+        let written = handshake
+            .write_message(&[], &mut message)
+            .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
+        write_handshake(stream, &message[..written], deadline)?;
+        let second = read_handshake(stream, deadline)?;
+        let read = handshake
+            .read_message(&second, &mut payload)
+            .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
+        if read != 0 {
+            return Err(QRunV06NoiseError::MalformedHandshake);
+        }
+        let remote = handshake
+            .get_remote_static()
+            .ok_or(QRunV06NoiseError::MalformedHandshake)?;
+        if remote.iter().all(|byte| *byte == 0) {
+            return Err(QRunV06NoiseError::UntrustedPeer);
+        }
+        let mut remote_static_public_key = [0u8; 32];
+        remote_static_public_key.copy_from_slice(remote);
+        let written = handshake
+            .write_message(&[], &mut message)
+            .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
+        write_handshake(stream, &message[..written], deadline)?;
+        let transport = handshake
+            .into_transport_mode()
+            .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
+        Ok(Self {
+            transport,
+            remote_static_public_key,
+        })
+    }
+
+    /// Accept any self-presented nonzero peer static key for permissionless participation.
+    ///
+    /// The peer key is not a trusted operator credential. This mode is vulnerable to
+    /// key-substitution/MITM at the transport identity layer; canonical consensus validation
+    /// and independent checkpoint anchoring remain mandatory before state is accepted.
+    pub fn accept_permissionless(
+        stream: &mut TcpStream,
+        local_static_private_key: &[u8; 32],
+        network_id: &[u8; 32],
+        profile_id: &[u8; 32],
+    ) -> Result<Self, QRunV06NoiseError> {
+        validate_context(local_static_private_key, network_id, profile_id)?;
+        let deadline = Instant::now() + HANDSHAKE_BUDGET;
+        let mut handshake = Builder::new(noise_params()?)
+            .prologue(&prologue(network_id, profile_id))
+            .local_private_key(local_static_private_key)
+            .build_responder()
+            .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
+        let mut payload = [0u8; MAX_HANDSHAKE_MESSAGE];
+        let mut message = [0u8; MAX_HANDSHAKE_MESSAGE];
+        let first = read_handshake(stream, deadline)?;
+        let read = handshake
+            .read_message(&first, &mut payload)
+            .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
+        if read != 0 {
+            return Err(QRunV06NoiseError::MalformedHandshake);
+        }
+        let written = handshake
+            .write_message(&[], &mut message)
+            .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
+        write_handshake(stream, &message[..written], deadline)?;
+        let third = read_handshake(stream, deadline)?;
+        let read = handshake
+            .read_message(&third, &mut payload)
+            .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
+        if read != 0 {
+            return Err(QRunV06NoiseError::MalformedHandshake);
+        }
+        let remote = handshake
+            .get_remote_static()
+            .ok_or(QRunV06NoiseError::MalformedHandshake)?;
+        if remote.iter().all(|byte| *byte == 0) {
+            return Err(QRunV06NoiseError::UntrustedPeer);
+        }
+        let mut remote_static_public_key = [0u8; 32];
+        remote_static_public_key.copy_from_slice(remote);
+        let transport = handshake
+            .into_transport_mode()
+            .map_err(|error| QRunV06NoiseError::Handshake(error.to_string()))?;
+        Ok(Self {
+            transport,
+            remote_static_public_key,
+        })
+    }
+
     /// Encrypt one bounded QFP6 application record with a five-second absolute deadline.
     pub fn write_record(
         &mut self,
@@ -516,6 +624,48 @@ mod tests {
         assert_eq!(
             session.read_record(&mut stream).unwrap(),
             b"QFP6-encrypted-ack"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn qfp6_permissionless_noise_accepts_unknown_peer_key_and_encrypts() {
+        let (server_private, server_public) = keypair();
+        let (client_private, client_public) = keypair();
+        let (listener, address) = listener();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut session = QRunV06NoiseSession::accept_permissionless(
+                &mut stream,
+                &server_private,
+                &NETWORK,
+                &PROFILE,
+            )
+            .unwrap();
+            assert_eq!(session.remote_static_public_key(), &client_public);
+            assert_eq!(
+                session.read_record(&mut stream).unwrap(),
+                b"permissionless-QFP6"
+            );
+            session
+                .write_record(&mut stream, b"validated-by-consensus")
+                .unwrap();
+        });
+        let mut stream = TcpStream::connect(address).unwrap();
+        let mut session = QRunV06NoiseSession::connect_permissionless(
+            &mut stream,
+            &client_private,
+            &NETWORK,
+            &PROFILE,
+        )
+        .unwrap();
+        assert_eq!(session.remote_static_public_key(), &server_public);
+        session
+            .write_record(&mut stream, b"permissionless-QFP6")
+            .unwrap();
+        assert_eq!(
+            session.read_record(&mut stream).unwrap(),
+            b"validated-by-consensus"
         );
         server.join().unwrap();
     }
