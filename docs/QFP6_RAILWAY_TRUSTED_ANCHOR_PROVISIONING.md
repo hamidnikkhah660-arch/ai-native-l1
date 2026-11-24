@@ -14,6 +14,17 @@ The Railway entrypoint accepts an optional service-level variable:
 - When absent, the field is omitted. A node with existing durable manifests will continue to fail closed. A genuinely fresh Genesis-only node can continue through its separate bootstrap path.
 - Invalid values cause the entrypoint to refuse before writing the bootstrap/config files.
 
+## Existing data-layout compatibility
+
+The currently observed service images do not all use the same directory version: the seed image's entrypoint uses v3 paths, while the relay/joiner image refresh uses v4 paths. The updated entrypoint selects an already existing per-role v3 or v4 layout rather than blindly switching to v4:
+
+- If only v3 paths exist, keep v3.
+- If only v4 paths exist, keep v4.
+- If neither exists, use v4 for a new node.
+- If both versions exist, or an existing path is a symlink/non-directory, refuse startup and require an explicit data inventory. It never merges or deletes the directories.
+
+This is intended to prevent an image refresh from silently ignoring a node's previous durable history. It does not migrate data between layouts.
+
 ## Provisioning requirements
 
 Do not populate this variable by copying a value out of the same node volume and treating it as an independent pin. Before configuring a service:
