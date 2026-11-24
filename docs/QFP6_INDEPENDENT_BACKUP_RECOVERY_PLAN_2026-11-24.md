@@ -11,23 +11,30 @@ Provide a verifiable, recoverable backup path for each QFP6 zero-value testnet n
 - The three Railway services (seed, relay, joiner) each have a distinct 500 MB persistent volume mounted at `/data`.
 - Their latest observed startup logs report a fail-closed preflight refusal: existing durable history requires an independently pinned `permissionless_runtime.trusted_manifest_anchor`.
 - A successful Railway deployment status is not evidence that the blockchain process completed startup.
-- Repository documentation for CP-0388 and CP-0389 explicitly states that checkpoint/archive replay and externally anchored restore primitives are not yet wired into the live PFM4 store/runtime.
-- The archive range sync candidate describes itself as research-only and not wired into the node or public wire.
-- No verified live node export/snapshot endpoint or operator backup/restore interface has been identified.
 - Railway volume UI inspection did not expose a verified manual backup/snapshot/restore workflow. Wipe-volume UI wording mentioning backups does not establish backup availability or restore capability.
+- No verified live node export/snapshot endpoint or operator backup/restore interface has been identified.
 
-## Additional runtime boundary discovered\n
-- The source header of `src/native/pow_bench/src/bin/private_testnet_node.rs` explicitly labels that binary a loopback-only, disposable integration harness, not a public P2P node or mainnet client. This must be reconciled against the exact Railway image/build command before making any public-network or value-bearing claims.
-- The source headers of `private_testnet_fork_store.rs` and `private_testnet_monetary_fork_store.rs` describe those stores as candidate-only and not integrated with the public TCP listener / live runtime. They must not be assumed to describe the actual mounted `/data` layout without tracing the deployed binary and startup configuration.
-\n## Non-negotiable safety rules
+## Exact deployed runtime trace (read-only inspection, 2026-11-24)
+
+- Railway's seed service uses image tag `1c2edc459093`, which resolves to repository commit `1c2edc45909329157b97d364c77666fbf19bf541`. Relay and joiner use `6fbbd98f4730`, resolving to `6fbbd98f47309f1deb5883b8bc6a6955f9e1702c`.
+- The latter image is an entrypoint-only refresh over base image `66468e2b3667`; its Dockerfile copies a Python entrypoint and does not rebuild or replace the Rust binary.
+- The base Dockerfile builds `qrun_v06_node` using `cargo build --release --locked --bin qrun_v06_node`. The Railway entrypoint executes that binary with `--public-testnet-run`. Therefore the deployed target is the QRun v0.6 public-testnet candidate runtime, not `devnet_node` and not `private_testnet_node`.
+- The separate `devnet_node` / `private_testnet_node` sources are explicitly loopback-only harnesses. They are not the Railway executable.
+- The entrypoint builds a config with a `trusted_manifest_anchor_vault_path` but does not populate `trusted_manifest_anchor`. The Rust startup gate requires that independent root value whenever the node data directory already contains manifest entries; otherwise it returns the exact fail-closed error shown in Railway logs.
+- The entrypoint's v4 paths place the data directory at `/data/node-data-<role>-v4`, mempool at `/data/mempool-<role>-v4`, and anchor vault at `/data/anchor-vault-<role>-v4`. These are separate directories, but all are under the same Railway `/data` volume. Lexical path separation does not make the anchor vault independent of rollback or loss of that volume.
+- The fresh-Genesis Joiner path is intentionally limited to a generation-zero, height-zero store with no existing history. It refuses to adopt existing history automatically. The current logs show that this condition is not met for the deployed services.
+- The runtime's public-testnet mode explicitly acknowledges anonymous Noise XX inbound security and labels itself a zero-value candidate. Deployment of the container image does not establish that a listener successfully opened or that Internet peers synchronized.
+
+## Non-negotiable safety rules
 
 1. Never wipe, detach, resize, replace, or reinitialize existing volumes as part of backup work.
 2. Never copy an actively-mutating database directory as if a raw filesystem copy were a consistent snapshot.
 3. Never export private keys, service secrets, signing material, or credentials into backup artifacts, logs, Git, or a third-party bucket.
-4. Preserve the existing independent trust anchor and monotonic anti-rollback state outside the node disk's rollback domain.
-5. Do not treat a locally generated checksum or a manifest stored beside the data as an independent trust anchor.
-6. No deploy, restart, service-variable change, volume mutation, or production cutover without a separate explicit approval and a reviewed rollback plan.
-7. No new paid storage or infrastructure unless costs and retention are disclosed and approved.
+4. Preserve an independently provisioned trust anchor and monotonic anti-rollback state outside the node disk's rollback domain.
+5. Do not treat a locally generated checksum, a manifest stored beside the data, or a second directory on the same volume as an independent trust anchor.
+6. Do not fabricate or infer the existing trusted manifest anchor from local history. It must be obtained and verified through an independent provisioning channel, then matched against the existing manifest chain and vault.
+7. No deploy, restart, service-variable change, volume mutation, or production cutover without a separate explicit approval and a reviewed rollback plan.
+8. No new paid storage or infrastructure unless costs and retention are disclosed and approved.
 
 ## Required architecture
 
@@ -77,14 +84,17 @@ A backup is not complete until all of the following evidence exists:
 ## Implementation sequence
 
 1. **Read-only inventory:** identify the exact live binary, command line, data layout, storage engine, writer lifecycle, and trust-anchor source. Do not inspect or print secret values.
-2. **Storage API review:** map the actual PFM4/PMT4 durable write path and determine whether a consistent logical snapshot can be exposed safely. Do not infer that standalone snapshot candidates are integrated.
-3. **Design and tests:** implement snapshot manifest schema, deterministic encoding, writer coordination, failure atomicity, and hostile-input tests in a separate branch.
-4. **Export path:** implement bounded streaming export with no secret material and explicit destination selection.
-5. **Restore path:** implement isolated restore, external anchor verification, monotonic floors, full archive replay, and canonical-tip equality checks.
-6. **CI:** add deterministic round-trip, crash/fault-injection, truncation, corruption, rollback, stale-anchor, missing-ancestry, and cross-node divergence tests.
-7. **Operator drill:** run against synthetic test data first; then request explicit approval for any live read/snapshot operation that may affect resource use.
-8. **Deployment gate:** only after independent review, passing CI, verified trust-anchor provisioning, and a separate explicit deployment approval.
+2. **Trust-anchor recovery:** independently provision the exact root anchor for each existing node and verify the matching local vault and manifest chain. Do not restart or change service variables until the value and rollback domain are independently validated.
+3. **Rollback-domain correction:** move monotonic high-water protection outside the Railway data volume (or integrate a genuinely independent, strongly consistent anchor service). A sibling directory under `/data` is not sufficient.
+4. **Storage API review:** map the actual QRun v0.6 durable write path and determine whether a consistent logical snapshot can be exposed safely. Do not infer that standalone snapshot candidates are integrated.
+5. **Design and tests:** implement snapshot manifest schema, deterministic encoding, writer coordination, failure atomicity, and hostile-input tests in a separate branch.
+6. **Export and restore:** implement bounded streaming export with no secret material, isolated restore, external anchor verification, monotonic floors, full archive replay, and canonical-tip equality checks.
+7. **CI:** add deterministic round-trip, crash/fault-injection, truncation, corruption, rollback, stale-anchor, missing-ancestry, and cross-node divergence tests.
+8. **Operator drill:** run against synthetic test data first; then request explicit approval for any live read/snapshot operation that may affect resource use.
+9. **Deployment gate:** only after independent review, passing CI, verified trust-anchor provisioning, and a separate explicit deployment approval.
 
 ## Current gate decision
 
-**NO-GO for live backup/export and NO-GO for deployment at this stage.** The runtime is currently refusing startup because the independent trusted manifest anchor is absent. The safe next engineering step is to trace the actual durable storage and anchor-loading path and implement/test an application-consistent snapshot contract offline. No claim of a usable backup should be made until a complete isolated restore drill passes.
+**NO-GO for live backup/export and NO-GO for deployment at this stage.** The deployed QRun v0.6 process refuses startup because existing durable manifests are present but the independent `trusted_manifest_anchor` is not supplied. The current entrypoint does not supply it, and the local anchor vault is colocated on the same Railway volume as the node data. Do not solve this by deleting history, silently enabling fresh-Genesis mode, or weakening the gate.
+
+The next safe engineering step is to obtain a read-only inventory of each existing volume's manifest/vault metadata and canonical tip, then independently establish the exact root anchor and a real external anti-rollback domain. Only after that should a consistent snapshot/export implementation be built and tested. No claim of a usable backup or operational public network should be made until a complete isolated restore and network synchronization drill passes.
