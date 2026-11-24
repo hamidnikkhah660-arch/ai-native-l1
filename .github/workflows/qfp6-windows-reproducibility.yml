@@ -209,9 +209,33 @@ jobs:
     needs: [build_a, build_b]
     if: always()
     steps:
-      - name: Report reproducibility evidence
+      - name: Checkout the exact revision's PE verifier
+        if: needs.build_a.result == 'success' && needs.build_b.result == 'success'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download independent Windows build A
+        if: needs.build_a.result == 'success' && needs.build_b.result == 'success'
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: qfp6-cp0849-windows-build-a
+          path: artifacts/build-a
+
+      - name: Download independent Windows build B
+        if: needs.build_a.result == 'success' && needs.build_b.result == 'success'
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: qfp6-cp0849-windows-build-b
+          path: artifacts/build-b
+
+      - name: Verify byte-identical PE content after strict metadata normalization
+        if: always()
         shell: bash
         env:
+          RESULT_A: ${{ needs.build_a.result }}
+          RESULT_B: ${{ needs.build_b.result }}
           COMMIT_A: ${{ needs.build_a.outputs.commit }}
           COMMIT_B: ${{ needs.build_b.outputs.commit }}
           HASH_A: ${{ needs.build_a.outputs.sha256 }}
@@ -235,25 +259,32 @@ jobs:
           {
             echo '## QFP6 independent Windows Release build comparison'
             echo
-            echo "- Commit A: \`${COMMIT_A:-missing}\`"
-            echo "- Commit B: \`${COMMIT_B:-missing}\`"
-            echo "- Build A SHA-256: \`${HASH_A:-missing}\` (size: ${SIZE_A:-missing})"
-            echo "- Build B SHA-256: \`${HASH_B:-missing}\` (size: ${SIZE_B:-missing})"
-            echo "- Rust: \`${RUSTC_A:-missing}\` / \`${RUSTC_B:-missing}\`"
-            echo "- Cargo: \`${CARGO_A:-missing}\` / \`${CARGO_B:-missing}\`"
-            echo "- MSVC linker SHA-256: \`${LINKER_A:-missing}\` / \`${LINKER_B:-missing}\`"
-            echo "- MSVC librarian SHA-256: \`${LIB_A:-missing}\` / \`${LIB_B:-missing}\`"
-            echo "- Windows SDK: \`${SDK_A:-missing}\` / \`${SDK_B:-missing}\`"
-            echo "- Cargo.lock SHA-256: \`${LOCK_A:-missing}\` / \`${LOCK_B:-missing}\`"
+            echo "- Commit A: \`\${COMMIT_A:-missing}\`"
+            echo "- Commit B: \`\${COMMIT_B:-missing}\`"
+            echo "- Raw build A SHA-256: \`\${HASH_A:-missing}\` (size: \${SIZE_A:-missing})"
+            echo "- Raw build B SHA-256: \`\${HASH_B:-missing}\` (size: \${SIZE_B:-missing})"
+            echo "- Rust: \`\${RUSTC_A:-missing}\` / \`\${RUSTC_B:-missing}\`"
+            echo "- Cargo: \`\${CARGO_A:-missing}\` / \`\${CARGO_B:-missing}\`"
+            echo "- MSVC linker SHA-256: \`\${LINKER_A:-missing}\` / \`\${LINKER_B:-missing}\`"
+            echo "- MSVC librarian SHA-256: \`\${LIB_A:-missing}\` / \`\${LIB_B:-missing}\`"
+            echo "- Windows SDK: \`\${SDK_A:-missing}\` / \`\${SDK_B:-missing}\`"
+            echo "- Cargo.lock SHA-256: \`\${LOCK_A:-missing}\` / \`\${LOCK_B:-missing}\`"
             echo
           } >> "$GITHUB_STEP_SUMMARY"
-          if [[ -z "$HASH_A" || -z "$HASH_B" ]]; then
+
+          if [[ "$RESULT_A" != "success" || "$RESULT_B" != "success" ]]; then
             echo 'RESULT=BUILD_OR_OUTPUT_MISSING' | tee -a "$GITHUB_STEP_SUMMARY"
-          elif [[ "$COMMIT_A" != "$COMMIT_B" || "$LOCK_A" != "$LOCK_B" || "$RUSTC_A" != "$RUSTC_B" || "$CARGO_A" != "$CARGO_B" || "$LINKER_A" != "$LINKER_B" || "$LIB_A" != "$LIB_B" || "$SDK_A" != "$SDK_B" ]]; then
-            echo 'RESULT=INCONCLUSIVE_ENVIRONMENT_MISMATCH' | tee -a "$GITHUB_STEP_SUMMARY"
-          elif [[ "$HASH_A" == "$HASH_B" && "$SIZE_A" == "$SIZE_B" ]]; then
-            echo 'RESULT=WHOLE_FILE_IDENTICAL_ACROSS_TWO_HOSTED_WINDOWS_BUILDS' | tee -a "$GITHUB_STEP_SUMMARY"
-          else
-            echo 'RESULT=WHOLE_FILE_DIFFERENT_ACROSS_TWO_HOSTED_WINDOWS_BUILDS' | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
-          echo 'This diagnostic reports the comparison result; a green workflow is not, by itself, a reproducibility approval.'
+          if [[ -z "$HASH_A" || -z "$HASH_B" || ! -f artifacts/build-a/qrun_v06_node.exe || ! -f artifacts/build-b/qrun_v06_node.exe ]]; then
+            echo 'RESULT=BUILD_OR_ARTIFACT_MISSING' | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if [[ "$COMMIT_A" != "$COMMIT_B" || "$LOCK_A" != "$LOCK_B" || "$RUSTC_A" != "$RUSTC_B" || "$CARGO_A" != "$CARGO_B" || "$LINKER_A" != "$LINKER_B" || "$LIB_A" != "$LIB_B" || "$SDK_A" != "$SDK_B" ]]; then
+            echo 'RESULT=INCONCLUSIVE_ENVIRONMENT_MISMATCH' | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          python3 scripts/verify_windows_pe_repro.py \
+            --binary-a artifacts/build-a/qrun_v06_node.exe \
+            --binary-b artifacts/build-b/qrun_v06_node.exe | tee -a "$GITHUB_STEP_SUMMARY"
