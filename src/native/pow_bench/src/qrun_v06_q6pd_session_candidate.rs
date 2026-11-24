@@ -19,6 +19,9 @@ use std::{
 
 pub const Q6PD_SESSION_VERSION: u16 = 1;
 pub const Q6PD_SESSION_OPEN_MAGIC: [u8; 4] = *b"Q6SO";
+/// Explicit opt-in for a short-lived NAT-only liveness slot; it carries no peer record or trust.
+pub const Q6PD_NAT_ONLY_SESSION_OPEN_MAGIC: [u8; 4] = *b"Q6NO";
+pub const Q6PD_NAT_ONLY_SESSION_ACK_MAGIC: [u8; 4] = *b"Q6NA";
 pub const Q6PD_SESSION_OPEN_ACK_MAGIC: [u8; 4] = *b"Q6SA";
 pub const Q6PD_SESSION_PING_MAGIC: [u8; 4] = *b"Q6SP";
 pub const Q6PD_SESSION_PONG_MAGIC: [u8; 4] = *b"Q6SR";
@@ -29,10 +32,13 @@ pub const Q6PD_SESSION_ACK_BYTES: usize = Q6PD_SESSION_CONTROL_BYTES + 1;
 /// Hard process-local bound. Persistent sockets never consume more than this many
 /// dedicated server threads, independently of the regular listener session budget.
 pub const Q6PD_MAX_PERSISTENT_SESSIONS: usize = 8;
+/// Unannounced NAT-only liveness sessions use a separate, much smaller resource pool.
+pub const Q6PD_MAX_NAT_ONLY_SESSIONS: usize = 2;
 pub const Q6PD_SESSION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const Q6PD_SERVER_READ_BUDGET: Duration = Duration::from_secs(20);
 const Q6PD_MAX_MISSED_HEARTBEATS: u8 = 3;
 const Q6PD_MAX_SESSION_LIFETIME: Duration = Duration::from_secs(6 * 60 * 60);
+const Q6PD_MAX_NAT_ONLY_SESSION_LIFETIME: Duration = Duration::from_secs(2 * 60);
 const Q6PD_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const Q6PD_CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(15);
 const Q6PD_OPEN_ACK_BUDGET: Duration = Duration::from_secs(8);
@@ -42,6 +48,7 @@ const Q6PD_RECONNECT_MAX: Duration = Duration::from_secs(300);
 const Q6PD_INTERRUPTIBLE_SLEEP: Duration = Duration::from_millis(100);
 
 static ACTIVE_Q6PD_PERSISTENT_SESSIONS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_Q6PD_NAT_ONLY_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Q6pdSessionControl {
@@ -125,6 +132,35 @@ pub fn encode_q6pd_session_open(value: &Q6pdSessionControl) -> Vec<u8> {
     encode_control(Q6PD_SESSION_OPEN_MAGIC, value)
 }
 
+/// A NAT-only Joiner opts into an unverified, non-gossip liveness slot explicitly.
+pub fn encode_q6pd_nat_only_session_open(value: &Q6pdSessionControl) -> Vec<u8> {
+    encode_control(Q6PD_NAT_ONLY_SESSION_OPEN_MAGIC, value)
+}
+
+pub fn decode_q6pd_nat_only_session_open(
+    frame: &[u8],
+    network_id: &[u8; 32],
+    profile_id: &[u8; 32],
+) -> Result<Q6pdSessionControl, Q6pdSessionControlError> {
+    decode_control(frame, Q6PD_NAT_ONLY_SESSION_OPEN_MAGIC, network_id, profile_id)
+}
+
+pub fn encode_q6pd_nat_only_session_ack(
+    value: &Q6pdSessionControl,
+    accepted: bool,
+) -> Vec<u8> {
+    let mut out = encode_control(Q6PD_NAT_ONLY_SESSION_ACK_MAGIC, value);
+    out.push(u8::from(accepted));
+    out
+}
+
+pub fn decode_q6pd_nat_only_session_ack(
+    frame: &[u8],
+    expected: &Q6pdSessionControl,
+) -> Result<bool, Q6pdSessionControlError> {
+    decode_control_ack(frame, Q6PD_NAT_ONLY_SESSION_ACK_MAGIC, expected)
+}
+
 pub fn decode_q6pd_session_open(
     frame: &[u8],
     network_id: &[u8; 32],
@@ -143,13 +179,20 @@ pub fn decode_q6pd_session_open_ack(
     frame: &[u8],
     expected: &Q6pdSessionControl,
 ) -> Result<bool, Q6pdSessionControlError> {
-    if frame.len() != Q6PD_SESSION_ACK_BYTES || frame.get(..4) != Some(&Q6PD_SESSION_OPEN_ACK_MAGIC)
-    {
+    decode_control_ack(frame, Q6PD_SESSION_OPEN_ACK_MAGIC, expected)
+}
+
+fn decode_control_ack(
+    frame: &[u8],
+    magic: [u8; 4],
+    expected: &Q6pdSessionControl,
+) -> Result<bool, Q6pdSessionControlError> {
+    if frame.len() != Q6PD_SESSION_ACK_BYTES || frame.get(..4) != Some(&magic) {
         return Err(Q6pdSessionControlError::Malformed);
     }
     let control = decode_control(
         &frame[..Q6PD_SESSION_CONTROL_BYTES],
-        Q6PD_SESSION_OPEN_ACK_MAGIC,
+        magic,
         &expected.network_id,
         &expected.profile_id,
     )?;
@@ -204,25 +247,88 @@ pub fn decode_q6pd_session_close(
     decode_control(frame, Q6PD_SESSION_CLOSE_MAGIC, network_id, profile_id)
 }
 
-/// A reservation owns one of the bounded persistent server-session slots.
-pub struct Q6pdPersistentSessionSlot;
-impl Drop for Q6pdPersistentSessionSlot {
-    fn drop(&mut self) {
-        ACTIVE_Q6PD_PERSISTENT_SESSIONS.fetch_sub(1, Ordering::AcqRel);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Q6pdSessionSlotKind {
+    SignedPeer,
+    NatOnlyUnverified,
+}
+
+/// A reservation owns one bounded liveness slot. NAT-only slots are separate and short-lived.
+pub struct Q6pdPersistentSessionSlot {
+    kind: Q6pdSessionSlotKind,
+}
+
+impl Q6pdPersistentSessionSlot {
+    fn max_lifetime(&self) -> Duration {
+        match self.kind {
+            Q6pdSessionSlotKind::SignedPeer => Q6PD_MAX_SESSION_LIFETIME,
+            Q6pdSessionSlotKind::NatOnlyUnverified => Q6PD_MAX_NAT_ONLY_SESSION_LIFETIME,
+        }
+    }
+
+    fn mode_name(&self) -> &'static str {
+        match self.kind {
+            Q6pdSessionSlotKind::SignedPeer => "signed_peer",
+            Q6pdSessionSlotKind::NatOnlyUnverified => "nat_only_unverified",
+        }
+    }
+
+    fn active_count(&self) -> usize {
+        match self.kind {
+            Q6pdSessionSlotKind::SignedPeer => active_q6pd_persistent_session_count(),
+            Q6pdSessionSlotKind::NatOnlyUnverified => active_q6pd_nat_only_session_count(),
+        }
     }
 }
 
-pub fn try_reserve_q6pd_persistent_session() -> Option<Q6pdPersistentSessionSlot> {
-    ACTIVE_Q6PD_PERSISTENT_SESSIONS
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-            (active < Q6PD_MAX_PERSISTENT_SESSIONS).then_some(active + 1)
+impl Drop for Q6pdPersistentSessionSlot {
+    fn drop(&mut self) {
+        match self.kind {
+            Q6pdSessionSlotKind::SignedPeer => {
+                ACTIVE_Q6PD_PERSISTENT_SESSIONS.fetch_sub(1, Ordering::AcqRel);
+            }
+            Q6pdSessionSlotKind::NatOnlyUnverified => {
+                ACTIVE_Q6PD_NAT_ONLY_SESSIONS.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
+}
+
+fn try_reserve_slot(
+    active: &AtomicUsize,
+    limit: usize,
+    kind: Q6pdSessionSlotKind,
+) -> Option<Q6pdPersistentSessionSlot> {
+    active
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            (count < limit).then_some(count + 1)
         })
         .ok()
-        .map(|_| Q6pdPersistentSessionSlot)
+        .map(|_| Q6pdPersistentSessionSlot { kind })
+}
+
+pub fn try_reserve_q6pd_persistent_session() -> Option<Q6pdPersistentSessionSlot> {
+    try_reserve_slot(
+        &ACTIVE_Q6PD_PERSISTENT_SESSIONS,
+        Q6PD_MAX_PERSISTENT_SESSIONS,
+        Q6pdSessionSlotKind::SignedPeer,
+    )
+}
+
+pub fn try_reserve_q6pd_nat_only_session() -> Option<Q6pdPersistentSessionSlot> {
+    try_reserve_slot(
+        &ACTIVE_Q6PD_NAT_ONLY_SESSIONS,
+        Q6PD_MAX_NAT_ONLY_SESSIONS,
+        Q6pdSessionSlotKind::NatOnlyUnverified,
+    )
 }
 
 pub fn active_q6pd_persistent_session_count() -> usize {
     ACTIVE_Q6PD_PERSISTENT_SESSIONS.load(Ordering::Acquire)
+}
+
+pub fn active_q6pd_nat_only_session_count() -> usize {
+    ACTIVE_Q6PD_NAT_ONLY_SESSIONS.load(Ordering::Acquire)
 }
 
 /// Serve only Q6PD liveness controls on a dedicated worker. Discovery pulls, announcements,
@@ -232,9 +338,11 @@ pub fn serve_q6pd_persistent_session(
     mut noise: QRunV06NoiseSession,
     open_request: Q6pdSessionControl,
     peer_addr: SocketAddr,
-    _slot: Q6pdPersistentSessionSlot,
+    slot: Q6pdPersistentSessionSlot,
 ) {
     let started = Instant::now();
+    let max_lifetime = slot.max_lifetime();
+    let session_mode = slot.mode_name();
     let mut replay_guard = QRunV06PeerReplayGuard::new();
     if replay_guard.accept(open_request.request_id).is_err() {
         return;
@@ -243,13 +351,14 @@ pub fn serve_q6pd_persistent_session(
     let remote_key = *noise.remote_static_public_key();
     let mut missed_heartbeats = 0u8;
     eprintln!(
-        "QFP6_Q6PD_PERSISTENT_SESSION_STARTED endpoint={} remote_static_pinned={} active={}",
+        "QFP6_Q6PD_PERSISTENT_SESSION_STARTED endpoint={} mode={} remote_static_pinned={} active={}",
         peer_addr,
+        session_mode,
         pinned,
-        active_q6pd_persistent_session_count()
+        slot.active_count()
     );
 
-    while started.elapsed() < Q6PD_MAX_SESSION_LIFETIME {
+    while started.elapsed() < max_lifetime {
         let frame = match noise.read_record_with_budget(&mut stream, Q6PD_SERVER_READ_BUDGET) {
             Ok(frame) => frame,
             Err(QRunV06NoiseError::RecordTimeout) => {
@@ -318,11 +427,12 @@ pub fn serve_q6pd_persistent_session(
     }
 
     eprintln!(
-        "QFP6_Q6PD_PERSISTENT_SESSION_STOPPED endpoint={} lifetime_seconds={} remote_key_prefix={:02x?} active={}",
+        "QFP6_Q6PD_PERSISTENT_SESSION_STOPPED endpoint={} mode={} lifetime_seconds={} remote_key_prefix={:02x?} active={}",
         peer_addr,
+        session_mode,
         started.elapsed().as_secs(),
         &remote_key[..4],
-        active_q6pd_persistent_session_count().saturating_sub(1)
+        slot.active_count().saturating_sub(1)
     );
 }
 
@@ -475,7 +585,30 @@ pub fn run_q6pd_persistent_peer_session_worker(
                     ),
                     // No local public endpoint is a supported NAT client mode. The
                     // remote key is still pinned by the signed Q6PD record and Noise handshake.
-                    None => Ok(()),
+                    None => {
+                        request_id = request_id.saturating_add(1).max(1);
+                        let opt_in = Q6pdSessionControl {
+                            request_id,
+                            network_id,
+                            profile_id,
+                        };
+                        noise.write_record(
+                            stream.as_mut(),
+                            &encode_q6pd_nat_only_session_open(&opt_in),
+                        )
+                        .map_err(|error| format!("NAT-only session opt-in write failed: {error}"))?;
+                        let ack = noise
+                            .read_record_with_budget(stream.as_mut(), Q6PD_OPEN_ACK_BUDGET)
+                            .map_err(|error| format!("NAT-only session opt-in acknowledgement failed: {error}"))?;
+                        match decode_q6pd_nat_only_session_ack(&ack, &opt_in) {
+                            Ok(true) => {
+                                eprintln!("QFP6_Q6PD_SESSION_NAT_ONLY_OPT_IN=PASS endpoint={}", address);
+                                Ok(())
+                            }
+                            Ok(false) => Err("remote peer refused bounded NAT-only liveness mode".into()),
+                            Err(error) => Err(format!("NAT-only session opt-in rejected: {error}")),
+                        }
+                    },
                 } {
                     eprintln!(
                         "QFP6_Q6PD_SESSION_LOCAL_ANNOUNCEMENT_REJECTED endpoint={} error={error}",
@@ -575,8 +708,9 @@ pub fn run_q6pd_persistent_peer_session_worker(
                                 }
                             }
                             Ok(false) => eprintln!(
-                                "QFP6_Q6PD_SESSION_CAPACITY_REJECTED endpoint={}",
-                                address
+                                "QFP6_Q6PD_SESSION_OPEN_REFUSED endpoint={} mode={}",
+                                address,
+                                if announcement_mode.is_some() { "signed_peer" } else { "nat_only_unverified" }
                             ),
                             Err(error) => eprintln!(
                                 "QFP6_Q6PD_SESSION_OPEN_REJECTED endpoint={} error={error:?}",
@@ -719,6 +853,51 @@ mod tests {
         drop(slots.pop());
         assert!(try_reserve_q6pd_persistent_session().is_some());
         drop(slots);
+    }
+
+    #[test]
+    fn nat_only_session_capacity_is_separate_bounded_and_short_lived() {
+        let mut slots = Vec::new();
+        for _ in 0..Q6PD_MAX_NAT_ONLY_SESSIONS {
+            slots.push(try_reserve_q6pd_nat_only_session().unwrap());
+        }
+        assert!(try_reserve_q6pd_nat_only_session().is_none());
+        assert!(try_reserve_q6pd_persistent_session().is_some());
+        drop(slots.pop());
+        assert!(try_reserve_q6pd_nat_only_session().is_some());
+        drop(slots);
+    }
+
+    #[test]
+    fn nat_only_session_control_is_domain_bound_and_carries_no_peer_record() {
+        let opt_in = control(411);
+        let request = encode_q6pd_nat_only_session_open(&opt_in);
+        assert_eq!(
+            decode_q6pd_nat_only_session_open(&request, &NETWORK, &PROFILE),
+            Ok(opt_in)
+        );
+        assert_eq!(
+            decode_q6pd_nat_only_session_open(&request, &[0x99; 32], &PROFILE),
+            Err(Q6pdSessionControlError::WrongNetwork)
+        );
+        assert_eq!(
+            decode_q6pd_nat_only_session_open(&request, &NETWORK, &[0x98; 32]),
+            Err(Q6pdSessionControlError::WrongProfile)
+        );
+        assert_eq!(
+            decode_q6pd_nat_only_session_ack(
+                &encode_q6pd_nat_only_session_ack(&opt_in, true),
+                &opt_in
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            decode_q6pd_nat_only_session_ack(
+                &encode_q6pd_nat_only_session_ack(&opt_in, false),
+                &opt_in
+            ),
+            Ok(false)
+        );
     }
     #[test]
     fn nat_joiner_can_open_persistent_session_without_public_self_announcement() {
