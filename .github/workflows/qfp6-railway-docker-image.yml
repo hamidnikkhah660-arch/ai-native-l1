@@ -26,6 +26,9 @@ jobs:
       - name: Checkout exact source revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      - name: Test Railway entrypoint trust-anchor input
+        run: python3 deploy/railway/qfp6-node/test_entrypoint.py
+
       - name: Build Linux x86_64 QFP6 image
         shell: bash
         run: |
