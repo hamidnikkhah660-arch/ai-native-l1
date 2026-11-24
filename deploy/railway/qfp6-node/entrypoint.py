@@ -84,6 +84,7 @@ def select_storage_layout(role: str) -> str:
         )
     return existing_versions[0] if existing_versions else "v4"
 
+
 def resolve_public_proxy_endpoint(value: str) -> tuple[str, int]:
     host, separator, port_text = value.rpartition(":")
     if not separator or not host or not port_text.isdigit():
@@ -141,14 +142,15 @@ def build_config(role: str) -> tuple[dict, bytes]:
         ip, port = resolve_public_proxy_endpoint(require_env("QFP6_ADVERTISE_PROXY_ENDPOINT"))
         advertise_endpoint = f"{ip}:{port}"
 
+    # Resolve the durable layout before writing any generated bootstrap/config files.
+    # Mixed or unsafe paths must fail before even non-chain runtime state is changed.
+    layout_version = select_storage_layout(role)
+
     BOOTSTRAP.parent.mkdir(parents=True, exist_ok=True)
     bootstrap_bytes = (json.dumps(peers, separators=(",", ":")) + "\n").encode("utf-8")
     BOOTSTRAP.write_bytes(bootstrap_bytes)
     bootstrap_sha = hashlib.sha256(bootstrap_bytes).hexdigest()
 
-    # Preserve an existing v3 or v4 data layout across an image refresh. If
-    # both versions exist, refuse instead of silently switching away from history.
-    layout_version = select_storage_layout(role)
     node_data = DATA / f"node-data-{role}-{layout_version}"
     mempool_data = DATA / f"mempool-{role}-{layout_version}"
     q6pd_data = DATA / f"q6pd-{role}-{layout_version}"
