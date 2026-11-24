@@ -585,7 +585,7 @@ pub fn run_q6pd_persistent_peer_session_worker(
                     ),
                     // No local public endpoint is a supported NAT client mode. The
                     // remote key is still pinned by the signed Q6PD record and Noise handshake.
-                    None => {
+                    None => (|| -> Result<(), String> {
                         request_id = request_id.saturating_add(1).max(1);
                         let opt_in = Q6pdSessionControl {
                             request_id,
@@ -608,7 +608,7 @@ pub fn run_q6pd_persistent_peer_session_worker(
                             Ok(false) => Err("remote peer refused bounded NAT-only liveness mode".into()),
                             Err(error) => Err(format!("NAT-only session opt-in rejected: {error}")),
                         }
-                    },
+                    })(),
                 } {
                     eprintln!(
                         "QFP6_Q6PD_SESSION_LOCAL_ANNOUNCEMENT_REJECTED endpoint={} error={error}",
