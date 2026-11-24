@@ -12,6 +12,7 @@ on:
       - "src/native/pow_bench/src/qrun_v06_peer_discovery_candidate.rs"
       - "src/native/pow_bench/src/qrun_v06_peer_discovery_store_candidate.rs"
       - "src/native/pow_bench/src/qrun_v06_q6pd_session_candidate.rs"
+      - "src/native/pow_bench/src/qrun_v06_peer_listener_candidate.rs"
       - "src/native/pow_bench/Cargo.toml"
       - "src/native/pow_bench/Cargo.lock"
       - ".github/workflows/qfp6-cp0849-hosted-seed-probe.yml"
