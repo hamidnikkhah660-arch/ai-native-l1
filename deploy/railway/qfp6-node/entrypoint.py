@@ -36,6 +36,25 @@ def require_env(name: str) -> str:
     return value
 
 
+def trusted_manifest_anchor_from_env() -> str | None:
+    """Read the operator-pinned public root anchor without deriving it from node data.
+
+    QFP6_TRUSTED_MANIFEST_ANCHOR is a 32-byte public commitment, not a signing key.
+    It must be independently verified against the node's immutable sequence-1 vault
+    record before being provisioned as a Railway service-level variable.
+    """
+    value = os.environ.get("QFP6_TRUSTED_MANIFEST_ANCHOR", "").strip()
+    if not value:
+        return None
+    if len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
+        raise RuntimeError(
+            "QFP6_TRUSTED_MANIFEST_ANCHOR must be exactly 64 lowercase hexadecimal characters"
+        )
+    if value == "0" * 64:
+        raise RuntimeError("QFP6_TRUSTED_MANIFEST_ANCHOR must not be zero")
+    return value
+
+
 def resolve_public_proxy_endpoint(value: str) -> tuple[str, int]:
     host, separator, port_text = value.rpartition(":")
     if not separator or not host or not port_text.isdigit():
@@ -68,6 +87,10 @@ def build_config(role: str) -> tuple[dict, bytes]:
     role = role.lower()
     if role not in {"seed", "relay", "joiner"}:
         raise RuntimeError("QFP6_NODE_ROLE must be seed, relay, or joiner")
+
+    # Validate this external pin before writing bootstrap/config files. Absence is
+    # allowed for genuinely fresh Genesis state; existing history will fail closed.
+    configured_root_anchor = trusted_manifest_anchor_from_env()
 
     is_seed = role == "seed"
     is_relay = role == "relay"
@@ -156,6 +179,8 @@ def build_config(role: str) -> tuple[dict, bytes]:
         runtime["fresh_genesis_anchor_derivation_acknowledgement"] = (
             "VERIFIED_GENESIS_DERIVED_ANCHOR_ZERO_VALUE_TESTNET_ONLY"
         )
+    if configured_root_anchor is not None:
+        runtime["trusted_manifest_anchor"] = configured_root_anchor
     if is_public:
         runtime["q6pd_self_advertise_endpoint"] = advertise_endpoint
 
