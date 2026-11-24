@@ -1158,6 +1158,19 @@ fn local_anchor_record_digest(record: &Value) -> Result<[u8; 32], String> {
     Ok(hash.finalize().into())
 }
 
+fn trusted_manifest_floor(cfg: &Value) -> Result<(u64, [u8; 32]), String> {
+    let generation = cfg
+        .get("trusted_manifest_floor_generation")
+        .and_then(Value::as_u64)
+        .ok_or("permissionless trusted_manifest_floor_generation must be an unsigned integer")?;
+    let anchor_text = cfg
+        .get("trusted_manifest_floor_anchor")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .ok_or("permissionless trusted_manifest_floor_anchor must be a non-empty 64-hex string")?;
+    let anchor = parse_hex32("trusted_manifest_floor_anchor", anchor_text)?;
+    Ok((generation, anchor))
+}
 /// Verify the full append-only vault chain on the separate local system volume.
 /// This detects D:-only rollback while the C: vault remains intact. It is not a TPM
 /// monotonic counter and cannot defeat full-machine/two-disk rollback.
@@ -1167,6 +1180,8 @@ fn validate_local_anchor_vault(
     expected_profile_id: &[u8; 32],
     data_latest_generation: u64,
     configured_root_anchor: &[u8; 32],
+    external_floor_generation: u64,
+    external_floor_anchor: &[u8; 32],
 ) -> Result<(u64, [u8; 32]), String> {
     let root = local_anchor_vault_directory(cfg)?;
     let root_meta = fs::symlink_metadata(&root)
@@ -1224,6 +1239,7 @@ fn validate_local_anchor_vault(
     let mut root_anchor = None::<[u8; 32]>;
     let mut latest_anchor = None::<[u8; 32]>;
     let mut latest_generation = None::<u64>;
+    let mut external_floor_matched = false;
     for (index, (sequence, path)) in paths.iter().enumerate() {
         let expected_sequence = (index as u64)
             .checked_add(1)
@@ -1283,6 +1299,15 @@ fn validate_local_anchor_vault(
         if network != *expected_network_id || profile != *expected_profile_id {
             return Err("local QFP6 anchor vault belongs to a different network/profile".into());
         }
+        if generation == external_floor_generation {
+            if anchor != *external_floor_anchor {
+                return Err(
+                    "local QFP6 anchor vault does not match the independently pinned generation floor"
+                        .into(),
+                );
+            }
+            external_floor_matched = true;
+        }
         if previous != previous_digest {
             return Err(format!(
                 "local QFP6 anchor vault predecessor mismatch at sequence {sequence}"
@@ -1322,6 +1347,11 @@ fn validate_local_anchor_vault(
 
     if root_anchor != Some(*configured_root_anchor) {
         return Err("permissionless trusted_manifest_anchor does not match the immutable sequence-1 C: vault root".into());
+    }
+    if !external_floor_matched {
+        return Err(format!(
+            "local QFP6 anchor vault is below or missing independently pinned floor generation {external_floor_generation}"
+        ));
     }
     let vault_generation = latest_generation.ok_or("local anchor vault has no tip generation")?;
     let vault_anchor = latest_anchor.ok_or("local anchor vault has no tip anchor")?;
@@ -1373,12 +1403,15 @@ fn trusted_manifest_anchor(
             let text = value.as_str().filter(|s| !s.trim().is_empty()).ok_or("trusted_manifest_anchor must be a non-empty 64-hex string")?;
             let configured_root_anchor = parse_hex32("trusted_manifest_anchor", text)?;
             let data_latest_generation = (entries as u64).checked_sub(1).ok_or("existing manifest count underflow")?;
+            let (floor_generation, floor_anchor) = trusted_manifest_floor(cfg)?;
             let vault_tip = validate_local_anchor_vault(
                 cfg,
                 expected_network_id,
                 expected_profile_id,
                 data_latest_generation,
                 &configured_root_anchor,
+                floor_generation,
+                &floor_anchor,
             )?;
             Ok(Some(vault_tip))
         }
@@ -1394,24 +1427,41 @@ fn trusted_manifest_anchor(
             let configured_root_anchor = parse_hex32("trusted_manifest_anchor", text)?;
             let vault_path = local_anchor_vault_directory(cfg)?;
             match fs::symlink_metadata(&vault_path) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                    && cfg.get("trusted_manifest_floor_generation").is_none()
+                    && cfg.get("trusted_manifest_floor_anchor").is_none() => Ok(None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(
+                    "external manifest floor is configured but the pre-provisioned Joining anchor vault is missing"
+                        .into(),
+                ),
                 Err(error) => Err(format!(
                     "cannot inspect pre-provisioned Joining C: anchor vault: {error}"
                 )),
                 Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(
                     "pre-provisioned Joining C: anchor vault must be a real directory".into(),
                 ),
-                Ok(_) => validate_local_anchor_vault(
-                    cfg,
-                    expected_network_id,
-                    expected_profile_id,
-                    0,
-                    &configured_root_anchor,
-                )
-                .map(Some),
+                Ok(_) => {
+                    let (floor_generation, floor_anchor) = trusted_manifest_floor(cfg)?;
+                    validate_local_anchor_vault(
+                        cfg,
+                        expected_network_id,
+                        expected_profile_id,
+                        0,
+                        &configured_root_anchor,
+                        floor_generation,
+                        &floor_anchor,
+                    )
+                    .map(Some)
+                },
             }
         },
         (false, Some(_)) => Err("trusted_manifest_anchor must be omitted for a fresh Genesis-only data directory".into()),
+        (false, None)
+            if cfg.get("trusted_manifest_floor_generation").is_some()
+                || cfg.get("trusted_manifest_floor_anchor").is_some() =>
+        {
+            Err("independent manifest floor requires trusted_manifest_anchor".into())
+        }
         (false, None) => Ok(None),
     }
 }
