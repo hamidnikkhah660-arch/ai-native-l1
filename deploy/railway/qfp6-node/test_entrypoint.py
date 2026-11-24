@@ -86,5 +86,6 @@ class TrustedManifestAnchorEnvironmentTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "must be a real directory"):
                     ENTRYPOINT.select_storage_layout("seed")
 
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
