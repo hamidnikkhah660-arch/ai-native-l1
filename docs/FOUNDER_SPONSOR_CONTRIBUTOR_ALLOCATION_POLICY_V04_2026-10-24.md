@@ -1,7 +1,9 @@
 # QuantumZXB Tokenomics and Distribution Policy v0.4
 
 **Date:** 2026-10-24
-**Status:** Owner-directed allocation proposal; not encoded in production Genesis, not an on-chain balance statement, and not a market or investment promise. This policy supersedes the former 40% / 30% / 30% allocation framework for current planning. The v0.3 policy is retained as historical context.
+**Status:** Historical owner-directed allocation proposal; not encoded in production Genesis, not an on-chain balance statement, and not a market or investment promise. At publication this proposal superseded the former 40% / 30% / 30% framework; it was itself superseded for current candidate economics by CP-0651 on 2026-11-14.
+
+> **Historical-policy notice (2026-11-17):** This v0.4 eight-bucket proposal, including its 3B QZXB mining/security envelope, was superseded for the current candidate by CP-0651. It must not be presented as active tokenomics, a current miner reserve, a block-subsidy schedule, or an entitlement. See the [current CP-0651 economics](../economics.html). This document is retained solely as a dated historical proposal.
 
 ## 1. Total cap and planned allocation
 

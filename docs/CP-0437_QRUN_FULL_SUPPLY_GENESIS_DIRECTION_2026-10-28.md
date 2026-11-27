@@ -1,10 +1,12 @@
 # CP-0437 ? QRun full-supply owner Genesis direction
 
+> **Supersession notice (2026-11-17):** This 10B owner-only / zero-subsidy direction was the candidate at the time of this dated decision. It was later superseded by CP-0651 (2026-11-14): a 7B maximum accounting ceiling, 1B intended owner Genesis allocation, six non-circulating 1B accounting labels and zero block subsidy with fee-only producer compensation. Read this file as historical decision context, not the current monetary policy.
+
 **Date:** 2026-10-28
 
-**Status:** Latest owner direction recorded; production runtime integration is NOT complete. This is a specification, not a Mainnet-launch claim.
+**Status:** Historical owner direction, superseded by CP-0651 on 2026-11-14; production runtime integration was NOT complete. This is retained as a dated specification, not the current policy or a Mainnet-launch claim.
 
-## Current requested QRun native-coin policy
+## Historical requested QRun native-coin policy (superseded)
 
 - Native network name: **QRun (Quantum Run)**.
 - Native asset symbol: **QZXB**. This is the native asset of the independent QZXB chain, not a wrapped asset on another chain.

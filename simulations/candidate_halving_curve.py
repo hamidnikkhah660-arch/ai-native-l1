@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Generate/check the candidate native mining-subsidy curve.
+"""Generate/check archived candidate mining-subsidy arithmetic.
 
-All outputs are arithmetic from a not-yet-ratified profile. This tool does not
+Historical 10B/3B halving model, superseded by CP-0651 (zero block subsidy); outputs remain reproducible historical research only. This tool does not
 read node state, broadcast transactions, or imply live issuance.
 """
 from __future__ import annotations
@@ -17,7 +17,9 @@ CSV_PATH = ROOT / "simulations" / "candidate_halving_curve.csv"
 START = "<!-- CANDIDATE_HALVING_CHART_START -->"
 END = "<!-- CANDIDATE_HALVING_CHART_END -->"
 ATOMS = 100_000_000
+# Historical model only; superseded by CP-0651 (7B accounting ceiling).
 SUPPLY_CAP = 10_000_000_000
+# Historical mining budget only; CP-0651 block subsidy is zero.
 MINING_BUDGET = 3_000_000_000
 HALVING_BLOCKS = 4_204_800
 INITIAL_SUBSIDY = 35_673_515_981
@@ -192,8 +194,14 @@ def main() -> int:
 
     if args.write:
         CSV_PATH.write_text(expected_csv, encoding="utf-8", newline="")
+        if START not in html and END not in html:
+            print(f"HALVING_CURVE_GENERATED=PASS eras={len(rows)}")
+            print("LEGACY_CHART_EMBED=SKIP; historical chart is intentionally excluded from the current CP-0651 homepage")
+            print(f"modeled_total_emission_coins={coins8(EXPECTED_TOTAL_ATOMS)}")
+            print(f"unused_mining_budget_coins={coins8(EXPECTED_REMAINDER_ATOMS)}")
+            return 0
         if START not in html or END not in html:
-            raise SystemExit("chart marker boundary is missing from index.html")
+            raise SystemExit("chart marker boundary is incomplete in index.html")
         before, rest = html.split(START, 1)
         _old, after = rest.split(END, 1)
         HTML_PATH.write_text(before + expected_block + after, encoding="utf-8", newline="")
@@ -205,8 +213,24 @@ def main() -> int:
 
     if not CSV_PATH.exists() or CSV_PATH.read_text(encoding="utf-8") != expected_csv:
         raise SystemExit("HALVING_CURVE_CSV=FAIL; run with --write")
+    if START not in html and END not in html:
+        economics = (ROOT / "economics.html").read_text(encoding="utf-8").lower()
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        historical_report = (ROOT / "docs" / "CP_0349_REPRODUCIBLE_CANDIDATE_HALVING_VISUALIZATION_2026-10-21.md").read_text(encoding="utf-8")
+        if (
+            "cp-0651" in economics
+            and "zero block subsidy" in economics
+            and "fee-only producer compensation" in economics
+            and "Historical halving simulation only (superseded by CP-0651)" in readme
+            and "Historical simulation notice" in historical_report
+        ):
+            print(f"HALVING_CURVE_CSV=PASS eras={len(rows)}")
+            print("HALVING_CURVE_HTML=PASS; historical chart intentionally omitted from current CP-0651 homepage")
+            print("NOTE=Archived 10B/3B curve remains historical data and is not a current QZXB emission schedule")
+            return 0
+        raise SystemExit("HALVING_CURVE_HTML=FAIL; chart absent without the required CP-0651 historical-policy disclosures")
     if START not in html or END not in html:
-        raise SystemExit("HALVING_CURVE_HTML=FAIL; chart markers missing")
+        raise SystemExit("HALVING_CURVE_HTML=FAIL; chart marker boundary is incomplete")
     before, rest = html.split(START, 1)
     _old, after = rest.split(END, 1)
     if before + START + _old + END + after != before + expected_block + after:
