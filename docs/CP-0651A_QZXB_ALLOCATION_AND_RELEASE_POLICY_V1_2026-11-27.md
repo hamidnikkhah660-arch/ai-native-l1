@@ -34,7 +34,7 @@ Every award or release must pass all applicable controls:
 2. **Documented authority:** the relevant release mechanism must be authorized by the final candidate/production policy and must not bypass consensus or supply invariants.
 3. **Purpose limitation:** tokens may be used only for the stated allocation purpose and approved agreement.
 4. **Evidence before release:** recipient identity, recipient account, amount, purpose, agreement, milestone evidence, approval and transaction reference must be recorded.
-5. **Staged release:** use milestone-based or time-based release; avoid one-time unrestricted releases where practical.
+5. **Staged and comparable release:** use milestone-based or time-based release; avoid one-time unrestricted releases. No recipient receives transferable tokens merely by designation. Before awards are approved, publish the applicable earning conditions, release schedule, lock-up (if any), and reason for any material difference between recipient groups. Material insider or strategic awards must not receive more favorable liquidity terms than the founder schedule without a documented, publicly disclosed rationale.
 6. **Disclosure:** report allocated, approved, earned, released, returned/cancelled and actually burned amounts separately.
 7. **No investment claims:** no allocation implies price appreciation, minimum price, profit, redemption, revenue share or investment return.
 8. **Legal and tax review:** any public distribution, sale, compensation, sponsor arrangement or exchange-related payment requires jurisdiction-specific legal, tax and compliance review before execution.
@@ -47,12 +47,13 @@ Every award or release must pass all applicable controls:
 
 Purpose: founder ownership allocation and documented support for continued QRun development.
 
-Proposed release discipline: 48-month total vesting from the authorized Genesis date, with a 12-month cliff. At month 12, 25% becomes vested; the remaining 75% vests in equal monthly portions over months 13–48. No schedule is active until encoded, tested and authorized.
+Proposed release discipline: 10% (100,000,000 QZXB) may become transferable at the authorized Mainnet launch, subject to the final Genesis and release controls. The remaining 90% (900,000,000 QZXB) is released linearly over 24 months beginning at Mainnet launch, with no additional cliff. The schedule must be encoded, tested and authorized before activation. No founder allocation is transferable merely because it appears in an accounting record or candidate Genesis manifest.
 
 Project-development use:
 - Project expenses must be recorded separately from personal expenses.
 - Where founder tokens are used to fund project expenses, disclose the amount, destination, purpose and supporting record.
 - Token value must not be represented as cash received; only realized proceeds or contracted funds count as project financing.
+- The founder is not subject to a longer mandatory time-based lock-up than other allocation recipients under this policy. Any voluntary extension or separate lock-up agreement must be disclosed.
 - Founder allocation does not grant hidden issuance, consensus override, privileged transaction validation or unilateral cap changes.
 
 ### B. Developers and Network Security — 1B
@@ -158,6 +159,7 @@ Before any allocation becomes executable:
 - [ ] Supply arithmetic and invariants pass tests across block production, validation/import, replay, recovery and state restoration.
 - [ ] Recipient/account verification and release controls are implemented.
 - [ ] Vesting and milestone mechanisms are tested; no off-chain promise is described as on-chain enforcement.
+- [ ] Founder and other material recipient release schedules, lock-ups and any differences are publicly disclosed and independently reconciled against the circulating-supply schedule.
 - [ ] Public accounting/reporting format is published.
 - [ ] Applicable legal, tax, sanctions and compliance review is complete.
 - [ ] Independent protocol/security review addresses material findings.
