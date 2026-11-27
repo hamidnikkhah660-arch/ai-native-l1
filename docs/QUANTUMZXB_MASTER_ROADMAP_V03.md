@@ -26,8 +26,8 @@ The plan below separates completed research evidence from acceptance work needed
 
 Deliverables:
 1. Freeze the production block/transaction/Genesis/snapshot schemas, network identifier, activation/migration rules and version compatibility.
-2. Ratify and integrate the 10B maximum cap and eight-bucket allocation in tokenomics policy v0.4; enforce supply invariants through production Genesis, block validation, persistence, replay and snapshots.
-3. Retain the owner-directed fully transferable founder allocation with no protocol lock or time vesting. A potential sponsor's up-to-1B allocation and a 0.1B-1B contributor/professional pool remain conditional proposals until milestones, agreements and award decisions exist. The owner retains at least 2B direct discretionary coins plus any unawarded remainder of the original founder tranche.
+2. Implement the CP-0651 candidate monetary model: 7B gross accounting ceiling, 1B owner Genesis allocation, six additional non-circulating 1B accounting labels, zero block subsidy and canonical-transaction-fee-only producer compensation. The former 10B/eight-bucket/3B-mining schedule is historical and must not be reactivated.
+3. Implement and test CP-0651-A v1.0 release controls. The founder release candidate is 100M transferable only at authorized Mainnet launch, then 900M linearly over 24 months from launch, with no additional cliff. Other material recipient schedules, lock-ups, earning conditions and any differences must be disclosed with documented rationale. These are policy candidates until implemented, tested and separately authorized.
 4. Integrate issuance, transfer, fee and treasury accounting through the canonical producer, validator/importer, fork-choice/reorg, durable store, replay, snapshots and state root.
 5. Add an independent reference implementation/vector oracle for Genesis, issuance schedule, rewards, reorg and exact-cap boundaries.
 6. Define the true circulating-supply calculation and make node/RPC/explorer/disclosures use one consistent rule.
@@ -63,6 +63,8 @@ Deliverables:
 **Exit evidence:** sample Solidity contract deployed and executed across at least two independently built nodes, matching receipts/state roots after restart and reorg; independent VM/protocol review. Until this phase closes, the EVM lab is a strong engineering asset but not the native production VM.
 
 ## Phase 4 - Public zero-value devnet and operator qualification
+
+Earlier Bitcoin-style peer-gossip exploration is historical design context, not a declaration that the final QRun networking protocol is identical to Bitcoin. Newer Q6PD signed-discovery and NAT-only persistent-session candidates are separate implementation work; local pull/gossip and history-sync success does not establish persistent interoperability with an older Seed or a multi-operator public mesh.
 
 Deliverables:
 1. Freeze signed deployment manifests, node/network IDs and public peer identity provisioning.
@@ -112,11 +114,11 @@ This phase is a decision gate, not an automatic step triggered by hitting a chos
 | Track | Current state | Next verifiable milestone |
 |---|---|---|
 | Public source / reproducibility | Public curated release exists; latest local changes are not published | Publish a reviewed versioned release from the authorized repository remote |
-| Native monetary path (Gate 2) | Candidate modules and tests; canonical integration incomplete | One frozen profile with independent end-to-end state/issuance vectors |
+| Native monetary path (Gate 2) | CP-0651/CP-0651-A candidate policy published; canonical runtime integration and release mechanism remain incomplete | One frozen profile with independent end-to-end state/issuance/release vectors |
 | Anti-rollback / recovery (Gate 8) | Extensive models and local process-crash evidence | Independent trust provider, canonical integration and multi-host storage tests |
 | ML-DSA / hybrid signatures | Real ML-DSA-65 verifier tests and hybrid candidates | Production-selected transaction path and key lifecycle review |
 | Native smart contracts | Isolated EVM lab and candidate adapters | Canonical VM/state/receipts/RPC integration with cross-client agreement |
-| Public devnet | Loopback/private zero-value harnesses | Multiple external operators with signed identities and operational controls |
+| Public devnet | Experimental alpha/Q6PD candidate lineage; Seed interoperability and independent multi-operator qualification remain incomplete | Multiple external operators with signed identities, persistent-session interoperability and operational controls |
 | Wallet / explorer / RPC | EVM testnet console exists; native production tooling not complete | Native toolchain connected to actual native devnet state |
 | External security audit | Not completed | Independent engagement and remediation report |
 | Sponsor / contributor allocation | Proposal only; no confirmed sponsor/award | Milestone agreement and versioned allocation record, if a sponsor is secured |
