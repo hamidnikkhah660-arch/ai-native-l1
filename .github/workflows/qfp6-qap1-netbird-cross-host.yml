@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   qfp6-qap1-cross-host:
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/feat/qzxb-usdt-trading-gate-20261104'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/feat/cp0587-q6ti-cross-host-recovery-20261111'
     runs-on: windows-latest
     timeout-minutes: 45
     steps:

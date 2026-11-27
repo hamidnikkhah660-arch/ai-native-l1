@@ -1,6 +1,8 @@
-# QuantumZXB - Master Engineering and Ecosystem Roadmap v0.2
+# QuantumZXB - Master Engineering and Ecosystem Roadmap v0.3
 Date: 2026-10-20
 Status: Public engineering roadmap aligned with the repository review. Milestones are evidence-based; no public-network launch date is promised.
+
+> **Current monetary-policy notice (2026-11-17):** CP-0651 is the active candidate direction: 7,000,000,000 QZXB maximum accounting ceiling, 1,000,000,000 QZXB intended owner Genesis allocation, six non-circulating 1B accounting labels and zero block subsidy; candidate producers receive transaction fees only. The earlier v0.4 / CP-0566D 10B model with 3B mining rewards, CP-0437 and CP-0604 are historical/superseded. No 3B mining reserve or active subsidy payout is part of CP-0651. The candidate is not an activated Mainnet issuance policy.
 
 ## North-star
 
@@ -26,10 +28,10 @@ The plan below separates completed research evidence from acceptance work needed
 
 Deliverables:
 1. Freeze the production block/transaction/Genesis/snapshot schemas, network identifier, activation/migration rules and version compatibility.
-2. Ratify and integrate the 10B maximum cap and eight-bucket allocation in tokenomics policy v0.4; enforce supply invariants through production Genesis, block validation, persistence, replay and snapshots.
-3. Retain the owner-directed fully transferable founder allocation with no protocol lock or time vesting. A potential sponsor's up-to-1B allocation and a 0.1B-1B contributor/professional pool remain conditional proposals until milestones, agreements and award decisions exist. The owner retains at least 2B direct discretionary coins plus any unawarded remainder of the original founder tranche.
+2. Integrate CP-0651 as the single candidate monetary profile: 7B maximum accounting ceiling, 1B intended owner Genesis allocation, six non-circulating 1B accounting labels, zero block subsidy and fee-only producer compensation. Enforce the same supply/accounting invariants through production Genesis, block validation, persistence, replay, reorgs and snapshots.
+3. Treat only the 1B CP-0651 owner Genesis amount as the intended owner allocation. The six other accounting labels do not create grants, sponsor rights, contributor awards, transferable balances or mint authority. Any future token distribution or reward arrangement requires a new owner-authorized policy version and canonical implementation; cash sponsorship and paid engineering contracts remain separate off-chain agreements.
 4. Integrate issuance, transfer, fee and treasury accounting through the canonical producer, validator/importer, fork-choice/reorg, durable store, replay, snapshots and state root.
-5. Add an independent reference implementation/vector oracle for Genesis, issuance schedule, rewards, reorg and exact-cap boundaries.
+5. Add independent reference vectors for the 1B Genesis amount, 7B accounting ceiling, zero block subsidy, fee accounting, reorg and exact-ceiling boundaries. Preserve earlier 3B halving vectors only as historical candidate research, not active CP-0651 reward rules.
 6. Define the true circulating-supply calculation and make node/RPC/explorer/disclosures use one consistent rule.
 
 **Exit evidence:** reproducible clean-checkout all-target tests, independent vectors, multi-client agreement and reviewed state transitions. Do not call the proposed supply schedule active until that evidence is attached to the selected production profile.

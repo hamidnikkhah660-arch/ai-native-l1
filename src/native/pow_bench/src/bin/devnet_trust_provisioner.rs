@@ -8,6 +8,7 @@
 //! current Windows user/machine and are not portable backups. Run key generation/signing offline
 //! under a dedicated Windows account; define and rehearse a separate recovery backup before value.
 
+use ai_native_l1_pow_bench::noise_identity_rotation_authorization as rotation_authorization;
 use ai_native_l1_pow_bench::{
     devnet_signed_peer_identity_candidate::{
         sign_signed_peer_identity, verify_signed_peer_identity,
@@ -15,7 +16,7 @@ use ai_native_l1_pow_bench::{
     identity_generation_store::encode_signed_rotation_statement,
     identity_policy::{encode as encode_key_record, KeyAlgorithm, KeyPurpose, KeyRecord, KeyState},
     noise_deployment_config::{
-        encode_signed_deployment_config, verify_signed_deployment_config,
+        encode_signed_deployment_config, verify_signed_deployment_config_with_floors,
         MAX_SIGNED_DEPLOYMENT_CONFIG_LEN,
     },
     noise_issuer_registry::{
@@ -26,6 +27,7 @@ use ai_native_l1_pow_bench::{
         load_protected_signing_seed, store_protected_signing_seed, SigningKeyRole,
     },
 };
+
 use ed25519_dalek::SigningKey;
 use std::{
     collections::BTreeMap,
@@ -37,6 +39,7 @@ use std::{
 
 const MAX_PEER_IDENTITY_LEN: usize =
     ai_native_l1_pow_bench::devnet_signed_peer_identity_candidate::MAX_SIGNED_PEER_IDENTITY_LEN;
+const MAX_ROTATION_AUTH_FILE_LEN: usize = 256 * 1024;
 
 fn usage() -> &'static str {
     "Offline Devnet trust provisioner (Windows CurrentUser DPAPI)\n\
@@ -49,13 +52,13 @@ fn usage() -> &'static str {
        devnet_trust_provisioner bootstrap --network-id-hex HEX64 --deployment-key-file PATH --governance-key-file PATH --recovery-key-file PATH --issuer-key-file PATH --issuer-id N --output-dir PATH\n\
      \n\
      Advance issuer retirement/revocation status (never reactivates or changes issuer keys):\n\
-       devnet_trust_provisioner update-issuer-status --network-id-hex HEX64 --deployment-config-file PATH --deployment-key-file PATH --minimum-config-sequence N --previous-registry-file PATH --governance-key-file PATH --issuer-id N --new-status retired|revoked --output-file PATH\n\
+       devnet_trust_provisioner update-issuer-status --network-id-hex HEX64 --deployment-config-file PATH --deployment-key-file PATH --minimum-config-sequence N --minimum-root-epoch N --previous-registry-file PATH --governance-key-file PATH --issuer-id N --new-status retired|revoked --output-file PATH\n\
      \n\
      Sign a peer Noise public key into NPI1:\n\
-       devnet_trust_provisioner issue-peer --network-id-hex HEX64 --deployment-config-file PATH --deployment-key-file PATH --minimum-config-sequence N --issuer-registry-file PATH --issuer-key-file PATH --issuer-id N --credential-id U128 --key-id N --noise-public-key-hex HEX64 --not-before UNIX --not-after UNIX --output-file PATH\n\
+       devnet_trust_provisioner issue-peer --network-id-hex HEX64 --deployment-config-file PATH --deployment-key-file PATH --minimum-config-sequence N --minimum-root-epoch N --issuer-registry-file PATH --issuer-key-file PATH --issuer-id N --credential-id U128 --key-id N --noise-public-key-hex HEX64 --not-before UNIX --not-after UNIX --output-file PATH\n\
      \n\
-     Rotate an existing peer key using an issuer-signed exact-successor NRT1 statement:\n\
-       devnet_trust_provisioner rotate-peer --network-id-hex HEX64 --deployment-config-file PATH --deployment-key-file PATH --minimum-config-sequence N --issuer-registry-file PATH --issuer-key-file PATH --issuer-id N --previous-identity-file PATH --new-noise-public-key-hex HEX64 --not-before UNIX --not-after UNIX --output-file PATH\n\
+     Rotate an existing peer key with NRT1 plus independent operator and owner attestations:\n\
+       devnet_trust_provisioner rotate-peer --network-id-hex HEX64 --deployment-config-file PATH --deployment-key-file PATH --minimum-config-sequence N --minimum-root-epoch N --issuer-registry-file PATH --issuer-key-file PATH --issuer-id N --previous-identity-file PATH --new-noise-public-key-hex HEX64 --not-before UNIX --not-after UNIX --rotation-manifest-file PATH --prepared-identity-file PATH --prepared-previous-identity-file PATH --endpoint-evidence-file PATH --fingerprint-evidence-file PATH --rotation-policy-file PATH --rotation-authorization-file PATH --operator-public-key-file PATH --operator-key-sha256 HEX64 --operator-signature-file PATH --owner-public-key-file PATH --owner-key-sha256 HEX64 --owner-signature-file PATH --output-file PATH\n\
      \n\
      Public-key hex is public data. Never pass private seeds on a command line. Keep ASK1 files offline."
 }
@@ -182,6 +185,14 @@ fn read_bounded_public_file(path: &Path, max_len: usize, label: &str) -> Result<
     Ok(bytes)
 }
 
+fn read_exact_public_file(path: &Path, exact_len: usize, label: &str) -> Result<Vec<u8>, String> {
+    let bytes = read_bounded_public_file(path, exact_len, label)?;
+    if bytes.len() != exact_len {
+        return Err(format!("{label} must be exactly {exact_len} bytes"));
+    }
+    Ok(bytes)
+}
+
 fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if path.file_name().is_none() || !parent_directory(path).is_dir() {
         return Err("output file must be in an existing directory".into());
@@ -295,10 +306,11 @@ fn build_bootstrap_artifacts(
     )
     .map_err(|error| format!("IRG1 construction rejected: {error:?}"))?;
 
-    let verified_deployment = verify_signed_deployment_config(
+    let verified_deployment = verify_signed_deployment_config_with_floors(
         &deployment_wire,
         &network_id,
         &deployment_authority.verifying_key().to_bytes(),
+        1,
         1,
     )
     .map_err(|error| format!("self-check of DPC1 failed: {error:?}"))?;
@@ -409,6 +421,7 @@ fn build_updated_registry_artifact(
     deployment_wire: &[u8],
     deployment_authority_public_key: &[u8; 32],
     minimum_config_sequence: u64,
+    minimum_root_epoch: u64,
     previous_registry_wire: &[u8],
     issuer_id: u32,
     new_status: IssuerStatus,
@@ -420,11 +433,12 @@ fn build_updated_registry_artifact(
     if new_status == IssuerStatus::Active {
         return Err("issuer update cannot activate or reactivate an issuer".into());
     }
-    let deployment = verify_signed_deployment_config(
+    let deployment = verify_signed_deployment_config_with_floors(
         deployment_wire,
         &network_id,
         deployment_authority_public_key,
         minimum_config_sequence,
+        minimum_root_epoch,
     )
     .map_err(|error| format!("DPC1 verification failed: {error:?}"))?;
     if governance_signing_key.verifying_key().to_bytes() != deployment.governance_public_key {
@@ -479,6 +493,10 @@ fn update_issuer_status(mut options: BTreeMap<String, String>) -> Result<(), Str
         take_required(&mut options, "--minimum-config-sequence")?,
         "minimum config sequence",
     )?;
+    let minimum_root_epoch = parse_nonzero_u64(
+        take_required(&mut options, "--minimum-root-epoch")?,
+        "minimum root epoch",
+    )?;
     let previous_registry_path =
         PathBuf::from(take_required(&mut options, "--previous-registry-file")?);
     let governance_key_path = PathBuf::from(take_required(&mut options, "--governance-key-file")?);
@@ -512,6 +530,7 @@ fn update_issuer_status(mut options: BTreeMap<String, String>) -> Result<(), Str
         &deployment_wire,
         &deployment_key.verifying_key().to_bytes(),
         minimum_config_sequence,
+        minimum_root_epoch,
         &previous_registry_wire,
         issuer_id,
         new_status,
@@ -546,6 +565,7 @@ fn build_peer_identity_artifact(
     deployment_wire: &[u8],
     deployment_authority_public_key: &[u8; 32],
     minimum_config_sequence: u64,
+    minimum_root_epoch: u64,
     registry_wire: &[u8],
     issuer_id: u32,
     credential_id: u128,
@@ -563,11 +583,12 @@ fn build_peer_identity_artifact(
     {
         return Err("peer identity IDs, key and validity window are invalid".into());
     }
-    let deployment = verify_signed_deployment_config(
+    let deployment = verify_signed_deployment_config_with_floors(
         deployment_wire,
         &network_id,
         deployment_authority_public_key,
         minimum_config_sequence,
+        minimum_root_epoch,
     )
     .map_err(|error| format!("DPC1 verification failed: {error:?}"))?;
     let registry = verify_signed_registry(
@@ -612,6 +633,7 @@ fn build_rotated_peer_identity_artifact(
     deployment_wire: &[u8],
     deployment_authority_public_key: &[u8; 32],
     minimum_config_sequence: u64,
+    minimum_root_epoch: u64,
     registry_wire: &[u8],
     issuer_id: u32,
     previous_identity_wire: &[u8],
@@ -619,18 +641,19 @@ fn build_rotated_peer_identity_artifact(
     not_before: u64,
     not_after: u64,
     issuer_signing_key: &SigningKey,
-) -> Result<(Vec<u8>, u32, u32), String> {
+) -> Result<(Vec<u8>, u32, u32, [u8; 32]), String> {
     if issuer_id == 0
         || new_noise_public_key.iter().all(|byte| *byte == 0)
         || not_before > not_after
     {
         return Err("peer rotation parameters or validity window are invalid".into());
     }
-    let deployment = verify_signed_deployment_config(
+    let deployment = verify_signed_deployment_config_with_floors(
         deployment_wire,
         &network_id,
         deployment_authority_public_key,
         minimum_config_sequence,
+        minimum_root_epoch,
     )
     .map_err(|error| format!("DPC1 verification failed: {error:?}"))?;
     let registry = verify_signed_registry(
@@ -701,7 +724,12 @@ fn build_rotated_peer_identity_artifact(
         issuer_signing_key,
     )
     .map_err(|error| format!("rotated NPI1 construction rejected: {error:?}"))?;
-    Ok((next_identity, previous.record.generation, next_generation))
+    Ok((
+        next_identity,
+        previous.record.generation,
+        next_generation,
+        previous.noise_public_key,
+    ))
 }
 
 fn rotate_peer(mut options: BTreeMap<String, String>) -> Result<(), String> {
@@ -709,14 +737,33 @@ fn rotate_peer(mut options: BTreeMap<String, String>) -> Result<(), String> {
         &take_required(&mut options, "--network-id-hex")?,
         "network ID",
     )?;
-    let deployment_path = PathBuf::from(take_required(&mut options, "--deployment-config-file")?);
     let deployment_key_path = PathBuf::from(take_required(&mut options, "--deployment-key-file")?);
+    let issuer_key_path = PathBuf::from(take_required(&mut options, "--issuer-key-file")?);
+    let deployment_key = load_signing_key(
+        &deployment_key_path,
+        &network_id,
+        SigningKeyRole::DeploymentAuthority,
+    )?;
+    let issuer_key = load_signing_key(&issuer_key_path, &network_id, SigningKeyRole::PeerIssuer)?;
+    rotate_peer_with_keys(options, network_id, &deployment_key, &issuer_key)
+}
+
+fn rotate_peer_with_keys(
+    mut options: BTreeMap<String, String>,
+    network_id: [u8; 32],
+    deployment_key: &SigningKey,
+    issuer_key: &SigningKey,
+) -> Result<(), String> {
+    let deployment_path = PathBuf::from(take_required(&mut options, "--deployment-config-file")?);
     let minimum_config_sequence = parse_nonzero_u64(
         take_required(&mut options, "--minimum-config-sequence")?,
         "minimum config sequence",
     )?;
+    let minimum_root_epoch = parse_nonzero_u64(
+        take_required(&mut options, "--minimum-root-epoch")?,
+        "minimum root epoch",
+    )?;
     let registry_path = PathBuf::from(take_required(&mut options, "--issuer-registry-file")?);
-    let issuer_key_path = PathBuf::from(take_required(&mut options, "--issuer-key-file")?);
     let issuer_id = parse_nonzero_u32(take_required(&mut options, "--issuer-id")?, "issuer ID")?;
     let previous_identity_path =
         PathBuf::from(take_required(&mut options, "--previous-identity-file")?);
@@ -730,6 +777,31 @@ fn rotate_peer(mut options: BTreeMap<String, String>) -> Result<(), String> {
     let not_after = take_required(&mut options, "--not-after")?
         .parse::<u64>()
         .map_err(|_| "not-after must be a UNIX timestamp")?;
+    let manifest_path = PathBuf::from(take_required(&mut options, "--rotation-manifest-file")?);
+    let prepared_identity_path =
+        PathBuf::from(take_required(&mut options, "--prepared-identity-file")?);
+    let prepared_previous_identity_path = PathBuf::from(take_required(
+        &mut options,
+        "--prepared-previous-identity-file",
+    )?);
+    let endpoint_evidence_path =
+        PathBuf::from(take_required(&mut options, "--endpoint-evidence-file")?);
+    let fingerprint_evidence_path =
+        PathBuf::from(take_required(&mut options, "--fingerprint-evidence-file")?);
+    let policy_path = PathBuf::from(take_required(&mut options, "--rotation-policy-file")?);
+    let authorization_path = PathBuf::from(take_required(
+        &mut options,
+        "--rotation-authorization-file",
+    )?);
+    let operator_public_path =
+        PathBuf::from(take_required(&mut options, "--operator-public-key-file")?);
+    let operator_pin = take_required(&mut options, "--operator-key-sha256")?;
+    let operator_signature_path =
+        PathBuf::from(take_required(&mut options, "--operator-signature-file")?);
+    let owner_public_path = PathBuf::from(take_required(&mut options, "--owner-public-key-file")?);
+    let owner_pin = take_required(&mut options, "--owner-key-sha256")?;
+    let owner_signature_path =
+        PathBuf::from(take_required(&mut options, "--owner-signature-file")?);
     let output_path = PathBuf::from(take_required(&mut options, "--output-file")?);
     no_extra_options(options)?;
 
@@ -748,25 +820,98 @@ fn rotate_peer(mut options: BTreeMap<String, String>) -> Result<(), String> {
         MAX_PEER_IDENTITY_LEN,
         "previous NPI1 peer identity",
     )?;
-    let deployment_key = load_signing_key(
-        &deployment_key_path,
-        &network_id,
-        SigningKeyRole::DeploymentAuthority,
+
+    // All authorization evidence is read as bounded regular non-symlink files.
+    let manifest_wire = read_bounded_public_file(
+        &manifest_path,
+        MAX_ROTATION_AUTH_FILE_LEN,
+        "rotation manifest",
     )?;
-    let issuer_key = load_signing_key(&issuer_key_path, &network_id, SigningKeyRole::PeerIssuer)?;
-    let (artifact, previous_generation, new_generation) = build_rotated_peer_identity_artifact(
-        network_id,
+    let prepared_identity_wire = read_bounded_public_file(
+        &prepared_identity_path,
+        MAX_ROTATION_AUTH_FILE_LEN,
+        "prepared identity",
+    )?;
+    let prepared_previous_identity_wire = read_bounded_public_file(
+        &prepared_previous_identity_path,
+        MAX_ROTATION_AUTH_FILE_LEN,
+        "prepared previous identity",
+    )?;
+    let endpoint_evidence_wire = read_bounded_public_file(
+        &endpoint_evidence_path,
+        MAX_ROTATION_AUTH_FILE_LEN,
+        "endpoint evidence",
+    )?;
+    let fingerprint_evidence_wire = read_bounded_public_file(
+        &fingerprint_evidence_path,
+        MAX_ROTATION_AUTH_FILE_LEN,
+        "fingerprint evidence",
+    )?;
+    let policy_wire =
+        read_bounded_public_file(&policy_path, MAX_ROTATION_AUTH_FILE_LEN, "rotation policy")?;
+    let authorization_wire = read_bounded_public_file(
+        &authorization_path,
+        MAX_ROTATION_AUTH_FILE_LEN,
+        "dual rotation authorization",
+    )?;
+    let operator_public =
+        read_exact_public_file(&operator_public_path, 32, "independent operator public key")?;
+    let operator_signature = read_exact_public_file(
+        &operator_signature_path,
+        64,
+        "independent operator signature",
+    )?;
+    let owner_public = read_exact_public_file(&owner_public_path, 32, "owner public key")?;
+    let owner_signature = read_exact_public_file(&owner_signature_path, 64, "owner signature")?;
+
+    // Construct in memory only; no NPI1 output is created until both attestations pass.
+    let (artifact, previous_generation, new_generation, previous_noise_public_key) =
+        build_rotated_peer_identity_artifact(
+            network_id,
+            &deployment_wire,
+            &deployment_key.verifying_key().to_bytes(),
+            minimum_config_sequence,
+            minimum_root_epoch,
+            &registry_wire,
+            issuer_id,
+            &previous_wire,
+            new_noise_public_key,
+            not_before,
+            not_after,
+            issuer_key,
+        )?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "system clock precedes UNIX epoch")?
+        .as_secs();
+    rotation_authorization::verify_dual_attestation(
+        &manifest_wire,
+        &prepared_identity_wire,
+        &prepared_previous_identity_wire,
+        &endpoint_evidence_wire,
+        &fingerprint_evidence_wire,
+        &policy_wire,
+        &authorization_wire,
+        &operator_public,
+        &operator_pin,
+        &operator_signature,
+        &owner_public,
+        &owner_pin,
+        &owner_signature,
         &deployment_wire,
-        &deployment_key.verifying_key().to_bytes(),
-        minimum_config_sequence,
         &registry_wire,
-        issuer_id,
         &previous_wire,
-        new_noise_public_key,
+        &network_id,
+        issuer_id,
+        u64::from(previous_generation),
+        u64::from(new_generation),
+        &new_noise_public_key,
+        &previous_noise_public_key,
         not_before,
         not_after,
-        &issuer_key,
+        now,
     )?;
+
     write_new_file(&output_path, &artifact)?;
     println!("peer_identity_file={}", output_path.display());
     println!("network_id_hex={}", hex(&network_id));
@@ -775,6 +920,9 @@ fn rotate_peer(mut options: BTreeMap<String, String>) -> Result<(), String> {
     println!("new_generation={new_generation}");
     println!("new_noise_public_key_hex={}", hex(&new_noise_public_key));
     println!("signed_rotation_statement=NRT1");
+    println!("dual_attestation_verified=true");
+    println!("independent_operator_verified=true");
+    println!("owner_authorization_verified=true");
     println!("private_seed_printed=false");
     Ok(())
 }
@@ -789,6 +937,10 @@ fn issue_peer(mut options: BTreeMap<String, String>) -> Result<(), String> {
     let minimum_config_sequence = parse_nonzero_u64(
         take_required(&mut options, "--minimum-config-sequence")?,
         "minimum config sequence",
+    )?;
+    let minimum_root_epoch = parse_nonzero_u64(
+        take_required(&mut options, "--minimum-root-epoch")?,
+        "minimum root epoch",
     )?;
     let registry_path = PathBuf::from(take_required(&mut options, "--issuer-registry-file")?);
     let issuer_key_path = PathBuf::from(take_required(&mut options, "--issuer-key-file")?);
@@ -834,6 +986,7 @@ fn issue_peer(mut options: BTreeMap<String, String>) -> Result<(), String> {
         &deployment_wire,
         &deployment_key.verifying_key().to_bytes(),
         minimum_config_sequence,
+        minimum_root_epoch,
         &registry_wire,
         issuer_id,
         credential_id,
@@ -886,10 +1039,439 @@ fn main() {
 mod tests {
     use super::*;
     use ai_native_l1_pow_bench::identity_generation_store::IdentityGenerationStateStore;
-    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::{Signer, SigningKey};
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+
+    fn sha(bytes: &[u8]) -> [u8; 32] {
+        Sha256::digest(bytes).into()
+    }
+
+    fn canonical_intent(intent: &serde_json::Value) -> Vec<u8> {
+        let mut out = b"QFP6-NOISE-ROTATION-INTENT\0v2".to_vec();
+        for name in [
+            "manifest_sha256",
+            "prepared_identity_sha256",
+            "dpc1_sha256",
+            "irg1_sha256",
+            "previous_npi1_sha256",
+            "network_id_hex",
+            "profile_id_hex",
+            "issuer_id",
+            "previous_generation",
+            "new_generation",
+            "peer_not_before_unix",
+            "peer_not_after_unix",
+            "role",
+            "generation_name",
+            "new_identity_sha256",
+            "previous_identity_sha256",
+            "previous_public_key_sha256_fingerprint",
+            "new_public_key_sha256_fingerprint",
+            "endpoint",
+            "endpoint_evidence_sha256",
+            "fingerprint_evidence_sha256",
+            "policy_sha256",
+            "operator_id",
+            "owner_authorization_id",
+            "activation_scope",
+            "overlap_policy_id",
+            "rollback_window_seconds",
+            "issued_at_unix",
+            "expires_at_unix",
+            "nonce",
+        ] {
+            let value = if matches!(
+                name,
+                "issuer_id"
+                    | "previous_generation"
+                    | "new_generation"
+                    | "peer_not_before_unix"
+                    | "peer_not_after_unix"
+                    | "rollback_window_seconds"
+                    | "issued_at_unix"
+                    | "expires_at_unix"
+            ) {
+                intent[name]
+                    .as_u64()
+                    .expect("numeric intent field")
+                    .to_string()
+            } else {
+                intent[name]
+                    .as_str()
+                    .expect("string intent field")
+                    .to_owned()
+            };
+            let name_len = u32::try_from(name.len()).expect("field name length");
+            let value_len = u32::try_from(value.len()).expect("field value length");
+            out.extend_from_slice(&name_len.to_be_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&value_len.to_be_bytes());
+            out.extend_from_slice(value.as_bytes());
+        }
+        out
+    }
 
     fn sk(byte: u8) -> SigningKey {
         SigningKey::from_bytes(&[byte; 32])
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rotate_peer_command_requires_dual_attestation_before_writing_npi1() {
+        let root = std::env::temp_dir().join(format!(
+            "ain1-cp0704-rotate-peer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+
+        let network = [0x71; 32];
+        let deployment = sk(0xc1);
+        let governance = sk(0xc2);
+        let recovery = sk(0xc3);
+        let issuer = sk(0xc4);
+        let operator = sk(0xd1);
+        let owner = sk(0xd2);
+        let old_noise = [0x41; 32];
+        let new_noise = [0x42; 32];
+        let issuer_id = 17u32;
+        let profile = "44".repeat(32);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let peer_not_before = now.saturating_sub(60);
+        let peer_not_after = now.saturating_add(3600);
+
+        let (deployment_wire, registry_wire) = build_bootstrap_artifacts(
+            network,
+            &deployment,
+            &governance,
+            &recovery,
+            issuer_id,
+            &issuer,
+        )
+        .unwrap();
+        let previous_wire = build_peer_identity_artifact(
+            network,
+            &deployment_wire,
+            &deployment.verifying_key().to_bytes(),
+            1,
+            1,
+            &registry_wire,
+            issuer_id,
+            88001,
+            701,
+            old_noise,
+            1,
+            u64::MAX,
+            &issuer,
+        )
+        .unwrap();
+
+        let prepared = serde_json::to_vec(&json!({
+            "schema": "qfp6-public-testnet-seed-noise-identity/v1",
+            "role": "seed",
+            "network_id_hex": hex(&network),
+            "profile_id_hex": profile,
+            "noise_static_public_key_hex": hex(&new_noise)
+        }))
+        .unwrap();
+        let prepared_previous = serde_json::to_vec(&json!({
+            "schema": "qfp6-public-testnet-seed-noise-identity/v1",
+            "role": "seed",
+            "network_id_hex": hex(&network),
+            "profile_id_hex": profile,
+            "noise_static_public_key_hex": hex(&old_noise)
+        }))
+        .unwrap();
+        let manifest = serde_json::to_vec(&json!({
+            "schema": "qfp6-noise-identity-rotation-preparation/v1",
+            "status": "PREPARED_NOT_ACTIVATED",
+            "role": "seed",
+            "generation": 2,
+            "generation_name": "generation-000002",
+            "network_id_hex": hex(&network),
+            "profile_id_hex": profile,
+            "new_identity_sha256": hex(&sha(&prepared)),
+            "previous_identity_sha256": hex(&sha(&prepared_previous)),
+            "previous_public_key_sha256_fingerprint": hex(&sha(&old_noise)),
+            "new_public_key_hex": hex(&new_noise),
+            "new_public_key_sha256_fingerprint": hex(&sha(&new_noise)),
+            "activation_authorized": false,
+            "active_identity_modified": false,
+            "active_protected_key_modified": false,
+            "node_started": false,
+            "listener_opened": false
+        }))
+        .unwrap();
+
+        let endpoint_evidence = b"synthetic operator endpoint evidence".to_vec();
+        let fingerprint_evidence =
+            b"synthetic independently collected fingerprint evidence".to_vec();
+        let policy = b"synthetic bounded rotation overlap policy".to_vec();
+        let operator_public = operator.verifying_key().to_bytes();
+        let owner_public = owner.verifying_key().to_bytes();
+        let intent = json!({
+            "manifest_sha256": hex(&sha(&manifest)),
+            "prepared_identity_sha256": hex(&sha(&prepared)),
+            "dpc1_sha256": hex(&sha(&deployment_wire)),
+            "irg1_sha256": hex(&sha(&registry_wire)),
+            "previous_npi1_sha256": hex(&sha(&previous_wire)),
+            "network_id_hex": hex(&network),
+            "profile_id_hex": profile,
+            "issuer_id": issuer_id,
+            "previous_generation": 1,
+            "new_generation": 2,
+            "peer_not_before_unix": peer_not_before,
+            "peer_not_after_unix": peer_not_after,
+            "role": "seed",
+            "generation_name": "generation-000002",
+            "new_identity_sha256": hex(&sha(&prepared)),
+            "previous_identity_sha256": hex(&sha(&prepared_previous)),
+            "previous_public_key_sha256_fingerprint": hex(&sha(&old_noise)),
+            "new_public_key_sha256_fingerprint": hex(&sha(&new_noise)),
+            "endpoint": "[2001:db8::1]:30333",
+            "endpoint_evidence_sha256": hex(&sha(&endpoint_evidence)),
+            "fingerprint_evidence_sha256": hex(&sha(&fingerprint_evidence)),
+            "policy_sha256": hex(&sha(&policy)),
+            "operator_id": "independent-operator",
+            "owner_authorization_id": "owner-authority",
+            "activation_scope": "ZERO_VALUE_PUBLIC_TESTNET_ONLY",
+            "overlap_policy_id": "rotation-overlap-policy-v1",
+            "rollback_window_seconds": 3600,
+            "issued_at_unix": now.saturating_sub(60),
+            "expires_at_unix": now.saturating_add(3600),
+            "nonce": "88".repeat(32)
+        });
+        let canonical = canonical_intent(&intent);
+        let digest = sha(&canonical);
+        let mut operator_message = b"QFP6-ROTATION-OPERATOR-SIGNATURE\0v1".to_vec();
+        operator_message.extend_from_slice(&digest);
+        let operator_signature = operator.sign(&operator_message).to_bytes().to_vec();
+        let mut owner_message = b"QFP6-ROTATION-OWNER-SIGNATURE\0v1".to_vec();
+        owner_message.extend_from_slice(&digest);
+        owner_message.extend_from_slice(&sha(&operator_public));
+        owner_message.extend_from_slice(&sha(&operator_signature));
+        let owner_signature = owner.sign(&owner_message).to_bytes().to_vec();
+        let authorization = serde_json::to_vec(&json!({
+            "schema": "qfp6-noise-identity-rotation-authorization/v3",
+            "intent": intent
+        }))
+        .unwrap();
+
+        let write = |name: &str, bytes: &[u8]| -> PathBuf {
+            let path = root.join(name);
+            fs::write(&path, bytes).unwrap();
+            path
+        };
+        let deployment_path = write("deployment.dpc1", &deployment_wire);
+        let registry_path = write("registry.irg1", &registry_wire);
+        let previous_path = write("previous.npi1", &previous_wire);
+        let manifest_path = write("manifest.json", &manifest);
+        let prepared_path = write("prepared.json", &prepared);
+        let prepared_previous_path = write("prepared-previous.json", &prepared_previous);
+        let endpoint_path = write("endpoint.evidence", &endpoint_evidence);
+        let fingerprint_path = write("fingerprint.evidence", &fingerprint_evidence);
+        let policy_path = write("rotation.policy", &policy);
+        let authorization_path = write("authorization.json", &authorization);
+        let operator_public_path = write("operator.pub", &operator_public);
+        let operator_signature_path = write("operator.sig", &operator_signature);
+        let owner_public_path = write("owner.pub", &owner_public);
+        let owner_signature_path = write("owner.sig", &owner_signature);
+        let deployment_key_path = root.join("deployment.ask1");
+        let issuer_key_path = root.join("issuer.ask1");
+        let deployment_seed = deployment.to_bytes();
+        let issuer_seed = issuer.to_bytes();
+        store_protected_signing_seed(
+            &deployment_key_path,
+            &network,
+            SigningKeyRole::DeploymentAuthority,
+            &deployment_seed,
+        )
+        .unwrap();
+        store_protected_signing_seed(
+            &issuer_key_path,
+            &network,
+            SigningKeyRole::PeerIssuer,
+            &issuer_seed,
+        )
+        .unwrap();
+
+        let output_path = root.join("rotated.npi1");
+        let mut options = BTreeMap::new();
+        for (key, value) in [
+            ("--network-id-hex", hex(&network)),
+            (
+                "--deployment-config-file",
+                deployment_path.display().to_string(),
+            ),
+            (
+                "--deployment-key-file",
+                deployment_key_path.display().to_string(),
+            ),
+            ("--minimum-config-sequence", "1".to_owned()),
+            ("--minimum-root-epoch", "1".to_owned()),
+            (
+                "--issuer-registry-file",
+                registry_path.display().to_string(),
+            ),
+            ("--issuer-key-file", issuer_key_path.display().to_string()),
+            ("--issuer-id", issuer_id.to_string()),
+            (
+                "--previous-identity-file",
+                previous_path.display().to_string(),
+            ),
+            ("--new-noise-public-key-hex", hex(&new_noise)),
+            ("--not-before", peer_not_before.to_string()),
+            ("--not-after", peer_not_after.to_string()),
+            (
+                "--rotation-manifest-file",
+                manifest_path.display().to_string(),
+            ),
+            (
+                "--prepared-identity-file",
+                prepared_path.display().to_string(),
+            ),
+            (
+                "--prepared-previous-identity-file",
+                prepared_previous_path.display().to_string(),
+            ),
+            (
+                "--endpoint-evidence-file",
+                endpoint_path.display().to_string(),
+            ),
+            (
+                "--fingerprint-evidence-file",
+                fingerprint_path.display().to_string(),
+            ),
+            ("--rotation-policy-file", policy_path.display().to_string()),
+            (
+                "--rotation-authorization-file",
+                authorization_path.display().to_string(),
+            ),
+            (
+                "--operator-public-key-file",
+                operator_public_path.display().to_string(),
+            ),
+            ("--operator-key-sha256", hex(&sha(&operator_public))),
+            (
+                "--operator-signature-file",
+                operator_signature_path.display().to_string(),
+            ),
+            (
+                "--owner-public-key-file",
+                owner_public_path.display().to_string(),
+            ),
+            ("--owner-key-sha256", hex(&sha(&owner_public))),
+            (
+                "--owner-signature-file",
+                owner_signature_path.display().to_string(),
+            ),
+            ("--output-file", output_path.display().to_string()),
+        ] {
+            options.insert(key.to_owned(), value);
+        }
+
+        // This invokes the actual rotate-peer handler, including DPAPI key loading.
+        rotate_peer(options.clone()).unwrap();
+        let original_output = fs::read(&output_path).unwrap();
+        let verified = verify_signed_peer_identity(
+            &original_output,
+            &network,
+            issuer_id,
+            &issuer.verifying_key().to_bytes(),
+            now,
+        )
+        .unwrap();
+        assert_eq!(verified.record.generation, 2);
+        assert_eq!(verified.noise_public_key, new_noise);
+        assert!(verified.rotation_wire.is_some());
+
+        // A missing independent operator signature is a mandatory command failure.
+        let missing_signature_output = root.join("missing-operator-signature.npi1");
+        let mut missing_signature_options = options.clone();
+        missing_signature_options.remove("--operator-signature-file");
+        missing_signature_options.insert(
+            "--output-file".into(),
+            missing_signature_output.display().to_string(),
+        );
+        assert!(rotate_peer(missing_signature_options).is_err());
+        assert!(!missing_signature_output.exists());
+
+        // Changing the NPI1 validity window after signing must not create an output.
+        let changed_validity_output = root.join("changed-validity.npi1");
+        let mut changed_validity_options = options.clone();
+        changed_validity_options.insert(
+            "--not-after".into(),
+            peer_not_after.saturating_add(1).to_string(),
+        );
+        changed_validity_options.insert(
+            "--output-file".into(),
+            changed_validity_output.display().to_string(),
+        );
+        assert!(rotate_peer(changed_validity_options).is_err());
+        assert!(!changed_validity_output.exists());
+
+        // An invalid operator attestation must not create an NPI1 output.
+        let mut bad_operator_signature = operator_signature.clone();
+        bad_operator_signature[0] ^= 1;
+        let bad_operator_signature_path = write("operator-bad.sig", &bad_operator_signature);
+        let bad_operator_output = root.join("operator-bad.npi1");
+        let mut bad_operator_options = options.clone();
+        bad_operator_options.insert(
+            "--operator-signature-file".into(),
+            bad_operator_signature_path.display().to_string(),
+        );
+        bad_operator_options.insert(
+            "--output-file".into(),
+            bad_operator_output.display().to_string(),
+        );
+        assert!(rotate_peer(bad_operator_options).is_err());
+        assert!(!bad_operator_output.exists());
+
+        // The same key cannot act as both operator and owner, even with matching pins.
+        let same_signer_public_path = write("same-signer-owner.pub", &operator_public);
+        let same_signer_output = root.join("same-signer.npi1");
+        let mut same_signer_options = options.clone();
+        same_signer_options.insert(
+            "--owner-public-key-file".into(),
+            same_signer_public_path.display().to_string(),
+        );
+        same_signer_options.insert("--owner-key-sha256".into(), hex(&sha(&operator_public)));
+        same_signer_options.insert(
+            "--output-file".into(),
+            same_signer_output.display().to_string(),
+        );
+        assert!(rotate_peer(same_signer_options).is_err());
+        assert!(!same_signer_output.exists());
+
+        // Owner signature tampering also fails before output creation.
+        let mut bad_owner_signature = owner_signature.clone();
+        bad_owner_signature[0] ^= 1;
+        let bad_owner_signature_path = write("owner-bad.sig", &bad_owner_signature);
+        let bad_owner_output = root.join("owner-bad.npi1");
+        let mut bad_owner_options = options.clone();
+        bad_owner_options.insert(
+            "--owner-signature-file".into(),
+            bad_owner_signature_path.display().to_string(),
+        );
+        bad_owner_options.insert(
+            "--output-file".into(),
+            bad_owner_output.display().to_string(),
+        );
+        assert!(rotate_peer(bad_owner_options).is_err());
+        assert!(!bad_owner_output.exists());
+
+        // Existing output is never overwritten after a valid authorization.
+        assert!(rotate_peer(options).is_err());
+        assert_eq!(fs::read(&output_path).unwrap(), original_output);
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -902,10 +1484,11 @@ mod tests {
         let (deployment_wire, registry_wire) =
             build_bootstrap_artifacts(network, &authority, &governance, &recovery, 17, &issuer)
                 .unwrap();
-        let deployment = verify_signed_deployment_config(
+        let deployment = verify_signed_deployment_config_with_floors(
             &deployment_wire,
             &network,
             &authority.verifying_key().to_bytes(),
+            1,
             1,
         )
         .unwrap();
@@ -947,6 +1530,7 @@ mod tests {
             &deployment_wire,
             &authority.verifying_key().to_bytes(),
             1,
+            1,
             &registry_wire,
             27,
             800,
@@ -966,6 +1550,7 @@ mod tests {
             &deployment_wire,
             &authority.verifying_key().to_bytes(),
             1,
+            1,
             &registry_wire,
             27,
             800,
@@ -980,6 +1565,7 @@ mod tests {
             network,
             &deployment_wire,
             &authority.verifying_key().to_bytes(),
+            1,
             1,
             &registry_wire,
             27,
@@ -997,6 +1583,7 @@ mod tests {
             network,
             &tampered,
             &authority.verifying_key().to_bytes(),
+            1,
             1,
             &registry_wire,
             27,
@@ -1026,6 +1613,7 @@ mod tests {
             &deployment_wire,
             &authority_public,
             1,
+            1,
             &registry_wire,
             47,
             88001,
@@ -1036,20 +1624,22 @@ mod tests {
             &issuer,
         )
         .unwrap();
-        let (rotated_wire, from_generation, to_generation) = build_rotated_peer_identity_artifact(
-            network,
-            &deployment_wire,
-            &authority_public,
-            1,
-            &registry_wire,
-            47,
-            &previous_wire,
-            [0x32; 32],
-            100,
-            u64::MAX,
-            &issuer,
-        )
-        .unwrap();
+        let (rotated_wire, from_generation, to_generation, _) =
+            build_rotated_peer_identity_artifact(
+                network,
+                &deployment_wire,
+                &authority_public,
+                1,
+                1,
+                &registry_wire,
+                47,
+                &previous_wire,
+                [0x32; 32],
+                100,
+                u64::MAX,
+                &issuer,
+            )
+            .unwrap();
         assert_eq!((from_generation, to_generation), (1, 2));
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1134,6 +1724,7 @@ mod tests {
             &deployment_wire,
             &authority_public,
             1,
+            1,
             &registry_wire,
             47,
             &previous_wire,
@@ -1149,6 +1740,7 @@ mod tests {
             network,
             &deployment_wire,
             &authority_public,
+            1,
             1,
             &registry_wire,
             47,
@@ -1180,6 +1772,7 @@ mod tests {
             &deployment_wire,
             &authority_public,
             minimum_config_sequence,
+            1,
             &initial_registry,
             37,
             IssuerStatus::Retired,
@@ -1204,6 +1797,7 @@ mod tests {
             &deployment_wire,
             &authority_public,
             minimum_config_sequence,
+            1,
             &retired_wire,
             37,
             IssuerStatus::Revoked,
@@ -1228,6 +1822,7 @@ mod tests {
             &deployment_wire,
             &authority_public,
             minimum_config_sequence,
+            1,
             &revoked_wire,
             37,
             IssuerStatus::Active,
@@ -1240,6 +1835,7 @@ mod tests {
             &deployment_wire,
             &authority_public,
             minimum_config_sequence,
+            1,
             &revoked_wire,
             37,
             IssuerStatus::Retired,
@@ -1252,6 +1848,7 @@ mod tests {
             &deployment_wire,
             &authority_public,
             minimum_config_sequence,
+            1,
             &revoked_wire,
             37,
             IssuerStatus::Revoked,
@@ -1264,6 +1861,7 @@ mod tests {
             &deployment_wire,
             &authority_public,
             minimum_config_sequence,
+            1,
             &initial_registry,
             37,
             IssuerStatus::Revoked,

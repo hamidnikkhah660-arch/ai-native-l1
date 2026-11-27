@@ -1,0 +1,93 @@
+{
+  "schema": "QFP6_SHA256D_CONFORMANCE_V1",
+  "note": "Independent serialization/hash vectors; values are non-production fixtures, not mined blocks or a network Genesis.",
+  "domain_ascii": "AIN1-POW-V1\\0",
+  "header_layout": [
+    [
+      "domain",
+      12,
+      "literal bytes AIN1-POW-V1 followed by NUL"
+    ],
+    [
+      "protocol_version",
+      2,
+      "unsigned big-endian"
+    ],
+    [
+      "network_id",
+      32,
+      "raw bytes; nonzero"
+    ],
+    [
+      "height",
+      8,
+      "unsigned big-endian"
+    ],
+    [
+      "timestamp",
+      8,
+      "unsigned big-endian"
+    ],
+    [
+      "parent_hash",
+      32,
+      "raw bytes"
+    ],
+    [
+      "previous_consensus_hash",
+      32,
+      "raw bytes"
+    ],
+    [
+      "state_root",
+      32,
+      "raw bytes"
+    ],
+    [
+      "target",
+      32,
+      "unsigned big-endian"
+    ],
+    [
+      "nonce",
+      8,
+      "unsigned big-endian"
+    ]
+  ],
+  "vectors": [
+    {
+      "name": "qfp6-test-header-initial-target",
+      "fields": {
+        "protocol_version": 6,
+        "network_id_hex": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "height": 1,
+        "timestamp": 100,
+        "parent_hash_hex": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "previous_consensus_hash_hex": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+        "state_root_hex": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        "target_hex": "007fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "nonce": 7
+      },
+      "expected_header_hex": "41494e312d504f572d5631000006a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a100000000000000010000000000000064b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3007fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000007",
+      "expected_sha256d_hex": "dc5ea6f42f0d0a504a968dadbed90853099ed35e7c85e346512b2c7118a0971c",
+      "expected_meets_target": false
+    },
+    {
+      "name": "qfp6-test-header-maximum-target",
+      "fields": {
+        "protocol_version": 6,
+        "network_id_hex": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "height": 1,
+        "timestamp": 100,
+        "parent_hash_hex": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        "previous_consensus_hash_hex": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+        "state_root_hex": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        "target_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "nonce": 7
+      },
+      "expected_header_hex": "41494e312d504f572d5631000006a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a100000000000000010000000000000064b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0000000000000007",
+      "expected_sha256d_hex": "de16b24aee733c5bc38fec35261cf153bf7533a71e2b253be26f96bb85601d91",
+      "expected_meets_target": true
+    }
+  ]
+}

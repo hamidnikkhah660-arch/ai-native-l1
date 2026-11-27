@@ -51,7 +51,7 @@ The project can link individual publications when verified publication pages, DO
 - Recorded maintainer-checkout regression: Rust format check, locked/offline all-target check and tests passed; the reviewed checkout reported 736/736 library tests and no failures in the remaining test targets.
 - Selected hash-pinned ML-DSA-65 verification fixture: 53 cases (48 expected-valid, 5 expected-invalid).
 - Local EVM fixed-supply contract, wallet-console and loopback-server test suites passed for a separate QX testnet experiment.
-- Candidate monetary-policy arithmetic cross-check: proposed 10B design cap, 4B founder / 3B mining-security / 3B public-goods envelopes, and a simulated four-year block-height halving schedule.
+- Historical monetary-policy research: arithmetic cross-checks of the superseded 10B / 4B-founder / 3B-mining / 3B-public-goods proposal and simulated four-year halving schedule. These are not the active CP-0651 candidate rules or a current miner reward allocation.
 
 These are dated engineering-regression results and scoped test evidence, not a third-party security audit, a throughput benchmark, or a production-readiness certificate. Native Genesis/issuance integration, independent anti-rollback trust, canonical EVM integration, an independent public devnet and external security review remain open.
 

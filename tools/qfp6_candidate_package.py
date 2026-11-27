@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""Build and validate an explicitly non-production QFP6 candidate package."""
+from __future__ import annotations
+import argparse, hashlib, json, pathlib
+
+SCHEMA = "qfp6-candidate-package/v2"
+BASE_COMPONENTS = ("genesis_snapshot", "genesis_descriptor_q6gd", "consensus_profile_q6cp", "network_profile_q6pn", "bootstrap_peers")
+ANCHORED_COMPONENTS = BASE_COMPONENTS + ("trust_bundle_q6ts",)
+RELEASE_PROFILES = {"permissionless_full_history": BASE_COMPONENTS, "anchored_checkpoint": ANCHORED_COMPONENTS}
+CP0651_LABELS = {
+    "community_airdrop",
+    "exchange_market_liquidity_partnerships",
+    "marketing_partners",
+    "developers_security_contributors",
+    "financial_strategic_supporters",
+    "protocol_burn_reserve",
+}
+
+
+def economic_policy_errors(data: dict) -> list[str]:
+    policy = data.get("economic_policy")
+    if not isinstance(policy, dict):
+        return ["economic_policy object is missing"]
+    errors = []
+    expected = {
+        "policy_id": "CP-0651",
+        "status": "OWNER_DIRECTED_CANDIDATE_UNRELEASED",
+        "max_gross_supply_qzxb": "7000000000",
+        "max_gross_supply_atoms": "700000000000000000",
+        "owner_genesis_qzxb": "1000000000",
+        "owner_genesis_atoms": "100000000000000000",
+        "accounting_labels_total_qzxb": "6000000000",
+        "block_subsidy_atoms": "0",
+        "miner_compensation": "CANONICAL_TRANSACTION_FEES_ONLY_NO_BLOCK_SUBSIDY",
+        "separate_mining_issuance_budget_qzxb": "0",
+        "burn_reserve_policy": "ACCOUNTING_LABEL_ONLY_NO_RELEASE_AUTHORITY_UNDER_CP0651",
+    }
+    for key, value in expected.items():
+        if policy.get(key) != value:
+            errors.append(f"CP-0651 economic_policy.{key} must be {value}")
+    if policy.get("labels_are_non_circulating_accounting_ceilings") is not True:
+        errors.append("CP-0651 accounting labels must remain non-circulating ceilings")
+    labels = policy.get("accounting_labels")
+    actual = {}
+    if isinstance(labels, list) and len(labels) == 6:
+        for item in labels:
+            if isinstance(item, dict) and isinstance(item.get("id"), str):
+                actual[item["id"]] = item.get("ceiling_qzxb")
+    if len(actual) != 6 or actual != {label: "1000000000" for label in CP0651_LABELS}:
+        errors.append("CP-0651 must contain exactly six canonical 1B accounting labels")
+    schedule = policy.get("mining_schedule")
+    if not isinstance(schedule, dict) or any((
+        schedule.get("initial_subsidy_atoms") != "0",
+        schedule.get("halving_interval_blocks") != 1,
+        schedule.get("maximum_mining_issuance_qzxb") != "0",
+        schedule.get("terminal_dust_qzxb") != "0",
+        schedule.get("terminal_dust_policy") != "NO_BLOCK_SUBSIDY_FEE_ONLY",
+    )):
+        errors.append("CP-0651 mining schedule must be fee-only with zero subsidy and zero issuance")
+    return errors
+ACCOUNT_DOMAIN = b"AIN1-QFP6-ACCOUNT-ID-HYBRID-V1\0"
+ED25519_PUBLIC_KEY_BYTES = 32
+MLDSA65_PUBLIC_KEY_BYTES = 1952
+
+
+def sha256_file(path: pathlib.Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def founder_account_id(ed25519: bytes, mldsa65: bytes) -> bytes:
+    if len(ed25519) != ED25519_PUBLIC_KEY_BYTES or len(mldsa65) != MLDSA65_PUBLIC_KEY_BYTES:
+        raise ValueError("founder public-key lengths do not match the QFP6 hybrid suite")
+    return hashlib.sha256(ACCOUNT_DOMAIN + (1).to_bytes(2, "big") + ed25519 + mldsa65).digest()
+
+
+def init_package(root: pathlib.Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "artifacts").mkdir(exist_ok=True)
+    manifest = {
+        "schema": SCHEMA,
+        "network_name": "QZXB",
+        "protocol_family": "QFP6",
+        "release_channel": "candidate",
+        "release_profile": "permissionless_full_history",
+        "production_authorized": False,
+        "mainnet_status": "NOT_AUTHORIZED",
+        "owner_genesis_account": None,
+        "founder_identity": None,
+        "components": {name: {"path": None, "sha256": None, "status": "MISSING"} for name in ANCHORED_COMPONENTS},
+        "economic_policy": {
+            "policy_id": "CP-0651",
+            "status": "OWNER_DIRECTED_CANDIDATE_UNRELEASED",
+            "max_gross_supply_qzxb": "7000000000",
+            "max_gross_supply_atoms": "700000000000000000",
+            "owner_genesis_qzxb": "1000000000",
+            "owner_genesis_atoms": "100000000000000000",
+            "accounting_labels_total_qzxb": "6000000000",
+            "block_subsidy_atoms": "0",
+            "miner_compensation": "CANONICAL_TRANSACTION_FEES_ONLY_NO_BLOCK_SUBSIDY",
+            "accounting_labels": [{"id": label, "ceiling_qzxb": "1000000000"} for label in sorted(CP0651_LABELS)],
+            "labels_are_non_circulating_accounting_ceilings": True,
+            "separate_mining_issuance_budget_qzxb": "0",
+            "mining_schedule": {
+                "initial_subsidy_atoms": "0",
+                "halving_interval_blocks": 1,
+                "maximum_mining_issuance_qzxb": "0",
+                "terminal_dust_qzxb": "0",
+                "terminal_dust_policy": "NO_BLOCK_SUBSIDY_FEE_ONLY"
+            },
+            "burn_reserve_policy": "ACCOUNTING_LABEL_ONLY_NO_RELEASE_AUTHORITY_UNDER_CP0651"
+        },
+        "independent_review": {"consensus": "PENDING", "cryptography": "PENDING", "economics": "PENDING"},
+        "signing": {"q6ts_signatures_present": False, "trust_floor_provisioned": False, "q6ts_runtime_enforced": False},
+        "runtime": {
+            "wired": False,
+            "full_history_replay_qualified": False,
+            "public_listener_qualified": False,
+            "permissionless_requires_cp0651_genesis": True,
+            "permissionless_cp0528_genesis_allowed": False,
+            "permissionless_cp0604_genesis_allowed": False
+        },
+        "notes": [
+            "Candidate scaffold only. No Genesis, trust roots, signatures, or service endpoints are fabricated.",
+            "Founder identity, when bound, is public-key metadata only and does not authorize or sign a Genesis.",
+            "Do not promote this manifest to Mainnet. Replace each missing component only with independently reviewed canonical artifacts.",
+            "Q6CP candidate parameters and QFP6 SHA-256d easy-fixture targets are not Mainnet-approved."
+        ]
+    }
+    target = root / "manifest.json"
+    if target.exists():
+        raise FileExistsError(f"refusing to overwrite existing manifest: {target}")
+    target.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    (root / "README.txt").write_text(
+        "QFP6 CANDIDATE PACKAGE\n\n"
+        "This is a structural scaffold, not a deployable network release.\n"
+        "Artifacts are intentionally absent until canonical inputs and independent trust material exist.\n"
+        "Optional founder binding stores public keys only; it does not sign or authorize Genesis.\n"
+        "Run: python tools/qfp6_candidate_package.py validate <package-directory>\n",
+        encoding="utf-8")
+    print(f"created candidate scaffold: {root.resolve()}")
+
+
+def bind_founder(root: pathlib.Path, identity_path: pathlib.Path) -> int:
+    manifest_path = root / "manifest.json"
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        identity = json.loads(identity_path.read_text(encoding="utf-8-sig"))
+        ed = bytes.fromhex(identity["ed25519_public_key_hex"])
+        pq = bytes.fromhex(identity["mldsa65_public_key_hex"])
+        account_hex = identity.get("public_account_id_hex", identity.get("account_id_hex"))
+        supplied_account = bytes.fromhex(account_hex)
+        calculated = founder_account_id(ed, pq)
+    except Exception as exc:
+        print(f"INVALID: cannot bind founder identity: {exc}")
+        return 2
+    if len(supplied_account) != 32 or supplied_account != calculated:
+        print("INVALID: founder account ID does not match the QFP6 hybrid public-key derivation")
+        return 2
+    if data.get("schema") != SCHEMA or data.get("protocol_family") != "QFP6":
+        print("INVALID: unsupported candidate manifest")
+        return 2
+    if data.get("production_authorized") is not False or data.get("mainnet_status") != "NOT_AUTHORIZED":
+        print("INVALID: refusing to bind identity to a production-authorized manifest")
+        return 2
+    data["founder_identity"] = {
+        "status": "PUBLIC_KEYS_BOUND_CANDIDATE_ONLY",
+        "derivation": "AIN1-QFP6-ACCOUNT-ID-HYBRID-V1",
+        "public_account_id_hex": supplied_account.hex(),
+        "ed25519_public_key_hex": ed.hex(),
+        "mldsa65_public_key_hex": pq.hex(),
+        "private_key_material_included": False,
+        "genesis_signature_present": False
+    }
+    data["owner_genesis_account"] = supplied_account.hex()
+    manifest_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    print("founder_identity_binding=VALID")
+    print(f"public_account_id_hex={supplied_account.hex()}")
+    print("private_key_material_included=false")
+    print("genesis_signature_present=false")
+    print("mainnet_authorized=false")
+    return 0
+
+
+
+def public_testnet_authorization_errors(root: pathlib.Path, data: dict) -> list[str]:
+    auth = data.get("signing", {}).get("q6ga_public_testnet_authorization")
+    if auth is None:
+        return []
+    errors = []
+    rel = auth.get("path")
+    expected = auth.get("sha256")
+    if not isinstance(rel, str) or not isinstance(expected, str) or len(expected) != 64:
+        return ["Q6GA public-testnet authorization path/SHA-256 metadata is malformed"]
+    artifact = (root / rel).resolve()
+    try:
+        artifact.relative_to(root.resolve())
+    except ValueError:
+        return ["Q6GA public-testnet authorization path escapes package directory"]
+    if not artifact.is_file() or artifact.is_symlink():
+        return ["Q6GA public-testnet authorization artifact is missing or not a regular file"]
+    raw = artifact.read_bytes()
+    actual = hashlib.sha256(raw).hexdigest()
+    if actual != expected:
+        errors.append("Q6GA public-testnet authorization SHA-256 mismatch")
+    if len(raw) != 5685 or raw[:4] != b"Q6GA":
+        return errors + ["Q6GA public-testnet authorization has an invalid envelope length or magic"]
+    if int.from_bytes(raw[4:6], "big") != 2 or int.from_bytes(raw[6:8], "big") != 1:
+        errors.append("Q6GA public-testnet authorization must be version 2 / Ed25519+ML-DSA-65")
+    scope_offset = 8 + 9 * 32 + 8 * 3 + 1
+    if raw[scope_offset] != 2 or raw[scope_offset + 1:scope_offset + 7] != bytes(6):
+        errors.append("Q6GA public-testnet authorization scope is not ZERO_VALUE_PUBLIC_TESTNET_ONLY")
+    if raw[264:296] != bytes(32):
+        errors.append("Q6GA v2 bootstrap-peer hash field must be zero by protocol design")
+    expected_owner = data.get("owner_genesis_account")
+    if isinstance(expected_owner, str) and raw[72:104].hex() != expected_owner:
+        errors.append("Q6GA owner account does not match candidate manifest")
+    components = data.get("components", {})
+    for name, start in (
+        ("genesis_descriptor_q6gd", 136),
+        ("consensus_profile_q6cp", 168),
+        ("network_profile_q6pn", 200),
+        ("genesis_snapshot", 232),
+    ):
+        expected_hash = components.get(name, {}).get("sha256")
+        if not isinstance(expected_hash, str) or raw[start:start + 32].hex() != expected_hash:
+            errors.append(f"Q6GA v2 is not bound to the manifest's exact {name} hash")
+    founder = data.get("founder_identity")
+    if isinstance(founder, dict):
+        if raw[328:360].hex() != founder.get("ed25519_public_key_hex"):
+            errors.append("Q6GA Ed25519 public key differs from the bound founder identity")
+        if raw[360:2312].hex() != founder.get("mldsa65_public_key_hex"):
+            errors.append("Q6GA ML-DSA-65 public key differs from the bound founder identity")
+    if int.from_bytes(raw[296:304], "big") != 700000000000000000:
+        errors.append("Q6GA gross-supply ceiling does not match CP-0651")
+    if int.from_bytes(raw[304:312], "big") != 100000000000000000:
+        errors.append("Q6GA owner Genesis allocation does not match CP-0651")
+    if int.from_bytes(raw[312:320], "big") != 0 or raw[320] != 1:
+        errors.append("Q6GA economics must be zero-subsidy / fee-only")
+    return errors
+
+
+def validate_package(root: pathlib.Path) -> int:
+    manifest_path = root / "manifest.json"
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"INVALID: cannot read manifest: {exc}")
+        return 2
+    errors, missing, checked = [], [], []
+    if data.get("schema") != SCHEMA:
+        errors.append("unsupported or missing schema")
+    if data.get("protocol_family") != "QFP6" or data.get("network_name") != "QZXB":
+        errors.append("wrong network/protocol identity")
+    if data.get("production_authorized") is not False or data.get("mainnet_status") != "NOT_AUTHORIZED":
+        errors.append("candidate package must remain explicitly non-production")
+    errors.extend(economic_policy_errors(data))
+    runtime_policy = data.get("runtime") if isinstance(data.get("runtime"), dict) else {}
+    if runtime_policy.get("permissionless_requires_cp0651_genesis") is not True:
+        errors.append("permissionless runtime must require CP-0651 Genesis")
+    if runtime_policy.get("permissionless_cp0528_genesis_allowed") is not False:
+        errors.append("permissionless runtime must reject legacy CP-0528 Genesis")
+    if runtime_policy.get("permissionless_cp0604_genesis_allowed") is not False:
+        errors.append("permissionless runtime must reject legacy CP-0604 Genesis")
+    founder = data.get("founder_identity")
+    if founder is not None:
+        try:
+            ed = bytes.fromhex(founder["ed25519_public_key_hex"])
+            pq = bytes.fromhex(founder["mldsa65_public_key_hex"])
+            account = bytes.fromhex(founder["public_account_id_hex"])
+            if founder.get("status") != "PUBLIC_KEYS_BOUND_CANDIDATE_ONLY":
+                raise ValueError("founder identity status is not candidate-only")
+            if founder.get("private_key_material_included") is not False or founder.get("genesis_signature_present") is not False:
+                raise ValueError("candidate identity must contain no private key or Genesis signature")
+            if founder_account_id(ed, pq) != account or data.get("owner_genesis_account") != account.hex():
+                raise ValueError("founder account ID/public-key binding mismatch")
+        except Exception as exc:
+            errors.append(f"founder identity invalid: {exc}")
+    elif data.get("owner_genesis_account") is not None:
+        errors.append("owner_genesis_account is set without a validated founder_identity")
+    profile = data.get("release_profile")
+    required_components = RELEASE_PROFILES.get(profile)
+    if required_components is None:
+        errors.append("release_profile must be permissionless_full_history or anchored_checkpoint")
+        required_components = ()
+    signing = data.get("signing") if isinstance(data.get("signing"), dict) else {}
+    if profile == "permissionless_full_history":
+        if signing.get("q6ts_runtime_enforced") is True:
+            errors.append("base profile cannot claim Q6TS runtime enforcement")
+        print("q6ts_required=false")
+        print("q6ts_runtime_enforced=false")
+    elif profile == "anchored_checkpoint":
+        if signing.get("q6ts_runtime_enforced") is not True:
+            errors.append("anchored profile requires an explicitly enforced Q6TS verifier")
+        if signing.get("q6ts_signatures_present") is not True or signing.get("trust_floor_provisioned") is not True:
+            errors.append("anchored profile requires Q6TS signatures and an independently provisioned trust floor")
+        print("q6ts_required=true")
+        print("q6ts_runtime_enforced=" + str(signing.get("q6ts_runtime_enforced") is True).lower())
+    components = data.get("components")
+    if not isinstance(components, dict):
+        errors.append("components object is missing")
+        components = {}
+    for name in required_components:
+        item = components.get(name)
+        if not isinstance(item, dict):
+            missing.append(name)
+            continue
+        rel, expected = item.get("path"), item.get("sha256")
+        if not rel or not expected:
+            missing.append(name)
+            continue
+        if not isinstance(expected, str) or len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+            errors.append(f"{name}: sha256 must be 64 lowercase hex characters")
+            continue
+        artifact = (root / rel).resolve()
+        try:
+            artifact.relative_to(root.resolve())
+        except ValueError:
+            errors.append(f"{name}: artifact path escapes package directory")
+            continue
+        if not artifact.is_file() or artifact.is_symlink():
+            errors.append(f"{name}: artifact missing or not a regular file")
+            continue
+        actual = sha256_file(artifact)
+        if actual != expected:
+            errors.append(f"{name}: SHA-256 mismatch")
+        else:
+            checked.append(name)
+    errors.extend(public_testnet_authorization_errors(root, data))
+    readiness = data.get("network_readiness")
+    readiness_blockers = []
+    if not isinstance(readiness, dict):
+        readiness_blockers.append("network_readiness_not_attached")
+    else:
+        for key in (
+            "public_testnet_launch_ready",
+            "public_peer_discovery_qualified",
+            "inbound_peer_identity_authenticated",
+            "public_seed_endpoint_attested",
+        ):
+            if readiness.get(key) is not True:
+                readiness_blockers.append(f"{key}=false")
+        bootstrap = components.get("bootstrap_peers")
+        if isinstance(bootstrap, dict) and bootstrap.get("path"):
+            try:
+                peer_rows = json.loads((root / bootstrap["path"]).read_text(encoding="utf-8"))
+                if not isinstance(peer_rows, list):
+                    errors.append("bootstrap_peers artifact must be a JSON array")
+                elif readiness.get("bootstrap_peer_count") != len(peer_rows):
+                    errors.append("network_readiness.bootstrap_peer_count does not match bootstrap_peers artifact")
+            except Exception as exc:
+                errors.append(f"cannot parse bootstrap_peers artifact: {exc}")
+    if errors:
+        print("INVALID: " + "; ".join(errors))
+        return 2
+    print(f"package_schema={SCHEMA}")
+    if data.get("signing", {}).get("q6ga_public_testnet_authorization"):
+        print("q6ga_public_testnet_authorization=STRUCTURE_AND_ARTIFACT_BINDINGS_VALID")
+        print("q6ga_cryptographic_signature_verification=RECORDED_ON_ORIGINAL_CP0676_RUNTIME_NOT_REPEATED_BY_PYTHON_VALIDATOR")
+    else:
+        print("q6ga_public_testnet_authorization=MISSING")
+    print("release_profile=" + str(profile))
+    print(f"artifacts_hash_verified={len(checked)}")
+    print(f"artifacts_missing={len(missing)}" + (":" + ",".join(missing) if missing else ""))
+    print("founder_identity_status=" + ("PUBLIC_KEYS_BOUND_CANDIDATE_ONLY" if founder else "NOT_BOUND"))
+    print("qfp6_package_status=CANDIDATE_SCAFFOLD_ONLY")
+    print("mainnet_authorized=false")
+    runtime = data.get("runtime") if isinstance(data.get("runtime"), dict) else {}
+    print("runtime_wired=" + str(runtime.get("wired") is True).lower())
+    print("anchored_qap1_candidate_wired=" + str(runtime.get("anchored_qap1_candidate_wired") is True).lower())
+    print("permissionless_base_runtime_wired=" + str(runtime.get("permissionless_base_runtime_wired") is True).lower())
+    print("public_mining_authorized=false")
+    print("network_readiness_status=" + ("INCOMPLETE" if readiness_blockers else "READY_FOR_SEPARATE_OWNER_LAUNCH_DECISION"))
+    print("network_readiness_blockers=" + (",".join(readiness_blockers) if readiness_blockers else "none"))
+    print("exit_status=" + ("INCOMPLETE" if missing or readiness_blockers else "HASHES_VALID_CANDIDATE_ONLY"))
+    return 2 if missing or readiness_blockers else 0
+
+
+def self_test() -> int:
+    import tempfile
+    with tempfile.TemporaryDirectory() as temp:
+        root = pathlib.Path(temp) / "package"
+        init_package(root)
+        if validate_package(root) != 2:
+            print("SELF-TEST FAILED: incomplete scaffold must fail closed")
+            return 1
+        m = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+        if m.get("release_profile") != "permissionless_full_history":
+            print("SELF-TEST FAILED: default profile must be permissionless full-history")
+            return 1
+        if economic_policy_errors(m):
+            print("SELF-TEST FAILED: default package must pin CP-0651 economics")
+            return 1
+        wrong_economics = json.loads(json.dumps(m))
+        wrong_economics["economic_policy"]["max_gross_supply_qzxb"] = "10000000000"
+        if not economic_policy_errors(wrong_economics):
+            print("SELF-TEST FAILED: obsolete 10B policy must be rejected")
+            return 1
+        wrong_economics["economic_policy"]["block_subsidy_atoms"] = "35673515981"
+        if not economic_policy_errors(wrong_economics):
+            print("SELF-TEST FAILED: obsolete mining subsidy must be rejected")
+            return 1
+        m["signing"]["q6ts_runtime_enforced"] = True
+        (root / "manifest.json").write_text(json.dumps(m), encoding="utf-8")
+        if validate_package(root) != 2:
+            print("SELF-TEST FAILED: base profile must reject false Q6TS enforcement claim")
+            return 1
+        m["release_profile"] = "anchored_checkpoint"
+        (root / "manifest.json").write_text(json.dumps(m), encoding="utf-8")
+        if validate_package(root) != 2:
+            print("SELF-TEST FAILED: anchored profile must fail without trust floor/signatures")
+            return 1
+        m["signing"] = {"q6ts_runtime_enforced": True, "q6ts_signatures_present": True, "trust_floor_provisioned": True}
+        (root / "manifest.json").write_text(json.dumps(m), encoding="utf-8")
+        if validate_package(root) != 2:
+            print("SELF-TEST FAILED: anchored profile must still require all anchored artifacts")
+            return 1
+        m["release_profile"] = "unknown_profile"
+        (root / "manifest.json").write_text(json.dumps(m), encoding="utf-8")
+        if validate_package(root) != 2:
+            print("SELF-TEST FAILED: unknown release profile must fail closed")
+            return 1
+        m["release_profile"] = "permissionless_full_history"
+        m["signing"]["q6ts_runtime_enforced"] = False
+        ed, pq = bytes(range(32)), bytes((i % 251 for i in range(MLDSA65_PUBLIC_KEY_BYTES)))
+        account = founder_account_id(ed, pq)
+        manifest_path = root / "manifest.json"
+        m = json.loads(manifest_path.read_text(encoding="utf-8"))
+        m["founder_identity"] = {
+            "status": "PUBLIC_KEYS_BOUND_CANDIDATE_ONLY",
+            "derivation": "AIN1-QFP6-ACCOUNT-ID-HYBRID-V1",
+            "public_account_id_hex": account.hex(),
+            "ed25519_public_key_hex": ed.hex(),
+            "mldsa65_public_key_hex": pq.hex(),
+            "private_key_material_included": False,
+            "genesis_signature_present": False
+        }
+        m["owner_genesis_account"] = account.hex()
+        manifest_path.write_text(json.dumps(m), encoding="utf-8")
+        if validate_package(root) != 2:
+            print("SELF-TEST FAILED: valid founder binding must not promote incomplete package")
+            return 1
+        m["owner_genesis_account"] = "00" * 32
+        manifest_path.write_text(json.dumps(m), encoding="utf-8")
+        if validate_package(root) != 2:
+            print("SELF-TEST FAILED: mismatched founder account must fail closed")
+            return 1
+    print("SELF-TEST PASSED: CP-0651 economics are pinned; obsolete 10B/subsidy policies fail; release profiles are separated; Q6TS claims fail closed; founder binding is verified; incomplete package remains non-production")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    p_init = sub.add_parser("init")
+    p_init.add_argument("directory", type=pathlib.Path)
+    p_val = sub.add_parser("validate")
+    p_val.add_argument("directory", type=pathlib.Path)
+    p_bind = sub.add_parser("bind-founder")
+    p_bind.add_argument("directory", type=pathlib.Path)
+    p_bind.add_argument("--identity-json", required=True, type=pathlib.Path)
+    sub.add_parser("self-test")
+    args = parser.parse_args()
+    if args.command == "init":
+        init_package(args.directory)
+        return 0
+    if args.command == "validate":
+        return validate_package(args.directory)
+    if args.command == "bind-founder":
+        return bind_founder(args.directory, args.identity_json)
+    return self_test()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
