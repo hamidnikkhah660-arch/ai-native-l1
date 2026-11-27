@@ -3,7 +3,7 @@
 **QRun** is the public brand of an independently developed native Layer-1 project; **QZXB** is the selected native-coin ticker and **QRun Blockchain** is the network name. The source contains a Rust-native ledger research programme, deterministic state/recovery candidates, authenticated peer-networking and release-integrity research, ML-DSA-65 and hybrid-identity work, an isolated EVM/revm smart-contract laboratory, candidate market-operation processing, wallet tooling and an AI-native ecosystem roadmap.
 
 
-## Public ecosystem status (2026-11-16)
+## Public ecosystem status (2026-11-27)
 
 The source repository and project website are public, and we are actively inviting independent node operators, code contributors, security reviewers, AI/ML researchers, application developers and milestone sponsors. **The running node remains experimental public-alpha; value-bearing native Mainnet and a genuine QZXB/USDT market are not live.** A public source tree is open for review/contribution; it is not a claim that candidate balances are publicly spendable.
 
@@ -19,8 +19,8 @@ The source repository and project website are public, and we are actively inviti
 - **Cryptography guide:** [ML-DSA-65, the selected 53-case fixture, hybrid-signature limits](cryptography.html).
 - **Current economics:** [CP-0651: 7B accounting ceiling, 1B owner Genesis allocation and fee-only production](economics.html).
 - **Allocation and release policy:** [CP-0651-A: seven allocation purposes, conditional release controls and public accounting terms](docs/CP-0651A_QZXB_ALLOCATION_AND_RELEASE_POLICY_V1_2026-11-27.md).
-- **Current Public Testnet readiness:** [Public status and ten release safeguards](status.html) — the separate Q6GA v2 authorization for zero-value Public Testnet has been owner-signed and locally verified. Public Testnet remains NO-GO until external hosts, independent operators, final network artifacts, external reachability and independent reviews are complete.
-- **Latest zero-value Public Testnet engineering update:** the separate authorization is signed and locally verified for zero-value testnet scope only. Fresh-Genesis recovery, protected identity reload and Release-node build checks have passed locally. No public network is live; see the [updated status and ten release safeguards](status.html).
+- **Current Public Testnet readiness:** [Public status and ten release safeguards](status.html) — Q6GA v2 authorizes zero-value Public Testnet only. PR #198 remains an unmerged candidate with an empty bootstrap-peer list, unqualified public peer discovery/authenticated inbound identity, and no approved public Seed endpoint. The multi-peer Public Testnet is NOT LAUNCHED.
+- **Latest recovery engineering update (2026-11-27):** developer-reported CP-0795–CP-0807 work includes Railway/Anchor Vault failure-domain findings, Q6PA/QAR2/Noise recovery candidates and local abrupt-process-kill recovery tests (8/8 dedicated; 31/31 Anchor regression). These are local/report-based results, not public-host or production qualification. See the [dated status and remaining acceptance gates](status.html).
 - **Release status:** [Current source branch, test inventory, production blockers](status.html).
 - **Contributions and sponsorship:** [How to submit a review, work plan or funding proposal](contribute.html).
 - **EVM toolchain security follow-up:** [Hardhat/EDR validation, clean dependency audit and CI coverage](docs/CP-0467_QRUN_EVM_TOOLCHAIN_DEPENDENCY_HARDENING_2026-10-29.md).
@@ -86,11 +86,11 @@ An isolated EVM lab pins revm and explores call/create, storage, gas, rollback a
 
 The codebase covers bounded wire parsing and ingress/worker queues, authenticated peer-session research, state-commitment candidates, fork/reorg history replay, archive paging, snapshot/store recovery models and process-crash tests. The next qualification stage adds an independently administered monotonic trust provider and tests across independently operated hosts and storage-failure conditions.
 
-## Current native QZXB policy (CP-0651, 2026-11-14)
+## Current native QZXB policy (CP-0651 / CP-0651-A, 2026-11-27)
 
-The active **candidate** monetary policy is a 7,000,000,000 QZXB maximum gross accounting ceiling: **1,000,000,000 QZXB** for the owner's Genesis allocation and six additional 1,000,000,000-QZXB accounting labels. Those six labels are explicitly non-circulating ceilings, not Genesis balances, not issued or transferable tokens, and not permission to mint. The block subsidy is zero; candidate producers receive canonical transaction fees only.
+The active **candidate** monetary policy is a 7,000,000,000 QZXB maximum gross accounting ceiling: **1,000,000,000 QZXB** for the owner's Genesis allocation and six additional 1,000,000,000-QZXB accounting labels. Those six labels are explicitly non-circulating ceilings, not Genesis balances, not issued or transferable tokens, and not permission to mint. The block subsidy is zero; candidate producers receive canonical transaction fees only. CP-0651-A v1.0 was merged to `main` on 2026-11-27. It sets the founder release candidate at 10% (100M) only at authorized Mainnet launch and the remaining 90% (900M) linearly over 24 months from launch, with no extra cliff; activation still requires implementation, tests and authorization. See the [full release policy](docs/CP-0651A_QZXB_ALLOCATION_AND_RELEASE_POLICY_V1_2026-11-27.md).
 
-This policy is implemented in the current candidate code and manifest but remains **unreleased**. The separate Q6GA v2 authorization for a zero-value Public Testnet has now been owner-signed and locally verified. This is not a Mainnet Genesis signature or Mainnet authorization. The canonical value-bearing Genesis execution snapshot, Q6GD descriptor, frozen Q6CP consensus profile, Q6PN network profile and externally verified public bootstrap peers are still not finalized/provisioned. No native QZXB balance is represented as live, spendable or transferable; Public Testnet is not launched and Mainnet is not authorized.
+This policy remains a **candidate** and is not activated on a value-bearing Mainnet. The Q6GA v2 authorization is limited to zero-value Public Testnet and is not Mainnet authorization. PR #198's attached candidate package still has an empty bootstrap list and lacks qualified public peer discovery, authenticated inbound identity and an approved public Seed endpoint; Public Testnet is not launched and Mainnet is not authorized. No native QZXB balance is represented as live, spendable or transferable.
 
 - **Active monetary policy:** [CP-0651 — 7B candidate accounting ceiling, 1B owner Genesis allocation, six non-circulating labels and fee-only producer compensation](economics.html).
 - **Public Testnet release gate:** [Current readiness, ten release safeguards and remaining blockers](status.html).
