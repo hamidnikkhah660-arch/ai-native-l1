@@ -18,6 +18,7 @@ The source repository and project website are public, and we are actively inviti
 - **Technology guide:** [Rust Layer-1 architecture and implementation boundaries](technology.html).
 - **Cryptography guide:** [ML-DSA-65, the selected 53-case fixture, hybrid-signature limits](cryptography.html).
 - **Current economics:** [CP-0651: 7B accounting ceiling, 1B owner Genesis allocation and fee-only production](economics.html).
+- **Allocation and release policy:** [CP-0651-A: seven allocation purposes, conditional release controls and public accounting terms](docs/CP-0651A_QZXB_ALLOCATION_AND_RELEASE_POLICY_V1_2026-11-27.md).
 - **Current Public Testnet readiness:** [Public status and ten release safeguards](status.html) — the separate Q6GA v2 authorization for zero-value Public Testnet has been owner-signed and locally verified. Public Testnet remains NO-GO until external hosts, independent operators, final network artifacts, external reachability and independent reviews are complete.
 - **Latest zero-value Public Testnet engineering update:** the separate authorization is signed and locally verified for zero-value testnet scope only. Fresh-Genesis recovery, protected identity reload and Release-node build checks have passed locally. No public network is live; see the [updated status and ten release safeguards](status.html).
 - **Release status:** [Current source branch, test inventory, production blockers](status.html).
