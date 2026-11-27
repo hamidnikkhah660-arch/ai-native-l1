@@ -1,4 +1,4 @@
-> **Current-policy note (2026-10-24):** v0.3 updates allocation wording only; engineering/test statements retain their cited review dates. Native QZXB mainnet and liquid native-coin market are not represented as launched.
+> **Historical-document notice (2026-11-27):** This v0.2/v0.3 white-paper snapshot is retained for engineering history. Its original 10B/3B-mining tokenomics and v0.4 allocation references are superseded by CP-0651 and CP-0651-A v1.0. Read the current candidate economics at `economics.html` and the [CP-0651-A allocation/release policy](CP-0651A_QZXB_ALLOCATION_AND_RELEASE_POLICY_V1_2026-11-27.md). Neither document authorizes a live Mainnet, issuance, or real-value transfer.
 
 # QuantumZXB - AI-Native L1 Native Coin and Ecosystem White Paper
 ## Version 0.2 - Public Technical Engineering White Paper
@@ -10,7 +10,7 @@ Document status: Public engineering white paper describing architecture, test ev
 
 QuantumZXB is the current working identity for an independently developed native Layer-1 project. Its engineering programme combines a Rust-based native ledger and proof-of-work research, deterministic state and chain-selection candidates, authenticated peer transport, durable-storage and recovery experiments, a post-quantum signature research path, and a separate EVM-compatibility laboratory for smart-contract execution.
 
-The native asset is a coin of its own network, distinct from the Ethereum Sepolia ERC-20 experiment. The current owner-directed design proposes a 10,000,000,000-coin maximum: 30% mining/network security and seven 10% buckets for community airdrop, exchange/market-integration and liquidity partnerships, major marketing partners, developers/security contributors, financial/strategic supporters, protocol burn reserve and owner allocation. These remain design terms, not active Mainnet rules. The canonical production Genesis, issuance path and all-bucket invariants must be frozen and integrated before launch. See allocation policy v0.4.
+The native asset is a coin of its own network, distinct from the Ethereum Sepolia ERC-20 experiment. The current CP-0651 candidate policy defines a 7,000,000,000-QZXB gross accounting ceiling: a 1B owner Genesis allocation plus six additional 1B accounting labels. Those six labels are non-circulating ceilings, not issued balances, transferable tokens, or mint authority. Block subsidy is zero and candidate producer compensation is canonical transaction fees only. CP-0651-A v1.0 proposes that 100M of the founder allocation may become transferable only at an authorized Mainnet launch, with the remaining 900M released linearly over 24 months from launch and no additional cliff. These remain candidate rules pending implementation, testing and authorization; no live Mainnet balance or transfer is implied.
 
 The project has substantial code and testing infrastructure. The maintainer's complete working checkout passed a full Rust regression with 736 library tests and no failures; the locked/offline all-target build check and format check also passed. The full working checkout is larger than this curated public tree, so this test count is tied to that review scope. The separate EVM launch-asset package's local test suite also passed. These are reproducible engineering signals, not substitutes for production-network qualification or an independent protocol audit.
 
@@ -24,17 +24,17 @@ The name "AI-Native" expresses the project's intended product direction. It does
 
 - **Network/project identity:** QuantumZXB is the current working brand.
 - **Proposed native coin ticker:** QZXB; it remains a proposal rather than a frozen production network identifier or verified listing symbol.
-- **Maximum supply design:** 10,000,000,000 native coins.
-- **Atomic-unit design:** eight decimal places; the candidate representation uses up to 10^18 atomic units across the full design cap.
-- **Current planned allocation:** 3B mining/network security (30%) and seven 1B buckets (10% each): community airdrop, exchange/market integrations and liquidity partnerships, major marketing partners, developers/security contributors, financial/strategic supporters, burn reserve and owner allocation. See tokenomics policy v0.4.
+- **Current candidate accounting ceiling (CP-0651):** 7,000,000,000 QZXB gross accounting units.
+- **Owner Genesis allocation:** 1,000,000,000 QZXB.
+- **Additional labels:** six conditional 1B accounting ceilings for developers/network security, community/public distribution, exchange/platform integration, marketing/growth, financial/strategic supporters and protocol burn reserve. They are not Genesis balances or issued/transferable tokens.
+- **Producer compensation:** zero block subsidy; candidate producers receive canonical transaction fees only.
+- **Founder release candidate (CP-0651-A v1.0):** 100M may become transferable only at authorized Mainnet launch; 900M released linearly over 24 months from launch, with no additional cliff. Implementation, tests and authorization remain prerequisites.
 
-The 10B cap and 30/10/10/10/10/10/10/10 allocation are design-level monetary decisions, not live supply or circulating-balance facts. They must become one versioned production monetary profile enforced in canonical production, validation/import, fork-choice/reorg, persistence, replay and snapshot/state-root paths before a native public Mainnet can rely on them.
+The older 10B/3B-mining and v0.4 bucket model is historical and superseded. The 7B figure is a gross accounting ceiling, not circulating supply or a live token balance. CP-0651 and CP-0651-A remain candidate policy documents; they do not activate issuance, minting, transferability, a market or Mainnet.
 
 ### 2.1 Owner, sponsor and contributor allocation framework
 
-Under owner-directed policy v0.4, the owner allocation is 1B coins (10%). Separate 1B allocations are planned for financial/strategic supporters and developers/security contributors; neither is a sub-allocation of the owner bucket. The exchange/market-integration and major-marketing buckets are also separate. Awards remain conditional on written terms and verified milestones. This plan does not create an on-chain balance, cash raised or market liquidity.
-
-No sponsor is currently confirmed, no entitlement under this proposal is already granted, and no production balance is created merely by describing the allocation. Sponsor and contributor quantities are internal proposal terms until an actual agreement, milestone evidence and final Genesis/issuance design exist. Coin allocation is not, by itself, company equity, revenue share, a redemption right or a promise of financial return. See `FOUNDER_SPONSOR_CONTRIBUTOR_ALLOCATION_POLICY_V04_2026-10-24.md`.
+Under CP-0651-A v1.0, the owner allocation is a 1B accounting allocation within the 7B gross ceiling. The six other 1B labels are conditional accounting ceilings with purpose-specific release controls. No sponsor is confirmed and no recipient entitlement or live balance is created by the policy. Awards require written terms, verified milestones, account checks and the applicable authorization. Coin allocation is not, by itself, company equity, revenue share, a redemption right or a promise of financial return. See `CP-0651A_QZXB_ALLOCATION_AND_RELEASE_POLICY_V1_2026-11-27.md`.
 
 ## 3. Architecture overview
 
@@ -46,7 +46,7 @@ The production protocol still needs one canonical, versioned monetary/Genesis pr
 
 ### 3.2 Networking and node operations
 
-The repository includes authenticated transport, Noise-based peer-connection candidates, pinned peer identities, bounded ingress/queue accounting, archive transfer limits and loopback/private devnet harnesses. The classical transport components include X25519/ChaChaPoly. That provides a useful foundation for safe peer-session research, while the final public network still needs authenticated discovery, key rotation/revocation operations, independent node operators, network-wide fault testing, monitoring and a production release/runbook.
+The repository includes authenticated transport, Noise-based peer-connection candidates, pinned peer identities, bounded ingress/queue accounting, archive transfer limits and loopback/private devnet harnesses. Earlier peer-to-peer design exploration borrowed concepts from Bitcoin-style peer gossip; that historical design context is not, by itself, the final QRun networking specification. Newer Q6PD work separately implements signed peer-discovery records, address/session management and NAT-friendly outbound persistent-session candidates (including the CP-0848/CP-0849 review lineage). These newer components must be evaluated on their own source and interoperability evidence rather than being conflated with the earlier Bitcoin-inspired exploration. The CP-0849 Joiner completed local pinned-Noise/Q6PD pull-gossip/history-sync tests, but persistent heartbeat interoperability against the then-running CP-0843 Seed was not passed; independent multi-operator mesh qualification remains open. Classical transport includes X25519/ChaChaPoly and is not post-quantum.
 
 A successful local two-node or loopback test is evidence for the specific profile tested, not evidence that a public production network is active.
 
@@ -124,7 +124,7 @@ A production release should ship a source commit and checksums, reproducible bui
 
 ## 10. Phased roadmap
 
-1. **Monetary and Genesis freeze:** select one canonical runtime/profile; finalise and implement all eight allocation buckets in policy v0.4; integrate issuance and all supply invariants into block production/import, fork choice, persistence, replay and snapshots.
+1. **Monetary and Genesis freeze:** select one canonical runtime/profile; implement the CP-0651 7B gross accounting ceiling, 1B owner Genesis allocation, six conditional non-circulating 1B labels and zero-subsidy/fee-only producer model; implement and test the CP-0651-A release controls across block production/import, fork choice, persistence, replay and snapshots. Historical 10B/3B-mining/v0.4 schedules must not be reactivated.
 2. **Hybrid identity and recovery:** define the canonical signature/authentication suite and migration boundary; integrate ML-DSA into the selected native transaction path; close independent monotonic trust and crash/recovery requirements.
 3. **Native EVM execution:** ratify fork/gas rules, native account/fee/funding mapping, EVM state representation, receipts/logs/roots, canonical node storage and RPC; pass cross-client end-to-end deployment tests.
 4. **Zero-value public testnet:** operate multiple independent nodes with a frozen profile, external participants, wallet/RPC/explorer, sync and upgrade rehearsals, real workload measurements and an incident-response programme.
