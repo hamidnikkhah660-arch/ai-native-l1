@@ -47,7 +47,7 @@ Every award or release must pass all applicable controls:
 
 Purpose: founder ownership allocation and documented support for continued QRun development.
 
-Proposed release discipline: 48-month vesting from the authorized Genesis date, with a 12-month cliff and monthly vesting thereafter. The final implementation must define whether the cliff releases the first 25% and how the remaining amount vests; no schedule is active until encoded, tested and authorized.
+Proposed release discipline: 48-month total vesting from the authorized Genesis date, with a 12-month cliff. At month 12, 25% becomes vested; the remaining 75% vests in equal monthly portions over months 13–48. No schedule is active until encoded, tested and authorized.
 
 Project-development use:
 - Project expenses must be recorded separately from personal expenses.
