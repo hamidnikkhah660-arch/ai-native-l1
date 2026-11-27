@@ -21,6 +21,7 @@ const MANIFEST_VERSION: u16 = 1;
 const MANIFEST_CORE_LEN: usize = 4 + 2 + 32 + 32 + 32 + 32 + 4 + 1;
 const MANIFEST_LEN: usize = MANIFEST_CORE_LEN + 32;
 const PROFILE_DOMAIN: &[u8] = b"QANVORYX-ZERO-VALUE-DEVNET-PROFILE-V1\0";
+const TEST_PROFILE_DOMAIN: &[u8] = b"QANVORYX-ZERO-VALUE-DEVNET-TEST-POW-PROFILE-V1\0";
 const CONSENSUS_DOMAIN: &[u8] = b"QANVORYX-DEVNET-CONSENSUS-DIGEST-V1\0";
 const MANIFEST_DOMAIN: &[u8] = b"QANVORYX-DEVNET-MANIFEST-DIGEST-V1\0";
 const EXPECTED_MINIMUM_MEMORY_KIB: u32 = 64 * 1024;
@@ -139,11 +140,29 @@ pub struct DevnetProfileCandidate {
 
 impl DevnetProfileCandidate {
     pub fn new(network_id: NetworkId) -> Result<Self, DevnetProfileError> {
+        Self::new_with_test_pow(network_id, false)
+    }
+
+    /// Explicit local-test-only zero-value profile. Its manifest receives a different profile ID,
+    /// maximum target and 8 MiB memory ceiling, so it cannot reuse the normal Devnet data directory.
+    pub fn new_test_pow(network_id: NetworkId) -> Result<Self, DevnetProfileError> {
+        Self::new_with_test_pow(network_id, true)
+    }
+
+    fn new_with_test_pow(
+        network_id: NetworkId,
+        test_only: bool,
+    ) -> Result<Self, DevnetProfileError> {
         if network_id.iter().all(|byte| *byte == 0) {
             return Err(DevnetProfileError::InvalidNetworkId);
         }
-        let consensus = ConsensusParameters::candidate_testnet()
+        let mut consensus = ConsensusParameters::candidate_testnet()
             .map_err(|error| DevnetProfileError::ConsensusParameters(error.to_string()))?;
+        if test_only {
+            consensus.initial_target = Uint256::MAX;
+            consensus.pow_limit = Uint256::MAX;
+            consensus.pow.memory_kib = 8 * 1024;
+        }
         consensus
             .validate()
             .map_err(|error| DevnetProfileError::ConsensusParameters(error.to_string()))?;
@@ -151,8 +170,13 @@ impl DevnetProfileCandidate {
             return Err(DevnetProfileError::UnsupportedAlgorithm);
         }
         // Do not inherit the private node's maximum initial target / 8 MiB smoke overrides.
-        if consensus.initial_target == Uint256::MAX
-            || consensus.pow.memory_kib < EXPECTED_MINIMUM_MEMORY_KIB
+        if (!test_only
+            && (consensus.initial_target == Uint256::MAX
+                || consensus.pow.memory_kib < EXPECTED_MINIMUM_MEMORY_KIB))
+            || (test_only
+                && (consensus.initial_target != Uint256::MAX
+                    || consensus.pow_limit != Uint256::MAX
+                    || consensus.pow.memory_kib != 8 * 1024))
             || consensus.pow.iterations == 0
             || consensus.pow.lanes == 0
         {
@@ -166,7 +190,11 @@ impl DevnetProfileCandidate {
             ));
         }
         let genesis_state_root = genesis.state_root();
-        let profile_id = hash(PROFILE_DOMAIN);
+        let profile_id = hash(if test_only {
+            TEST_PROFILE_DOMAIN
+        } else {
+            PROFILE_DOMAIN
+        });
         let consensus_digest = consensus_digest(&consensus);
         Ok(Self {
             network_id,
@@ -379,6 +407,31 @@ mod tests {
         assert_eq!(profile.consensus.pow.algorithm, PowAlgorithm::Argon2id);
         assert!(!profile.value_bearing());
         assert_eq!(profile.genesis_account_count(), 0);
+    }
+
+    #[test]
+    fn test_easy_pow_profile_is_zero_value_and_cannot_reuse_production_candidate_manifest() {
+        let network = network(0x46);
+        let normal = DevnetProfileCandidate::new(network).unwrap();
+        let test = DevnetProfileCandidate::new_test_pow(network).unwrap();
+        assert_ne!(normal.profile_id(), test.profile_id());
+        assert_ne!(normal.consensus_digest(), test.consensus_digest());
+        assert_eq!(test.consensus.initial_target, Uint256::MAX);
+        assert_eq!(test.consensus.pow_limit, Uint256::MAX);
+        assert_eq!(test.consensus.pow.memory_kib, 8 * 1024);
+        assert_eq!(test.genesis_account_count(), 0);
+        assert!(!test.value_bearing());
+        assert_ne!(normal.encode_manifest(), test.encode_manifest());
+        assert_eq!(
+            test.verify_manifest(&test.encode_manifest())
+                .unwrap()
+                .genesis_account_count(),
+            0
+        );
+        assert_eq!(
+            normal.verify_manifest(&test.encode_manifest()),
+            Err(DevnetProfileError::ProfileMismatch)
+        );
     }
 
     #[test]

@@ -14,8 +14,6 @@ use std::{
 pub(crate) struct StoreWriterLock {
     file: File,
     locked: bool,
-    #[cfg(windows)]
-    overlapped: WindowsOverlapped,
 }
 
 impl StoreWriterLock {
@@ -31,8 +29,6 @@ impl StoreWriterLock {
         let mut lock = Self {
             file,
             locked: false,
-            #[cfg(windows)]
-            overlapped: WindowsOverlapped::default(),
         };
         lock.lock_exclusive()?;
         lock.locked = true;
@@ -57,8 +53,12 @@ impl StoreWriterLock {
             // ERROR_LOCK_VIOLATION is returned when another process/handle owns the byte range.
             const ERROR_LOCK_VIOLATION: i32 = 33;
 
-            // SAFETY: file is a valid open handle; OVERLAPPED is correctly laid out and stored
-            // in this guard for the whole lock lifetime. The operation is immediate, not pending.
+            // LockFileEx needs OVERLAPPED only for this synchronous call: the File is opened
+            // without FILE_FLAG_OVERLAPPED and LOCKFILE_FAIL_IMMEDIATELY is specified. Keeping
+            // this FFI structure on the stack avoids making the long-lived lock guard !Send.
+            let mut overlapped = WindowsOverlapped::default();
+            // SAFETY: file is a live readable/writable handle; the OVERLAPPED layout and byte
+            // offset are correct, hEvent is null, and the call completes before this value drops.
             // It locks byte 4096, separate from the diagnostic PID header rewritten at offset 0.
             let result = unsafe {
                 LockFileEx(
@@ -67,7 +67,7 @@ impl StoreWriterLock {
                     0,
                     1,
                     0,
-                    &mut self.overlapped,
+                    &mut overlapped,
                 )
             };
             if result == 0 {
@@ -142,14 +142,18 @@ impl Drop for StoreWriterLock {
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawHandle;
-            // SAFETY: the same file handle and byte range were successfully locked by this guard.
+            // UnlockFileEx identifies the exact byte range through the OVERLAPPED offset;
+            // reconstruct that offset locally instead of retaining an FFI pointer in the guard.
+            let mut overlapped = WindowsOverlapped::default();
+            // SAFETY: the same live file handle and exact byte range were successfully locked.
+            // The file handle is synchronous, so the local OVERLAPPED remains valid for the call.
             unsafe {
                 let _ = UnlockFileEx(
                     self.file.as_raw_handle() as *mut std::ffi::c_void,
                     0,
                     1,
                     0,
-                    &mut self.overlapped,
+                    &mut overlapped,
                 );
             }
         }
@@ -237,6 +241,20 @@ mod tests {
         let reopened = StoreWriterLock::acquire(&directory, "writer.lock").unwrap();
         let content = fs::read_to_string(&lock_path).unwrap();
         assert_eq!(content, format!("pid={}\n", std::process::id()));
+        drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn writer_lock_can_move_to_another_thread_and_unlock_there() {
+        let directory = temp_dir();
+        let first = StoreWriterLock::acquire(&directory, "writer.lock").unwrap();
+
+        // Moving the guard must preserve exclusive ownership, and dropping it on the
+        // receiving thread must release the same OS byte-range lock.
+        std::thread::spawn(move || drop(first)).join().unwrap();
+
+        let reopened = StoreWriterLock::acquire(&directory, "writer.lock").unwrap();
         drop(reopened);
         fs::remove_dir_all(directory).unwrap();
     }

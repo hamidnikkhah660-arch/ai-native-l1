@@ -734,11 +734,24 @@ mod tcp_loopback_tests {
             let (mut stream, _) = listener.accept().unwrap();
             let until = deadline(Duration::from_secs(5)).unwrap();
             let _request = read_frame(&mut stream, MAX_REQUEST_FRAME, until).unwrap();
-            stream.write_all(&100u32.to_be_bytes()).unwrap();
+            stream.set_nodelay(true).unwrap();
+            if stream.write_all(&100u32.to_be_bytes()).is_err() {
+                return;
+            }
             let mut partial = RESPONSE_MAGIC.to_vec();
             partial.extend_from_slice(&[0xA1; 4]);
-            stream.write_all(&partial).unwrap();
-            thread::sleep(Duration::from_millis(150));
+            if stream.write_all(&partial).is_err() {
+                return;
+            }
+            // Keep making small progress more frequently than the per-operation timeout. A broken
+            // implementation that resets its deadline on each read will keep waiting for this
+            // trickle; a correct implementation enforces one absolute deadline for the whole frame.
+            for _ in 0..20 {
+                thread::sleep(Duration::from_millis(15));
+                if stream.write_all(&[0xB2]).is_err() {
+                    break;
+                }
+            }
         });
         let begin = Instant::now();
         let result = tcp_request(address, SESSION, None, Duration::from_millis(35));
@@ -748,8 +761,8 @@ mod tcp_loopback_tests {
             io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
         ));
         assert!(
-            elapsed < Duration::from_millis(120),
-            "total deadline exceeded: {elapsed:?}"
+            elapsed < Duration::from_millis(275),
+            "total deadline exceeded under a slow response trickle: {elapsed:?}"
         );
         server_thread.join().unwrap();
     }

@@ -25,6 +25,8 @@ pub enum SigningKeyRole {
     GovernanceRoot = 2,
     OfflineRecovery = 3,
     PeerIssuer = 4,
+    ReferenceTimeAuthority = 5,
+    ReferenceTimePolicyAdmin = 6,
 }
 
 impl SigningKeyRole {
@@ -34,6 +36,8 @@ impl SigningKeyRole {
             Self::GovernanceRoot => "governance-root",
             Self::OfflineRecovery => "offline-recovery",
             Self::PeerIssuer => "peer-issuer",
+            Self::ReferenceTimeAuthority => "reference-time-authority",
+            Self::ReferenceTimePolicyAdmin => "reference-time-policy-admin",
         }
     }
 
@@ -43,6 +47,8 @@ impl SigningKeyRole {
             "governance-root" => Ok(Self::GovernanceRoot),
             "offline-recovery" => Ok(Self::OfflineRecovery),
             "peer-issuer" => Ok(Self::PeerIssuer),
+            "reference-time-authority" => Ok(Self::ReferenceTimeAuthority),
+            "reference-time-policy-admin" => Ok(Self::ReferenceTimePolicyAdmin),
             _ => Err("unknown signing-key role".into()),
         }
     }
@@ -53,6 +59,8 @@ impl SigningKeyRole {
             2 => Ok(Self::GovernanceRoot),
             3 => Ok(Self::OfflineRecovery),
             4 => Ok(Self::PeerIssuer),
+            5 => Ok(Self::ReferenceTimeAuthority),
+            6 => Ok(Self::ReferenceTimePolicyAdmin),
             _ => Err("protected signing-key role is invalid".into()),
         }
     }
@@ -377,6 +385,14 @@ mod tests {
         assert_eq!(
             SigningKeyRole::parse("peer-issuer").unwrap(),
             SigningKeyRole::PeerIssuer
+        );
+        assert_eq!(
+            SigningKeyRole::parse("reference-time-authority").unwrap(),
+            SigningKeyRole::ReferenceTimeAuthority
+        );
+        assert_eq!(
+            SigningKeyRole::parse("reference-time-policy-admin").unwrap(),
+            SigningKeyRole::ReferenceTimePolicyAdmin
         );
         assert!(SigningKeyRole::parse("admin").is_err());
     }
